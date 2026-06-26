@@ -60,6 +60,8 @@ import cydo.web.transport : McpCallbacks, RawSourceLookupResult, RawSourceLookup
 	TransportAdapter, WebSocketCallbacks;
 import cydo.domain.usage.tracker : AgentUsageTracker;
 
+import cydo.agent.resolver : createConfiguredAgent, displayNameForDriver,
+	effectiveDefaultAgentName, tryCreateConfiguredAgent;
 import cydo.agent.contract : Agent;
 import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
 	HistoryBoundary, ItemStartedEvent, SessionRateLimitEvent, TaskDiagnosticEvent, TaskDiagnosticSeverity,
@@ -68,7 +70,7 @@ import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
 import cydo.agent.drivers.registry : isRegisteredAgent;
 import cydo.agent.session : AgentSession;
 import cydo.agent.drivers.codex : CodexSession;
-import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
+import cydo.runtime.config : AgentConfig, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
 import cydo.domain.storage.persistence : Persistence, openDatabase;
 import cydo.server.config_resolution : loadRuntimeConfig, reloadRuntimeConfig;
 import cydo.runtime.launch.sandbox : cleanup, resolveExecutablePath, runtimeDir;
@@ -207,18 +209,7 @@ class App
 			taskDirTemplate: () => taskDirTemplate,
 		));
 		foreach (name, ref ac; config.agents)
-		{
-			auto driver = ac.driver.value;
-			auto a = createAgentByDriver(driver);
-			a.setModelAliases(ac.model_aliases);
-			{
-				import cydo.agent.drivers.copilot : CopilotAgent;
-				if (auto ca = cast(CopilotAgent) a)
-					ca.toolDispatch_ = (string tool, string callerTid, JSONFragment args) =>
-						dispatchTool(tool, callerTid, args);
-			}
-			agentsByName[name] = a;
-		}
+			agentsByName[name] = createConfiguredAppAgent(name);
 		auto defaultName = defaultAgentName("");
 		agent = agentsByName[defaultName];
 		transport = new TransportAdapter(
@@ -2221,22 +2212,14 @@ class App
 		auto td = &tasks[tid];
 		if (auto p = td.agentType in agentsByName)
 			return *p;
-		auto a = tryCreateAgentByName(td.agentType);
+		auto a = tryCreateConfiguredAppAgent(td.agentType);
 		if (!a)
 			return null;
-		if (auto ac = td.agentType in config.agents)
-			a.setModelAliases(ac.model_aliases);
-		{
-			import cydo.agent.drivers.copilot : CopilotAgent;
-			if (auto ca = cast(CopilotAgent) a)
-				ca.toolDispatch_ = (string tool, string callerTid, JSONFragment args) =>
-					dispatchTool(tool, callerTid, args);
-		}
 		agentsByName[td.agentType] = a;
 		return a;
 	}
 
-	/// Like tryAgentForTask but throws if the agent type isn't registered.
+	/// Like tryAgentForTask but throws if the configured agent is unknown.
 	/// Use this in happy-path code that has already established the task's
 	/// agent is configured; orphan-aware code should call tryAgentForTask
 	/// and null-check.
@@ -2244,30 +2227,37 @@ class App
 	{
 		auto a = tryAgentForTask(tid);
 		if (!a)
-			throw new Exception("Unknown agent type: " ~ tasks[tid].agentType);
+			throw new Exception("Unknown configured agent: " ~ tasks[tid].agentType);
 		return a;
 	}
 
-	/// Create an Agent by registered driver enum. Throws if registry doesn't know the driver.
-	private static Agent createAgentByDriver(AgentDriver driver)
+	private Agent decorateConfiguredAgent(Agent a, ref AgentConfig ac)
 	{
-		import cydo.agent.drivers.registry : agentRegistry;
-		import std.conv : to;
-		auto driverName = to!string(driver);
-		foreach (ref entry; agentRegistry)
-			if (entry.name == driverName)
-				return entry.create();
-		throw new Exception("Unknown driver: " ~ driverName);
+		a.setModelAliases(ac.model_aliases);
+		{
+			import cydo.agent.drivers.copilot : CopilotAgent;
+			if (auto ca = cast(CopilotAgent) a)
+				ca.toolDispatch_ = (string tool, string callerTid, JSONFragment args) =>
+					dispatchTool(tool, callerTid, args);
+		}
+		return a;
+	}
+
+	private Agent createConfiguredAppAgent(string agentName)
+	{
+		auto ac = agentName in config.agents;
+		assert(ac !is null);
+		return decorateConfiguredAgent(createConfiguredAgent(config, agentName), *ac);
 	}
 
 	/// Create an Agent by user-chosen agent name (config.agents key).
 	/// Returns null if the name isn't in config.agents.
-	private Agent tryCreateAgentByName(string agentName)
+	private Agent tryCreateConfiguredAppAgent(string agentName)
 	{
 		auto ac = agentName in config.agents;
 		if (!ac)
 			return null;
-		return createAgentByDriver(ac.driver.value);
+		return decorateConfiguredAgent(tryCreateConfiguredAgent(config, agentName), *ac);
 	}
 
 	/// Finalize pending task runtime state right before the first message starts it.
@@ -2503,15 +2493,7 @@ class App
 
 	private string defaultAgentName(string workspaceName)
 	{
-		foreach (ref ws; config.workspaces)
-			if (ws.name == workspaceName && ws.default_agent.length > 0)
-				return ws.default_agent;
-		if (config.default_agent.length > 0)
-			return config.default_agent;
-		// Post-overlay agentsByName is non-empty; fall through to first key.
-		foreach (name, _; agentsByName)
-			return name;
-		throw new Exception("no agents configured");
+		return effectiveDefaultAgentName(config, workspaceName);
 	}
 
 	private string defaultTaskType(string workspaceName)
@@ -2836,17 +2818,7 @@ class App
 				}
 			}
 			if (!reuseExisting)
-			{
-				auto a = createAgentByDriver(ac.driver.value);
-				a.setModelAliases(ac.model_aliases);
-				{
-					import cydo.agent.drivers.copilot : CopilotAgent;
-					if (auto ca = cast(CopilotAgent) a)
-						ca.toolDispatch_ = (string tool, string callerTid, JSONFragment args) =>
-							dispatchTool(tool, callerTid, args);
-				}
-				rebuilt[name] = a;
-			}
+				rebuilt[name] = createConfiguredAppAgent(name);
 		}
 		agentsByName = rebuilt;
 		auto defaultName = defaultAgentName("");
@@ -3025,7 +2997,6 @@ class App
 
 	private AgentInfoEntry[] snapshotAgentEntries()
 	{
-		import cydo.agent.drivers.registry : agentRegistry;
 		import std.conv : to;
 		import std.path : expandTilde;
 		import std.process : environment;
@@ -3045,7 +3016,7 @@ class App
 			auto driver = ac.driver.value;  // SetInfo: post-overlay always set
 			auto a = agentsByName.get(name, null);
 			if (a is null)
-				a = createAgentByDriver(driver);
+				a = createConfiguredAppAgent(name);
 
 			auto execPath = resolveExecutablePath(a.executableName(env), env);
 			// Honor CYDO_<DRIVER>_BIN env-var fallback when the resolved path
@@ -3059,14 +3030,7 @@ class App
 			// Display name resolution priority:
 			//   1. ac.display_name (user-configured override)
 			//   2. driver registry's display name (e.g. "Claude Code")
-			//   3. agent name itself (final fallback)
-			string displayName = name;
-			foreach (ref reg; agentRegistry)
-				if (to!AgentDriver(reg.name) == driver)
-				{
-					displayName = reg.displayName;
-					break;
-				}
+			string displayName = displayNameForDriver(driver);
 			if (ac.display_name.length > 0)
 				displayName = ac.display_name;
 

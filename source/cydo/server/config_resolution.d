@@ -5,6 +5,7 @@ import configy.attributes : SetInfo;
 import std.conv : to;
 import std.typecons : Nullable;
 
+import cydo.agent.resolver : effectiveDefaultAgentName, isConfiguredAgentName;
 import cydo.agent.drivers.registry : agentRegistry;
 import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, loadConfig, reloadConfig;
 
@@ -40,6 +41,15 @@ void resolveConfig(ref CydoConfig config)
 			config.agents[reg.name] = synthesized;
 		}
 	}
+
+	if (config.default_agent.length > 0)
+	{
+		if (!isConfiguredAgentName(config, config.default_agent))
+			throw new Exception("default_agent references unknown configured agent: "
+				~ config.default_agent);
+	}
+	else
+		config.default_agent = effectiveDefaultAgentName(config);
 }
 
 CydoConfig loadRuntimeConfig()
@@ -66,6 +76,7 @@ unittest
 	CydoConfig config;
 	resolveConfig(config);
 	assert(config.agents.length == agentRegistry.length);
+	assert(config.default_agent == "claude");
 	foreach (ref reg; agentRegistry)
 	{
 		assert((reg.name in config.agents) !is null);
@@ -85,6 +96,7 @@ unittest
 	assert(("work-claude" in config.agents) !is null);
 	assert(("claude" in config.agents) is null);
 	assert(config.agents.length == agentRegistry.length);
+	assert(config.default_agent == "work-claude");
 	assert(config.agents["work-claude"].driver.value == AgentDriver.claude);
 	assert(config.agents["codex"].driver.value == AgentDriver.codex);
 	assert(config.agents["copilot"].driver.value == AgentDriver.copilot);
@@ -113,4 +125,40 @@ unittest
 	}
 	catch (Exception e)
 		assert(e.msg == "agents['custom']: driver field is required (not a known driver name)");
+}
+
+unittest
+{
+	CydoConfig config;
+	AgentConfig workClaude;
+	workClaude.driver = typeof(workClaude.driver)(AgentDriver.claude, true);
+	config.agents["work-claude"] = workClaude;
+	config.default_agent = "claude";
+
+	try
+	{
+		resolveConfig(config);
+		assert(false, "expected resolveConfig to throw");
+	}
+	catch (Exception e)
+		assert(e.msg == "default_agent references unknown configured agent: claude");
+}
+
+unittest
+{
+	CydoConfig config;
+	AgentConfig workClaude;
+	workClaude.driver = typeof(workClaude.driver)(AgentDriver.claude, true);
+	config.agents["work-claude"] = workClaude;
+	AgentConfig reviewClaude;
+	reviewClaude.driver = typeof(reviewClaude.driver)(AgentDriver.claude, true);
+	config.agents["review-claude"] = reviewClaude;
+
+	try
+	{
+		resolveConfig(config);
+		assert(false, "expected resolveConfig to throw");
+	}
+	catch (Exception e)
+		assert(e.msg == "Multiple Claude-configured agents exist; set default_agent explicitly");
 }
