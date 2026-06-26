@@ -210,7 +210,7 @@ public:
 				now.year, cast(int) now.month, now.day,
 				now.hour, now.minute, now.second);
 			write(debugDir ~ "/meta.json",
-				toJson(DebugMeta(tid, td.agentType, td.taskType, timestamp)));
+				toJson(DebugMeta(tid, td.agentName, td.taskType, timestamp)));
 		}
 
 		td.suggestGeneration++;

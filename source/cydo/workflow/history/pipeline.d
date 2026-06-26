@@ -94,7 +94,7 @@ class HistoryEventPipeline
 		string lastDequeuedRawLine;
 		auto stripTransientStatus = (TranslatedEvent[] events) {
 			foreach (ref e; events)
-				e.translated = host_.injectAgentNameIntoSessionInit(e.translated, td.agentType);
+				e.translated = host_.injectAgentNameIntoSessionInit(e.translated, td.agentName);
 			return filterTransientSessionStatusEvents(events);
 		};
 
@@ -234,7 +234,7 @@ class HistoryEventPipeline
 
 		if (orphan)
 			appendTaskDiagnostic(tid, "Failed to load session history",
-				buildOrphanAgentBody(td.agentType));
+				buildOrphanAgentBody(td.agentName));
 
 		td.clearPendingDequeuedSteering();
 		if (!hasQueueOps && td.pendingSteeringTexts.length > userMsgFromJsonl)
@@ -319,7 +319,7 @@ class HistoryEventPipeline
 
 		auto snapshot = TaskData(tid, source.workspace, source.projectPath);
 		snapshot.agentSessionId = source.agentSessionId;
-		snapshot.agentType = source.agentType;
+		snapshot.agentName = source.agentName;
 		snapshot.worktreeTid = source.worktreeTid;
 		snapshot.history.reset(watermarkFromPath(path));
 
@@ -573,13 +573,13 @@ class HistoryEventPipeline
 	}
 
 private:
-	static string buildOrphanAgentBody(string agentType)
+	static string buildOrphanAgentBody(string agentName)
 	{
 		import std.algorithm : map;
 		import std.array : join;
 		import cydo.agent.drivers.registry : agentRegistry;
 		auto knownNames = agentRegistry[].map!(r => "`" ~ r.name ~ "`").join(", ");
-		return "This task uses agent `" ~ agentType ~ "`, which is not configured.\n\n"
+		return "This task uses agent `" ~ agentName ~ "`, which is not configured.\n\n"
 			~ "The currently available agents are: " ~ knownNames ~ ".";
 	}
 
@@ -1021,7 +1021,7 @@ unittest
 
 	enum tid = 1;
 	auto td = TaskData(tid, "local", projectPath);
-	td.agentType = "claude";
+	td.agentName = "claude";
 	td.agentSessionId = "S";
 	td.worktreeTid = 0;
 
@@ -1111,7 +1111,7 @@ unittest
 
 	enum tid = 1;
 	auto td = TaskData(tid, "local", projectPath);
-	td.agentType = "claude";
+	td.agentName = "claude";
 	td.agentSessionId = "S";
 	td.worktreeTid = 0;
 

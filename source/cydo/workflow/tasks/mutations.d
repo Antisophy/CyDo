@@ -158,13 +158,13 @@ public:
 			}
 
 			auto childTid = createForkTask(*host_.persistence(), tid, "", td.projectPath,
-				td.workspace, td.title, td.description, td.taskType, td.agentType);
+				td.workspace, td.title, td.description, td.taskType, td.agentName);
 			auto newTd = TaskData(childTid, td.workspace, td.projectPath);
 			newTd.title = td.title.length > 0 ? td.title ~ " (fork)" : "(fork)";
 			newTd.parentTid = tid;
 			newTd.relationType = "fork";
 			newTd.status = TaskStatus.completed;
-			newTd.agentType = td.agentType;
+			newTd.agentName = td.agentName;
 			newTd.description = td.description;
 			newTd.taskType = td.taskType;
 			newTd.createdAt = Clock.currStdTime;
@@ -228,7 +228,7 @@ public:
 			(string sid) => ta.historyPath(sid,
 				sid == td.agentSessionId ? host_.effectiveCwd(td) : td.projectPath),
 			&ta.rewriteSessionId, &ta.forkIdMatchesLine, td.description, td.taskType,
-			td.agentType);
+			td.agentName);
 		if (result.tid < 0)
 		{
 			ws.send(Data(toJson(ErrorMessage("error",
@@ -244,7 +244,7 @@ public:
 		newTd.parentTid = tid;
 		newTd.relationType = "fork";
 		newTd.status = TaskStatus.completed;
-		newTd.agentType = td.agentType;
+		newTd.agentName = td.agentName;
 		newTd.description = td.description;
 		newTd.taskType = td.taskType;
 		newTd.createdAt = Clock.currStdTime;
@@ -776,7 +776,7 @@ private:
 					(string sid) => ta.historyPath(sid,
 						sid == td.agentSessionId ? host_.effectiveCwd(td) : td.projectPath),
 					&ta.rewriteSessionId, &ta.forkIdMatchesLine,
-					td.description, td.taskType, td.agentType);
+					td.description, td.taskType, td.agentName);
 				if (backup.tid >= 0)
 				{
 					auto bTd = TaskData(backup.tid, td.workspace, td.projectPath);
@@ -785,7 +785,7 @@ private:
 					bTd.parentTid = tid;
 					bTd.relationType = "undo-backup";
 					bTd.status = TaskStatus.completed;
-					bTd.agentType = td.agentType;
+					bTd.agentName = td.agentName;
 					bTd.description = td.description;
 					bTd.taskType = td.taskType;
 					bTd.createdAt = Clock.currStdTime;
@@ -876,7 +876,7 @@ unittest
 
 	enum tid = 71;
 	auto task = TaskData(tid, "local", "/tmp");
-	task.agentType = "claude";
+	task.agentName = "claude";
 	task.agentSessionId = "session";
 	Agent agent = new ClaudeCodeAgent();
 	int replies;

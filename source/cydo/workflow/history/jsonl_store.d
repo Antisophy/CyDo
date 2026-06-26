@@ -68,8 +68,8 @@ struct ForkResult
 ForkResult forkTask(ref Persistence persistence, int sourceTid, string sourceSessionId, string afterForkId,
 	string projectPath, string workspace, string title, string delegate(string sessionId) historyPathFn,
 	string delegate(string line, string oldId, string newId) rewriteSessionIdFn,
-	bool delegate(string line, int lineNum, string forkId) matchFn,
-	string description = "", string taskType = "", string agentType = "claude")
+bool delegate(string line, int lineNum, string forkId) matchFn,
+	string description = "", string taskType = "", string agentName = "claude")
 {
 	import std.file : exists, mkdirRecurse, readText, write;
 	import std.string : lineSplitter;
@@ -128,7 +128,7 @@ ForkResult forkTask(ref Persistence persistence, int sourceTid, string sourceSes
 
 	// Create DB entry with the new agent session ID
 	return ForkResult(createForkTask(persistence, sourceTid, newSessionId, projectPath,
-		workspace, title, description, taskType, agentType), newSessionId);
+		workspace, title, description, taskType, agentName), newSessionId);
 }
 
 /// Edit a message in a JSONL file by replacing its content.

@@ -529,7 +529,7 @@ struct TaskData
 	string description;
 	string entryPoint;
 	string taskType = "blank";
-	string agentType = "claude";
+	string agentName = "claude";
 	int parentTid;
 	string relationType;
 	string workspace;

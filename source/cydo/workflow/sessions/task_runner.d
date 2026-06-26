@@ -297,7 +297,7 @@ class TaskSessionRunner
 
 		auto wsSandbox = host_.findWorkspaceSandbox(td.workspace);
 		auto wsRoot = host_.findWorkspaceRoot(td.workspace);
-		auto agentTypeSandbox = host_.findAgentSandbox(td.agentType);
+		auto agentNameSandbox = host_.findAgentSandbox(td.agentName);
 		bool readOnly = typeDef !is null && typeDef.read_only;
 		AgentSandboxConfig agentSandbox;
 		agentSandbox.configureSandbox = (ref PathMode[string] paths, ref string[string] env) {
@@ -305,7 +305,7 @@ class TaskSessionRunner
 		};
 		agentSandbox.gitName = taskAgent.gitName;
 		agentSandbox.gitEmail = taskAgent.gitEmail;
-		auto sandbox = launchSandbox.resolveSandbox(host_.globalSandbox(), agentTypeSandbox, wsSandbox,
+		auto sandbox = launchSandbox.resolveSandbox(host_.globalSandbox(), agentNameSandbox, wsSandbox,
 			agentSandbox, workDir, wsRoot, readOnly);
 
 		if (td.hasWorktree && workDir.length > 0)
@@ -401,7 +401,7 @@ class TaskSessionRunner
 		host_.reportMcpToolDescriptionLimit(td.projectPath, td.taskType,
 			checkRenderedCydoToolDescriptionViolations(taskTypes, entryPoints,
 				td.taskType, options: renderedToolOptions));
-		sessionConfig.agentName = td.agentType;
+		sessionConfig.agentName = td.agentName;
 
 		return TaskSessionLaunch(td.launch, sessionConfig);
 	}
@@ -829,7 +829,7 @@ class TaskSessionRunner
 
 			auto status = td.status;
 			infof("Resuming session %d/%d (tid=%d, agent=%s, status=%s)",
-				i + 1, toResume.length, tid, td.agentType, status);
+				i + 1, toResume.length, tid, td.agentName, status);
 
 			if (status == "waiting")
 			{
@@ -957,7 +957,7 @@ private:
 			string installHint;
 			if (ta is null)
 			{
-				binEnvVar = "CYDO_" ~ td.agentType.toUpper ~ "_BIN";
+				binEnvVar = "CYDO_" ~ td.agentName.toUpper ~ "_BIN";
 				installHint = "the appropriate package for your agent";
 			}
 			else
@@ -976,7 +976,7 @@ private:
 					break;
 				}
 			}
-			return "The **`" ~ td.agentType ~ "`** CLI was not found on `PATH`.\n\n"
+			return "The **`" ~ td.agentName ~ "`** CLI was not found on `PATH`.\n\n"
 				~ "Install it (e.g. via " ~ installHint ~ ") or set the `"
 				~ binEnvVar ~ "` environment variable to its absolute path, "
 				~ "then click **Resume** again.";
@@ -1023,7 +1023,7 @@ version (unittest) private void assertLinkedWorktreeGitMetadataMode(
 			TaskData[int] tasks;
 			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
 			tasks[1].taskType = taskTypeName;
-			tasks[1].agentType = "claude";
+			tasks[1].agentName = "claude";
 			assert(!tasks[1].hasWorktree);
 
 			auto workspaceSandbox = unrestrictedLaunchTestSandbox();
@@ -1230,7 +1230,7 @@ unittest
 			TaskData[int] tasks;
 			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
 			tasks[1].taskType = "managed";
-			tasks[1].agentType = "claude";
+			tasks[1].agentName = "claude";
 			tasks[1].worktreeTid = 1;
 
 			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
@@ -1280,7 +1280,7 @@ unittest
 			TaskData[int] tasks;
 			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
 			tasks[1].taskType = "parent";
-			tasks[1].agentType = "claude";
+			tasks[1].agentName = "claude";
 
 			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
 				unrestrictedLaunchTestSandbox(), "", fixture.linkedCheckout);
@@ -1319,7 +1319,7 @@ unittest
 			TaskData[int] tasks;
 			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
 			tasks[1].taskType = "managed";
-			tasks[1].agentType = "claude";
+			tasks[1].agentName = "claude";
 			tasks[1].worktreeTid = 1;
 
 			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
@@ -1366,7 +1366,7 @@ unittest
 			TaskData[int] tasks;
 			tasks[1] = TaskData(1, "local", projectPath);
 			tasks[1].taskType = "parent";
-			tasks[1].agentType = "claude";
+			tasks[1].agentName = "claude";
 			assert(!tasks[1].isGitCheckout);
 
 			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,

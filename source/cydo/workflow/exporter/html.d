@@ -83,19 +83,19 @@ string exportTaskData(ref Persistence persistence, Persistence.TaskRow[] taskRow
 	foreach (ref t; taskRows)
 		taskExports ~= TaskExport(t.tid, t.title, t.status, t.parentTid,
 			t.relationType, t.workspace, t.projectPath, t.taskType,
-			t.agentType, t.createdAt, t.lastActive);
+			t.agentName, t.createdAt, t.lastActive);
 
 	// Cache agent instances by type
 	Agent[string] agentCache;
-	Agent getAgent(string agentType)
+	Agent getAgent(string agentName)
 	{
-		if (auto p = agentType in agentCache)
+		if (auto p = agentName in agentCache)
 			return *p;
 		foreach (ref entry; agentRegistry)
-			if (entry.name == agentType)
+			if (entry.name == agentName)
 			{
 				auto a = entry.create();
-				agentCache[agentType] = a;
+				agentCache[agentName] = a;
 				return a;
 			}
 		return null;
@@ -108,7 +108,7 @@ string exportTaskData(ref Persistence persistence, Persistence.TaskRow[] taskRow
 		if (t.agentSessionId.length == 0)
 			continue;
 
-		auto agent = getAgent(t.agentType);
+		auto agent = getAgent(t.agentName);
 		if (agent is null)
 			continue;
 

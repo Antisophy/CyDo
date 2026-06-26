@@ -178,11 +178,12 @@ struct Persistence
 		return 0;
 	}
 
-	int createTask(string workspace = "", string projectPath = "", string agentType = "claude",
+	int createTask(string workspace = "", string projectPath = "", string agentName = "claude",
 		string entryPoint = "")
 	{
 		import std.datetime : Clock;
-		db.stmt!"INSERT INTO tasks (workspace, project_path, agent_type, created_at, entry_point) VALUES (?, ?, ?, ?, ?)".exec(workspace, projectPath, agentType, Clock.currStdTime, entryPoint);
+		// tasks.agent_type stores the configured agent name from config.agents.
+		db.stmt!"INSERT INTO tasks (workspace, project_path, agent_type, created_at, entry_point) VALUES (?, ?, ?, ?, ?)".exec(workspace, projectPath, agentName, Clock.currStdTime, entryPoint);
 		return cast(int) db.db.lastInsertRowID;
 	}
 
@@ -216,9 +217,9 @@ struct Persistence
 		db.stmt!"UPDATE tasks SET entry_point = ? WHERE tid = ?".exec(entryPoint, tid);
 	}
 
-	void setAgentType(int tid, string agentType)
+	void setAgentName(int tid, string agentName)
 	{
-		db.stmt!"UPDATE tasks SET agent_type = ? WHERE tid = ?".exec(agentType, tid);
+		db.stmt!"UPDATE tasks SET agent_type = ? WHERE tid = ?".exec(agentName, tid);
 	}
 
 	void setParentTid(int tid, int parentTid)
@@ -265,7 +266,7 @@ struct Persistence
 		string taskStartHead;
 		string title;
 		string status;
-		string agentType;
+		string agentName;
 		bool archived;
 		string draft;
 		string resultText;
@@ -280,11 +281,12 @@ struct Persistence
 		TaskRow[] result;
 		foreach (int tid, string agentSessionId, string description, string taskType,
 			int parentTid, string relationType, string workspace, string projectPath,
-			int worktreeTid, string taskStartHead, string title, string status, string agentType, int archived, string draft,
+			int worktreeTid, string taskStartHead, string title, string status, string agentName, int archived, string draft,
 			string resultText, long createdAt, long lastActive, string entryPoint, int needsAttention;
 			db.stmt!"SELECT tid, COALESCE(agent_session_id,''), COALESCE(description,''), COALESCE(task_type,'blank'), COALESCE(parent_tid,0), COALESCE(relation_type,''), COALESCE(workspace,''), COALESCE(project_path,''), COALESCE(worktree_tid,0), COALESCE(task_start_head,''), COALESCE(title,''), COALESCE(status,'completed'), COALESCE(agent_type,'claude'), COALESCE(archived,0), COALESCE(draft,''), COALESCE(result_text,''), COALESCE(created_at,0), COALESCE(last_active,0), COALESCE(entry_point,''), COALESCE(needs_attention,0) FROM tasks".iterate())
 		{
-			result ~= TaskRow(tid, agentSessionId, description, taskType, parentTid, relationType, workspace, projectPath, worktreeTid, taskStartHead, title, status, agentType, archived != 0, draft, resultText, createdAt, lastActive, entryPoint, needsAttention != 0);
+			// tasks.agent_type stores the configured agent name from config.agents.
+			result ~= TaskRow(tid, agentSessionId, description, taskType, parentTid, relationType, workspace, projectPath, worktreeTid, taskStartHead, title, status, agentName, archived != 0, draft, resultText, createdAt, lastActive, entryPoint, needsAttention != 0);
 		}
 		return result;
 	}
@@ -310,20 +312,20 @@ struct Persistence
 
 		struct CachePathRow
 		{
-			string agentType;
+			string driverName;
 			string sessionId;
 			string projectPath;
 		}
 		CachePathRow[] cacheRows;
-		foreach (string agentType, string sessionId, string projectPath;
+		foreach (string driverName, string sessionId, string projectPath;
 			db.stmt!"SELECT agent_type, session_id, project_path FROM session_meta_cache".iterate())
-			cacheRows ~= CachePathRow(agentType, sessionId, projectPath);
+			cacheRows ~= CachePathRow(driverName, sessionId, projectPath);
 		foreach (row; cacheRows)
 		{
 			auto normalized = normalize(row.projectPath);
 			if (normalized != row.projectPath)
 				db.stmt!"UPDATE session_meta_cache SET project_path = ? WHERE agent_type = ? AND session_id = ?"
-					.exec(normalized, row.agentType, row.sessionId);
+					.exec(normalized, row.driverName, row.sessionId);
 		}
 	}
 
@@ -360,7 +362,7 @@ struct Persistence
 
 	struct CacheRow
 	{
-		string agentType;
+		string driverName;
 		string sessionId;
 		long mtime;
 		string projectPath;
@@ -371,25 +373,26 @@ struct Persistence
 	CacheRow[] loadSessionMetaCache()
 	{
 		CacheRow[] result;
-		foreach (string agentType, string sessionId, long mtime, string projectPath, string title, int hasMessages;
+		foreach (string driverName, string sessionId, long mtime, string projectPath, string title, int hasMessages;
 			db.stmt!"SELECT agent_type, session_id, mtime, project_path, title, has_messages FROM session_meta_cache".iterate())
 		{
-			result ~= CacheRow(agentType, sessionId, mtime, projectPath, title, hasMessages != 0);
+			// session_meta_cache.agent_type is a legacy column name; it stores the driver name.
+			result ~= CacheRow(driverName, sessionId, mtime, projectPath, title, hasMessages != 0);
 		}
 		return result;
 	}
 
-	void upsertSessionMetaCache(string agentType, string sessionId, long mtime,
+	void upsertSessionMetaCache(string driverName, string sessionId, long mtime,
 		string projectPath, string title, bool hasMessages)
 	{
 		db.stmt!"INSERT OR REPLACE INTO session_meta_cache (agent_type, session_id, mtime, project_path, title, has_messages) VALUES (?, ?, ?, ?, ?, ?)"
-			.exec(agentType, sessionId, mtime, projectPath, title, hasMessages ? 1 : 0);
+			.exec(driverName, sessionId, mtime, projectPath, title, hasMessages ? 1 : 0);
 	}
 
-	void deleteSessionMetaCacheEntry(string agentType, string sessionId)
+	void deleteSessionMetaCacheEntry(string driverName, string sessionId)
 	{
 		db.stmt!"DELETE FROM session_meta_cache WHERE agent_type = ? AND session_id = ?"
-			.exec(agentType, sessionId);
+			.exec(driverName, sessionId);
 	}
 }
 
@@ -461,13 +464,13 @@ struct LoadedHistory
 
 int createForkTask(ref Persistence persistence, int sourceTid, string agentSessionId,
 	string projectPath, string workspace, string title,
-	string description = "", string taskType = "", string agentType = "claude")
+	string description = "", string taskType = "", string agentName = "claude")
 {
 	import std.datetime : Clock;
 	auto forkTitle = title.length > 0 ? title ~ " (fork)" : "(fork)";
 	persistence.db.stmt!"INSERT INTO tasks (agent_session_id, title, workspace, project_path, parent_tid, relation_type, status, description, task_type, agent_type, created_at, last_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 		.exec(agentSessionId, forkTitle, workspace, projectPath, sourceTid, "fork", "completed",
-			description, taskType.length > 0 ? taskType : "blank", agentType,
+			description, taskType.length > 0 ? taskType : "blank", agentName,
 			Clock.currStdTime, Clock.currStdTime);
 	return cast(int) persistence.db.db.lastInsertRowID;
 }

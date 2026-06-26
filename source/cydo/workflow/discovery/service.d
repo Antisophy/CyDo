@@ -12,8 +12,9 @@ import std.process : execute;
 import ae.utils.promise : Promise, resolve;
 import ae.utils.promise.concurrency : threadAsync;
 
+import cydo.agent.resolver : isConfiguredAgentName, resolveConfiguredAgent;
 import cydo.agent.contract : Agent, DiscoveredSession;
-import cydo.runtime.config : CydoConfig;
+import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig;
 import cydo.domain.storage.persistence : Persistence;
 import cydo.foundation.platform.path : bestEffortProjectPathIdentity, canonicalProjectPath;
 import cydo.runtime.launch.sandbox : buildCommandPrefix, cleanup, cydoBinaryDir, cydoBinaryPath,
@@ -28,7 +29,7 @@ struct DiscoveryTaskSnapshot
 	int parentTid;
 	string status;
 	string agentSessionId;
-	string agentType;
+	string agentName;
 	string projectPath;
 }
 
@@ -51,8 +52,8 @@ struct DiscoveryServiceHost
 	void delegate(ImportableTaskSpec spec) createImportableTask;
 	void delegate(WorkspaceInfo[] workspaces) broadcastWorkspaces;
 	void delegate(bool active) broadcastScanStatus;
-	void delegate(string agentType, string sessionId) deleteSessionMetaCacheEntry;
-	void delegate(string agentType, string sessionId, long mtime, string projectPath,
+	void delegate(string driverName, string sessionId) deleteSessionMetaCacheEntry;
+	void delegate(string driverName, string sessionId, long mtime, string projectPath,
 		string title, bool hasMessages) upsertSessionMetaCache;
 }
 
@@ -73,7 +74,7 @@ struct DiscoveryScanInput
 
 struct ScannedSessionRecord
 {
-	string agentType;
+	string driverName;
 	string importAgentName;
 	string sessionId;
 	long mtime;
@@ -177,14 +178,11 @@ class DiscoveryService
 
 		auto taskSnapshot = host_.snapshotTasks();
 
-		bool[string] knownSessionIds;
-		foreach (ref td; taskSnapshot)
-			if (td.agentSessionId.length > 0)
-				knownSessionIds[td.agentType ~ "\0" ~ td.agentSessionId] = true;
+		auto knownSessionIds = knownDriverSessionKeys(config, taskSnapshot);
 
 		Persistence.CacheRow[string] cacheMap;
 		foreach (row; host_.loadSessionMetaCache())
-			cacheMap[row.agentType ~ "\0" ~ row.sessionId] = row;
+			cacheMap[sessionKey(row.driverName, row.sessionId)] = row;
 
 		auto discoveryAgents = snapshotDiscoveryAgents(agentsByName);
 
@@ -224,7 +222,7 @@ class DiscoveryService
 		runScan_(scanInput).then((ScannedSessionRecord[] results) {
 			bool[string] discoveredKeys;
 			foreach (ref r; results)
-				discoveredKeys[r.agentType ~ "\0" ~ r.sessionId] = true;
+				discoveredKeys[sessionKey(r.driverName, r.sessionId)] = true;
 
 			host_.withMutationTransaction({
 				foreach (key; cacheKeys)
@@ -236,16 +234,10 @@ class DiscoveryService
 							host_.deleteSessionMetaCacheEntry(key[0 .. sep], key[sep + 1 .. $]);
 					}
 
+				auto currentKnownSessions = knownDriverSessionKeys(config, host_.snapshotTasks());
 				foreach (ref r; results)
 				{
-					bool alreadyKnown = false;
-					foreach (ref td; host_.snapshotTasks())
-						if (td.agentSessionId == r.sessionId && td.agentType == r.agentType)
-						{
-							alreadyKnown = true;
-							break;
-						}
-					if (alreadyKnown)
+					if (sessionKey(r.driverName, r.sessionId) in currentKnownSessions)
 						continue;
 
 					string finalProjectPath = bestEffortProjectPathIdentity(
@@ -254,7 +246,7 @@ class DiscoveryService
 					if (!r.hasMessages)
 					{
 						if (!r.fromCache)
-							host_.upsertSessionMetaCache(r.agentType, r.sessionId, r.mtime,
+							host_.upsertSessionMetaCache(r.driverName, r.sessionId, r.mtime,
 								finalProjectPath, r.title, false);
 						continue;
 					}
@@ -262,7 +254,7 @@ class DiscoveryService
 					string finalTitle = r.title.length > 0 ? r.title : "(untitled)";
 
 					if (!r.fromCache)
-						host_.upsertSessionMetaCache(r.agentType, r.sessionId, r.mtime,
+						host_.upsertSessionMetaCache(r.driverName, r.sessionId, r.mtime,
 							finalProjectPath, finalTitle, true);
 
 					host_.createImportableTask(ImportableTaskSpec(
@@ -272,6 +264,7 @@ class DiscoveryService
 						finalTitle,
 						r.mtime,
 					));
+					currentKnownSessions[sessionKey(r.driverName, r.sessionId)] = true;
 				}
 			});
 
@@ -417,7 +410,7 @@ private:
 					auto cachedp = compositeKey in input.cacheMap;
 
 					ScannedSessionRecord record;
-					record.agentType = entry.driverName;
+					record.driverName = entry.driverName;
 					record.importAgentName = entry.importAgentName;
 					record.sessionId = ds.sessionId;
 					record.mtime = ds.mtime;
@@ -454,6 +447,25 @@ private:
 			return results;
 		});
 	}
+
+	static string sessionKey(string driverName, string sessionId)
+	{
+		return driverName ~ "\0" ~ sessionId;
+	}
+
+	static bool[string] knownDriverSessionKeys(ref CydoConfig config,
+		DiscoveryTaskSnapshot[int] tasks)
+	{
+		bool[string] known;
+		foreach (ref td; tasks)
+		{
+			if (td.agentSessionId.length == 0 || !isConfiguredAgentName(config, td.agentName))
+				continue;
+			auto resolved = resolveConfiguredAgent(config, td.agentName);
+			known[sessionKey(to!string(resolved.driver), td.agentSessionId)] = true;
+		}
+		return known;
+	}
 }
 
 unittest
@@ -468,8 +480,8 @@ unittest
 		createImportableTask: (ImportableTaskSpec spec) {},
 		broadcastWorkspaces: (WorkspaceInfo[] workspaces) {},
 		broadcastScanStatus: (bool active) {},
-		deleteSessionMetaCacheEntry: (string agentType, string sessionId) {},
-		upsertSessionMetaCache: (string agentType, string sessionId, long mtime,
+		deleteSessionMetaCacheEntry: (string driverName, string sessionId) {},
+		upsertSessionMetaCache: (string driverName, string sessionId, long mtime,
 			string projectPath, string title, bool hasMessages) {},
 	));
 
@@ -499,10 +511,15 @@ unittest
 	import ae.net.asockets : socketManager;
 
 	int createCount;
+	int upsertCount;
 	bool[] scanTransitions;
 	int snapshotCount;
 
 	DiscoveryTaskSnapshot[int] knownTasks;
+	CydoConfig config;
+	AgentConfig workClaude;
+	workClaude.driver = typeof(workClaude.driver)(AgentDriver.claude, true);
+	config.agents["work-claude"] = workClaude;
 	auto service = new DiscoveryService(
 		DiscoveryServiceHost(
 			snapshotTasks: () {
@@ -525,25 +542,30 @@ unittest
 			broadcastScanStatus: (bool active) {
 				scanTransitions ~= active;
 			},
-			deleteSessionMetaCacheEntry: (string agentType, string sessionId) {},
-			upsertSessionMetaCache: (string agentType, string sessionId, long mtime,
-				string projectPath, string title, bool hasMessages) {},
+			deleteSessionMetaCacheEntry: (string driverName, string sessionId) {},
+			upsertSessionMetaCache: (string driverName, string sessionId, long mtime,
+				string projectPath, string title, bool hasMessages) {
+				upsertCount++;
+			},
 		),
 		(DiscoveryScanInput input) {
 			ScannedSessionRecord[] results = [
-				ScannedSessionRecord("claude", "claude", "session-1", 1, "", "Imported", "", false, true),
+				ScannedSessionRecord("claude", "work-claude", "session-1", 1, "", "Imported", "", false, true),
 			];
 			return resolve(results);
 		},
 	);
 
-	knownTasks[1] = DiscoveryTaskSnapshot(1, 0, "completed", "session-1", "claude", "");
+	knownTasks[1] = DiscoveryTaskSnapshot(1, 0, "completed", "session-1", "work-claude", "");
 
 	Agent[string] agentsByName;
-	service.enumerateSessions(CydoConfig.init, agentsByName);
+	service.enumerateSessions(config, agentsByName);
 	socketManager.loop().assertNotThrown;
 
-	assert(createCount == 0, "enumerateSessions must re-check current tasks before import");
+	assert(createCount == 0,
+		"enumerateSessions must treat custom agent definition keys as the persisted task identity");
+	assert(upsertCount == 0,
+		"enumerateSessions must not upsert cache rows for sessions already owned by a task");
 	assert(snapshotCount >= 2, "enumerateSessions must snapshot tasks again after scan");
 	assert(scanTransitions == [true, false]);
 }
@@ -638,4 +660,50 @@ unittest
 	assert(service.workspacesInfo.length == 1);
 	assert(service.workspacesInfo[0].projects.length == 1);
 	assert(service.workspacesInfo[0].projects[0].path == canonicalProjectPath(project));
+}
+
+unittest
+{
+	import std.exception : assertNotThrown;
+	import ae.net.asockets : socketManager;
+
+	int createCount;
+
+	DiscoveryTaskSnapshot[int] knownTasks;
+	CydoConfig config;
+	AgentConfig claude;
+	claude.driver = typeof(claude.driver)(AgentDriver.claude, true);
+	config.agents["claude"] = claude;
+
+	auto service = new DiscoveryService(
+		DiscoveryServiceHost(
+			snapshotTasks: () => knownTasks,
+			loadSessionMetaCache: () => Persistence.CacheRow[].init,
+			withMutationTransaction: (scope void delegate() work) => work(),
+			importableHistoryPath: (int tid) => "",
+			deleteImportableTask: (int tid) {},
+			createImportableTask: (ImportableTaskSpec spec) {
+				createCount++;
+			},
+			broadcastWorkspaces: (WorkspaceInfo[] workspaces) {},
+			broadcastScanStatus: (bool active) {},
+			deleteSessionMetaCacheEntry: (string driverName, string sessionId) {},
+			upsertSessionMetaCache: (string driverName, string sessionId, long mtime,
+				string projectPath, string title, bool hasMessages) {},
+		),
+		(DiscoveryScanInput input) {
+			return resolve([
+				ScannedSessionRecord("claude", "claude", "session-1", 1, "", "Imported", "", false, true),
+			]);
+		},
+	);
+
+	knownTasks[1] = DiscoveryTaskSnapshot(1, 0, "completed", "session-1", "work-claude", "");
+
+	Agent[string] agentsByName;
+	service.enumerateSessions(config, agentsByName);
+	socketManager.loop().assertNotThrown;
+
+	assert(createCount == 1,
+		"orphaned configured agent names must not claim discovered driver sessions");
 }

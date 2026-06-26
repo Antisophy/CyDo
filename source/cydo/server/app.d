@@ -267,12 +267,12 @@ class App
 			createImportableTask: &createImportableTask,
 			broadcastWorkspaces: &broadcastDiscoveryWorkspaces,
 			broadcastScanStatus: &broadcastDiscoveryScanStatus,
-			deleteSessionMetaCacheEntry: (string agentType, string sessionId) {
-				persistence.deleteSessionMetaCacheEntry(agentType, sessionId);
+			deleteSessionMetaCacheEntry: (string driverName, string sessionId) {
+				persistence.deleteSessionMetaCacheEntry(driverName, sessionId);
 			},
-			upsertSessionMetaCache: (string agentType, string sessionId, long mtime,
+			upsertSessionMetaCache: (string driverName, string sessionId, long mtime,
 				string projectPath, string title, bool hasMessages) {
-				persistence.upsertSessionMetaCache(agentType, sessionId, mtime,
+				persistence.upsertSessionMetaCache(driverName, sessionId, mtime,
 					projectPath, title, hasMessages);
 			},
 		));
@@ -765,7 +765,7 @@ class App
 			td.description = row.description;
 			td.entryPoint = row.entryPoint;
 			td.taskType = row.taskType;
-			td.agentType = row.agentType;
+			td.agentName = row.agentName;
 			td.parentTid = row.parentTid;
 			td.relationType = row.relationType;
 			td.worktreeTid = row.worktreeTid;
@@ -1273,8 +1273,8 @@ class App
 		foreach (name; config.agents.byKey)
 			if (name == json.agent_name) { found = true; break; }
 		if (!found) return;
-		tasks[tid].agentType = json.agent_name;
-		persistence.setAgentType(tid, json.agent_name);
+		tasks[tid].agentName = json.agent_name;
+		persistence.setAgentName(tid, json.agent_name);
 		broadcastTaskUpdate(tid);
 	}
 
@@ -2116,7 +2116,7 @@ class App
 				td.parentTid,
 				td.status,
 				td.agentSessionId,
-				td.agentType,
+				td.agentName,
 				td.projectPath,
 			);
 		return snapshot;
@@ -2187,7 +2187,7 @@ class App
 	{
 		auto tid = persistence.createTask(workspace, projectPath, agentName, entryPoint);
 		auto td = TaskData(tid, workspace, projectPath);
-		td.agentType = agentName;
+		td.agentName = agentName;
 		td.entryPoint = entryPoint;
 		td.history.reset(Watermark.none()); // New tasks have no JSONL to load
 		import std.datetime : Clock;
@@ -2210,12 +2210,12 @@ class App
 	private Agent tryAgentForTask(int tid)
 	{
 		auto td = &tasks[tid];
-		if (auto p = td.agentType in agentsByName)
+		if (auto p = td.agentName in agentsByName)
 			return *p;
-		auto a = tryCreateConfiguredAppAgent(td.agentType);
+		auto a = tryCreateConfiguredAppAgent(td.agentName);
 		if (!a)
 			return null;
-		agentsByName[td.agentType] = a;
+		agentsByName[td.agentName] = a;
 		return a;
 	}
 
@@ -2227,7 +2227,7 @@ class App
 	{
 		auto a = tryAgentForTask(tid);
 		if (!a)
-			throw new Exception("Unknown configured agent: " ~ tasks[tid].agentType);
+			throw new Exception("Unknown configured agent: " ~ tasks[tid].agentName);
 		return a;
 	}
 
@@ -2738,7 +2738,7 @@ class App
 
 		string payload;
 		auto changed = agentUsageTracker.updateFromClaudeEvent(
-			tasks[tid].agentType, translated, payload);
+			tasks[tid].agentName, translated, payload);
 		if (changed)
 			clientHub.broadcast(payload);
 		return changed;
@@ -3284,7 +3284,7 @@ unittest
 		&isKnownPromptParityAgent);
 	app.tasks[41] = TaskData(41, "local", projectPath);
 	app.tasks[41].taskType = "parent";
-	app.tasks[41].agentType = "codex";
+	app.tasks[41].agentName = "codex";
 	app.taskPathResolver = new TaskPathResolver(TaskPathResolverHost(
 		getTask: (int tid) {
 			auto td = tid in app.tasks;
@@ -3359,7 +3359,7 @@ unittest
 		assert(0, "non-Git project is masked");
 	}
 
-	app.tasks[41].agentType = "claude";
+	app.tasks[41].agentName = "claude";
 	auto claudeLaunch = runner.prepareTaskSessionLaunch(41, new TestClaudePromptAgent(),
 		currentTypeDef());
 	auto claudeProjectMode = projectPath in claudeLaunch.processLaunch.sandbox.paths;
@@ -3377,7 +3377,7 @@ unittest
 	}
 	assert(claudeLaunch.sessionConfig.appendSystemPrompt == codexPrompt);
 
-	app.tasks[41].agentType = "copilot";
+	app.tasks[41].agentName = "copilot";
 	auto copilotLaunch = runner.prepareTaskSessionLaunch(41, new TestCopilotPromptAgent(),
 		currentTypeDef());
 	auto copilotProjectMode = projectPath in copilotLaunch.processLaunch.sandbox.paths;
@@ -3499,7 +3499,7 @@ unittest
 	TaskData[int] tasks;
 	tasks[7] = TaskData(7, "local", projectPath);
 	tasks[7].taskType = "parent";
-	tasks[7].agentType = "claude";
+	tasks[7].agentName = "claude";
 
 	auto taskPathResolver = new TaskPathResolver(TaskPathResolverHost(
 		getTask: (int tid) {

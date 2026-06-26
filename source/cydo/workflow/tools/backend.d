@@ -158,14 +158,14 @@ unittest
 	TaskData[int] tasks;
 	tasks[1] = TaskData(1, "local", "/tmp/cydo-task-startup-failure");
 	tasks[1].taskType = "parent";
-	tasks[1].agentType = "fake";
+	tasks[1].agentName = "fake";
 	int nextTid = 2;
 
 	auto backend = new WorkflowToolsBackend(WorkflowToolsHost(
 		getTask: (int tid) { auto td = tid in tasks; return td is null ? null : td; },
 		createTask: (string workspace, string projectPath, string agentName) {
 			auto tid = nextTid++; tasks[tid] = TaskData(tid, workspace, projectPath);
-			tasks[tid].agentType = agentName; return tid;
+			tasks[tid].agentName = agentName; return tid;
 		},
 		persistTaskType: (int tid, string taskType) {},
 		persistDescription: (int tid, string description) {},
@@ -390,12 +390,12 @@ public:
 				"Unknown task type: " ~ resolvedTaskType));
 
 		auto childAgent = host_.resolveTaskAgent(childTypeDef.agent,
-			parentTd.agentType);
+			parentTd.agentName);
 		if (childAgent.length == 0 || !host_.isRegisteredAgent(childAgent))
 		{
 			return ValidatedTask(structuredTaskError(format(
 				"task type '%s' resolves agent to '%s' (parent='%s') — not a registered agent",
-				resolvedTaskType, childAgent, parentTd.agentType)));
+				resolvedTaskType, childAgent, parentTd.agentName)));
 		}
 
 		return ValidatedTask(McpResult.init, () {
@@ -1492,13 +1492,13 @@ private:
 		else
 		{
 			auto contAgent = host_.resolveTaskAgent(newTypeDef.agent,
-				td.agentType);
+				td.agentName);
 			if (contAgent.length == 0
 				|| !host_.isRegisteredAgent(contAgent))
 			{
 				td.error = format(
 					"Successor type '%s' resolved agent to '%s' (parent='%s') — not a registered agent",
-					contDef.task_type, contAgent, td.agentType);
+					contDef.task_type, contAgent, td.agentName);
 				host_.transitionTaskFrom(tid,
 					[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
 						TaskStatus.waiting, TaskStatus.completed], TaskStatus.failed,
@@ -1635,7 +1635,7 @@ unittest
 	TaskData[int] tasks;
 	tasks[1] = TaskData(1, "local", taskRoot);
 	tasks[1].taskType = "parent";
-	tasks[1].agentType = "fake";
+	tasks[1].agentName = "fake";
 	int nextTid = 2;
 	string persistedTaskStartHead;
 	int launchCalls;
@@ -1652,7 +1652,7 @@ unittest
 		createTask: (string workspace, string projectPath, string agentName) {
 			auto tid = nextTid++;
 			tasks[tid] = TaskData(tid, workspace, projectPath);
-			tasks[tid].agentType = agentName;
+			tasks[tid].agentName = agentName;
 			return tid;
 		},
 		persistTaskType: (int tid, string taskType) {},
