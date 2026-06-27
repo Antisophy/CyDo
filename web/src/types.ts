@@ -272,8 +272,10 @@ export interface TaskState {
   taskType?: string;
   /** Current user-facing entry point (e.g. "agentic", "direct", "isolated"). */
   entryPoint?: string;
-  /** Current agent type (e.g. "claude", "codex"). */
-  agentType?: string;
+  /** Configured agent key (e.g. "work-claude", "codex"). */
+  agentName?: string;
+  /** Runtime driver identity from session/init (e.g. "claude", "codex"). */
+  driver?: string;
   archived?: boolean;
   archiving?: boolean;
   /** Last stderr text from non-zero exit; cleared on restart. */
@@ -342,10 +344,11 @@ export function makeTaskState(
   archived: boolean = false,
   createdAt?: number,
   lastActive?: number,
-  agentType?: string,
+  agentName?: string,
   entryPoint?: string,
   archiving: boolean = false,
   canStop: boolean = alive,
+  driver?: string,
 ): TaskState {
   return {
     uuid: crypto.randomUUID(),
@@ -375,7 +378,8 @@ export function makeTaskState(
     historyOperations: null,
     taskType,
     entryPoint,
-    agentType,
+    agentName,
+    driver,
     archived,
     archiving: archiving || false,
     createdAt: createdAt || undefined,

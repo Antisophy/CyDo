@@ -27,6 +27,26 @@ function makeState() {
 }
 
 describe("session/status reducer", () => {
+  it("stores configured agent name separately from runtime driver on session/init", () => {
+    const next = reduceMessage(makeState(), {
+      type: "session/init",
+      model: "codex-mini-latest",
+      agent_version: "1.0.0",
+      session_id: "sid-1",
+      cwd: "/tmp/project",
+      tools: [],
+      permission_mode: "default",
+      agent: "codex",
+      agent_name: "work-codex",
+      supports_file_revert: false,
+    });
+
+    expect(next.agentName).toBe("work-codex");
+    expect(next.driver).toBe("codex");
+    expect(next.sessionInfo?.agent_name).toBe("work-codex");
+    expect(next.sessionInfo?.agent).toBe("codex");
+  });
+
   it("updates transient status and permission mode without transcript messages", () => {
     const s = makeState();
     const next = reduceMessage(s, {
@@ -200,7 +220,8 @@ describe("session init and metadata reducers", () => {
       10,
     );
 
-    expect(initialized.agentType).toBe("codex");
+    expect(initialized.driver).toBe("codex");
+    expect(initialized.agentName).toBe("reviewer");
     expect(initialized.sessionStatus).toBeNull();
     expect(initialized.sessionInfo).toMatchObject({
       model: "codex-mini",
@@ -489,7 +510,11 @@ describe("system event suppression", () => {
 
 describe("tracked file edits", () => {
   it("tracks codex fileChange markdown add events as full-content edits", () => {
-    const state = { ...makeState(), agentType: "codex" };
+    const state = {
+      ...makeState(),
+      agentName: "work-codex",
+      driver: "codex",
+    };
     const next = reduceMessage(
       state,
       asEvent({
@@ -510,10 +535,12 @@ describe("tracked file edits", () => {
     );
 
     const tracked = next.trackedFiles.get("/tmp/project/docs/new.md");
+    const blockKey = next.itemIdMap.get("fc-1");
     expect(tracked).toBeTruthy();
     expect(tracked?.edits).toHaveLength(1);
     expect(tracked?.edits[0]?.source).toBe("codex-fileChange");
     expect(tracked?.edits[0]?.status).toBe("pending");
+    expect(next.blocks.get(blockKey!)?.driver).toBe("codex");
     expect(tracked?.edits[0]?.payload).toEqual({
       mode: "full_content",
       content: "# New markdown\n",
@@ -521,7 +548,11 @@ describe("tracked file edits", () => {
   });
 
   it("tracks codex apply_patch markdown update events as patch-text edits", () => {
-    const state = { ...makeState(), agentType: "codex" };
+    const state = {
+      ...makeState(),
+      agentName: "work-codex",
+      driver: "codex",
+    };
     const next = reduceMessage(
       state,
       asEvent({
@@ -555,7 +586,7 @@ describe("tracked file edits", () => {
 
   it("keeps claude Write tracking behavior", () => {
     const started = reduceMessage(
-      { ...makeState(), agentType: "claude" },
+      { ...makeState(), agentName: "work-claude", driver: "claude" },
       asEvent({
         type: "item/started",
         item_type: "tool_use",

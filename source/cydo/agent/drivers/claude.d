@@ -2012,7 +2012,7 @@ private string translateSessionInit(string rawLine, string agentName)
 	ev.tools         = raw.tools;
 	ev.agent_version = raw.claude_code_version;
 	ev.permission_mode = raw.permissionMode;
-	ev.agent         = raw.agent;
+	ev.agent         = raw.agent.length > 0 ? raw.agent : "claude";
 	ev.agent_name    = agentName;
 	ev.api_key_source  = raw.apiKeySource;
 	ev.fast_mode_state = raw.fast_mode_state;

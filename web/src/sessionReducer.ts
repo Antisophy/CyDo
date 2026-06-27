@@ -255,9 +255,10 @@ function reduceSessionInitBootstrap(
 ): SessionState {
   return {
     ...s,
-    // Propagate agent type from init message so blocks created before task_updated
-    // arrives still carry the correct agentType.
-    agentType: msg.agent ?? s.agentType,
+    // Preserve the configured agent key separately from the runtime driver so
+    // pre-task_updated blocks still get the correct driver identity.
+    driver: msg.agent ?? s.driver,
+    agentName: msg.agent_name ?? s.agentName,
     sessionInfo: {
       model: msg.model,
       version: msg.agent_version,
@@ -1101,6 +1102,7 @@ export function reduceItemStarted(
     event.item_type === "user_message"
       ? event.item_type
       : "other";
+  const driver = s.driver ?? s.sessionInfo?.agent;
   const block: Block = {
     itemId: event.item_id,
     type: blockType,
@@ -1108,7 +1110,7 @@ export function reduceItemStarted(
     name: event.name,
     toolServer: event.tool_server,
     toolSource: event.tool_source,
-    driver: s.agentType,
+    driver,
     input: event.input,
     completed: false,
     creationOrder,
@@ -1121,12 +1123,7 @@ export function reduceItemStarted(
 
   if (event.item_type === "tool_use") {
     if (
-      toolIs(
-        event.name ?? "",
-        s.agentType,
-        event.tool_server,
-        "codex/fileChange",
-      )
+      toolIs(event.name ?? "", driver, event.tool_server, "codex/fileChange")
     ) {
       const rawForEdits =
         event.input != null ? { params: { item: event.input } } : undefined;
@@ -1139,12 +1136,7 @@ export function reduceItemStarted(
       );
       state = appendTrackedEdits(state, edits);
     } else if (
-      toolIs(
-        event.name ?? "",
-        s.agentType,
-        event.tool_server,
-        "codex/apply_patch",
-      )
+      toolIs(event.name ?? "", driver, event.tool_server, "codex/apply_patch")
     ) {
       const edits = buildEditsFromApplyPatchInput(
         (block.input ?? {}) as Record<string, unknown>,

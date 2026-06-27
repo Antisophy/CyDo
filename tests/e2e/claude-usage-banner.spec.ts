@@ -6,6 +6,7 @@ import {
   assistantText,
   responseTimeout,
 } from "./fixtures";
+import { writeFileSync } from "fs";
 
 test.use({
   backendEnv: {
@@ -32,6 +33,57 @@ test("usage banner reflects pushed rate_limit_event headers", async ({
   await expect(assistantText(page, "usage-headers-7d")).toHaveCount(1, {
     timeout,
   });
+
+  const usageWidget = page.locator(".banner-usage");
+  await expect(usageWidget).toBeVisible({ timeout });
+
+  const fiveHourRow = usageWidget
+    .locator(".banner-usage-row")
+    .filter({ hasText: "5h" })
+    .first();
+  await expect(fiveHourRow.locator(".banner-usage-value")).toHaveText("42%");
+
+  const weekRow = usageWidget
+    .locator(".banner-usage-row")
+    .filter({ hasText: "Week" })
+    .first();
+  await expect(weekRow.locator(".banner-usage-value")).toHaveText("71%");
+});
+
+test("custom Claude-backed agent still updates the Claude usage banner", { tag: "@claude-only" }, async ({
+  page,
+  agentType,
+}) => {
+  writeFileSync(
+    "/tmp/playwright-home/.config/cydo/config.yaml",
+    `default_agent: claude
+agents:
+  claude:
+    driver: claude
+  work-claude:
+    driver: claude
+workspaces:
+  local:
+    root: /tmp/cydo-test-workspace
+`,
+  );
+  await page.waitForTimeout(500);
+
+  await enterSession(page);
+  await page.selectOption(".agent-picker", "work-claude");
+
+  const timeout = responseTimeout(agentType);
+  await sendMessage(page, "usage headers fixture 5h");
+  await expect(assistantText(page, "usage-headers-5h")).toHaveCount(1, {
+    timeout,
+  });
+
+  await sendMessage(page, "usage headers fixture 7d");
+  await expect(assistantText(page, "usage-headers-7d")).toHaveCount(1, {
+    timeout,
+  });
+
+  await expect(page.locator(".banner-agent")).toContainText("work-claude");
 
   const usageWidget = page.locator(".banner-usage");
   await expect(usageWidget).toBeVisible({ timeout });

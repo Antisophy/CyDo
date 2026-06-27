@@ -34,10 +34,11 @@ function makeRichState(): TaskState {
       true,
       1000,
       2000,
-      "codex",
+      "work-codex",
       "agentic",
       true,
       true,
+      "codex",
     ),
     uuid: "task-uuid-7",
     sessionStatus: "requesting",
@@ -272,7 +273,8 @@ describe("history replay reset", () => {
     expect(reset.status).toBe(before.status);
     expect(reset.taskType).toBe(before.taskType);
     expect(reset.entryPoint).toBe(before.entryPoint);
-    expect(reset.agentType).toBe(before.agentType);
+    expect(reset.agentName).toBe(before.agentName);
+    expect(reset.driver).toBe(before.driver);
     expect(reset.archived).toBe(before.archived);
     expect(reset.archiving).toBe(before.archiving);
     expect(reset.createdAt).toBe(before.createdAt);
@@ -326,7 +328,8 @@ describe("history replay reset", () => {
       resumable: before.resumable,
       taskType: before.taskType,
       entryPoint: before.entryPoint,
-      agentType: before.agentType,
+      agentName: before.agentName,
+      driver: before.driver,
       archived: before.archived,
       archiving: before.archiving,
       createdAt: before.createdAt,
@@ -374,7 +377,7 @@ describe("history replay reset", () => {
       asEvent({ type: "session/metadata", model: "codex-max" }),
     );
 
-    expect(replayed.agentType).toBe("codex");
+    expect(replayed.driver).toBe("codex");
     expect(replayed.sessionInfo).toMatchObject({
       sessionId: "replayed-sid",
       cwd: "/tmp/replayed-project",

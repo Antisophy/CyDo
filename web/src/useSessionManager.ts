@@ -52,7 +52,7 @@ type DraftPhase =
       uuid: string;
       timerId: ReturnType<typeof setTimeout>;
       entryPoint?: string;
-      agentType?: string;
+      agentName?: string;
     }
   | { phase: "create_pending"; uuid: string }
   | { phase: "create_cancelled"; uuid: string }
@@ -155,7 +155,7 @@ export interface TaskManager {
     text: string,
     images?: ImageAttachment[],
     entryPointName?: string,
-    agentType?: string,
+    agentName?: string,
   ) => void;
   interrupt: (uuid: string) => void;
   stop: (uuid: string) => void;
@@ -187,7 +187,7 @@ export interface TaskManager {
   sendPermissionPromptResponse: (tid: number, content: string) => void;
   editMessage: (tid: number, uuid: string, content: string) => void;
   editRawEvent: (tid: number, seq: number, content: string) => void;
-  createDraftTask: (entryPointName?: string, agentType?: string) => void;
+  createDraftTask: (entryPointName?: string, agentName?: string) => void;
   deleteDraftTask: () => void;
   draftRenderKey: string | null;
   sidebarTasks: Array<{
@@ -541,7 +541,7 @@ export function useTaskManager(
   }, [setDraft]);
 
   const createDraftTask = useCallback(
-    (entryPointName?: string, agentType?: string) => {
+    (entryPointName?: string, agentName?: string) => {
       const cur = draftRef.current;
       if (cur.phase !== "virtual") return;
       const ws = activeWorkspaceRef.current;
@@ -559,7 +559,7 @@ export function useTaskManager(
           projPath || "",
           entryPointName,
           undefined,
-          agentType,
+          agentName,
           uuid,
         );
       }, 16);
@@ -568,7 +568,7 @@ export function useTaskManager(
         uuid,
         timerId,
         entryPoint: entryPointName,
-        agentType,
+        agentName,
       });
     },
     [setDraft],
@@ -611,7 +611,8 @@ export function useTaskManager(
           uuid,
           entryPoint: existing?.entryPoint,
           taskType: existing?.taskType,
-          agentType: existing?.agentType,
+          agentName: existing?.agentName,
+          driver: existing?.driver,
         };
         // Clear stale in-memory draft so InputBox starts fresh on the next cycle
         inputDrafts.delete(uuid);
@@ -988,7 +989,7 @@ export function useTaskManager(
                 status: entry.status || existing.status,
                 taskType: entry.task_type || existing.taskType,
                 entryPoint: entry.entry_point || existing.entryPoint,
-                agentType: entry.agent_name || existing.agentType,
+                agentName: entry.agent_name || existing.agentName,
                 suggestions:
                   entry.isProcessing && !existing.isProcessing
                     ? undefined
@@ -1079,7 +1080,7 @@ export function useTaskManager(
               status: entry.status || existing.status,
               taskType: entry.task_type || existing.taskType,
               entryPoint: entry.entry_point || existing.entryPoint,
-              agentType: entry.agent_name || existing.agentType,
+              agentName: entry.agent_name || existing.agentName,
               suggestions:
                 entry.isProcessing && !existing.isProcessing
                   ? undefined
@@ -1793,7 +1794,7 @@ export function useTaskManager(
       text: string,
       images?: ImageAttachment[],
       entryPointName?: string,
-      agentType?: string,
+      agentName?: string,
     ) => {
       const content = buildContentBlocks(text, images);
       const taskState = liveStates.get(uuid);
@@ -1807,7 +1808,7 @@ export function useTaskManager(
         if (isPromotedDraft) {
           if (entryPointName)
             connRef.current?.setEntryPoint(draftTid, entryPointName);
-          if (agentType) connRef.current?.setAgentName(draftTid, agentType);
+          if (agentName) connRef.current?.setAgentName(draftTid, agentName);
         }
         const nonce = crypto.randomUUID();
         outbox.add({ tid: draftTid, nonce, content, createdAt: Date.now() });
@@ -1896,7 +1897,7 @@ export function useTaskManager(
         projPath ?? (ws ? "" : undefined),
         entryPointName,
         content,
-        agentType,
+        agentName,
         correlationId,
       );
     },

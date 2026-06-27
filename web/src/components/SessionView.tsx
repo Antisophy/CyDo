@@ -38,7 +38,7 @@ interface Props {
     text: string,
     images?: ImageAttachment[],
     entryPointName?: string,
-    agentType?: string,
+    agentName?: string,
   ) => void;
   onInterrupt: (uuid: string) => void;
   onStop: (uuid: string) => void;
@@ -70,7 +70,7 @@ interface Props {
   agents?: AgentInfo[];
   defaultAgent?: string;
   defaultTaskType?: string;
-  onContentStart?: (entryPointName: string, agentType: string) => void;
+  onContentStart?: (entryPointName: string, agentName: string) => void;
   onContentEnd?: () => void;
   exportMode?: boolean;
   getTaskHref?: (id: string) => string;
@@ -143,7 +143,7 @@ function SessionViewInner({
   const entryPointPickerRef = useRef<HTMLDivElement>(null);
 
   // Agent picker state (only used in draft mode)
-  const [selectedAgent, setSelectedAgent] = useState(task.agentType ?? "");
+  const [selectedAgent, setSelectedAgent] = useState(task.agentName ?? "");
 
   const focusTaskTypePicker = useCallback(() => {
     entryPointPickerRef.current?.focus();
@@ -203,8 +203,8 @@ function SessionViewInner({
   }, [isDraft, initialEntryPoint]);
 
   useEffect(() => {
-    if (isDraft) setSelectedAgent(task.agentType ?? "");
-  }, [isDraft, task.agentType]);
+    if (isDraft) setSelectedAgent(task.agentName ?? "");
+  }, [isDraft, task.agentName]);
 
   const [fileViewerState, setFileViewerState] = useState<{
     open: boolean;
