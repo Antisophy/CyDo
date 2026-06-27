@@ -504,7 +504,7 @@ void generateDot(TaskTypeDef[] types, UserEntryPointDef[] entryPoints)
 // ---------------------------------------------------------------------------
 
 /// Load and validate task types from a YAML file, returning null on error.
-private TaskTypeConfig* loadAndValidate(string path, bool function(string) isKnownAgent)
+private TaskTypeConfig* loadAndValidate(string path, bool delegate(string) isConfiguredAgentName)
 {
 	TaskTypeConfig config;
 	try
@@ -515,7 +515,8 @@ private TaskTypeConfig* loadAndValidate(string path, bool function(string) isKno
 		return null;
 	}
 
-	auto errors = validateTaskTypes(config.types, config.entryPoints, isKnownAgent, [dirName(path)]);
+	auto errors = validateTaskTypes(config.types, config.entryPoints,
+		isConfiguredAgentName, [dirName(path)]);
 	if (errors.length > 0)
 	{
 		writeln("=== Validation Errors ===\n");
@@ -527,9 +528,9 @@ private TaskTypeConfig* loadAndValidate(string path, bool function(string) isKno
 	return new TaskTypeConfig(config.types, config.entryPoints);
 }
 
-void runSimulator(string path, bool function(string) isKnownAgent)
+void runSimulator(string path, bool delegate(string) isConfiguredAgentName)
 {
-	auto config = loadAndValidate(path, isKnownAgent);
+	auto config = loadAndValidate(path, isConfiguredAgentName);
 	if (config is null)
 		return;
 
@@ -538,9 +539,9 @@ void runSimulator(string path, bool function(string) isKnownAgent)
 	simulateWorkflow(config.types, config.entryPoints);
 }
 
-void runDot(string path, bool function(string) isKnownAgent)
+void runDot(string path, bool delegate(string) isConfiguredAgentName)
 {
-	auto config = loadAndValidate(path, isKnownAgent);
+	auto config = loadAndValidate(path, isConfiguredAgentName);
 	if (config is null)
 		return;
 

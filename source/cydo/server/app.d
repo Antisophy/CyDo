@@ -61,13 +61,12 @@ import cydo.web.transport : McpCallbacks, RawSourceLookupResult, RawSourceLookup
 import cydo.domain.usage.tracker : AgentUsageTracker;
 
 import cydo.agent.resolver : createConfiguredAgent, displayNameForDriver,
-	effectiveDefaultAgentName, tryCreateConfiguredAgent;
+	effectiveDefaultAgentName, isConfiguredAgentName, tryCreateConfiguredAgent;
 import cydo.agent.contract : Agent;
 import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
 	HistoryBoundary, ItemStartedEvent, SessionRateLimitEvent, TaskDiagnosticEvent, TaskDiagnosticSeverity,
 	TaskEventEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
 	UnconfirmedUserEventEnvelope, extractContentText;
-import cydo.agent.drivers.registry : isRegisteredAgent;
 import cydo.agent.session : AgentSession;
 import cydo.agent.drivers.codex : CodexSession;
 import cydo.runtime.config : AgentConfig, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
@@ -184,8 +183,9 @@ class App
 				infof("Application base directory: %s", baseDir);
 			auto taskTypesDir = buildPath(baseDir, "defs");
 			auto taskTypesPath = buildPath(baseDir, "defs/task-types.yaml");
-			taskTypeCatalog = new TaskTypeCatalog(taskTypesDir, taskTypesPath, &isRegisteredAgent);
 			webDistDir = buildPath(baseDir, "web/dist/");
+			taskTypeCatalog = new TaskTypeCatalog(taskTypesDir, taskTypesPath,
+				(string name) => isConfiguredAgentName(config, name));
 		}
 		{
 			persistence = openDatabase();
@@ -345,8 +345,8 @@ class App
 			resolveTaskAgent: (string requestedAgent, string parentAgent) {
 				return resolveAgent(requestedAgent, parentAgent);
 			},
-			isRegisteredAgent: (string agentName) {
-				return isRegisteredAgent(agentName);
+			isConfiguredAgentName: (string agentName) {
+				return isConfiguredAgentName(config, agentName);
 			},
 			agentForTask: &agentForTask,
 			taskSystemPromptForMessage: &taskSystemPromptForMessage,
@@ -486,6 +486,10 @@ class App
 			injectAgentNameIntoSessionInit: &injectAgentNameIntoSessionInit,
 			normalizeKnownSystemMessageMeta: (string translated, int tid) {
 				return systemMessageNormalizer.normalizeKnownSystemMessageMeta(translated, tid);
+			},
+			configuredAgentNames: () {
+				import std.array : array;
+				return config.agents.byKey.array;
 			},
 			makeTaskDiagnosticEventJson: &makeTaskDiagnosticEventJson,
 			sendToSubscribed: (int tid, Data data) {
@@ -1268,11 +1272,7 @@ class App
 		if (tid < 0 || tid !in tasks) return;
 		if (taskAlive(tid)) return; // can't change type of a running task
 		if (json.agent_name.length == 0) return;
-		// config.agents always contains at least the three driver names (overlay in commit 1).
-		bool found = false;
-		foreach (name; config.agents.byKey)
-			if (name == json.agent_name) { found = true; break; }
-		if (!found) return;
+		if (!isConfiguredAgentName(config, json.agent_name)) return;
 		tasks[tid].agentName = json.agent_name;
 		persistence.setAgentName(tid, json.agent_name);
 		broadcastTaskUpdate(tid);
@@ -2735,10 +2735,13 @@ class App
 	{
 		if (tid !in tasks)
 			return false;
+		auto agent = tryAgentForTask(tid);
+		if (!agent)
+			return false;
 
 		string payload;
 		auto changed = agentUsageTracker.updateFromClaudeEvent(
-			tasks[tid].agentName, translated, payload);
+			agent.driver, translated, payload);
 		if (changed)
 			clientHub.broadcast(payload);
 		return changed;

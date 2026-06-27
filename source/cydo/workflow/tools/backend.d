@@ -13,9 +13,9 @@ import cydo.agent.contract : Agent;
 import cydo.agent.terminal : TerminalProcess;
 import cydo.domain.policy.permissions : evaluatePermissionPolicy,
 	makePermissionAllowJson, makePermissionDenyJson;
-import cydo.domain.task_types.definition : ContinuationDef, TaskTypeDef,
+import cydo.domain.task_types.definition : ContinuationDef, CreatableTaskDef, TaskTypeDef,
 	UserEntryPointDef, WorktreeMode, byName, isInteractive,
-	loadProjectMemory, renderContinuationPrompt, renderPrompt,
+	loadProjectMemory, renderContinuationPrompt, renderPrompt, resolveAgent,
 	substituteVars;
 import cydo.domain.tasks.model;
 import cydo.domain.tasks.lifecycle : TaskNotificationChange;
@@ -62,7 +62,7 @@ struct WorkflowToolsHost
 	string[] delegate(string projectPath) promptSearchPath;
 	bool[string] delegate(string projectPath) treeReadOnlyForProject;
 	string delegate(string requestedAgent, string parentAgent) resolveTaskAgent;
-	bool delegate(string agentName) isRegisteredAgent;
+	bool delegate(string agentName) isConfiguredAgentName;
 	Agent delegate(int tid) agentForTask;
 	string delegate(int tid, TaskTypeDef* typeDef) taskSystemPromptForMessage;
 	string delegate(string relativePath, string projectPath,
@@ -188,7 +188,7 @@ unittest
 		promptSearchPath: (string projectPath) => cast(string[]) null,
 		treeReadOnlyForProject: (string projectPath) => cast(bool[string]) null,
 		resolveTaskAgent: (string requestedAgent, string parentAgent) => "fake",
-		isRegisteredAgent: (string agentName) => agentName == "fake",
+		isConfiguredAgentName: (string agentName) => agentName == "fake",
 		agentForTask: (int tid) { assert(0); return cast(Agent) null; },
 		taskSystemPromptForMessage: (int tid, TaskTypeDef* typeDef) => "",
 		readPromptFile: (string relativePath, string projectPath, string[string] vars) => "",
@@ -391,10 +391,10 @@ public:
 
 		auto childAgent = host_.resolveTaskAgent(childTypeDef.agent,
 			parentTd.agentName);
-		if (childAgent.length == 0 || !host_.isRegisteredAgent(childAgent))
+		if (childAgent.length == 0 || !host_.isConfiguredAgentName(childAgent))
 		{
 			return ValidatedTask(structuredTaskError(format(
-				"task type '%s' resolves agent to '%s' (parent='%s') — not a registered agent",
+				"task type '%s' resolves agent to '%s' (parent='%s') — not a configured agent",
 				resolvedTaskType, childAgent, parentTd.agentName)));
 		}
 
@@ -1494,10 +1494,10 @@ private:
 			auto contAgent = host_.resolveTaskAgent(newTypeDef.agent,
 				td.agentName);
 			if (contAgent.length == 0
-				|| !host_.isRegisteredAgent(contAgent))
+				|| !host_.isConfiguredAgentName(contAgent))
 			{
 				td.error = format(
-					"Successor type '%s' resolved agent to '%s' (parent='%s') — not a registered agent",
+					"Successor type '%s' resolved agent to '%s' (parent='%s') — not a configured agent",
 					contDef.task_type, contAgent, td.agentName);
 				host_.transitionTaskFrom(tid,
 					[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
@@ -1685,7 +1685,7 @@ unittest
 		promptSearchPath: (string projectPath) => cast(string[]) null,
 		treeReadOnlyForProject: (string projectPath) => cast(bool[string]) null,
 		resolveTaskAgent: (string requestedAgent, string parentAgent) => "fake",
-		isRegisteredAgent: (string agentName) => agentName == "fake",
+		isConfiguredAgentName: (string agentName) => agentName == "fake",
 		agentForTask: (int tid) {
 			assert(0, "agentForTask should not be needed for this test");
 			return cast(Agent) null;
@@ -1823,4 +1823,40 @@ unittest
 	drainPromiseNextTicks();
 	assert(resolved);
 	assert(tasks[4].taskStartHead == expectedTaskStartHead);
+}
+
+unittest
+{
+	TaskData[int] tasks;
+	tasks[1] = TaskData(1, "local", "/tmp/project");
+	tasks[1].taskType = "parent";
+	tasks[1].agentName = "work-claude";
+
+	TaskTypeDef parent;
+	parent.name = "parent";
+	parent.model_class = "large";
+	parent.creatable_tasks = [CreatableTaskDef("child", "child",
+		WorktreeMode.inherit, "", "", "")];
+
+	TaskTypeDef child;
+	child.name = "child";
+	child.model_class = "large";
+	child.agent = "{{ parent_agent_type }}";
+
+	WorkflowToolsHost host;
+	host.getTask = (int tid) {
+		auto task = tid in tasks;
+		return task is null ? null : &tasks[tid];
+	};
+	host.taskTypesForProject = (string projectPath) => [parent, child];
+	host.resolveTaskAgent = (string requestedAgent, string parentAgent) {
+		return resolveAgent(requestedAgent, parentAgent);
+	};
+	host.isConfiguredAgentName = (string agentName) => agentName == "work-claude";
+
+	auto backend = new WorkflowToolsBackend(host);
+	auto validated = backend.handleCreateTask("1", 0, "Child task", "child",
+		"Implement it");
+	assert(validated.launch !is null);
+	assert(!validated.error.isError);
 }

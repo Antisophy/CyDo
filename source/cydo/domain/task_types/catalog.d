@@ -18,13 +18,19 @@ class TaskTypeCatalog
 	private ProjectTypeCache[string] taskTypesByProject;
 	private string taskTypesDir;
 	private string taskTypesPath;
-	private bool function(string) isKnownAgent;
+	private bool delegate(string) isConfiguredAgentName;
 
-	this(string taskTypesDir, string taskTypesPath, bool function(string) isKnownAgent)
+	this(string taskTypesDir, string taskTypesPath, bool delegate(string) isConfiguredAgentName)
 	{
 		this.taskTypesDir = taskTypesDir;
 		this.taskTypesPath = taskTypesPath;
-		this.isKnownAgent = isKnownAgent;
+		this.isConfiguredAgentName = isConfiguredAgentName;
+	}
+
+	this(string taskTypesDir, string taskTypesPath, bool function(string) isConfiguredAgentName)
+	{
+		this(taskTypesDir, taskTypesPath,
+			(string name) => isConfiguredAgentName(name));
 	}
 
 	string[] promptSearchPath(string projectPath)
@@ -50,7 +56,7 @@ class TaskTypeCatalog
 				? buildPath(projectPath, ".cydo/task-types.yaml") : "";
 			auto config = loadTaskTypes(taskTypesPath, userTypesPath, projectTypesPath);
 			auto errors = validateTaskTypes(config.types, config.entryPoints,
-				isKnownAgent, promptSearchPath(projectPath));
+				isConfiguredAgentName, promptSearchPath(projectPath));
 			foreach (e; errors)
 				warningf("task type: %s", e);
 			taskTypesByProject[projectPath] = ProjectTypeCache(

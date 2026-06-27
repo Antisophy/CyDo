@@ -42,6 +42,7 @@ struct HistoryEventPipelineHost
 	string delegate(int tid) effectiveCwd;
 	string delegate(string translated, string agentName) injectAgentNameIntoSessionInit;
 	string delegate(string translated, int tid) normalizeKnownSystemMessageMeta;
+	string[] delegate() configuredAgentNames;
 	string delegate(string subject, string body) makeTaskDiagnosticEventJson;
 	void delegate(int tid, Data data) sendToSubscribed;
 	void delegate(WebSocketAdapter ws, int tid) subscribe;
@@ -234,7 +235,8 @@ class HistoryEventPipeline
 
 		if (orphan)
 			appendTaskDiagnostic(tid, "Failed to load session history",
-				buildOrphanAgentBody(td.agentName));
+				buildOrphanAgentBody(td.agentName,
+					host_.configuredAgentNames is null ? null : host_.configuredAgentNames()));
 
 		td.clearPendingDequeuedSteering();
 		if (!hasQueueOps && td.pendingSteeringTexts.length > userMsgFromJsonl)
@@ -573,12 +575,11 @@ class HistoryEventPipeline
 	}
 
 private:
-	static string buildOrphanAgentBody(string agentName)
+	static string buildOrphanAgentBody(string agentName, string[] configuredAgentNames)
 	{
 		import std.algorithm : map;
 		import std.array : join;
-		import cydo.agent.drivers.registry : agentRegistry;
-		auto knownNames = agentRegistry[].map!(r => "`" ~ r.name ~ "`").join(", ");
+		auto knownNames = configuredAgentNames.map!(name => "`" ~ name ~ "`").join(", ");
 		return "This task uses agent `" ~ agentName ~ "`, which is not configured.\n\n"
 			~ "The currently available agents are: " ~ knownNames ~ ".";
 	}
@@ -856,6 +857,18 @@ private:
 		return translated.canFind(`"type":"queue-operation"`)
 			|| translated.canFind(`"type":"queue\/operation"`);
 	}
+}
+
+unittest
+{
+	auto body = HistoryEventPipeline.buildOrphanAgentBody("missing-agent",
+		["work-claude", "codex", "copilot"]);
+	assert(body.canFind("`missing-agent`"));
+	assert(body.canFind("`work-claude`"));
+	assert(body.canFind("`codex`"));
+	assert(body.canFind("`copilot`"));
+	assert(!body.canFind("`claude`"),
+		"orphan message must list configured names, not implicit driver names");
 }
 
 // Regression test: a task history where a queue dequeue is immediately followed

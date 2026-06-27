@@ -201,7 +201,7 @@ public:
 			static struct DebugMeta
 			{
 				int tid;
-				string agentType;
+				string agentName;
 				string taskType;
 				string timestamp;
 			}

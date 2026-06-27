@@ -3,7 +3,8 @@ module cydo.workflow.exporter.html;
 import ae.utils.json : JSONFragment, toJson;
 
 import cydo.agent.contract : Agent;
-import cydo.runtime.config : AgentDriver;
+import cydo.agent.resolver : tryCreateConfiguredAgent;
+import cydo.runtime.config : AgentDriver, CydoConfig;
 import cydo.protocol : TaskEventSeqEnvelope, TranslatedEvent;
 import cydo.domain.storage.persistence : Persistence;
 import cydo.domain.tasks.model : TypeInfoEntry;
@@ -56,11 +57,10 @@ Persistence.TaskRow[] collectTaskTree(ref Persistence persistence, int[] rootTid
 /// Serialize task metadata and event history as the export JSON blob.
 /// Format: {"tasks": [...], "events": {"<tid>": [TaskEventSeqEnvelope, ...]}, "typeInfo": [...]}
 string exportTaskData(ref Persistence persistence, Persistence.TaskRow[] taskRows,
-	TypeInfoEntry[] typeInfo = null)
+	ref CydoConfig config, TypeInfoEntry[] typeInfo = null)
 {
 	import std.format : format;
 
-	import cydo.agent.drivers.registry : agentRegistry;
 	import cydo.domain.tasks.model : extractEventFromEnvelope, extractTsFromEnvelope;
 
 	// Serialize task metadata
@@ -85,19 +85,18 @@ string exportTaskData(ref Persistence persistence, Persistence.TaskRow[] taskRow
 			t.relationType, t.workspace, t.projectPath, t.taskType,
 			t.agentName, t.createdAt, t.lastActive);
 
-	// Cache agent instances by type
+	// Cache agent instances by configured name
 	Agent[string] agentCache;
 	Agent getAgent(string agentName)
 	{
 		if (auto p = agentName in agentCache)
 			return *p;
-		foreach (ref entry; agentRegistry)
-			if (entry.name == agentName)
-			{
-				auto a = entry.create();
-				agentCache[agentName] = a;
-				return a;
-			}
+		auto a = tryCreateConfiguredAgent(config, agentName);
+		if (a !is null)
+		{
+			agentCache[agentName] = a;
+			return a;
+		}
 		return null;
 	}
 

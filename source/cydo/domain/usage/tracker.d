@@ -4,6 +4,7 @@ import std.math : fabs, isFinite, isNaN;
 
 import ae.utils.json : JSONOptional, jsonParse, toJson;
 
+import cydo.runtime.config : AgentDriver;
 import cydo.protocol : SessionRateLimitEvent;
 
 private struct AgentUsageLimitWindowMessage
@@ -50,11 +51,11 @@ class AgentUsageTracker
 		return payloads;
 	}
 
-	bool updateFromClaudeEvent(string agentType, string translated, out string payload)
+	bool updateFromClaudeEvent(AgentDriver driver, string translated, out string payload)
 	{
 		import std.datetime.systime : Clock;
 
-		if (agentType != "claude" || !isSessionRateLimitEvent(translated))
+		if (driver != AgentDriver.claude || !isSessionRateLimitEvent(translated))
 			return false;
 
 		SessionRateLimitEvent rateLimitEvent;
@@ -162,7 +163,7 @@ unittest
 	auto tracker = new AgentUsageTracker();
 
 	string payload;
-	auto changed = tracker.updateFromClaudeEvent("claude",
+	auto changed = tracker.updateFromClaudeEvent(AgentDriver.claude,
 		`{"type":"session/rate_limit","rate_limit_info":{"rateLimitType":"five_hour","utilization":0.42,"resetsAt":1000,"status":"allowed"}}`,
 		payload);
 	assert(changed);
@@ -171,7 +172,7 @@ unittest
 	assert(tracker.agentUsageByAgent["claude"].limits["five_hour"].hasUtilization);
 	assert(tracker.agentUsageByAgent["claude"].limits["five_hour"].utilization == 42);
 
-	changed = tracker.updateFromClaudeEvent("claude",
+	changed = tracker.updateFromClaudeEvent(AgentDriver.claude,
 		`{"type":"session/rate_limit","rate_limit_info":{"rateLimitType":"seven_day","utilization":71.5}}`,
 		payload);
 	assert(changed);
@@ -179,7 +180,7 @@ unittest
 	assert(tracker.agentUsageByAgent["claude"].limits["five_hour"].utilization == 42);
 	assert(tracker.agentUsageByAgent["claude"].limits["seven_day"].utilization == 71.5);
 
-	changed = tracker.updateFromClaudeEvent("claude",
+	changed = tracker.updateFromClaudeEvent(AgentDriver.claude,
 		`{"type":"session/rate_limit","rate_limit_info":{"rateLimitType":"five_hour","resetsAt":2000,"status":"allowed_warning"}}`,
 		payload);
 	assert(changed);
@@ -189,7 +190,7 @@ unittest
 	assert(msg.limits["five_hour"].resetsAt == 2000);
 	assert(msg.limits["five_hour"].status == "allowed_warning");
 
-	changed = tracker.updateFromClaudeEvent("claude",
+	changed = tracker.updateFromClaudeEvent(AgentDriver.claude,
 		`{"type":"session/rate_limit","rate_limit_info":{"rateLimitType":"seven_day","status":"allowed"}}`,
 		payload);
 	assert(changed);
@@ -198,7 +199,7 @@ unittest
 	assert(msg.limits["seven_day"].utilization == 71.5);
 	assert(msg.limits["seven_day"].status == "allowed");
 
-	changed = tracker.updateFromClaudeEvent("claude",
+	changed = tracker.updateFromClaudeEvent(AgentDriver.claude,
 		`{"type":"session/rate_limit","rate_limit_info":{"rateLimitType":"overage","status":"rejected","resetsAt":3000}}`,
 		payload);
 	assert(changed);
@@ -207,4 +208,16 @@ unittest
 	assert(msg.limits["overage"].status == "rejected");
 	assert(msg.limits["overage"].resetsAt == 3000);
 	assert(isNaN(msg.limits["overage"].utilization));
+}
+
+unittest
+{
+	auto tracker = new AgentUsageTracker();
+
+	string payload;
+	auto changed = tracker.updateFromClaudeEvent(AgentDriver.codex,
+		`{"type":"session/rate_limit","rate_limit_info":{"rateLimitType":"five_hour","utilization":0.42,"resetsAt":1000,"status":"allowed"}}`,
+		payload);
+	assert(!changed);
+	assert(tracker.agentUsageByAgent.length == 0);
 }

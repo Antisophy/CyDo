@@ -53,14 +53,14 @@ import cydo.domain.usage.tracker : AgentUsageTracker;
 import cydo.mcp.tool_descriptions : RenderedCydoToolsOptions,
 	checkRenderedCydoToolDescriptionViolations, mcpToolDescriptionMaxChars;
 
+import cydo.agent.resolver : createConfiguredAgent, isConfiguredAgentName;
 import cydo.agent.contract : Agent;
 import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
 	ItemStartedEvent, SessionRateLimitEvent, TaskEventEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
 	UnconfirmedUserEventEnvelope, extractContentText;
-import cydo.agent.drivers.registry : isRegisteredAgent;
 import cydo.agent.session : AgentSession;
 import cydo.agent.terminal : TerminalProcess;
-import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig, loadConfig, reloadConfig;
+import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
 import cydo.domain.storage.persistence : Persistence, openDatabase;
 import cydo.runtime.launch.sandbox : cleanup, resolveExecutablePath, runtimeDir;
 import cydo.domain.task_types.definition : TaskTypeDef, ContinuationDef, OutputType, WorktreeMode, byName, isInteractive, loadTaskTypes,
@@ -76,6 +76,7 @@ import cydo.foundation.system.known_messages : KnownSystemMessageKind, KnownSyst
 import cydo.domain.tasks.model;
 import cydo.workflow.workspace.worktree;
 import cydo.server.app : App, initLogger, applyConfiguredLogLevel;
+import cydo.server.config_resolution : loadRuntimeConfig;
 import cydo.runtime.shutdown : setupShutdownPipe;
 
 private string resolveTaskTypesPath()
@@ -89,6 +90,43 @@ private string resolveTaskTypesPath()
 		return "defs/task-types.yaml";
 	}
 	return buildPath(dir, "defs/task-types.yaml");
+}
+
+@JSONPartial
+private struct ReplayMeta
+{
+	@JSONOptional string agentName;
+	@JSONOptional string agentType;
+}
+
+private string replayConfiguredAgentName(ReplayMeta meta, ref CydoConfig config)
+{
+	if (meta.agentName.length > 0)
+		return meta.agentName;
+	if (meta.agentType.length > 0)
+		return meta.agentType;
+	return config.default_agent;
+}
+
+unittest
+{
+	import configy.attributes : SetInfo;
+
+	CydoConfig config;
+	config.default_agent = "codex";
+	AgentConfig workClaude;
+	workClaude.driver = SetInfo!AgentDriver(AgentDriver.claude, true);
+	config.agents["work-claude"] = workClaude;
+
+	assert(replayConfiguredAgentName(ReplayMeta(agentName: "work-claude"), config)
+		== "work-claude");
+	assert(replayConfiguredAgentName(ReplayMeta(agentType: "work-claude"), config)
+		== "work-claude");
+	assert(replayConfiguredAgentName(ReplayMeta.init, config) == "codex");
+
+	auto agent = createConfiguredAgent(config,
+		replayConfiguredAgentName(ReplayMeta(agentType: "work-claude"), config));
+	assert(agent.driver == AgentDriver.claude);
 }
 
 @(`CyDo backend and tooling.`)
@@ -129,14 +167,18 @@ static:
 	void simulate()
 	{
 		import cydo.cli.tasktype_tooling : runSimulator;
-		runSimulator(resolveTaskTypesPath(), &isRegisteredAgent);
+		auto config = loadRuntimeConfig();
+		runSimulator(resolveTaskTypesPath(),
+			(string name) => isConfiguredAgentName(config, name));
 	}
 
 	@(`Generate Graphviz dot output for task types.`)
 	void dot()
 	{
 		import cydo.cli.tasktype_tooling : runDot;
-		runDot(resolveTaskTypesPath(), &isRegisteredAgent);
+		auto config = loadRuntimeConfig();
+		runDot(resolveTaskTypesPath(),
+			(string name) => isConfiguredAgentName(config, name));
 	}
 
 	@(`Dump agent context for a task type.`)
@@ -145,7 +187,9 @@ static:
 	)
 	{
 		import cydo.cli.tasktype_context : runDumpContext;
-		runDumpContext(resolveTaskTypesPath(), typeName, &isRegisteredAgent);
+		auto config = loadRuntimeConfig();
+		runDumpContext(resolveTaskTypesPath(), typeName,
+			(string name) => isConfiguredAgentName(config, name));
 	}
 
 	@(`Check rendered MCP tool descriptions against the shared length policy.`)
@@ -309,13 +353,12 @@ static:
 		import std.file : exists, readText;
 		import std.path : buildPath;
 		import std.string : strip, splitLines;
-		import ae.utils.json : jsonParse, JSONPartial;
+		import ae.utils.json : jsonParse;
 		import cydo.agent.contract : Agent;
-		import cydo.agent.drivers.registry : agentRegistry;
 		import cydo.domain.task_types.definition : substituteVars;
 
 		initLogger();
-		auto config = loadConfig();
+		auto config = loadRuntimeConfig();
 		applyConfiguredLogLevel(config.log_level);
 
 		// Verify required files exist
@@ -335,8 +378,6 @@ static:
 		}
 
 		// Parse meta.json
-		@JSONPartial
-		static struct ReplayMeta { string agentType; }
 		auto meta = jsonParse!ReplayMeta(readText(metaPath));
 
 		// Parse context.jsonl — one envelope per non-empty line
@@ -365,16 +406,13 @@ static:
 		}
 		auto prompt = substituteVars(readText(promptPath), ["conversation": history]);
 
-		// Create agent from meta.json agentType, falling back to "claude"
 		Agent agent;
-		foreach (ref entry; agentRegistry)
-			if (entry.name == meta.agentType) { agent = entry.create(); break; }
-		if (agent is null)
-			foreach (ref entry; agentRegistry)
-				if (entry.name == "claude") { agent = entry.create(); break; }
-		if (agent is null)
+		try
+			agent = createConfiguredAgent(config,
+				replayConfiguredAgentName(meta, config));
+		catch (Exception e)
 		{
-			stderr.writeln("Error: could not find agent");
+			stderr.writeln("Error: ", e.msg);
 			import core.stdc.stdlib : exit;
 			exit(1);
 		}
@@ -471,7 +509,8 @@ static:
 			typeInfo ~= TypeInfoEntry(def.name, def.icon);
 
 		// Export task data as JSON
-		auto jsonData = exportTaskData(persistence, taskRows, typeInfo);
+		auto config = loadRuntimeConfig();
+		auto jsonData = exportTaskData(persistence, taskRows, config, typeInfo);
 
 		// Inject data and write output
 		auto html = buildExportHtml(templatePath, jsonData);

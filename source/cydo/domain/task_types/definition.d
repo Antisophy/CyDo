@@ -283,7 +283,7 @@ string resolveAgent(string expr, string parentAgentType)
 // ---------------------------------------------------------------------------
 
 string[] validateTaskTypes(TaskTypeDef[] types, UserEntryPointDef[] entryPoints,
-	bool function(string) isKnownAgent, string[] typesDirs = null)
+	bool delegate(string) isConfiguredAgentName, string[] typesDirs = null)
 {
 	import std.file : exists, readText;
 	import std.path : buildPath;
@@ -590,11 +590,11 @@ string[] validateTaskTypes(TaskTypeDef[] types, UserEntryPointDef[] entryPoints,
 
 	// Agent checks -------------------------------------------------------
 
-	// 1. Literal-agent check: hardcoded values (no '{{') must name a known agent.
+	// 1. Literal-agent check: hardcoded values (no '{{') must name a configured agent.
 	foreach (ref def; types)
 	{
-		if (!def.agent.canFind("{{") && !isKnownAgent(def.agent))
-			errors ~= format("%s: agent '%s' is not a registered agent", def.name, def.agent);
+		if (!def.agent.canFind("{{") && !isConfiguredAgentName(def.agent))
+			errors ~= format("%s: agent '%s' is not a configured agent", def.name, def.agent);
 	}
 
 	// 2. keep_context cluster-agreement check (union-find on undirected edges).
@@ -685,6 +685,13 @@ string[] validateTaskTypes(TaskTypeDef[] types, UserEntryPointDef[] entryPoints,
 	}
 
 	return errors;
+}
+
+string[] validateTaskTypes(TaskTypeDef[] types, UserEntryPointDef[] entryPoints,
+	bool function(string) isConfiguredAgentName, string[] typesDirs = null)
+{
+	return validateTaskTypes(types, entryPoints,
+		(string name) => isConfiguredAgentName(name), typesDirs);
 }
 
 /// Compute which types are "tree-read-only": the type itself is read_only,
@@ -1074,6 +1081,11 @@ version (unittest) private bool isKnownTestAgent(string name)
 	return ["claude", "codex", "copilot"].canFind(name);
 }
 
+version (unittest) private bool isConfiguredCustomTestAgent(string name)
+{
+	return name == "work-claude";
+}
+
 version (unittest) private bool rejectAllTestAgents(string name)
 {
 	return false;
@@ -1109,7 +1121,7 @@ unittest // 2. resolveAgent substitutes parent_agent_type correctly
 	assert(resolveAgent("codex", "claude") == "codex");
 }
 
-unittest // 3. Validator emits error for unregistered hardcoded literal
+unittest // 3. Validator emits error for unconfigured hardcoded literal
 {
 	TaskTypeDef t;
 	t.name = "foo";
@@ -1117,7 +1129,28 @@ unittest // 3. Validator emits error for unregistered hardcoded literal
 	t.agent = "codeex"; // typo
 
 	auto errors = validateTaskTypes([t], [], &isKnownTestAgent);
-	assert(errors.canFind("foo: agent 'codeex' is not a registered agent"), errors.to!string);
+	assert(errors.canFind("foo: agent 'codeex' is not a configured agent"), errors.to!string);
+}
+
+unittest // 3b. Validator accepts configured custom agent names and rejects raw drivers
+{
+	TaskTypeDef custom;
+	custom.name = "custom";
+	custom.model_class = "large";
+	custom.agent = "work-claude";
+
+	auto errors = validateTaskTypes([custom], [], &isConfiguredCustomTestAgent);
+	assert(!errors.canFind("custom: agent 'work-claude' is not a configured agent"),
+		errors.to!string);
+
+	TaskTypeDef driver;
+	driver.name = "driver";
+	driver.model_class = "large";
+	driver.agent = "claude";
+
+	errors = validateTaskTypes([driver], [], &isConfiguredCustomTestAgent);
+	assert(errors.canFind("driver: agent 'claude' is not a configured agent"),
+		errors.to!string);
 }
 
 unittest // 4. Validator errors on keep_context cluster with disagreeing hardcoded agents (with entry points)
@@ -1192,7 +1225,7 @@ unittest // 6. Validator allows {{ parent_agent_type }} / defaultAgentExpr even 
 	implement.agent = defaultAgentExpr; // dynamic — not hardcoded
 
 	auto errors = validateTaskTypes([implement], [], &rejectAllTestAgents);
-	assert(!errors.canFind("implement: agent '{{ parent_agent_type }}' is not a registered agent"),
+	assert(!errors.canFind("implement: agent '{{ parent_agent_type }}' is not a configured agent"),
 		errors.to!string);
 }
 
