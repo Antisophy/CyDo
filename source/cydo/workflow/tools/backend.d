@@ -350,6 +350,17 @@ public:
 						renderedPrompt,
 						taskPromptMsgSubject))],
 					null, subtaskMeta, null);
+			}).except((Exception e) {
+				auto failedChild = requireTask(childTid,
+					"Created child task must exist when launch fails");
+				failedChild.status = "failed";
+				failedChild.error = e.msg;
+				failedChild.resultText = e.msg;
+				host_.persistStatus(childTid, "failed");
+				host_.persistResultText(childTid, failedChild.resultText);
+				host_.broadcastTaskUpdate(childTid);
+				if (hasPendingSubTask(childTid))
+					deliverFailedPendingSubTaskResult(childTid);
 			}).ignoreResult();
 
 			if (description.length == 0)
@@ -1410,4 +1421,157 @@ private:
 			host_.broadcastTaskUpdate(tid);
 		}
 	}
+}
+
+unittest
+{
+	import ae.net.asockets : onNextTick, socketManager;
+	import ae.utils.promise : reject;
+	import ae.utils.promise.await : async;
+	import cydo.domain.task_types.definition : CreatableTaskDef;
+	import cydo.protocol : BatchResultEnvelope;
+	import cydo.mcp.tools : CydoToolsImpl, TaskSpec;
+	import cydo.runtime.config : SandboxConfig;
+	import std.conv : to;
+	import std.path : buildPath;
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager, "nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	TaskTypeDef parentType;
+	parentType.name = "parent";
+	parentType.agent = "fake";
+	CreatableTaskDef edge;
+	edge.name = "child";
+	edge.worktree = WorktreeMode.fork;
+	parentType.creatable_tasks = [edge];
+
+	TaskTypeDef childType;
+	childType.name = "child";
+	childType.agent = "fake";
+	auto taskTypes = [parentType, childType];
+
+	TaskData[int] tasks;
+	tasks[1] = TaskData(1, "local", "/tmp/cydo-task-startup-failure");
+	tasks[1].taskType = "parent";
+	tasks[1].agentType = "fake";
+	int nextTid = 2;
+
+	auto backend = new WorkflowToolsBackend(WorkflowToolsHost(
+		getTask: (int tid) {
+			auto td = tid in tasks;
+			return td is null ? null : td;
+		},
+		createTask: (string workspace, string projectPath, string agentName) {
+			auto tid = nextTid++;
+			tasks[tid] = TaskData(tid, workspace, projectPath);
+			tasks[tid].agentType = agentName;
+			return tid;
+		},
+		persistTaskType: (int tid, string taskType) {},
+		persistDescription: (int tid, string description) {},
+		persistParentTid: (int tid, int parentTid) {},
+		persistRelationType: (int tid, string relationType) {},
+		persistTitle: (int tid, string title) {},
+		persistStatus: (int tid, string status) {},
+		persistNeedsAttention: (int tid, bool needsAttention) {},
+		persistLastActive: (int tid, long lastActive) {},
+		persistResultText: (int tid, string resultText) {},
+		touchTask: (int tid) {},
+		taskTypesForProject: (string projectPath) => taskTypes,
+		entryPointsForProject: (string projectPath) => cast(UserEntryPointDef[]) null,
+		promptSearchPath: (string projectPath) => cast(string[]) null,
+		treeReadOnlyForProject: (string projectPath) => cast(bool[string]) null,
+		resolveTaskAgent: (string requestedAgent, string parentAgent) => "fake",
+		isRegisteredAgent: (string agentName) => agentName == "fake",
+		agentForTask: (int tid) {
+			assert(0, "agentForTask should not be needed for this test");
+			return cast(Agent) null;
+		},
+		taskSystemPromptForMessage: (int tid, TaskTypeDef* typeDef) => "",
+		readPromptFile: (string relativePath, string projectPath,
+			string[string] vars) => "",
+		buildKnownSystemMessageMeta: (KnownSystemMessageKind kind,
+			string subject, string[string] vars, string bodyVar) => "{}",
+		systemKeyword: () => "SYSTEM",
+		taskDir: (const TaskData* td) => buildPath("/tmp", "cydo-task-startup-failure",
+			"tasks", td.tid.to!string),
+		outputPath: (const TaskData* td) => buildPath("/tmp", "cydo-task-startup-failure",
+			"tasks", td.tid.to!string, "output.md"),
+		worktreePath: (const TaskData* td) => buildPath("/tmp", "cydo-task-startup-failure",
+			"tasks", td.tid.to!string, "worktree"),
+		worktreeForkBaseHead: (int tid) => "",
+		taskProducesCommitOutput: (string projectPath, string taskTypeName) => false,
+		setupWorktreeForEdge: (int childTid, int parentTid, WorktreeMode mode) {},
+		ensureProcessQueueAlive: (int tid) =>
+			reject!void(new Exception("simulated child session startup failure")),
+		sendTaskMessage: (int tid, const(ContentBlock)[] content,
+			const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) {
+			assert(0, "startup failure should prevent sending the child prompt");
+		},
+		emitTaskReload: (int tid, string reason) {},
+		appendSynthesizedHistoryError: (int tid, string subject, string body) {},
+		taskAlive: (int tid) => false,
+		tasksShareWorkspace: (int aTid, int bTid) => true,
+		taskWorkspaceLabel: (int tid) => "local",
+		addIdleCallback: (int tid, void delegate() cb) {},
+		reactivateTask: (int tid, void delegate() onReady) {},
+		canSendSystemMessage: (int tid, out string sessionState) {
+			sessionState = "dead";
+			return false;
+		},
+		sendKnownSystemMessage: (int tid, KnownSystemMessageKind kind,
+			string body) {},
+		persistAddTaskDep: (int parentTid, int childTid) {},
+		persistRemoveTaskDep: (int parentTid, int childTid) {},
+		persistRemoveAllChildDeps: (int childTid) {},
+		loadTaskDeps: () => cast(int[][int]) null,
+		broadcastTaskUpdate: (int tid) {},
+		broadcastFocusHint: (int fromTid, int toTid) {},
+		sendAskUserQuestionPrompt: (int tid, JSONFragment questions,
+			string toolUseId) {},
+		clearAskUserQuestionPrompt: (int tid) {},
+		sendPermissionPrompt: (int tid, string toolUseId, string toolName,
+			JSONFragment input) {},
+		clearPermissionPrompt: (int tid) {},
+		appendTaskSpawnedEvent: (int parentTid, int childTid, int specIndex) {},
+		broadcastTaskCreated: (TaskCreatedMessage message) {},
+		workspacePermissionPolicy: (string workspaceName) => "",
+		onNextTick: (void delegate() cb) { onNextTick(socketManager, cb); },
+		generateTitle: (int tid, string prompt) {},
+	));
+
+	auto tools = new CydoToolsImpl(backend, "1");
+	bool resolved;
+	McpResult result;
+	async({
+		return tools.createTasks([
+			TaskSpec("child startup", "child", "trigger child startup failure"),
+		]);
+	}).then((McpResult r) {
+		resolved = true;
+		result = r;
+	});
+
+	drainPromiseNextTicks();
+
+	assert(resolved,
+		"Task MCP call stayed pending after child session startup failure");
+	assert(result.isError);
+	auto batch = jsonParse!BatchResultEnvelope(result.text);
+	assert(batch.tasks.length == 1);
+	auto taskResult = jsonParse!TaskResult(batch.tasks[0].json);
+	assert(taskResult.status == "error");
+	assert(taskResult.summary == "simulated child session startup failure");
+	assert(taskResult.error == "simulated child session startup failure");
 }

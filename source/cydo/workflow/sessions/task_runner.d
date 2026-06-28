@@ -528,7 +528,9 @@ class TaskSessionRunner
 				current.status = "failed";
 				if (current.error.length == 0)
 					current.error = "Process exited unexpectedly";
+				current.resultText = current.error;
 				host_.persistStatus(tid, "failed");
+				host_.persistResultText(tid, current.resultText);
 				if (current.relationType != "fork")
 				{
 					auto ancestor = host_.findAliveAncestor(tid);
@@ -536,6 +538,8 @@ class TaskSessionRunner
 						host_.broadcastFocusHint(tid, ancestor);
 				}
 				host_.broadcastTaskUpdate(tid);
+				if (!host_.deliverFailedPendingSubTaskResult(tid))
+					host_.deliverWaitingParentResultsIfReady(tid);
 				return;
 			}
 
@@ -626,11 +630,15 @@ class TaskSessionRunner
 				td = requireTask(tid, "Task must exist when spawn fails");
 				td.status = "failed";
 				td.error = e.msg;
+				td.resultText = e.msg;
 				host_.persistStatus(tid, "failed");
+				host_.persistResultText(tid, td.resultText);
 				auto translated = host_.appendSynthesizedHistoryError(
 					tid, "Failed to resume session", buildLaunchFailureBody(tid, e));
 				host_.broadcastAppendedTaskEvent(tid, translated);
 				host_.broadcastTaskUpdate(tid);
+				if (!host_.deliverFailedPendingSubTaskResult(tid))
+					host_.deliverWaitingParentResultsIfReady(tid);
 				return reject!ProcessState(e);
 			}
 			host_.broadcastTaskUpdate(tid);
