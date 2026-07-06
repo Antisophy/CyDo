@@ -3,7 +3,7 @@ module cydo.workflow.sessions.task_runner;
 import core.time : seconds;
 
 import std.file : mkdirRecurse;
-import std.path : absolutePath, buildPath;
+import std.path : absolutePath, buildPath, dirName;
 import std.process : execute;
 import std.string : strip;
 import std.logger : infof, tracef, warningf;
@@ -211,24 +211,39 @@ class TaskSessionRunner
 
 		sandbox.paths[tdDir] = PathMode.rw;
 
-		if (td.worktreeTid > 0 && !readOnly && workDir.length > 0)
+		// Other tasks' outputs are part of the workflow contract (sub-task
+		// results are delivered to the parent as paths into the sub-tasks'
+		// directories), and the tasks container is not necessarily reachable
+		// through the workspace-root mount (it may live on another volume) —
+		// mount it read-only, unless configuration says otherwise.
+		auto tasksRoot = dirName(tdDir);
+		if (tasksRoot !in sandbox.paths)
+			sandbox.paths[tasksRoot] = PathMode.ro;
+
+		if (td.worktreeTid > 0 && workDir.length > 0)
 		{
 			sandbox.paths[workDir] = PathMode.ro;
 
+			// Read-only tasks need the worktree mounted too: the task
+			// directory tree is not necessarily reachable through the
+			// workspace-root mount (it may live on another volume).
 			auto wtPath = host_.worktreePath(td);
-			sandbox.paths[wtPath] = PathMode.rw;
+			sandbox.paths[wtPath] = readOnly ? PathMode.ro : PathMode.rw;
 
-			auto gitDirResult = execute(["git", "-C", wtPath, "rev-parse", "--git-dir"]);
-			if (gitDirResult.status == 0)
+			if (!readOnly)
 			{
-				auto gitDir = gitDirResult.output.strip.absolutePath(wtPath);
-				sandbox.paths[gitDir] = PathMode.rw;
-			}
-			auto gitCommonResult = execute(["git", "-C", wtPath, "rev-parse", "--git-common-dir"]);
-			if (gitCommonResult.status == 0)
-			{
-				auto gitCommonDir = gitCommonResult.output.strip.absolutePath(wtPath);
-				sandbox.paths[gitCommonDir] = PathMode.rw;
+				auto gitDirResult = execute(["git", "-C", wtPath, "rev-parse", "--git-dir"]);
+				if (gitDirResult.status == 0)
+				{
+					auto gitDir = gitDirResult.output.strip.absolutePath(wtPath);
+					sandbox.paths[gitDir] = PathMode.rw;
+				}
+				auto gitCommonResult = execute(["git", "-C", wtPath, "rev-parse", "--git-common-dir"]);
+				if (gitCommonResult.status == 0)
+				{
+					auto gitCommonDir = gitCommonResult.output.strip.absolutePath(wtPath);
+					sandbox.paths[gitCommonDir] = PathMode.rw;
+				}
 			}
 		}
 
