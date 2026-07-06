@@ -1,10 +1,15 @@
 module cydo.runtime.launch.sandbox_resolver;
 
-import std.algorithm : canFind;
-import std.file : exists;
+import std.algorithm : any, canFind, startsWith;
+import std.exception : enforce;
+import std.file : exists, isSymlink, readLink;
+import std.format : format;
 import std.logger : warningf;
-import std.path : expandTilde;
+import std.path : expandTilde, pathSplitter;
 import std.process : environment;
+import std.string : lastIndexOf;
+
+import ae.sys.file : realPath;
 
 import configy.attributes : SetInfo;
 
@@ -57,7 +62,6 @@ ResolvedSandbox resolveSandbox(SandboxConfig global, SandboxConfig agentTypeConf
 	// can honor sandbox.env overrides such as PATH.
 	agent.configureSandbox(result.paths, result.env);
 
-	expandResolvedPaths(result.paths);
 	renderResolvedEnv(result.env);
 	resolveGitIdentity(result, agent.gitName, agent.gitEmail,
 		global.git, agentTypeConfig.git, workspace.git);
@@ -93,8 +97,6 @@ ResolvedSandbox resolveSandboxForDiscovery(SandboxConfig global, SandboxConfig w
 		if (mode == PathMode.rw || mode == PathMode.always_rw)
 			mode = PathMode.ro;
 
-	expandResolvedPaths(result.paths);
-
 	// Merge env: global, then workspace overrides
 	mergeEnv(result.env, global.env);
 	mergeEnv(result.env, workspace.env);
@@ -106,18 +108,100 @@ ResolvedSandbox resolveSandboxForDiscovery(SandboxConfig global, SandboxConfig w
 
 private:
 
-void expandResolvedPaths(ref PathMode[string] paths)
+/// Expand and rewrite sandbox path spellings so each is mountable as a bwrap
+/// destination and reachable inside the sandbox at run time.
+///
+/// bwrap materializes destination parents as plain directories in its staging
+/// root, following any symlinks that already exist there. A symlink component
+/// exists in the staging root only when an enclosing host-content mount
+/// exposes it — destination creation would then chase it into paths that do
+/// not exist yet (and run-time resolution chases it likewise), so such
+/// spellings are rewritten to the symlink's target. A symlink no mount
+/// exposes simply materializes as a plain directory (or, as a final
+/// component, a dereferenced bind), so its spelling is kept as-is.
+///
+/// Called by the renderer, at the last moment before argv generation: paths
+/// are contributed both by config resolution and by later launch stages
+/// (task dir, worktree, git dirs), and all of them must pass through here.
+/// `builtinMounts` are the renderer's hardcoded host-content binds, which
+/// expose symlinks just like configured ones.
+public void rewriteSandboxPaths(ref PathMode[string] paths, const(string)[] builtinMounts)
 {
-	PathMode[string] expanded;
+	auto providers = builtinMounts.dup;
+	foreach (path, mode; paths)
+		if (mode == PathMode.ro || mode == PathMode.rw || mode == PathMode.always_rw)
+		{
+			auto logical = expandTilde(path);
+			if (exists(logical))
+				providers ~= logical;
+		}
+
+	PathMode[string] rewritten;
+	string[string] spellings; // rewritten → configured spelling
 	foreach (path, mode; paths)
 	{
-		auto resolved = expandTilde(path);
-		if (exists(resolved))
-			expanded[resolved] = mode;
-		else
-			warningf("sandbox: skipping non-existent path: %s", resolved);
+		auto logical = expandTilde(path);
+		if (!exists(logical))
+		{
+			warningf("sandbox: skipping non-existent path: %s", logical);
+			continue;
+		}
+		auto dest = rewriteSandboxPath(logical, providers);
+		if (auto existingMode = dest in rewritten)
+			enforce(*existingMode == mode, format(
+				"sandbox: %s and %s are the same path (%s) with conflicting modes",
+				spellings[dest], logical, dest));
+		rewritten[dest] = mode;
+		spellings[dest] = logical;
 	}
-	paths = expanded;
+	paths = rewritten;
+}
+
+/// Walk `logical` the way the sandbox resolves it: a symlink component is
+/// followed (spelling rewritten to its target) only when it is strictly
+/// inside a host-content mount and therefore present in the sandbox;
+/// otherwise the component is kept literally, to materialize as a plain
+/// directory or dereferenced bind.
+string rewriteSandboxPath(string logical, const(string)[] providers)
+{
+	// Terminates: mirrors the host resolution of `logical`, whose full
+	// resolvability was already proven by exists() above.
+	string current; // spelling-so-far; "" is the root
+	auto remaining = pathComponents(logical);
+	while (remaining.length)
+	{
+		auto component = remaining[0];
+		remaining = remaining[1 .. $];
+		if (component == ".")
+			continue;
+		if (component == "..")
+		{
+			auto slash = current.lastIndexOf('/');
+			current = slash <= 0 ? "" : current[0 .. slash];
+			continue;
+		}
+		auto candidate = current ~ "/" ~ component;
+		if (isSymlink(candidate)
+			&& providers.any!(p => candidate.startsWith(p ~ "/")))
+		{
+			auto target = readLink(candidate);
+			remaining = pathComponents(target) ~ remaining;
+			if (target.startsWith("/"))
+				current = "";
+		}
+		else
+			current = candidate;
+	}
+	return current;
+}
+
+string[] pathComponents(string path)
+{
+	string[] result;
+	foreach (component; path.pathSplitter)
+		if (component != "/")
+			result ~= component;
+	return result;
 }
 
 void renderResolvedEnv(ref string[string] env)
@@ -345,6 +429,63 @@ unittest
 	assert(resolved.env["AGENT_ADDED"] == "present");
 	assert(resolved.gitName == "Agent Type Name");
 	assert(resolved.gitEmail == "workspace@example.com");
+}
+
+unittest
+{
+	import std.exception : assertThrown;
+	import std.file : mkdirRecurse, rmdirRecurse, symlink;
+	import std.path : buildPath;
+
+	auto root = buildPath(realPath("/tmp"), "cydo-sandbox-symlink");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope(exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	// ws/.cydo/tasks is an absolute symlink whose target spelling traverses
+	// another (relative) symlink, mirroring a tasks directory relocated to
+	// another volume that is itself reached through a symlink.
+	auto wsRoot = buildPath(root, "ws");
+	auto movedTasks = buildPath(root, "moved", "tasks");
+	auto taskDir = buildPath(movedTasks, "1");
+	auto hop = buildPath(root, "hop"); // hop → moved
+	auto tasksLink = buildPath(wsRoot, ".cydo", "tasks"); // → hop/tasks
+	mkdirRecurse(buildPath(wsRoot, ".cydo"));
+	mkdirRecurse(taskDir);
+	symlink("moved", hop);
+	symlink(buildPath(hop, "tasks"), tasksLink);
+	auto logicalTaskDir = buildPath(tasksLink, "1");
+
+	// The ro wsRoot mount exposes the tasks symlink inside the sandbox, so
+	// the spelling is rewritten to its target. The hop symlink inside the
+	// target spelling is exposed by nothing and stays literal — it will
+	// materialize as a plain directory.
+	PathMode[string] paths = [wsRoot: PathMode.ro, logicalTaskDir: PathMode.rw];
+	rewriteSandboxPaths(paths, null);
+	assert(paths == [wsRoot: PathMode.ro, buildPath(hop, "tasks", "1"): PathMode.rw]);
+
+	// With no mount exposing the tasks symlink, bwrap materializes the
+	// spelling as plain directories — it is kept as-is.
+	PathMode[string] uncovered = [logicalTaskDir: PathMode.rw];
+	rewriteSandboxPaths(uncovered, null);
+	assert(uncovered == [logicalTaskDir: PathMode.rw]);
+
+	// Builtin renderer mounts provide visibility like configured ones.
+	PathMode[string] viaBuiltin = [logicalTaskDir: PathMode.rw];
+	rewriteSandboxPaths(viaBuiltin, [wsRoot]);
+	assert(viaBuiltin == [buildPath(hop, "tasks", "1"): PathMode.rw]);
+
+	// Two spellings rewriting to the same path with conflicting modes.
+	auto tasksLink2 = buildPath(wsRoot, ".cydo", "tasks2"); // → hop/tasks too
+	symlink(buildPath(hop, "tasks"), tasksLink2);
+	PathMode[string] conflicting = [
+		wsRoot: PathMode.ro,
+		logicalTaskDir: PathMode.rw,
+		buildPath(tasksLink2, "1"): PathMode.ro,
+	];
+	assertThrown(rewriteSandboxPaths(conflicting, null));
 }
 
 unittest

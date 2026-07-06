@@ -13,6 +13,7 @@ import core.sys.posix.unistd : X_OK, access;
 import cydo.runtime.config : PathMode;
 import cydo.runtime.launch.sandbox_materialization : createGitConfigTempFile, createGroupTempFile,
 	createPasswdTempFile, emptyDirPath, emptyFilePath;
+import cydo.runtime.launch.sandbox_resolver : rewriteSandboxPaths;
 import cydo.runtime.launch.types : ProcessLaunch, ResolvedSandbox;
 
 /// Absolute path to the currently running cydo binary, resolved at
@@ -125,6 +126,10 @@ string[] buildCommandPrefix(ref ResolvedSandbox sandbox, string workDir)
 	{
 		// Restricted mode: selective bind mounts
 
+		// Host-content binds emitted below, tracked as symlink-visibility
+		// providers for rewriteSandboxPaths.
+		string[] builtinMounts;
+
 		// Pseudo-filesystems
 		args ~= ["--dev", "/dev"];
 		args ~= ["--proc", "/proc"];
@@ -152,37 +157,57 @@ string[] buildCommandPrefix(ref ResolvedSandbox sandbox, string workDir)
 			];
 			foreach (p; nixPaths)
 				if (exists(p))
+				{
 					args ~= ["--ro-bind", p, p];
+					builtinMounts ~= p;
+				}
 
 			args ~= ["--tmpfs", "/run"];
 			args ~= ["--symlink", currentSystem, "/run/current-system"];
 			if (exists("/run/wrappers"))
+			{
 				args ~= ["--ro-bind", "/run/wrappers", "/run/wrappers"];
+				builtinMounts ~= "/run/wrappers";
+			}
 		}
 		else
 		{
 			// non-NixOS: bind-mount system directories so dynamically linked
 			// binaries can find shared libraries, the ELF interpreter (ld-linux),
 			// DNS resolver (systemd-resolved socket in /run), and CA certificates
-			if (exists("/run"))
-				args ~= ["--ro-bind", "/run", "/run"];
-			if (exists("/etc"))
-				args ~= ["--ro-bind", "/etc", "/etc"];
-			if (exists("/usr"))
-				args ~= ["--ro-bind", "/usr", "/usr"];
+			foreach (p; ["/run", "/etc", "/usr"])
+				if (exists(p))
+				{
+					args ~= ["--ro-bind", p, p];
+					builtinMounts ~= p;
+				}
 			if (exists("/lib64") && isSymlink("/lib64"))
 				args ~= ["--symlink", readLink("/lib64"), "/lib64"];
 			else if (exists("/lib64"))
+			{
 				args ~= ["--ro-bind", "/lib64", "/lib64"];
+				builtinMounts ~= "/lib64";
+			}
 			if (exists("/lib") && isSymlink("/lib"))
 				args ~= ["--symlink", readLink("/lib"), "/lib"];
 			else if (exists("/lib") && !exists("/lib64"))
+			{
 				args ~= ["--ro-bind", "/lib", "/lib"];
+				builtinMounts ~= "/lib";
+			}
 		}
 
 		// Cgroup filesystem
 		if (exists("/sys/fs/cgroup"))
+		{
 			args ~= ["--bind", "/sys/fs/cgroup", "/sys/fs/cgroup"];
+			builtinMounts ~= "/sys/fs/cgroup";
+		}
+
+		// Rewrite here, not in resolveSandbox: paths keep being added between
+		// resolution and launch (task dir, worktree, git dirs), and every one
+		// of them must be rewritten to be mountable.
+		rewriteSandboxPaths(sandbox.paths, builtinMounts);
 
 		// Configured path binds — sorted by length so parent dirs are bound before
 		// children. This ensures a child rw bind overrides a parent ro bind.
@@ -416,6 +441,56 @@ unittest
 	assert(derived.cmdPrefix[0 .. 3] == ["env", "-C", "/tmp/cydo-launch"]);
 	assert(derived.cmdPrefix.canFind("A=1"));
 	assert(derived.cmdPrefix.canFind("B=2"));
+}
+
+unittest
+{
+	import std.file : mkdirRecurse, remove, rmdirRecurse, symlink, write;
+	import std.path : buildPath;
+
+	import ae.sys.file : realPath;
+
+	// Regression: paths are added to the sandbox after resolveSandbox (task
+	// dir, worktree, git dirs) — spelling rewriting must still apply to
+	// them, so it happens at render time.
+	auto root = buildPath(realPath("/tmp"), "cydo-renderer-symlink");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope(exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	// findBwrap only produces argv[0]; satisfy it in environments without a
+	// real bwrap (the Nix build sandbox).
+	auto fakeBin = buildPath(root, "bin");
+	mkdirRecurse(fakeBin);
+	write(buildPath(fakeBin, "bwrap"), "");
+	auto oldPath = environment.get("PATH", "");
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	scope(exit)
+		environment["PATH"] = oldPath;
+
+	auto wsRoot = buildPath(root, "ws");
+	auto taskDir = buildPath(root, "moved", "tasks", "1");
+	auto tasksLink = buildPath(wsRoot, ".cydo", "tasks");
+	mkdirRecurse(taskDir);
+	mkdirRecurse(buildPath(wsRoot, ".cydo"));
+	symlink(buildPath(root, "moved", "tasks"), tasksLink);
+
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	sandbox.isolate_processes = false;
+	sandbox.isolate_environment = false;
+	sandbox.paths[wsRoot] = PathMode.ro;
+	sandbox.paths[buildPath(tasksLink, "1")] = PathMode.rw;
+
+	auto args = buildCommandPrefix(sandbox, "");
+	scope(exit)
+		foreach (tempFile; sandbox.tempFiles)
+			remove(tempFile);
+	assert(args.canFind(["--ro-bind", wsRoot, wsRoot]));
+	assert(args.canFind(["--bind", taskDir, taskDir]));
+	assert(!args.canFind(buildPath(tasksLink, "1")));
 }
 
 unittest
