@@ -62,6 +62,8 @@ class AgentProcess
 		auto stdoutPipe = pipe();
 		auto stderrPipe = pipe();
 
+		tracef("Spawning agent process: %s", args);
+		tracef("Environment: %s", env);
 		pid = spawnProcess(
 			args,
 			noStdin ? File("/dev/null") : stdinPipe.readEnd,
