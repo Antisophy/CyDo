@@ -1713,9 +1713,10 @@ class App
 		string draft = json.content.json !is null ? jsonParse!string(json.content.json) : "";
 		td.draft = draft;
 		persistence.setDraft(tid, draft);
-		// Broadcast to other subscribed clients (not the sender)
+		// Broadcast to every other client (not the sender): draft text is task metadata,
+		// not history-subscription-only state.
 		auto data = Data(toJson(DraftUpdatedMessage("draft_updated", tid, draft)).representation);
-		clientHub.sendToSubscribedExcept(tid, senderWs, data);
+		clientHub.broadcastExcept(senderWs, data);
 	}
 
 	private void handleDeleteTaskMsg(WsMessage json)

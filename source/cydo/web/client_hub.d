@@ -65,6 +65,13 @@ class ClientHub
 						ws.send(payload);
 	}
 
+	void broadcastExcept(WebSocketAdapter excludedWs, Data payload)
+	{
+		foreach (ws; clients)
+			if (ws !is excludedWs)
+				ws.send(payload);
+	}
+
 	void broadcast(string payload)
 	{
 		auto data = Data(payload.representation);
@@ -127,24 +134,24 @@ unittest
 	auto hub = new ClientHub();
 	auto excluded = new StubWebSocketAdapter();
 	auto included = new StubWebSocketAdapter();
-	auto otherTid = new StubWebSocketAdapter();
+	auto unsubscribed = new StubWebSocketAdapter();
 	scope(exit)
 	{
 		excluded.disconnect("test complete", DisconnectType.requested);
 		included.disconnect("test complete", DisconnectType.requested);
-		otherTid.disconnect("test complete", DisconnectType.requested);
+		unsubscribed.disconnect("test complete", DisconnectType.requested);
 	}
 	hub.add(excluded);
 	hub.add(included);
-	hub.add(otherTid);
+	hub.add(unsubscribed);
 	hub.subscribe(excluded, 7);
 	hub.subscribe(included, 7);
-	hub.subscribe(otherTid, 9);
 
-	hub.sendToSubscribedExcept(7, excluded, Data("payload".representation));
+	hub.broadcastExcept(excluded, Data("payload".representation));
 
 	assert(excluded.sent.length == 0);
 	assert(included.sent.length == 1);
 	assert(included.sent[0] == "payload");
-	assert(otherTid.sent.length == 0);
+	assert(unsubscribed.sent.length == 1);
+	assert(unsubscribed.sent[0] == "payload");
 }
