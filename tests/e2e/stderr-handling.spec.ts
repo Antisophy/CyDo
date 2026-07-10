@@ -1,4 +1,4 @@
-import { writeFileSync } from "fs";
+import { existsSync, writeFileSync } from "fs";
 import {
   test,
   expect,
@@ -24,6 +24,10 @@ test("codex stderr view source keeps tabs and shows abstract stderr payload", { 
   ).toBeVisible({ timeout: responseTimeout(agentType) });
 
   const fixturePath = `${backend.wsDir}/tmp/codex-fileviewer-create.txt`;
+  expect(
+    existsSync(fixturePath),
+    "Codex completed without executing the fixture's apply_patch tool call; check model compatibility and request framing",
+  ).toBe(true);
   writeFileSync(fixturePath, "external edit from playwright\n", "utf8");
 
   await sendMessage(page, "codex filechange update fixture");
