@@ -435,10 +435,10 @@ class CodexAgent : Agent
 			return *p;
 		switch (modelClass)
 		{
-			case "small":  return "gpt-5.3-codex-spark";
-			case "medium": return "gpt-5.4";
-			case "large":  return "gpt-5.5";
-			default:       return "gpt-5.4-mini";
+			case "small":  return "gpt-5.6-luna";
+			case "medium": return "gpt-5.6-terra";
+			case "large":  return "gpt-5.6-sol";
+			default:       return "gpt-5.6-luna";
 		}
 	}
 
