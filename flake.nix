@@ -103,16 +103,16 @@
           nodejs = pkgs.nodejs_22;
 
           # Codex CLI — pre-built static binary from npm
-          codexVersion = "0.139.0";
+          codexVersion = "0.144.1";
           codexSrc = {
             x86_64-linux = {
               url = "https://registry.npmjs.org/@openai/codex/-/codex-${codexVersion}-linux-x64.tgz";
-              hash = "sha256-+BO39k/esntNvU5EyaEuri8DR831bbUspGE0kmtlfxI=";
+              hash = "sha256-4qZNQhwQqvC348DovXG3Hkl9dYIwAzGLZ0onjXGt0Mc=";
               triple = "x86_64-unknown-linux-musl";
             };
             aarch64-linux = {
               url = "https://registry.npmjs.org/@openai/codex/-/codex-${codexVersion}-linux-arm64.tgz";
-              hash = "sha256-YZVnfkulHyKpobXw4qAaJVpCpXVbdAEjzmj1MO0t08o=";
+              hash = "sha256-JcZtRFHE9X32tCcXPtfT1+KcEp1h3FhJjb25Rnh7dlU=";
               triple = "aarch64-unknown-linux-musl";
             };
           }.${system} or (throw "Codex CLI: unsupported system ${system}");
@@ -656,7 +656,7 @@ EOF
 
               export CYDO_BIN="${cydoDebug}/bin/cydo"
               ${lib.optionalString (agentType == "codex" && lib.hasPrefix "e2e/codex-compaction.spec.ts:" testMatch) ''
-              export CYDO_CODEX_COMPACT_LIMIT=100
+              export CYDO_CODEX_COMPACT_LIMIT=10000
               ''}
 
               cp -r $src /tmp/tests

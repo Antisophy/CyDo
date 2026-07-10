@@ -24,7 +24,7 @@ test("codex context compaction shows compacting status", { tag: "@codex-only" },
   const timeout = responseTimeout(agentType);
 
   // Turn 1: "trigger compaction" → mock returns text with total_tokens=500000,
-  // which exceeds CYDO_CODEX_COMPACT_LIMIT=100
+  // which exceeds CYDO_CODEX_COMPACT_LIMIT=10000
   await sendMessage(page, "trigger compaction");
   await expect(assistantText(page, "Ready for compaction.")).toBeVisible({
     timeout,
