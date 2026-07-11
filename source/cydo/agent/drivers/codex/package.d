@@ -1629,6 +1629,16 @@ string buildConfigOverride(int tid, string creatableTaskTypes,
 	// "team of agents" framing in one shot.
 	config["features.multi_agent"] = JSONFragment("false");
 
+	// Force CyDo's MCP tools to be exposed as top-level DIRECT model tools rather
+	// than nested inside Codex's code-mode `exec` sandbox. In code mode the exec
+	// cell yields control back to the model after a 10s timer while an awaited
+	// tools.mcp__cydo__Task(...) is still pending, which breaks the strict-blocking
+	// invariant (parent must do no inference until the child completes). The
+	// direct-call path awaits the full MCP result with no yield timer.
+	// Note: features.code_mode=false is insufficient — model tool_mode metadata
+	// ("code_mode_only") overrides the feature flag; this per-namespace knob wins.
+	config["features.code_mode.direct_only_tool_namespaces"] = JSONFragment(`["mcp__cydo"]`);
+
 	// If CYDO_CODEX_COMPACT_LIMIT is set (test-only), override compaction threshold.
 	auto compactLimit = environment.get("CYDO_CODEX_COMPACT_LIMIT", "");
 	if (compactLimit.length > 0)
@@ -1668,6 +1678,8 @@ unittest
 	auto config = buildConfigOverride(1, "", "", "", null, "");
 	assert(config.indexOf(`"features.multi_agent":false`) >= 0,
 		"Codex config must disable the built-in multi-agent feature; actual=" ~ config);
+	assert(config.indexOf(`"features.code_mode.direct_only_tool_namespaces":["mcp__cydo"]`) >= 0,
+		"Codex config must expose CyDo MCP tools as direct calls; actual=" ~ config);
 }
 
 /// Extract display-level command input from a live Codex commandExecution item.
