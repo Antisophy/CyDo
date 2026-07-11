@@ -1623,6 +1623,12 @@ string buildConfigOverride(int tid, string creatableTaskTypes,
 	// Always request reasoning summaries from the model.
 	config["model_reasoning_summary"] = JSONFragment(`"auto"`);
 
+	// Disable Codex's built-in multi-agent collaboration feature. CyDo agents must
+	// delegate only via mcp__cydo__Task, never Codex's own spawn_agent/team tools.
+	// Turning the feature off removes both the collaboration tools and the injected
+	// "team of agents" framing in one shot.
+	config["features.multi_agent"] = JSONFragment("false");
+
 	// If CYDO_CODEX_COMPACT_LIMIT is set (test-only), override compaction threshold.
 	auto compactLimit = environment.get("CYDO_CODEX_COMPACT_LIMIT", "");
 	if (compactLimit.length > 0)
@@ -1653,6 +1659,15 @@ string buildConfigOverride(int tid, string creatableTaskTypes,
 	}
 
 	return toJson(config);
+}
+
+unittest
+{
+	import std.string : indexOf;
+
+	auto config = buildConfigOverride(1, "", "", "", null, "");
+	assert(config.indexOf(`"features.multi_agent":false`) >= 0,
+		"Codex config must disable the built-in multi-agent feature; actual=" ~ config);
 }
 
 /// Extract display-level command input from a live Codex commandExecution item.
