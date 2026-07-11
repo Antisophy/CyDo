@@ -12,7 +12,8 @@ import std.string : splitLines, strip;
 import ae.utils.json : toJson;
 import ae.utils.promise : Promise;
 
-import cydo.domain.tasks.model : TaskData;
+import cydo.domain.tasks.model : TaskData, TaskStatus;
+import cydo.domain.tasks.lifecycle : TaskNotificationChange;
 import cydo.foundation.system.known_messages : KnownSystemMessageKind;
 import cydo.mcp : McpResult;
 import cydo.mcp.payloads : TaskResult;
@@ -27,6 +28,10 @@ struct SubtaskResultDeliveryHost
 	string delegate(int tid) worktreeForkBaseHead;
 	bool delegate(string projectPath, string taskTypeName) taskProducesCommitOutput;
 	void delegate(int tid, string status) persistStatus;
+	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
+		TaskNotificationChange notification) transitionTask;
+	void delegate(int tid, TaskStatus[] expectedFrom, TaskStatus to,
+		TaskNotificationChange notification) transitionTaskFrom;
 	void delegate(int tid, string resultText) persistResultText;
 	bool delegate(int tid, out Promise!(McpResult) pending) readPendingSubTask;
 	void delegate(int tid) clearPendingSubTask;
@@ -62,7 +67,7 @@ public:
 		if (td is null)
 			return false;
 
-		td.status = "completed";
+		td.status = TaskStatus.completed;
 		host_.persistStatus(childTid, "completed");
 		host_.persistResultText(childTid, td.resultText);
 
@@ -293,7 +298,7 @@ private:
 			"Parent task must exist after sub-task batch result delivery");
 		if (td.status == "waiting")
 		{
-			td.status = "alive";
+			td.status = TaskStatus.alive;
 			host_.persistStatus(parentTid, "alive");
 			host_.broadcastTaskUpdate(parentTid);
 		}

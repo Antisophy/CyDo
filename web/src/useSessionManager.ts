@@ -1957,7 +1957,12 @@ export function useTaskManager(
     const t = liveStates.get(uuid);
     if (!t || t.tid === null || t.archived) return;
     connRef.current?.resumeTask(t.tid);
-    const updated = { ...t, alive: true, resumable: false, status: "active" };
+    const updated: TaskState = {
+      ...t,
+      alive: true,
+      resumable: false,
+      status: "active",
+    };
     liveStates.set(uuid, updated);
     setTasks((prev) => {
       const next = new Map(prev);
@@ -1971,7 +1976,7 @@ export function useTaskManager(
     if (!t || t.status !== "importable") return;
     connRef.current?.promoteTask(tid);
     // Optimistic update
-    const updated = { ...t, status: "completed", resumable: true };
+    const updated: TaskState = { ...t, status: "completed", resumable: true };
     liveStates.set(t.uuid, updated);
     setTasks((prev) => {
       const next = new Map(prev);

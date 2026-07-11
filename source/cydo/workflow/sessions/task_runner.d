@@ -19,7 +19,8 @@ import cydo.protocol : ProcessExitEvent, ProcessStderrEvent, TranslatedEvent;
 import cydo.runtime.config : AgentDriver, PathMode, SandboxConfig;
 import cydo.runtime.launch.types : AgentSandboxConfig, ProcessLaunch;
 import launchSandbox = cydo.runtime.launch.sandbox;
-import cydo.domain.tasks.model : ProcessState, TaskData;
+import cydo.domain.tasks.model : ProcessState, TaskData, TaskStatus;
+import cydo.domain.tasks.lifecycle : TaskNotificationChange;
 import cydo.domain.task_types.catalog : TaskTypeCatalog;
 import cydo.domain.task_types.definition : TaskTypeDef,
 	formatCompactCreatableTaskTypeToolSummary, formatCompactHandoffToolSummary,
@@ -80,6 +81,10 @@ struct TaskSessionRunnerHost
 	int delegate(int tid) findAliveAncestor;
 	void delegate(int fromTid, int toTid) broadcastFocusHint;
 	void delegate(int tid, string status) persistStatus;
+	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
+		TaskNotificationChange notification) transitionTask;
+	void delegate(int tid, TaskStatus[] expectedFrom, TaskStatus to,
+		TaskNotificationChange notification) transitionTaskFrom;
 	void delegate(int tid, string resultText) persistResultText;
 	void delegate(int tid, string missingOutputs) requestMissingOutputs;
 	void delegate(int tid) spawnContinuation;
@@ -540,7 +545,7 @@ class TaskSessionRunner
 
 			if (!intentionalExit)
 			{
-				current.status = "failed";
+				current.status = TaskStatus.failed;
 				if (current.error.length == 0)
 					current.error = "Process exited unexpectedly";
 				current.resultText = current.error;
@@ -590,7 +595,7 @@ class TaskSessionRunner
 			}
 
 			if (current.status != "completed")
-				current.status = exitCode == 0 ? "completed" : "failed";
+				current.status = exitCode == 0 ? TaskStatus.completed : TaskStatus.failed;
 			host_.persistStatus(tid, current.status);
 			host_.persistResultText(tid, current.resultText);
 
@@ -618,7 +623,7 @@ class TaskSessionRunner
 			host_.broadcastTaskUpdate(tid);
 		};
 
-		td.status = "active";
+		td.status = TaskStatus.active;
 		host_.persistStatus(tid, "active");
 		td.error = null;
 	}
@@ -643,7 +648,7 @@ class TaskSessionRunner
 			catch (Exception e)
 			{
 				td = requireTask(tid, "Task must exist when spawn fails");
-				td.status = "failed";
+				td.status = TaskStatus.failed;
 				td.error = e.msg;
 				td.resultText = e.msg;
 				host_.persistStatus(tid, "failed");

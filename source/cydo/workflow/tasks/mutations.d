@@ -19,8 +19,9 @@ import cydo.agent.session : AgentSession;
 import cydo.domain.storage.persistence : Persistence, createForkTask;
 import cydo.domain.task_types.definition : TaskTypeDef;
 import cydo.domain.tasks.model : ArchiveState, ErrorMessage, ProcessState,
-	TaskCreatedMessage, TaskData, UndoPreviewMessage, UndoResultMessage,
+	TaskCreatedMessage, TaskData, TaskStatus, UndoPreviewMessage, UndoResultMessage,
 	Watermark, WsMessage, watermarkFromPath;
+import cydo.domain.tasks.lifecycle : TaskNotificationChange;
 import cydo.workflow.history.jsonl_edit : replaceUserMessageContent;
 import cydo.workflow.history.jsonl_store : countLinesAfterForkId,
 	editJsonlMessage, forkTask, lastForkIdInJsonl, spliceJsonlByLine,
@@ -53,6 +54,10 @@ struct TaskMutationServiceHost
 	void delegate(int tid, string relationType) setRelationType;
 	void delegate(int tid, string title) setTitle;
 	void delegate(int tid, string status) persistStatus;
+	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
+		TaskNotificationChange notification) transitionTask;
+	void delegate(int tid, TaskStatus[] expectedFrom, TaskStatus to,
+		TaskNotificationChange notification) transitionTaskFrom;
 
 	void delegate(int tid) ensureHistoryLoaded;
 	string delegate(int tid) getUndoJsonl;
@@ -113,7 +118,7 @@ public:
 			newTd.title = td.title.length > 0 ? td.title ~ " (fork)" : "(fork)";
 			newTd.parentTid = tid;
 			newTd.relationType = "fork";
-			newTd.status = "completed";
+			newTd.status = TaskStatus.completed;
 			newTd.agentType = td.agentType;
 			newTd.description = td.description;
 			newTd.taskType = td.taskType;
@@ -205,7 +210,7 @@ public:
 		newTd.agentSessionId = result.agentSessionId;
 		newTd.parentTid = tid;
 		newTd.relationType = "fork";
-		newTd.status = "completed";
+		newTd.status = TaskStatus.completed;
 		newTd.agentType = td.agentType;
 		newTd.description = td.description;
 		newTd.taskType = td.taskType;
@@ -702,7 +707,7 @@ private:
 					bTd.agentSessionId = backup.agentSessionId;
 					bTd.parentTid = tid;
 					bTd.relationType = "undo-backup";
-					bTd.status = "completed";
+					bTd.status = TaskStatus.completed;
 					bTd.agentType = td.agentType;
 					bTd.description = td.description;
 					bTd.taskType = td.taskType;
@@ -772,7 +777,7 @@ private:
 				auto current = host_.getTask(tid);
 				assert(current !is null,
 					"Undo task must exist while auto-resume is scheduled");
-				current.status = "active";
+				current.status = TaskStatus.active;
 				host_.persistStatus(tid, "active");
 				try
 					host_.generateSuggestions(tid);

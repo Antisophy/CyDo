@@ -190,10 +190,19 @@ export interface SessionInfo {
   supports_file_revert?: boolean;
 }
 
+export type TaskStatus =
+  | "pending"
+  | "active"
+  | "alive"
+  | "waiting"
+  | "completed"
+  | "failed"
+  | "importable";
+
 export interface TaskState {
   uuid: string;
   tid: number | null;
-  status: string; // pending, active, completed, failed
+  status: TaskStatus;
   messages: DisplayMessage[];
   sessionInfo: SessionInfo | null;
   sessionStatus?: string | null;
@@ -297,7 +306,7 @@ export function makeTaskState(
   projectPath?: string,
   parentTid?: number,
   relationType?: string,
-  status: string = "pending",
+  status: TaskStatus = "pending",
   isProcessing: boolean = false,
   stdinClosed: boolean = false,
   needsAttention: boolean = false,

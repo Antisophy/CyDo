@@ -61,6 +61,7 @@ import type {
   AgentUnrecognizedEvent,
   CydoTaskSpawnedEvent,
 } from "./generated/protocol";
+import type { TaskStatus } from "./types";
 
 // ---------------------------------------------------------------------------
 // Backwards-compatible type aliases (old names → generated types)
@@ -198,7 +199,7 @@ export interface TasksListMessage {
     project_path?: string;
     parent_tid?: number;
     relation_type?: string;
-    status?: string;
+    status?: TaskStatus;
     task_type?: string;
     entry_point?: string;
     agent_name?: string;
@@ -227,7 +228,7 @@ export interface TaskUpdatedMessage {
     project_path?: string;
     parent_tid?: number;
     relation_type?: string;
-    status?: string;
+    status?: TaskStatus;
     task_type?: string;
     entry_point?: string;
     agent_name?: string;

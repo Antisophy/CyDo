@@ -16,6 +16,7 @@ import cydo.domain.task_types.definition : ContinuationDef, TaskTypeDef,
 	loadProjectMemory, renderContinuationPrompt, renderPrompt,
 	substituteVars;
 import cydo.domain.tasks.model;
+import cydo.domain.tasks.lifecycle : TaskNotificationChange;
 import cydo.foundation.system.known_messages : KnownSystemMessageKind,
 	handoffSubject, modeSwitchSubject, subTaskWaitingForAnswerSubject,
 	taskPromptSubject, wrapKnownSystemMessage;
@@ -45,6 +46,10 @@ struct WorkflowToolsHost
 	void delegate(int tid, string relationType) persistRelationType;
 	void delegate(int tid, string title) persistTitle;
 	void delegate(int tid, string status) persistStatus;
+	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
+		TaskNotificationChange notification) transitionTask;
+	void delegate(int tid, TaskStatus[] expectedFrom, TaskStatus to,
+		TaskNotificationChange notification) transitionTaskFrom;
 	void delegate(int tid, bool needsAttention) persistNeedsAttention;
 	void delegate(int tid, long lastActive) persistLastActive;
 	void delegate(int tid, string resultText) persistResultText;
@@ -136,6 +141,8 @@ public:
 				worktreeForkBaseHead: host_.worktreeForkBaseHead,
 				taskProducesCommitOutput: host_.taskProducesCommitOutput,
 				persistStatus: host_.persistStatus,
+				transitionTask: host_.transitionTask,
+				transitionTaskFrom: host_.transitionTaskFrom,
 				persistResultText: host_.persistResultText,
 				readPendingSubTask: (int tid,
 					out Promise!(McpResult) pending) {
@@ -180,6 +187,8 @@ public:
 				host_.sendTaskMessage(tid, content, null, cydoMeta, nonce);
 			},
 			persistStatus: host_.persistStatus,
+			transitionTask: host_.transitionTask,
+			transitionTaskFrom: host_.transitionTaskFrom,
 			persistResultText: host_.persistResultText,
 			broadcastTaskUpdate: host_.broadcastTaskUpdate,
 			broadcastFocusHint: host_.broadcastFocusHint,
@@ -303,7 +312,7 @@ public:
 			pendingSubTasks_[childTid] = promise;
 			host_.persistAddTaskDep(parentTid, childTid);
 			taskDeps_[childTid] = parentTid;
-			pd.status = "waiting";
+			pd.status = TaskStatus.waiting;
 			host_.persistStatus(parentTid, "waiting");
 			host_.broadcastTaskUpdate(parentTid);
 
@@ -353,7 +362,7 @@ public:
 			}).except((Exception e) {
 				auto failedChild = requireTask(childTid,
 					"Created child task must exist when launch fails");
-				failedChild.status = "failed";
+				failedChild.status = TaskStatus.failed;
 				failedChild.error = e.msg;
 				failedChild.resultText = e.msg;
 				host_.persistStatus(childTid, "failed");
@@ -739,7 +748,7 @@ public:
 
 		if (td.status == "waiting")
 		{
-			td.status = "active";
+			td.status = TaskStatus.active;
 			host_.persistStatus(tid, "active");
 			host_.broadcastTaskUpdate(tid);
 		}
@@ -1051,7 +1060,7 @@ public:
 		{
 			errorf("spawnContinuation: unknown task type '%s' for tid=%d",
 				td.taskType, tid);
-			td.status = "failed";
+			td.status = TaskStatus.failed;
 			host_.persistStatus(tid, "failed");
 			host_.broadcastTaskUpdate(tid);
 			return;
@@ -1062,7 +1071,7 @@ public:
 		{
 			errorf("spawnContinuation: unknown continuation '%s' for type '%s' tid=%d",
 				contKey, td.taskType, tid);
-			td.status = "failed";
+			td.status = TaskStatus.failed;
 			host_.persistStatus(tid, "failed");
 			host_.broadcastTaskUpdate(tid);
 			return;
@@ -1282,7 +1291,7 @@ private:
 		{
 			errorf("executeContinuation: unknown successor type '%s' for tid=%d",
 				contDef.task_type, tid);
-			td.status = "failed";
+			td.status = TaskStatus.failed;
 			host_.persistStatus(tid, "failed");
 			host_.broadcastTaskUpdate(tid);
 			return;
@@ -1301,7 +1310,7 @@ private:
 
 			host_.emitTaskReload(tid, "continuation");
 
-			td.status = "active";
+			td.status = TaskStatus.active;
 			host_.persistStatus(tid, "active");
 
 			auto renderedContinuationPrompt = renderContinuationPrompt(contDef,
@@ -1339,7 +1348,7 @@ private:
 			if (contAgent.length == 0
 				|| !host_.isRegisteredAgent(contAgent))
 			{
-				td.status = "failed";
+				td.status = TaskStatus.failed;
 				td.error = format(
 					"Successor type '%s' resolved agent to '%s' (parent='%s') — not a registered agent",
 					contDef.task_type, contAgent, td.agentType);
@@ -1350,7 +1359,7 @@ private:
 				return;
 			}
 
-			td.status = "completed";
+			td.status = TaskStatus.completed;
 			host_.persistStatus(tid, "completed");
 			host_.emitTaskReload(tid, "continuation");
 

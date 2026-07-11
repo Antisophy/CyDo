@@ -77,6 +77,7 @@ import cydo.foundation.system.known_messages : KnownSystemMessageKind,
 	sessionStartSubject, systemMessagePrefix, wrapKnownSystemMessage;
 import cydo.foundation.platform.path : bestEffortProjectPathIdentity, canonicalProjectPath;
 import cydo.domain.tasks.model;
+import cydo.domain.tasks.lifecycle : TaskLifecycle, TaskNotificationChange;
 import cydo.foundation.text.title : truncateTitle;
 import cydo.workflow.history.jsonl_store : findNextUserUuid;
 import cydo.workflow.workspace.worktree;
@@ -132,6 +133,7 @@ class App
 	private ClientHub clientHub = new ClientHub();
 	private TaskData[int] tasks;
 	private Persistence persistence;
+	private TaskLifecycle taskLifecycle;
 	private CydoConfig config;
 	private string taskDirTemplate;
 	private DiscoveryService discoveryService;
@@ -182,6 +184,13 @@ class App
 		}
 		{
 			persistence = openDatabase();
+			taskLifecycle = TaskLifecycle(
+				getTask: (int tid) => tid in tasks ? &tasks[tid] : null,
+				persistStatus: (int tid, string status) => persistence.setStatus(tid, status),
+				persistNeedsAttention: (int tid, bool needsAttention) =>
+					persistence.setNeedsAttention(tid, needsAttention),
+				publishSnapshot: &broadcastTaskUpdate,
+			);
 			import cydo.runtime.launch.sandbox : runtimeDir;
 			createPidFile("cydo.pid", runtimeDir());
 		}
@@ -315,6 +324,8 @@ class App
 			persistStatus: (int tid, string status) {
 				persistence.setStatus(tid, status);
 			},
+			transitionTask: &transitionTask,
+			transitionTaskFrom: &transitionTask,
 			persistNeedsAttention: (int tid, bool needsAttention) {
 				persistence.setNeedsAttention(tid, needsAttention);
 			},
@@ -585,6 +596,8 @@ class App
 			persistStatus: (int tid, string status) {
 				persistence.setStatus(tid, status);
 			},
+			transitionTask: &transitionTask,
+			transitionTaskFrom: &transitionTask,
 			persistResultText: (int tid, string resultText) {
 				persistence.setResultText(tid, resultText);
 			},
@@ -647,6 +660,8 @@ class App
 			persistStatus: (int tid, string status) {
 				persistence.setStatus(tid, status);
 			},
+			transitionTask: &transitionTask,
+			transitionTaskFrom: &transitionTask,
 			ensureHistoryLoaded: (int tid) {
 				historyPipeline.ensureHistoryLoaded(tid);
 			},
@@ -708,7 +723,7 @@ class App
 			td.relationType = row.relationType;
 			td.worktreeTid = row.worktreeTid;
 			td.title = row.title;
-			td.status = row.status;
+			td.status = parseTaskStatus(row.status);
 			td.archived = row.archived;
 			td.draft = row.draft;
 			td.resultText = row.resultText;
@@ -1583,7 +1598,7 @@ class App
 			auto td = &tasks[tid];
 			if (td.status == "alive")
 			{
-				td.status = "active";
+				td.status = TaskStatus.active;
 				persistence.setStatus(tid, "active");
 			}
 			sendTaskMessage(tid, messageToSend, blocks, userMsgMeta, msgNonce);
@@ -1637,7 +1652,7 @@ class App
 		td.notificationBody = "";
 		td.processQueue.setGoal(ProcessState.Alive).then(() {
 			auto td = &tasks[tid];
-			td.status = "alive";
+			td.status = TaskStatus.alive;
 			persistence.setStatus(tid, "alive");
 			try
 				derivedTextJobs.generateSuggestions(tid);
@@ -2086,7 +2101,7 @@ class App
 	{
 		auto tid = createTask("", spec.projectPath, spec.agentName);
 		auto td = &tasks[tid];
-		td.status = "importable";
+		td.status = TaskStatus.importable;
 		td.agentSessionId = spec.sessionId;
 		td.title = spec.title;
 		td.lastActive = spec.lastActive;
@@ -2282,7 +2297,7 @@ class App
 		if (tid !in tasks)
 			return;
 		auto td = &tasks[tid];
-		td.status = "alive";
+		td.status = TaskStatus.alive;
 		persistence.setStatus(tid, "alive");
 		td.needsAttention = true;
 		persistence.setNeedsAttention(tid, true);
@@ -2724,7 +2739,7 @@ class App
 		auto td = &tasks[tid];
 		if (td.status != "importable")
 			return;
-		td.status = "completed";
+		td.status = TaskStatus.completed;
 		persistence.setStatus(tid, "completed");
 		broadcastTaskUpdate(tid);
 	}
@@ -2879,6 +2894,18 @@ class App
 
 		clientHub.broadcast(toJson(TaskUpdatedMessage("task_updated",
 			buildTaskEntry(tasks[tid], taskAlive(tid), taskCanStop(tid)))));
+	}
+
+	private void transitionTask(int tid, TaskStatus expectedFrom, TaskStatus to,
+		TaskNotificationChange notification = TaskNotificationChange.preserve)
+	{
+		taskLifecycle.transitionTask(tid, expectedFrom, to, notification);
+	}
+
+	private void transitionTask(int tid, TaskStatus[] expectedFrom, TaskStatus to,
+		TaskNotificationChange notification = TaskNotificationChange.preserve)
+	{
+		taskLifecycle.transitionTask(tid, expectedFrom, to, notification);
 	}
 
 	private void broadcastFocusHint(int fromTid, int toTid)

@@ -20,6 +20,33 @@ import std.path : buildPath, expandTilde;
 
 enum defaultTaskDirTemplate = "{{ workspace_root }}/.cydo/tasks/{{ tid }}";
 
+enum TaskStatus : string
+{
+	pending = "pending",
+	active = "active",
+	alive = "alive",
+	waiting = "waiting",
+	completed = "completed",
+	failed = "failed",
+	importable = "importable",
+}
+
+TaskStatus parseTaskStatus(string value)
+{
+	switch (value)
+	{
+	case "pending": return TaskStatus.pending;
+	case "active": return TaskStatus.active;
+	case "alive": return TaskStatus.alive;
+	case "waiting": return TaskStatus.waiting;
+	case "completed": return TaskStatus.completed;
+	case "failed": return TaskStatus.failed;
+	case "importable": return TaskStatus.importable;
+	default: enforce(false, "Unknown persisted task status: " ~ value);
+	}
+	assert(0);
+}
+
 /// Git repository root for the selected project.
 /// Falls back to projectPath if git resolution fails.
 string resolveProjectRepoPath(string projectPath)
@@ -64,6 +91,31 @@ string worktreePathForTaskDir(string taskDir)
 {
 	enforce(taskDir.length > 0, "taskDir must not be empty");
 	return buildPath(taskDir, "worktree");
+}
+
+unittest
+{
+	import std.exception : assertThrown;
+
+	auto values = [
+		TaskStatus.pending,
+		TaskStatus.active,
+		TaskStatus.alive,
+		TaskStatus.waiting,
+		TaskStatus.completed,
+		TaskStatus.failed,
+		TaskStatus.importable,
+	];
+	foreach (status; values)
+		assert(parseTaskStatus(cast(string) status) == status);
+	assert(cast(string) TaskStatus.pending == "pending");
+	assert(cast(string) TaskStatus.active == "active");
+	assert(cast(string) TaskStatus.alive == "alive");
+	assert(cast(string) TaskStatus.waiting == "waiting");
+	assert(cast(string) TaskStatus.completed == "completed");
+	assert(cast(string) TaskStatus.failed == "failed");
+	assert(cast(string) TaskStatus.importable == "importable");
+	assertThrown!Exception(parseTaskStatus("unknown"));
 }
 
 string effectiveCwdForTask(string projectPath, string repoPath, string worktreePath,
@@ -460,7 +512,7 @@ struct TaskData
 	string projectPath;
 	int worktreeTid;  // 0 = no worktree; own tid = owns worktree; other tid = shares worktree
 	string title;
-	string status = "pending";  // pending, active, alive, waiting, completed, failed, importable
+	TaskStatus status = TaskStatus.pending;
 	bool archived;
 	long createdAt;    // StdTime; 0 = not set
 	long lastActive;   // StdTime; 0 = not set

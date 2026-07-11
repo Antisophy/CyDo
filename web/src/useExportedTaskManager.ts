@@ -10,7 +10,7 @@ import {
 import type { TaskManager, TypeInfo } from "./useSessionManager";
 import type { AgnosticEvent } from "./protocol";
 import { makeTaskState } from "./types";
-import type { TaskState } from "./types";
+import type { TaskState, TaskStatus } from "./types";
 import { reduceMessage } from "./sessionReducer";
 
 interface ExportTaskEntry {
@@ -22,7 +22,7 @@ interface ExportTaskEntry {
   project_path?: string;
   parent_tid?: number;
   relation_type?: string;
-  status?: string;
+  status?: TaskStatus;
   stdinClosed?: boolean;
   canStop?: boolean;
   task_type?: string;

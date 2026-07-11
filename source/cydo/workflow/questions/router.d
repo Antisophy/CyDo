@@ -14,7 +14,8 @@ import cydo.workflow.batch.registry : BatchHandle, BatchRegistry;
 import cydo.mcp : McpResult;
 import cydo.foundation.system.known_messages : KnownSystemMessageKind, followUpFromParentSubject,
 	questionFromTaskSubject, wrapKnownSystemMessage;
-import cydo.domain.tasks.model : TaskData;
+import cydo.domain.tasks.model : TaskData, TaskStatus;
+import cydo.domain.tasks.lifecycle : TaskNotificationChange;
 import cydo.foundation.text.title : truncateTitle;
 
 package(cydo):
@@ -63,6 +64,10 @@ struct QuestionRouterHost
 	void delegate(int tid, const(ContentBlock)[] content, string cydoMeta,
 		string nonce) sendTaskMessage;
 	void delegate(int tid, string status) persistStatus;
+	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
+		TaskNotificationChange notification) transitionTask;
+	void delegate(int tid, TaskStatus[] expectedFrom, TaskStatus to,
+		TaskNotificationChange notification) transitionTaskFrom;
 	void delegate(int tid, string resultText) persistResultText;
 	void delegate(int tid) broadcastTaskUpdate;
 	void delegate(int fromTid, int toTid) broadcastFocusHint;
@@ -345,7 +350,7 @@ public:
 				auto askerTd = host_.getTask(route.askerTid);
 				if (askerTd !is null)
 				{
-					askerTd.status = "active";
+					askerTd.status = TaskStatus.active;
 					askerTd.notificationBody = "";
 					host_.persistStatus(route.askerTid, "active");
 					host_.broadcastTaskUpdate(route.askerTid);
@@ -434,7 +439,7 @@ private:
 				return;
 			}
 
-			currentAnswerer.status = "active";
+			currentAnswerer.status = TaskStatus.active;
 			host_.persistStatus(currentRoute.answererTid, "active");
 			host_.broadcastTaskUpdate(currentRoute.answererTid);
 			host_.broadcastFocusHint(currentRoute.askerTid, currentRoute.answererTid);
@@ -548,7 +553,7 @@ private:
 			if (currentRoute.afterAnswer
 				== QuestionAfterAnswer.completeAnswererOnIdle)
 			{
-				answererTd.status = "completed";
+				answererTd.status = TaskStatus.completed;
 				host_.persistStatus(currentRoute.answererTid, "completed");
 				host_.persistResultText(currentRoute.answererTid,
 					answererTd.resultText);
@@ -564,7 +569,7 @@ private:
 			auto askerTd = host_.getTask(currentRoute.askerTid);
 			if (askerTd !is null)
 			{
-				askerTd.status = "active";
+				askerTd.status = TaskStatus.active;
 				askerTd.notificationBody = "";
 				host_.persistStatus(currentRoute.askerTid, "active");
 				host_.broadcastTaskUpdate(currentRoute.askerTid);
@@ -572,7 +577,7 @@ private:
 			if (currentRoute.afterAnswer
 				== QuestionAfterAnswer.leaveAnswererAlive)
 			{
-				answererTd.status = "alive";
+				answererTd.status = TaskStatus.alive;
 				host_.persistStatus(currentRoute.answererTid, "alive");
 				host_.broadcastTaskUpdate(currentRoute.answererTid);
 			}
@@ -632,7 +637,7 @@ private:
 		auto askerTd = host_.getTask(currentRoute.askerTid);
 		if (askerTd !is null)
 		{
-			askerTd.status = "waiting";
+			askerTd.status = TaskStatus.waiting;
 			if (currentRoute.afterAnswer == QuestionAfterAnswer.continueBatch)
 			{
 				askerTd.notificationBody = "Asking parent: "
