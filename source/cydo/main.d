@@ -33,6 +33,7 @@ import cydo.web.client_hub : ClientHub;
 import cydo.runtime.config.watcher : ConfigWatcher, ConfigWatcherHost;
 import cydo.workflow.discovery.service : DiscoveryService, DiscoveryServiceHost,
 	DiscoveryTaskSnapshot, ImportableTaskSpec;
+import cydo.cli.open_matching : findOpenProjectName, pathIsUnderRoot;
 import cydo.web.snapshots : buildAgentsList, buildNoticesList,
 	buildServerStatus, buildTaskEntry, buildTasksList, buildTaskTypesList,
 	buildTaskTypesListForProject, buildWorkspacesList;
@@ -223,17 +224,14 @@ static:
 		import cydo.runtime.config : ProjectDiscoveryConfig, loadConfig;
 		import cydo.workflow.discovery.scanner : discoverProjects;
 		import std.file : getcwd;
-		import std.path : absolutePath, expandTilde;
+		import cydo.foundation.platform.path : canonicalProjectPath;
 		import std.process : browse, environment, execute, spawnProcess;
-		import std.algorithm : startsWith;
 		import std.string : replace, strip;
 
 		auto config = loadConfig();
 
 		// Determine target directory
-		string targetDir = path.length > 0
-			? absolutePath(expandTilde(path))
-			: getcwd();
+		string targetDir = canonicalProjectPath(path.length > 0 ? path : getcwd());
 
 		// Discover workspace and project for targetDir
 		string workspace;
@@ -244,32 +242,16 @@ static:
 			auto wsRoot = ws.root;
 
 			// Check if targetDir is under this workspace root
-			if (!targetDir.startsWith(wsRoot))
-				continue;
-			// Make sure it's a proper prefix (not just a partial directory name match)
-			if (targetDir.length > wsRoot.length && targetDir[wsRoot.length] != '/')
+			if (!pathIsUnderRoot(targetDir, wsRoot))
 				continue;
 
 			// Run discovery for this workspace
 			auto projects = discoverProjects(wsRoot, ws.name, ws.exclude, ws.project_discovery);
 
 			// Find the project that contains targetDir (longest match)
-			string bestPath;
-			string bestName;
-			foreach (ref p; projects)
-			{
-				if (targetDir.startsWith(p.path) &&
-					(targetDir.length == p.path.length || targetDir[p.path.length] == '/'))
-				{
-					if (p.path.length > bestPath.length)
-					{
-						bestPath = p.path;
-						bestName = p.name;
-					}
-				}
-			}
+			auto bestName = findOpenProjectName(targetDir, projects);
 
-			if (bestPath.length > 0)
+			if (bestName.length > 0)
 			{
 				workspace = ws.name;
 				projectName = bestName;

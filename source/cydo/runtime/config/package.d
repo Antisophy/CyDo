@@ -107,7 +107,61 @@ private void ensureDefaultWorkspace(ref CydoConfig config)
 
 private void normalizeWorkspacePaths(ref CydoConfig config)
 {
-	import std.path : absolutePath, buildNormalizedPath, expandTilde;
+	import cydo.foundation.platform.path : bestEffortProjectPathIdentity;
+	import std.exception : enforce;
+	import std.file : exists, isDir;
 	foreach (ref ws; config.workspaces)
-		ws.root = buildNormalizedPath(absolutePath(expandTilde(ws.root)));
+	{
+		auto root = bestEffortProjectPathIdentity(ws.root);
+		enforce(!exists(root) || isDir(root),
+			"workspace root must be a directory");
+		ws.root = root;
+	}
+}
+
+version (unittest)
+{
+	import ae.sys.file : realPath;
+	import std.exception : assertThrown;
+	import std.file : exists, mkdirRecurse, rmdirRecurse, symlink, write;
+	import std.path : buildPath, buildNormalizedPath;
+
+	unittest
+	{
+		auto root = buildPath(realPath("/tmp"), "cydo-test-workspace-config-path");
+		if (exists(root))
+			rmdirRecurse(root);
+		scope (exit)
+			if (exists(root))
+				rmdirRecurse(root);
+
+		auto workspace = buildPath(root, "workspace");
+		auto workspaceLink = buildPath(root, "workspace-link");
+		auto missing = buildPath(root, "missing", "workspace");
+		auto regularFile = buildPath(root, "file");
+		mkdirRecurse(workspace);
+		symlink(workspace, workspaceLink);
+		write(regularFile, "file");
+
+		CydoConfig loaded;
+		loaded.workspaces = [WorkspaceConfig("real", workspace),
+			WorkspaceConfig("link", workspaceLink)];
+		applyPostLoadFixups(loaded);
+		assert(loaded.workspaces[0].root == buildNormalizedPath(realPath(workspace)));
+		assert(loaded.workspaces[1].root == loaded.workspaces[0].root);
+
+		CydoConfig reloaded;
+		reloaded.workspaces = [WorkspaceConfig("link", workspaceLink)];
+		applyPostLoadFixups(reloaded);
+		assert(reloaded.workspaces[0].root == loaded.workspaces[0].root);
+
+		CydoConfig legacy;
+		legacy.workspaces = [WorkspaceConfig("missing", missing)];
+		applyPostLoadFixups(legacy);
+		assert(legacy.workspaces[0].root == buildNormalizedPath(missing));
+
+		CydoConfig invalid;
+		invalid.workspaces = [WorkspaceConfig("file", regularFile)];
+		assertThrown!Exception(applyPostLoadFixups(invalid));
+	}
 }
