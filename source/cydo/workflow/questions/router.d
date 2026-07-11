@@ -410,7 +410,7 @@ private:
 			answererProjectPath,
 			["message": message, "qid": to!string(qid)]);
 		if (body.length == 0)
-			body = message ~ "\n\nAnswer with Answer(" ~ to!string(qid)
+			body = message ~ "\n\nAnswer with mcp__cydo__Answer(" ~ to!string(qid)
 				~ ", \"your response\").";
 		return wrapKnownSystemMessage(host_.systemKeyword(),
 			KnownSystemMessageKind.questionFromTask, body, subject);
