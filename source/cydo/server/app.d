@@ -75,7 +75,7 @@ import cydo.domain.task_types.definition : TaskTypeDef, OutputType, WorktreeMode
 import cydo.foundation.system.framing : prependTaskFraming, validateTemplateSource;
 import cydo.foundation.system.known_messages : KnownSystemMessageKind,
 	sessionStartSubject, systemMessagePrefix, wrapKnownSystemMessage;
-import cydo.foundation.platform.path : canonicalProjectPath;
+import cydo.foundation.platform.path : bestEffortProjectPathIdentity, canonicalProjectPath;
 import cydo.domain.tasks.model;
 import cydo.foundation.text.title : truncateTitle;
 import cydo.workflow.history.jsonl_store : findNextUserUuid;
@@ -186,6 +186,7 @@ class App
 			createPidFile("cydo.pid", runtimeDir());
 		}
 		config = loadRuntimeConfig();
+		persistence.normalizeProjectPaths(&bestEffortProjectPathIdentity);
 		taskDirTemplate = config.task_dir.length > 0 ? config.task_dir : defaultTaskDirTemplate;
 		applyConfiguredLogLevel(config.log_level);
 		taskPathResolver = new TaskPathResolver(TaskPathResolverHost(
@@ -1217,9 +1218,21 @@ class App
 	private void handleCreateTaskMsg(WebSocketAdapter ws, WsMessage json)
 	{
 		auto at = json.agent_name.length > 0 ? json.agent_name : defaultAgentName(json.workspace);
+		string projectPath;
+		if (json.project_path.length > 0)
+		{
+			try
+				projectPath = canonicalProjectPath(json.project_path);
+			catch (Exception)
+			{
+				ws.send(Data(toJson(ErrorMessage("error",
+					"Project path must be an existing directory")).representation));
+				return;
+			}
+		}
 		// Top-level user task creation must always come through a concrete entry point.
 		// Internal tasks (subtasks, continuations, imports) are created through other paths.
-		auto entryPoints = taskTypeCatalog.getEntryPointsForProject(json.project_path);
+		auto entryPoints = taskTypeCatalog.getEntryPointsForProject(projectPath);
 		if (json.entry_point.length == 0)
 		{
 			ws.send(Data(toJson(ErrorMessage("error",
@@ -1234,9 +1247,9 @@ class App
 			return;
 		}
 		auto epTemplate = ep.prompt_template;
-		auto tid = createTask(json.workspace, json.project_path, at, json.entry_point);
+		auto tid = createTask(json.workspace, projectPath, at, json.entry_point);
 		// Call getTaskTypesForProject() after getEntryPointsForProject() so the cache is populated.
-		auto taskTypes = taskTypeCatalog.getTaskTypesForProject(json.project_path);
+		auto taskTypes = taskTypeCatalog.getTaskTypesForProject(projectPath);
 		tasks[tid].entryPoint = json.entry_point;
 		persistence.setEntryPoint(tid, json.entry_point);
 		tasks[tid].taskType = ep.resolvedType;
@@ -1244,7 +1257,7 @@ class App
 			persistence.setTaskType(tid, ep.resolvedType);
 		// Send task_created only to the requesting client (unicast) so that
 		// parallel test workers don't steal each other's task IDs.
-		ws.send(Data(toJson(TaskCreatedMessage("task_created", tid, json.workspace, json.project_path, 0, "", json.correlation_id)).representation));
+		ws.send(Data(toJson(TaskCreatedMessage("task_created", tid, json.workspace, projectPath, 0, "", json.correlation_id)).representation));
 		unicastFocusHint(ws, 0, tid);
 		// Broadcast updated task state so all other clients see the new task.
 		broadcastTaskUpdate(tid);

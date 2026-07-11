@@ -232,6 +232,64 @@ async function requestInvalidProjectTaskTypes(projectPath: string): Promise<void
   });
 }
 
+async function requestInvalidTaskCreation(projectPath: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(`${BACKEND_URL.replace(/^http/, "ws")}/ws`);
+    ws.binaryType = "arraybuffer";
+    let settled = false;
+    const timeout = setTimeout(() => {
+      settled = true;
+      ws.close();
+      reject(
+        new Error(
+          `Timed out waiting for invalid create error for ${projectPath}`,
+        ),
+      );
+    }, 10_000);
+
+    ws.addEventListener("open", () => {
+      ws.send(
+        JSON.stringify({
+          type: "create_task",
+          workspace: "parent",
+          project_path: projectPath,
+          entry_point: "agentic",
+        }),
+      );
+    });
+
+    ws.addEventListener("message", (ev) => {
+      const msg = JSON.parse(decodeWebSocketData(ev.data)) as {
+        type?: string;
+        message?: string;
+      };
+      if (msg.type === "error") {
+        settled = true;
+        clearTimeout(timeout);
+        ws.close();
+        expect(msg.message).toBe("Project path must be an existing directory");
+        resolve();
+      }
+    });
+
+    ws.addEventListener("error", () => {
+      settled = true;
+      clearTimeout(timeout);
+      reject(
+        new Error(`WebSocket error while creating task for ${projectPath}`),
+      );
+    });
+
+    ws.addEventListener("close", () => {
+      clearTimeout(timeout);
+      if (!settled)
+        reject(
+          new Error(`WebSocket closed while creating task for ${projectPath}`),
+        );
+    });
+  });
+}
+
 async function rewriteConfigAndWaitForReload(
   configPath: string,
   workspaceRoot: string,
@@ -363,6 +421,113 @@ test(
 );
 
 test(
+  "creating a task through a symlink emits the canonical project path",
+  { tag: "@claude-only" },
+  async ({}, testInfo) => {
+    const suffix = `symlink-create-${testInfo.workerIndex}`;
+    const { workDir, workerHome } = createWorkDir(suffix);
+    const realWorkspaceRoot = `/tmp/cydo-symlink-create-real-${testInfo.workerIndex}`;
+    const symlinkWorkspaceRoot = `/tmp/cydo-symlink-create-link-${testInfo.workerIndex}`;
+    const realRepoPath = `${realWorkspaceRoot}/repo`;
+    const symlinkRepoPath = `${symlinkWorkspaceRoot}/repo`;
+    const configPath = `${workerHome}/.config/cydo/config.yaml`;
+
+    rmSync(realWorkspaceRoot, { recursive: true, force: true });
+    rmSync(symlinkWorkspaceRoot, { recursive: true, force: true });
+    initGitRepo(realRepoPath);
+    mkdirSync(`${realRepoPath}/.cydo`, { recursive: true });
+    symlinkSync(realWorkspaceRoot, symlinkWorkspaceRoot);
+    writeConfig(configPath, realWorkspaceRoot);
+
+    const proc = spawnBackend(workDir, workerHome);
+    try {
+      await waitForBackend(proc);
+      const tid = await new Promise<number>((resolve, reject) => {
+        const ws = new WebSocket(`${BACKEND_URL.replace(/^http/, "ws")}/ws`);
+        ws.binaryType = "arraybuffer";
+        let createdTid: number | undefined;
+        const timeout = setTimeout(() => {
+          ws.close();
+          reject(new Error("Timed out waiting for task_created"));
+        }, 10_000);
+        ws.addEventListener("open", () => {
+          ws.send(
+            JSON.stringify({
+              type: "create_task",
+              workspace: "parent",
+              project_path: symlinkRepoPath,
+              entry_point: "agentic",
+              correlation_id: "symlink-create",
+            }),
+          );
+        });
+        ws.addEventListener("message", (ev) => {
+          const msg = JSON.parse(decodeWebSocketData(ev.data)) as {
+            type?: string;
+            tid?: number;
+            task?: { tid?: number; project_path?: string };
+          };
+          if (msg.type === "task_created" && msg.tid !== undefined) {
+            createdTid = msg.tid;
+            return;
+          }
+          if (msg.type === "task_updated" && msg.task?.tid === createdTid) {
+            clearTimeout(timeout);
+            ws.close();
+            expect(msg.task.project_path).toBe(realRepoPath);
+            resolve(msg.task.tid);
+          }
+        });
+        ws.addEventListener("error", () => {
+          clearTimeout(timeout);
+          reject(new Error("WebSocket error while creating task"));
+        });
+      });
+      expect(tid).toBeGreaterThan(0);
+      await expectBackendAlive(proc);
+      await killBackend(proc);
+
+      const restarted = spawnBackend(workDir, workerHome);
+      try {
+        await waitForBackend(restarted);
+        const projectPath = await new Promise<string>((resolve, reject) => {
+          const ws = new WebSocket(`${BACKEND_URL.replace(/^http/, "ws")}/ws`);
+          ws.binaryType = "arraybuffer";
+          const timeout = setTimeout(() => {
+            ws.close();
+            reject(new Error("Timed out waiting for persisted tasks_list"));
+          }, 10_000);
+          ws.addEventListener("message", (ev) => {
+            const msg = JSON.parse(decodeWebSocketData(ev.data)) as {
+              type?: string;
+              tasks?: { tid: number; project_path: string }[];
+            };
+            const task = msg.tasks?.find((entry) => entry.tid === tid);
+            if (msg.type === "tasks_list" && task) {
+              clearTimeout(timeout);
+              ws.close();
+              resolve(task.project_path);
+            }
+          });
+          ws.addEventListener("error", () => {
+            clearTimeout(timeout);
+            reject(new Error("WebSocket error while loading persisted task"));
+          });
+        });
+        expect(projectPath).toBe(realRepoPath);
+      } finally {
+        if (restarted.exitCode === null) await killBackend(restarted);
+      }
+    } finally {
+      if (proc.exitCode === null) await killBackend(proc);
+      rmSync(workDir, { recursive: true, force: true });
+      rmSync(symlinkWorkspaceRoot, { recursive: true, force: true });
+      rmSync(realWorkspaceRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "invalid project task type request does not stop backend",
   { tag: "@claude-only" },
   async ({}, testInfo) => {
@@ -383,6 +548,8 @@ test(
       await waitForBackend(proc);
 
       await requestInvalidProjectTaskTypes(missingProjectPath);
+      await expectBackendAlive(proc);
+      await requestInvalidTaskCreation(missingProjectPath);
       await expectBackendAlive(proc);
       await requestInvalidProjectTaskTypes(regularFilePath);
       await expectBackendAlive(proc);

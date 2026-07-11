@@ -19,7 +19,7 @@ string bestEffortProjectPathIdentity(string path)
 	if (path.length == 0)
 		return "";
 	auto absolute = buildNormalizedPath(absolutePath(expandTilde(path)));
-	if (exists(absolute))
+	if (exists(absolute) && isDir(absolute))
 		return canonicalProjectPath(path);
 	return absolute;
 }
@@ -57,6 +57,7 @@ version (unittest)
 		assertThrown!Exception(canonicalProjectPath(regularFile));
 		assert(bestEffortProjectPathIdentity(missingWithComponents) ==
 			buildNormalizedPath(absolutePath(missing)));
-		assertThrown!Exception(bestEffortProjectPathIdentity(regularFile));
+		assert(bestEffortProjectPathIdentity(regularFile) ==
+			buildNormalizedPath(absolutePath(regularFile)));
 	}
 }

@@ -281,6 +281,44 @@ struct Persistence
 		return result;
 	}
 
+	void normalizeProjectPaths(string function(string) normalize)
+	{
+		struct TaskPathRow
+		{
+			int tid;
+			string projectPath;
+		}
+		TaskPathRow[] tasks;
+		foreach (int tid, string projectPath;
+			db.stmt!"SELECT tid, project_path FROM tasks".iterate())
+			tasks ~= TaskPathRow(tid, projectPath);
+		foreach (row; tasks)
+		{
+			auto normalized = normalize(row.projectPath);
+			if (normalized != row.projectPath)
+				db.stmt!"UPDATE tasks SET project_path = ? WHERE tid = ?"
+					.exec(normalized, row.tid);
+		}
+
+		struct CachePathRow
+		{
+			string agentType;
+			string sessionId;
+			string projectPath;
+		}
+		CachePathRow[] cacheRows;
+		foreach (string agentType, string sessionId, string projectPath;
+			db.stmt!"SELECT agent_type, session_id, project_path FROM session_meta_cache".iterate())
+			cacheRows ~= CachePathRow(agentType, sessionId, projectPath);
+		foreach (row; cacheRows)
+		{
+			auto normalized = normalize(row.projectPath);
+			if (normalized != row.projectPath)
+				db.stmt!"UPDATE session_meta_cache SET project_path = ? WHERE agent_type = ? AND session_id = ?"
+					.exec(normalized, row.agentType, row.sessionId);
+		}
+	}
+
 	void setDraft(int tid, string draft)
 	{
 		db.stmt!"UPDATE tasks SET draft = ? WHERE tid = ?".exec(draft, tid);
@@ -345,6 +383,58 @@ struct Persistence
 		db.stmt!"DELETE FROM session_meta_cache WHERE agent_type = ? AND session_id = ?"
 			.exec(agentType, sessionId);
 	}
+}
+
+version (unittest)
+unittest
+{
+	import cydo.foundation.platform.path : bestEffortProjectPathIdentity, canonicalProjectPath;
+	import std.file : exists, mkdirRecurse, rmdirRecurse, symlink, write;
+	import std.path : absolutePath, buildNormalizedPath, buildPath;
+
+	auto root = buildPath("/tmp", "cydo-persistence-project-path-unittest");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto project = buildPath(root, "project");
+	auto projectLink = buildPath(root, "project-link");
+	auto missing = buildPath(root, "missing", "project");
+	auto regularFile = buildPath(root, "file");
+	mkdirRecurse(project);
+	symlink(project, projectLink);
+	write(regularFile, "file");
+
+	auto persistence = Persistence(buildPath(root, "cydo.db"));
+	auto firstTid = persistence.createTask("", projectLink);
+	auto secondTid = persistence.createTask("", projectLink);
+	auto fileTid = persistence.createTask("", regularFile);
+	persistence.upsertSessionMetaCache("claude", "symlink-session", 1, projectLink, "", true);
+	persistence.upsertSessionMetaCache("claude", "missing-session", 1, missing, "", true);
+	persistence.upsertSessionMetaCache("claude", "file-session", 1, regularFile, "", true);
+
+	persistence.normalizeProjectPaths(&bestEffortProjectPathIdentity);
+	auto canonical = canonicalProjectPath(project);
+	auto tasks = persistence.loadTasks();
+	assert(tasks.length == 3);
+	assert(tasks[0].tid == firstTid && tasks[0].projectPath == canonical);
+	assert(tasks[1].tid == secondTid && tasks[1].projectPath == canonical);
+	assert(tasks[2].tid == fileTid && tasks[2].projectPath == buildNormalizedPath(absolutePath(regularFile)));
+	auto cacheRows = persistence.loadSessionMetaCache();
+	assert(cacheRows.length == 3);
+	assert(cacheRows[0].projectPath == canonical);
+	assert(cacheRows[1].projectPath == buildNormalizedPath(absolutePath(missing)));
+	assert(cacheRows[2].projectPath == buildNormalizedPath(absolutePath(regularFile)));
+
+	persistence.normalizeProjectPaths(&bestEffortProjectPathIdentity);
+	tasks = persistence.loadTasks();
+	cacheRows = persistence.loadSessionMetaCache();
+	assert(tasks.length == 3 && tasks[0].tid == firstTid && tasks[1].tid == secondTid && tasks[2].tid == fileTid);
+	assert(cacheRows[0].projectPath == canonical);
+	assert(cacheRows[1].projectPath == buildNormalizedPath(absolutePath(missing)));
+	assert(cacheRows[2].projectPath == buildNormalizedPath(absolutePath(regularFile)));
 }
 
 /// Result from loadTaskHistory: translated events plus parallel raw sources.
