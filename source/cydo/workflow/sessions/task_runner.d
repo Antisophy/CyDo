@@ -594,16 +594,18 @@ class TaskSessionRunner
 						tid, missing);
 			}
 
-			if (current.status != "completed")
-				current.status = exitCode == 0 ? TaskStatus.completed : TaskStatus.failed;
-			host_.persistStatus(tid, current.status);
-			host_.persistResultText(tid, current.resultText);
-
 			bool deliveredPendingSubTask = false;
-			if (current.status == "completed")
+			if (exitCode == 0 && host_.hasPendingSubTask(tid))
 				deliveredPendingSubTask = host_.finalizeCompletedSubTask(tid, false);
 			else
-				deliveredPendingSubTask = host_.deliverFailedPendingSubTaskResult(tid);
+			{
+				if (current.status != "completed")
+					current.status = exitCode == 0 ? TaskStatus.completed : TaskStatus.failed;
+				host_.persistStatus(tid, current.status);
+				host_.persistResultText(tid, current.resultText);
+				if (current.status != TaskStatus.completed)
+					deliveredPendingSubTask = host_.deliverFailedPendingSubTaskResult(tid);
+			}
 
 			if (!deliveredPendingSubTask)
 				host_.deliverWaitingParentResultsIfReady(tid);
@@ -620,7 +622,8 @@ class TaskSessionRunner
 				if (ancestor >= 0)
 					host_.broadcastFocusHint(tid, ancestor);
 			}
-			host_.broadcastTaskUpdate(tid);
+			if (!deliveredPendingSubTask)
+				host_.broadcastTaskUpdate(tid);
 		};
 
 		td.status = TaskStatus.active;

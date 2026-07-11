@@ -20,6 +20,38 @@ type ItemResultEventLike = {
   content?: unknown;
 };
 
+type ParentAnswerEvent =
+  | { kind: "status"; status: string }
+  | { kind: "output"; eventType: string };
+
+function observeParentAnswerEvents(page: Page, tid: number): ParentAnswerEvent[] {
+  const events: ParentAnswerEvent[] = [];
+  page.on("websocket", (ws) => {
+    ws.on("framereceived", (frame) => {
+      try {
+        const data = JSON.parse(frame.payload.toString()) as {
+          type?: string;
+          task?: { tid?: number; status?: string };
+          tid?: number;
+          event?: { type?: string };
+        };
+        if (
+          data.type === "task_updated" &&
+          data.task?.tid === tid &&
+          typeof data.task.status === "string"
+        ) {
+          events.push({ kind: "status", status: data.task.status });
+        } else if (data.tid === tid && typeof data.event?.type === "string") {
+          events.push({ kind: "output", eventType: data.event.type });
+        }
+      } catch {
+        // Ignore non-JSON frames and unrelated events.
+      }
+    });
+  });
+  return events;
+}
+
 function currentMessageList(page: Page): Locator {
   return page.locator('[style*="display: contents"] .message-list');
 }
@@ -309,6 +341,7 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
   test.setTimeout(TALK_TIMEOUT);
   const taskCreatedEvents = observeTaskCreatedEvents(page);
   const reloadEvents = observeTaskReloadEvents(page);
+  const answerEvents = observeParentAnswerEvents(page, 1);
 
   await enterSession(page);
 
@@ -357,6 +390,7 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
     .getByText("Done.", { exact: true })
     .count();
   const reloadCountBeforeFollowUpAsk = reloadEvents.length;
+  const answerStart = answerEvents.length;
 
   // Parent calls Ask on the completed child with a follow-up question.
   await sendMessage(page, `call ask ${childTid} any follow-up?`);
@@ -369,6 +403,28 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
       .getByText("follow-up-answered", { exact: true })
       .last(),
   ).toBeVisible({ timeout: 90_000 });
+
+  await expect
+    .poll(
+      () => answerEvents.slice(answerStart).some((event) => event.kind === "output"),
+      { timeout: 90_000 },
+    )
+    .toBe(true);
+
+  const answerRouteEvents = answerEvents.slice(answerStart);
+  const waitingIndex = answerRouteEvents.findIndex(
+    (event) => event.kind === "status" && event.status === "waiting",
+  );
+  const activeIndex = answerRouteEvents.findIndex(
+    (event, index) =>
+      index > waitingIndex && event.kind === "status" && event.status === "active",
+  );
+  const firstResumedOutput = answerRouteEvents.findIndex(
+    (event, index) => index > activeIndex && event.kind === "output",
+  );
+  expect(waitingIndex).toBeGreaterThanOrEqual(0);
+  expect(activeIndex).toBeGreaterThan(waitingIndex);
+  expect(firstResumedOutput).toBeGreaterThan(activeIndex);
 
   if (agentType === "claude") {
     await expect
@@ -399,6 +455,10 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
     .toBe(true);
 
   await page.reload();
+  await openTask(page, 1);
+  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
+    timeout: 30_000,
+  });
   await openTask(page, childTid!);
   await expect(
     page.locator(

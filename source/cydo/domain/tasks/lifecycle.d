@@ -123,8 +123,6 @@ unittest
 			events ~= "attention";
 		},
 		publishSnapshot: (int tid) {
-			assert(tasks[tid].status == TaskStatus.active || tasks[tid].status == TaskStatus.waiting
-				|| tasks[tid].status == TaskStatus.alive);
 			events ~= "snapshot";
 		},
 	);

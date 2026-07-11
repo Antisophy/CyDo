@@ -63,13 +63,11 @@ struct QuestionRouterHost
 		string[string] vars, string bodyVar) buildKnownSystemMessageMeta;
 	void delegate(int tid, const(ContentBlock)[] content, string cydoMeta,
 		string nonce) sendTaskMessage;
-	void delegate(int tid, string status) persistStatus;
 	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
 		TaskNotificationChange notification) transitionTask;
 	void delegate(int tid, TaskStatus[] expectedFrom, TaskStatus to,
 		TaskNotificationChange notification) transitionTaskFrom;
 	void delegate(int tid, string resultText) persistResultText;
-	void delegate(int tid) broadcastTaskUpdate;
 	void delegate(int fromTid, int toTid) broadcastFocusHint;
 	void delegate(int tid, void delegate() cb) addIdleCallback;
 	void delegate(int tid, void delegate() onReady) reactivateTask;
@@ -344,17 +342,10 @@ public:
 				auto answerJson = toJson(AnswerResult("answered", callerTidInt, 0,
 					callerTd.title, message,
 					"Use Ask(question) to ask follow-up questions."));
+				host_.transitionTask(route.askerTid, TaskStatus.waiting,
+					TaskStatus.active, TaskNotificationChange.clearBody);
 				(*questionPromise).fulfill(McpResult.structured(answerJson));
 				clearQuestionRoute(qid);
-
-				auto askerTd = host_.getTask(route.askerTid);
-				if (askerTd !is null)
-				{
-					askerTd.status = TaskStatus.active;
-					askerTd.notificationBody = "";
-					host_.persistStatus(route.askerTid, "active");
-					host_.broadcastTaskUpdate(route.askerTid);
-				}
 
 				return host_.awaitBatchLoop(route.answererTid, route.batchId);
 			}
@@ -439,9 +430,11 @@ private:
 				return;
 			}
 
-			currentAnswerer.status = TaskStatus.active;
-			host_.persistStatus(currentRoute.answererTid, "active");
-			host_.broadcastTaskUpdate(currentRoute.answererTid);
+			if (currentAnswerer.status != TaskStatus.active)
+				host_.transitionTaskFrom(currentRoute.answererTid,
+					[TaskStatus.pending, TaskStatus.alive, TaskStatus.waiting,
+						TaskStatus.completed, TaskStatus.failed], TaskStatus.active,
+					TaskNotificationChange.preserve);
 			host_.broadcastFocusHint(currentRoute.askerTid, currentRoute.answererTid);
 
 			string prompt;
@@ -547,17 +540,19 @@ private:
 				return;
 			}
 
+			host_.transitionTask(currentRoute.askerTid, TaskStatus.waiting,
+				TaskStatus.active, TaskNotificationChange.clearBody);
+
 			if (auto qp = currentRoute.qid in pendingQuestions_)
 				(*qp).fulfill(answerResult);
 
 			if (currentRoute.afterAnswer
 				== QuestionAfterAnswer.completeAnswererOnIdle)
 			{
-				answererTd.status = TaskStatus.completed;
-				host_.persistStatus(currentRoute.answererTid, "completed");
 				host_.persistResultText(currentRoute.answererTid,
 					answererTd.resultText);
-				host_.broadcastTaskUpdate(currentRoute.answererTid);
+				host_.transitionTask(currentRoute.answererTid, TaskStatus.active,
+					TaskStatus.completed, TaskNotificationChange.preserve);
 				host_.cleanupAfterFollowUpAnswerDelivery(
 					currentRoute.answererTid);
 				host_.broadcastFocusHint(currentRoute.answererTid,
@@ -566,20 +561,11 @@ private:
 				return;
 			}
 
-			auto askerTd = host_.getTask(currentRoute.askerTid);
-			if (askerTd !is null)
-			{
-				askerTd.status = TaskStatus.active;
-				askerTd.notificationBody = "";
-				host_.persistStatus(currentRoute.askerTid, "active");
-				host_.broadcastTaskUpdate(currentRoute.askerTid);
-			}
 			if (currentRoute.afterAnswer
 				== QuestionAfterAnswer.leaveAnswererAlive)
 			{
-				answererTd.status = TaskStatus.alive;
-				host_.persistStatus(currentRoute.answererTid, "alive");
-				host_.broadcastTaskUpdate(currentRoute.answererTid);
+				host_.transitionTask(currentRoute.answererTid, TaskStatus.active,
+					TaskStatus.alive, TaskNotificationChange.preserve);
 			}
 			host_.broadcastFocusHint(currentRoute.answererTid,
 				currentRoute.askerTid);
@@ -634,25 +620,24 @@ private:
 			});
 		}
 
-		auto askerTd = host_.getTask(currentRoute.askerTid);
-		if (askerTd !is null)
+		if (currentRoute.afterAnswer == QuestionAfterAnswer.continueBatch)
 		{
-			askerTd.status = TaskStatus.waiting;
-			if (currentRoute.afterAnswer == QuestionAfterAnswer.continueBatch)
-			{
-				askerTd.notificationBody = "Asking parent: "
-					~ truncateTitle(message, 100);
-			}
-			else if (currentRoute.afterAnswer
-				== QuestionAfterAnswer.leaveAnswererAlive)
-			{
-				askerTd.notificationBody = "Asking task "
-					~ to!string(currentRoute.answererTid)
-					~ ": " ~ truncateTitle(message, 100);
-			}
-			host_.persistStatus(currentRoute.askerTid, "waiting");
-			host_.broadcastTaskUpdate(currentRoute.askerTid);
+			auto askerTd = host_.getTask(currentRoute.askerTid);
+			assert(askerTd !is null);
+			askerTd.notificationBody = "Asking parent: "
+				~ truncateTitle(message, 100);
 		}
+		else if (currentRoute.afterAnswer
+				== QuestionAfterAnswer.leaveAnswererAlive)
+		{
+			auto askerTd = host_.getTask(currentRoute.askerTid);
+			assert(askerTd !is null);
+			askerTd.notificationBody = "Asking task "
+				~ to!string(currentRoute.answererTid)
+				~ ": " ~ truncateTitle(message, 100);
+		}
+		host_.transitionTask(currentRoute.askerTid, TaskStatus.active,
+			TaskStatus.waiting, TaskNotificationChange.preserve);
 
 		host_.broadcastFocusHint(currentRoute.askerTid, currentRoute.answererTid);
 

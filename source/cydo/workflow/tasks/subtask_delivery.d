@@ -27,7 +27,6 @@ struct SubtaskResultDeliveryHost
 	string delegate(const TaskData* td) worktreePath;
 	string delegate(int tid) worktreeForkBaseHead;
 	bool delegate(string projectPath, string taskTypeName) taskProducesCommitOutput;
-	void delegate(int tid, string status) persistStatus;
 	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
 		TaskNotificationChange notification) transitionTask;
 	void delegate(int tid, TaskStatus[] expectedFrom, TaskStatus to,
@@ -43,7 +42,6 @@ struct SubtaskResultDeliveryHost
 	bool delegate(int tid, out string sessionState) canSendSystemMessage;
 	void delegate(int tid, KnownSystemMessageKind kind, string body) sendKnownSystemMessage;
 	void delegate(int parentTid, int childTid) removeTaskDependency;
-	void delegate(int tid) broadcastTaskUpdate;
 	bool delegate(int tid) taskAlive;
 	void delegate(void delegate() cb) onNextTick;
 }
@@ -67,9 +65,10 @@ public:
 		if (td is null)
 			return false;
 
-		td.status = TaskStatus.completed;
-		host_.persistStatus(childTid, "completed");
 		host_.persistResultText(childTid, td.resultText);
+		host_.transitionTaskFrom(childTid,
+			[TaskStatus.active, TaskStatus.alive, TaskStatus.waiting],
+			TaskStatus.completed, TaskNotificationChange.preserve);
 
 		Promise!(McpResult) pending;
 		if (!host_.readPendingSubTask(childTid, pending))
@@ -296,12 +295,9 @@ private:
 
 		auto td = requireTask(parentTid,
 			"Parent task must exist after sub-task batch result delivery");
-		if (td.status == "waiting")
-		{
-			td.status = TaskStatus.alive;
-			host_.persistStatus(parentTid, "alive");
-			host_.broadcastTaskUpdate(parentTid);
-		}
+		if (td.status == TaskStatus.waiting)
+			host_.transitionTask(parentTid, TaskStatus.waiting, TaskStatus.alive,
+				TaskNotificationChange.preserve);
 	}
 
 	TaskData* requireTask(int tid, string message)

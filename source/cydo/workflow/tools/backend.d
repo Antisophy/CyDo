@@ -140,7 +140,6 @@ public:
 				worktreePath: host_.worktreePath,
 				worktreeForkBaseHead: host_.worktreeForkBaseHead,
 				taskProducesCommitOutput: host_.taskProducesCommitOutput,
-				persistStatus: host_.persistStatus,
 				transitionTask: host_.transitionTask,
 				transitionTaskFrom: host_.transitionTaskFrom,
 				persistResultText: host_.persistResultText,
@@ -170,7 +169,6 @@ public:
 				canSendSystemMessage: host_.canSendSystemMessage,
 				sendKnownSystemMessage: host_.sendKnownSystemMessage,
 				removeTaskDependency: &removeTaskDependency,
-				broadcastTaskUpdate: host_.broadcastTaskUpdate,
 				taskAlive: host_.taskAlive,
 				onNextTick: host_.onNextTick,
 			));
@@ -186,11 +184,9 @@ public:
 				string cydoMeta, string nonce) {
 				host_.sendTaskMessage(tid, content, null, cydoMeta, nonce);
 			},
-			persistStatus: host_.persistStatus,
 			transitionTask: host_.transitionTask,
 			transitionTaskFrom: host_.transitionTaskFrom,
 			persistResultText: host_.persistResultText,
-			broadcastTaskUpdate: host_.broadcastTaskUpdate,
 			broadcastFocusHint: host_.broadcastFocusHint,
 			addIdleCallback: host_.addIdleCallback,
 			reactivateTask: host_.reactivateTask,
@@ -312,9 +308,10 @@ public:
 			pendingSubTasks_[childTid] = promise;
 			host_.persistAddTaskDep(parentTid, childTid);
 			taskDeps_[childTid] = parentTid;
-			pd.status = TaskStatus.waiting;
-			host_.persistStatus(parentTid, "waiting");
-			host_.broadcastTaskUpdate(parentTid);
+			if (pd.status != TaskStatus.waiting)
+				host_.transitionTaskFrom(parentTid,
+					[TaskStatus.pending, TaskStatus.active], TaskStatus.waiting,
+					TaskNotificationChange.preserve);
 
 			host_.broadcastTaskCreated(TaskCreatedMessage("task_created",
 				childTid, pd.workspace, pd.projectPath, parentTid, "subtask"));
@@ -362,12 +359,12 @@ public:
 			}).except((Exception e) {
 				auto failedChild = requireTask(childTid,
 					"Created child task must exist when launch fails");
-				failedChild.status = TaskStatus.failed;
 				failedChild.error = e.msg;
 				failedChild.resultText = e.msg;
-				host_.persistStatus(childTid, "failed");
 				host_.persistResultText(childTid, failedChild.resultText);
-				host_.broadcastTaskUpdate(childTid);
+				host_.transitionTaskFrom(childTid,
+					[TaskStatus.pending, TaskStatus.active], TaskStatus.failed,
+					TaskNotificationChange.preserve);
 				if (hasPendingSubTask(childTid))
 					deliverFailedPendingSubTaskResult(childTid);
 			}).ignoreResult();
@@ -746,12 +743,9 @@ public:
 		foreach (childTid; children)
 			removeTaskDependency(tid, childTid);
 
-		if (td.status == "waiting")
-		{
-			td.status = TaskStatus.active;
-			host_.persistStatus(tid, "active");
-			host_.broadcastTaskUpdate(tid);
-		}
+		if (td.status == TaskStatus.waiting)
+			host_.transitionTask(tid, TaskStatus.waiting, TaskStatus.active,
+				TaskNotificationChange.preserve);
 	}
 
 	void onMcpDeliveryFailed(string callerTidStr)
@@ -1496,6 +1490,19 @@ unittest
 		persistRelationType: (int tid, string relationType) {},
 		persistTitle: (int tid, string title) {},
 		persistStatus: (int tid, string status) {},
+		transitionTask: (int tid, TaskStatus expectedFrom, TaskStatus to,
+			TaskNotificationChange notification) {
+			assert(tasks[tid].status == expectedFrom);
+			tasks[tid].status = to;
+		},
+		transitionTaskFrom: (int tid, TaskStatus[] expectedFrom, TaskStatus to,
+			TaskNotificationChange notification) {
+			bool expected;
+			foreach (from; expectedFrom)
+				expected = expected || tasks[tid].status == from;
+			assert(expected);
+			tasks[tid].status = to;
+		},
 		persistNeedsAttention: (int tid, bool needsAttention) {},
 		persistLastActive: (int tid, long lastActive) {},
 		persistResultText: (int tid, string resultText) {},
