@@ -1459,6 +1459,9 @@ unittest
 	TaskTypeDef childType;
 	childType.name = "child";
 	childType.agent = "fake";
+	ContinuationDef continuation;
+	continuation.task_type = "child";
+	parentType.continuations["continue"] = continuation;
 	auto taskTypes = [parentType, childType];
 
 	TaskData[int] tasks;
@@ -1513,11 +1516,13 @@ unittest
 		worktreeForkBaseHead: (int tid) => "",
 		taskProducesCommitOutput: (string projectPath, string taskTypeName) => false,
 		setupWorktreeForEdge: (int childTid, int parentTid, WorktreeMode mode) {},
-		ensureProcessQueueAlive: (int tid) =>
-			reject!void(new Exception("simulated child session startup failure")),
+		ensureProcessQueueAlive: (int tid) => tid == 2
+			? reject!void(new Exception("simulated child session startup failure"))
+			: resolve(),
 		sendTaskMessage: (int tid, const(ContentBlock)[] content,
 			const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) {
-			assert(0, "startup failure should prevent sending the child prompt");
+			assert(tid == 3,
+				"startup failure should prevent sending the subtask prompt");
 		},
 		emitTaskReload: (int tid, string reason) {},
 		appendSynthesizedHistoryError: (int tid, string subject, string body) {},
@@ -1574,4 +1579,12 @@ unittest
 	assert(taskResult.status == "error");
 	assert(taskResult.summary == "simulated child session startup failure");
 	assert(taskResult.error == "simulated child session startup failure");
+	assert(tasks[2].projectPath == "/tmp/cydo-task-startup-failure");
+
+	// A non-keep-context continuation creates a new TaskData through the
+	// same host seam as a subtask and must retain the parent's identity.
+	tasks[1].pendingContinuation = new PendingContinuation(
+		PendingContinuation.Kind.handoff, "continue", "follow-up");
+	backend.spawnContinuation(1);
+	assert(tasks[3].projectPath == "/tmp/cydo-task-startup-failure");
 }

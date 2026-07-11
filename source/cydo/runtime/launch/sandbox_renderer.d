@@ -471,10 +471,14 @@ unittest
 		environment["PATH"] = oldPath;
 
 	auto wsRoot = buildPath(root, "ws");
+	auto wsLink = buildPath(root, "ws-link");
+	auto projectDir = buildPath(wsRoot, "project");
 	auto taskDir = buildPath(root, "moved", "tasks", "1");
 	auto tasksLink = buildPath(wsRoot, ".cydo", "tasks");
 	mkdirRecurse(taskDir);
+	mkdirRecurse(projectDir);
 	mkdirRecurse(buildPath(wsRoot, ".cydo"));
+	symlink(wsRoot, wsLink);
 	symlink(buildPath(root, "moved", "tasks"), tasksLink);
 
 	ResolvedSandbox sandbox;
@@ -482,6 +486,10 @@ unittest
 	sandbox.isolate_processes = false;
 	sandbox.isolate_environment = false;
 	sandbox.paths[wsRoot] = PathMode.ro;
+	// The default task mounts are canonical, but configured paths retain their
+	// spelling. Both must survive renderer rewriting.
+	sandbox.paths[projectDir] = PathMode.rw;
+	sandbox.paths[wsLink] = PathMode.tmpfs;
 	sandbox.paths[buildPath(tasksLink, "1")] = PathMode.rw;
 
 	auto args = buildCommandPrefix(sandbox, "");
@@ -489,6 +497,8 @@ unittest
 		foreach (tempFile; sandbox.tempFiles)
 			remove(tempFile);
 	assert(args.canFind(["--ro-bind", wsRoot, wsRoot]));
+	assert(args.canFind(["--bind", projectDir, projectDir]));
+	assert(args.canFind(["--tmpfs", wsLink]));
 	assert(args.canFind(["--bind", taskDir, taskDir]));
 	assert(!args.canFind(buildPath(tasksLink, "1")));
 }

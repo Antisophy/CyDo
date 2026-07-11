@@ -330,32 +330,42 @@ void mergeEnv(ref string[string] dest, string[string] source)
 
 unittest
 {
-	import std.file : exists, mkdirRecurse, rmdirRecurse;
+	import ae.sys.file : realPath;
+	import std.file : exists, mkdirRecurse, rmdirRecurse, symlink;
 	import std.path : buildPath;
 
-	auto wsRoot = buildPath("/tmp", "cydo-sandbox-ws-root");
+	auto root = buildPath(realPath("/tmp"), "cydo-sandbox-ws-root");
+	auto wsRoot = buildPath(root, "workspace");
+	auto wsLink = buildPath(root, "workspace-link");
 	auto projectDir = buildPath(wsRoot, "project");
-	if (exists(wsRoot))
-		rmdirRecurse(wsRoot);
+	if (exists(root))
+		rmdirRecurse(root);
 	scope(exit)
-		if (exists(wsRoot))
-			rmdirRecurse(wsRoot);
+		if (exists(root))
+			rmdirRecurse(root);
 
 	mkdirRecurse(projectDir);
+	symlink(wsRoot, wsLink);
 
 	SandboxConfig workspace;
-	workspace.paths = [wsRoot : PathMode.tmpfs];
+	// Config preserves its written spelling, while task defaults use the
+	// canonical workspace/project identities.
+	workspace.paths = [wsLink : PathMode.tmpfs];
 
 	AgentSandboxConfig agent;
 	agent.configureSandbox = (ref PathMode[string] paths, ref string[string] env) {};
 	auto taskSandbox = resolveSandbox(SandboxConfig.init, SandboxConfig.init,
 		workspace, agent, projectDir, wsRoot);
-	assert(taskSandbox.paths[wsRoot] == PathMode.tmpfs);
+	assert(taskSandbox.paths[wsRoot] == PathMode.ro);
 	assert(taskSandbox.paths[projectDir] == PathMode.rw);
+	assert(taskSandbox.paths[wsLink] == PathMode.tmpfs);
 
 	auto discoverySandbox = resolveSandboxForDiscovery(SandboxConfig.init,
 		workspace, wsRoot, "");
-	assert(discoverySandbox.paths[wsRoot] == PathMode.tmpfs);
+	// Discovery uses the canonical workspace root (ro) while the configured
+	// symlink spelling keeps its written mode.
+	assert(discoverySandbox.paths[wsRoot] == PathMode.ro);
+	assert(discoverySandbox.paths[wsLink] == PathMode.tmpfs);
 }
 
 unittest

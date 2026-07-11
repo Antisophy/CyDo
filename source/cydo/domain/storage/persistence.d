@@ -410,6 +410,8 @@ unittest
 	auto persistence = Persistence(buildPath(root, "cydo.db"));
 	auto firstTid = persistence.createTask("", projectLink);
 	auto secondTid = persistence.createTask("", projectLink);
+	auto forkTid = createForkTask(persistence, firstTid, "fork-session",
+		canonicalProjectPath(project), "", "parent");
 	auto fileTid = persistence.createTask("", regularFile);
 	persistence.upsertSessionMetaCache("claude", "symlink-session", 1, projectLink, "", true);
 	persistence.upsertSessionMetaCache("claude", "missing-session", 1, missing, "", true);
@@ -418,10 +420,11 @@ unittest
 	persistence.normalizeProjectPaths(&bestEffortProjectPathIdentity);
 	auto canonical = canonicalProjectPath(project);
 	auto tasks = persistence.loadTasks();
-	assert(tasks.length == 3);
+	assert(tasks.length == 4);
 	assert(tasks[0].tid == firstTid && tasks[0].projectPath == canonical);
 	assert(tasks[1].tid == secondTid && tasks[1].projectPath == canonical);
-	assert(tasks[2].tid == fileTid && tasks[2].projectPath == buildNormalizedPath(absolutePath(regularFile)));
+	assert(tasks[2].tid == forkTid && tasks[2].projectPath == canonical);
+	assert(tasks[3].tid == fileTid && tasks[3].projectPath == buildNormalizedPath(absolutePath(regularFile)));
 	auto cacheRows = persistence.loadSessionMetaCache();
 	assert(cacheRows.length == 3);
 	assert(cacheRows[0].projectPath == canonical);
@@ -431,7 +434,8 @@ unittest
 	persistence.normalizeProjectPaths(&bestEffortProjectPathIdentity);
 	tasks = persistence.loadTasks();
 	cacheRows = persistence.loadSessionMetaCache();
-	assert(tasks.length == 3 && tasks[0].tid == firstTid && tasks[1].tid == secondTid && tasks[2].tid == fileTid);
+	assert(tasks.length == 4 && tasks[0].tid == firstTid && tasks[1].tid == secondTid && tasks[2].tid == forkTid && tasks[3].tid == fileTid);
+	assert(tasks[2].projectPath == canonical);
 	assert(cacheRows[0].projectPath == canonical);
 	assert(cacheRows[1].projectPath == buildNormalizedPath(absolutePath(missing)));
 	assert(cacheRows[2].projectPath == buildNormalizedPath(absolutePath(regularFile)));
