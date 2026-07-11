@@ -131,8 +131,8 @@ function decodeWebSocketData(data: unknown): string {
   return String(data);
 }
 
-async function requestProjectTaskTypes(projectPath: string): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
+async function requestProjectTaskTypes(projectPath: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
     const ws = new WebSocket(`${BACKEND_URL.replace(/^http/, "ws")}/ws`);
     ws.binaryType = "arraybuffer";
     let settled = false;
@@ -158,12 +158,12 @@ async function requestProjectTaskTypes(projectPath: string): Promise<void> {
       };
       if (
         msg.type === "project_task_types_list" &&
-        msg.project_path === projectPath
+        msg.project_path !== undefined
       ) {
         settled = true;
         clearTimeout(timeout);
         ws.close();
-        resolve();
+        resolve(msg.project_path);
       }
     });
 
@@ -186,6 +186,48 @@ async function requestProjectTaskTypes(projectPath: string): Promise<void> {
           ),
         );
       }
+    });
+  });
+}
+
+async function requestInvalidProjectTaskTypes(projectPath: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(`${BACKEND_URL.replace(/^http/, "ws")}/ws`);
+    ws.binaryType = "arraybuffer";
+    let settled = false;
+    const timeout = setTimeout(() => {
+      settled = true;
+      ws.close();
+      reject(new Error(`Timed out waiting for invalid project error for ${projectPath}`));
+    }, 10_000);
+
+    ws.addEventListener("open", () => {
+      ws.send(JSON.stringify({ type: "request_task_types", project_path: projectPath }));
+    });
+
+    ws.addEventListener("message", (ev) => {
+      const msg = JSON.parse(decodeWebSocketData(ev.data)) as {
+        type?: string;
+        message?: string;
+      };
+      if (msg.type === "error") {
+        settled = true;
+        clearTimeout(timeout);
+        ws.close();
+        expect(msg.message).toBe("Project path must be an existing directory");
+        resolve();
+      }
+    });
+
+    ws.addEventListener("error", () => {
+      settled = true;
+      clearTimeout(timeout);
+      reject(new Error(`WebSocket error while requesting task types for ${projectPath}`));
+    });
+
+    ws.addEventListener("close", () => {
+      clearTimeout(timeout);
+      if (!settled) reject(new Error(`WebSocket closed for ${projectPath}`));
     });
   });
 }
@@ -272,6 +314,77 @@ test(
 
       await rewriteConfigAndWaitForReload(configPath, workspaceRoot);
       await requestProjectTaskTypes(repoPath);
+      await expectBackendAlive(proc);
+    } finally {
+      if (proc.exitCode === null) await killBackend(proc);
+      rmSync(workDir, { recursive: true, force: true });
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "opening symlinked project then canonical project path keeps one project watch",
+  { tag: "@claude-only" },
+  async ({}, testInfo) => {
+    const suffix = `symlink-watch-${testInfo.workerIndex}`;
+    const { workDir, workerHome } = createWorkDir(suffix);
+    const realWorkspaceRoot = `/tmp/cydo-symlink-watch-real-${testInfo.workerIndex}`;
+    const symlinkWorkspaceRoot = `/tmp/cydo-symlink-watch-link-${testInfo.workerIndex}`;
+    const realRepoPath = `${realWorkspaceRoot}/repo`;
+    const symlinkRepoPath = `${symlinkWorkspaceRoot}/repo`;
+    const configPath = `${workerHome}/.config/cydo/config.yaml`;
+
+    rmSync(realWorkspaceRoot, { recursive: true, force: true });
+    rmSync(symlinkWorkspaceRoot, { recursive: true, force: true });
+    initGitRepo(realRepoPath);
+    mkdirSync(`${realRepoPath}/.cydo`, { recursive: true });
+    symlinkSync(realWorkspaceRoot, symlinkWorkspaceRoot);
+    writeConfig(configPath, realWorkspaceRoot);
+
+    const proc = spawnBackend(workDir, workerHome);
+    try {
+      await waitForBackend(proc);
+
+      const symlinkResponsePath = await requestProjectTaskTypes(symlinkRepoPath);
+      expect(symlinkResponsePath).toBe(realRepoPath);
+      await expectBackendAlive(proc);
+
+      const realResponsePath = await requestProjectTaskTypes(realRepoPath);
+      expect(realResponsePath).toBe(symlinkResponsePath);
+      await expectBackendAlive(proc);
+    } finally {
+      if (proc.exitCode === null) await killBackend(proc);
+      rmSync(workDir, { recursive: true, force: true });
+      rmSync(symlinkWorkspaceRoot, { recursive: true, force: true });
+      rmSync(realWorkspaceRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "invalid project task type request does not stop backend",
+  { tag: "@claude-only" },
+  async ({}, testInfo) => {
+    const suffix = `invalid-project-watch-${testInfo.workerIndex}`;
+    const { workDir, workerHome } = createWorkDir(suffix);
+    const workspaceRoot = `/tmp/cydo-invalid-project-watch-${testInfo.workerIndex}`;
+    const configPath = `${workerHome}/.config/cydo/config.yaml`;
+    const missingProjectPath = `${workspaceRoot}/missing`;
+    const regularFilePath = `${workspaceRoot}/file`;
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    mkdirSync(workspaceRoot, { recursive: true });
+    writeFileSync(regularFilePath, "file\n");
+    writeConfig(configPath, workspaceRoot);
+
+    const proc = spawnBackend(workDir, workerHome);
+    try {
+      await waitForBackend(proc);
+
+      await requestInvalidProjectTaskTypes(missingProjectPath);
+      await expectBackendAlive(proc);
+      await requestInvalidProjectTaskTypes(regularFilePath);
       await expectBackendAlive(proc);
     } finally {
       if (proc.exitCode === null) await killBackend(proc);

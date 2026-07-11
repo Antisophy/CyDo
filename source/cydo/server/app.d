@@ -75,6 +75,7 @@ import cydo.domain.task_types.definition : TaskTypeDef, OutputType, WorktreeMode
 import cydo.foundation.system.framing : prependTaskFraming, validateTemplateSource;
 import cydo.foundation.system.known_messages : KnownSystemMessageKind,
 	sessionStartSubject, systemMessagePrefix, wrapKnownSystemMessage;
+import cydo.foundation.platform.path : canonicalProjectPath;
 import cydo.domain.tasks.model;
 import cydo.foundation.text.title : truncateTitle;
 import cydo.workflow.history.jsonl_store : findNextUserUuid;
@@ -2906,11 +2907,20 @@ class App
 			).representation));
 		else
 		{
-			configWatcher.ensureProjectWatch(json.project_path);
+			string projectPath;
+			try
+				projectPath = canonicalProjectPath(json.project_path);
+			catch (Exception)
+			{
+				ws.send(Data(toJson(ErrorMessage("error",
+					"Project path must be an existing directory")).representation));
+				return;
+			}
+			configWatcher.ensureProjectWatch(projectPath);
 			ws.send(Data(buildTaskTypesListForProject(
-				json.project_path,
-				taskTypeCatalog.getTaskTypesForProject(json.project_path),
-				taskTypeCatalog.getEntryPointsForProject(json.project_path),
+				projectPath,
+				taskTypeCatalog.getTaskTypesForProject(projectPath),
+				taskTypeCatalog.getEntryPointsForProject(projectPath),
 			).representation));
 		}
 	}
