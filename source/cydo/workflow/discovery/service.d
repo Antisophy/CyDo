@@ -15,6 +15,7 @@ import ae.utils.promise.concurrency : threadAsync;
 import cydo.agent.contract : Agent, DiscoveredSession;
 import cydo.runtime.config : CydoConfig;
 import cydo.domain.storage.persistence : Persistence;
+import cydo.foundation.platform.path : bestEffortProjectPathIdentity, canonicalProjectPath;
 import cydo.runtime.launch.sandbox : buildCommandPrefix, cleanup, cydoBinaryDir, cydoBinaryPath,
 	resolveSandboxForDiscovery;
 import cydo.domain.tasks.model : ProjectInfo, WorkspaceInfo;
@@ -155,7 +156,8 @@ class DiscoveryService
 			{
 				auto json = parseJSON(result.output);
 				foreach (entry; json.array)
-					projInfos ~= ProjectInfo(entry["name"].str, entry["path"].str, false, true);
+					projInfos ~= ProjectInfo(entry["name"].str,
+						canonicalProjectPath(entry["path"].str), false, true);
 			}
 			catch (Exception e)
 				warningf("Discovery JSON parse failed for workspace '%s': %s", ws.name, e.msg);
@@ -246,7 +248,8 @@ class DiscoveryService
 					if (alreadyKnown)
 						continue;
 
-					string finalProjectPath = r.projectPath.length > 0 ? r.projectPath : r.enumProjectPath;
+					string finalProjectPath = bestEffortProjectPathIdentity(
+						r.projectPath.length > 0 ? r.projectPath : r.enumProjectPath);
 
 					if (!r.hasMessages)
 					{
@@ -302,16 +305,20 @@ private:
 		bool[string] seen;
 		string[] taskPaths;
 		foreach (ref td; tasks)
-			if (td.parentTid == 0 && td.projectPath.length > 0 && td.projectPath !in seen)
+			if (td.parentTid == 0 && td.projectPath.length > 0)
 			{
-				seen[td.projectPath] = true;
-				taskPaths ~= td.projectPath;
+				auto projectPath = bestEffortProjectPathIdentity(td.projectPath);
+				if (projectPath !in seen)
+				{
+					seen[projectPath] = true;
+					taskPaths ~= projectPath;
+				}
 			}
 
 		bool[string] coveredPaths;
 		foreach (ref wi; workspacesInfo_)
 			foreach (ref pi; wi.projects)
-				coveredPaths[pi.path] = true;
+				coveredPaths[bestEffortProjectPathIdentity(pi.path)] = true;
 
 		string[] orphanedPaths;
 		foreach (projectPath; taskPaths)
@@ -322,7 +329,7 @@ private:
 			bool matched = false;
 			foreach (ref ws; config.workspaces)
 			{
-				auto wsRoot = ws.root;
+				auto wsRoot = bestEffortProjectPathIdentity(ws.root);
 				if (projectPath == wsRoot || projectPath.startsWith(wsRoot ~ "/"))
 				{
 					matched = true;
@@ -439,6 +446,8 @@ private:
 								entry.driverName, ds.sessionId, e.msg);
 						record.fromCache = false;
 					}
+					record.enumProjectPath = bestEffortProjectPathIdentity(record.enumProjectPath);
+					record.projectPath = bestEffortProjectPathIdentity(record.projectPath);
 					results ~= record;
 				}
 			}
@@ -537,4 +546,96 @@ unittest
 	assert(createCount == 0, "enumerateSessions must re-check current tasks before import");
 	assert(snapshotCount >= 2, "enumerateSessions must snapshot tasks again after scan");
 	assert(scanTransitions == [true, false]);
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import std.file : exists, mkdirRecurse, rmdirRecurse, symlink;
+	import std.path : buildPath;
+
+	auto root = buildPath("/tmp", "cydo-discovery-project-path-unittest");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto project = buildPath(root, "project");
+	auto projectLink = buildPath(root, "project-link");
+	auto missing = buildPath(root, "missing", "project");
+	mkdirRecurse(project);
+	symlink(project, projectLink);
+
+	ImportableTaskSpec[] imported;
+	string[] cachedPaths;
+	DiscoveryTaskSnapshot[int] tasks;
+	auto service = new DiscoveryService(
+		DiscoveryServiceHost(
+			snapshotTasks: () => tasks,
+			loadSessionMetaCache: () => Persistence.CacheRow[].init,
+			withMutationTransaction: (scope void delegate() work) => work(),
+			importableHistoryPath: (int tid) => "",
+			deleteImportableTask: (int tid) {},
+			createImportableTask: (ImportableTaskSpec spec) { imported ~= spec; },
+			broadcastWorkspaces: (WorkspaceInfo[] workspaces) {},
+			broadcastScanStatus: (bool active) {},
+			deleteSessionMetaCacheEntry: (string agentType, string sessionId) {},
+			upsertSessionMetaCache: (string agentType, string sessionId, long mtime,
+				string projectPath, string title, bool hasMessages) { cachedPaths ~= projectPath; },
+		),
+		(DiscoveryScanInput input) => resolve([
+			ScannedSessionRecord("claude", "claude", "existing", 1, "", "Existing", projectLink, false, true),
+			ScannedSessionRecord("claude", "claude", "missing", 1, missing, "Missing", "", false, true),
+		]),
+	);
+
+	Agent[string] agentsByName;
+	service.enumerateSessions(CydoConfig.init, agentsByName);
+	socketManager.loop();
+
+	auto canonical = canonicalProjectPath(project);
+	assert(imported.length == 2);
+	assert(imported[0].projectPath == canonical);
+	assert(cachedPaths[0] == canonical);
+	assert(imported[1].projectPath == bestEffortProjectPathIdentity(missing));
+	assert(cachedPaths[1] == bestEffortProjectPathIdentity(missing));
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, symlink;
+	import std.path : buildPath;
+
+	auto root = buildPath("/tmp", "cydo-discovery-virtual-project-path-unittest");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto project = buildPath(root, "project");
+	auto projectLink = buildPath(root, "project-link");
+	mkdirRecurse(project);
+	symlink(project, projectLink);
+
+	DiscoveryTaskSnapshot[int] tasks;
+	tasks[1] = DiscoveryTaskSnapshot(1, 0, "", "", "", project);
+	tasks[2] = DiscoveryTaskSnapshot(2, 0, "", "", "", projectLink);
+	auto service = new DiscoveryService(DiscoveryServiceHost(
+		snapshotTasks: () => tasks,
+		loadSessionMetaCache: () => Persistence.CacheRow[].init,
+		withMutationTransaction: (scope void delegate() work) => work(),
+		importableHistoryPath: (int tid) => "",
+		deleteImportableTask: (int tid) {},
+		createImportableTask: (ImportableTaskSpec spec) {},
+		broadcastWorkspaces: (WorkspaceInfo[] workspaces) {},
+		broadcastScanStatus: (bool active) {},
+		deleteSessionMetaCacheEntry: (string agentType, string sessionId) {},
+		upsertSessionMetaCache: (string agentType, string sessionId, long mtime,
+			string projectPath, string title, bool hasMessages) {},
+	));
+
+	service.discoverAllWorkspaces(CydoConfig.init);
+	assert(service.workspacesInfo.length == 1);
+	assert(service.workspacesInfo[0].projects.length == 1);
+	assert(service.workspacesInfo[0].projects[0].path == canonicalProjectPath(project));
 }
