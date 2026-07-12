@@ -20,10 +20,12 @@ import cydo.protocol : TranslatedEvent;
 
 class AppServerProcess
 {
+	private string[] args;
 	private AgentProcess process;
 	private JsonRpcCodec codec;
 	private JsonRpcDispatcher!ICodexServer serverDispatcher;
 	private bool terminating_;
+	private void delegate() releaseStartupGate_;
 
 	enum State { starting, initializing, authenticating, ready, failed, dead }
 	private State state_ = State.starting;
@@ -38,8 +40,14 @@ class AppServerProcess
 
 	this(string[] args)
 	{
+		this.args = args;
+	}
+
+	void startProcess(void delegate() releaseStartupGate)
+	{
 		// Environment and current directory are handled by bwrap (included in args).
 		process = new AgentProcess(args, logName: "codex");
+		releaseStartupGate_ = releaseStartupGate;
 
 		// Set up bidirectional JSON-RPC codec on the process connection.
 		// The codec takes over handleReadData from stdoutLines; onStdoutLine
@@ -105,6 +113,7 @@ class AppServerProcess
 		};
 
 		process.onExit = (int status) {
+			releaseStartupGateOnce();
 			state_ = State.dead;
 			auto effectiveStatus = status;
 			if (terminating_)
@@ -156,9 +165,21 @@ class AppServerProcess
 
 	void terminate()
 	{
-		if (process.dead || terminating_)
+		if (terminating_)
 			return;
 		terminating_ = true;
+		if (process is null)
+		{
+			if (onCancelStartup_)
+				onCancelStartup_();
+			state_ = State.dead;
+			foreach (session; sessionsByTid)
+				if (session.onServerExit !is null)
+					session.onServerExit(143);
+			return;
+		}
+		if (process.dead)
+			return;
 		// codex app-server runs over stdio; closing stdin reliably triggers
 		// shutdown even when SIGTERM is not handled promptly.
 		process.closeStdin();
@@ -169,20 +190,38 @@ class AppServerProcess
 		process.killAfterTimeout(0.seconds);
 	}
 
-	@property bool dead() { return process.dead; }
+	@property bool dead()
+	{
+		if (state_ == State.dead || state_ == State.failed)
+			return true;
+		return process !is null && process.dead;
+	}
 
 	/// Callback invoked when this server shuts down, for pool cleanup.
 	package void delegate() onShutdown_;
+	package void delegate() onCancelStartup_;
 
 	/// Terminate the server immediately and notify remaining sessions.
 	/// Nulls onExit to prevent double-firing from the async process exit.
 	void shutdown()
 	{
 		if (state_ == State.dead) return;
-		process.onExit = null;
-		process.closeStdin();
-		process.terminate();
-		process.killAfterTimeout(0.seconds);
+		if (process is null)
+		{
+			if (onCancelStartup_)
+				onCancelStartup_();
+		}
+		else
+		{
+			releaseStartupGateOnce();
+			process.onExit = null;
+			if (!process.dead)
+			{
+				process.closeStdin();
+				process.terminate();
+				process.killAfterTimeout(0.seconds);
+			}
+		}
 		state_ = State.dead;
 		foreach (session; sessionsByTid)
 			if (session.onServerExit !is null)
@@ -210,8 +249,18 @@ class AppServerProcess
 			InitializeParams.ClientInfo("cydo", "0.1.0"),
 			JSONFragment(`{"experimentalApi":true}`)
 		))).then((JsonRpcResponse result) {
+			releaseStartupGateOnce();
 			sendLogin();
 		});
+	}
+
+	private void releaseStartupGateOnce()
+	{
+		if (releaseStartupGate_ is null)
+			return;
+		auto release = releaseStartupGate_;
+		releaseStartupGate_ = null;
+		release();
 	}
 
 	private void sendLogin()

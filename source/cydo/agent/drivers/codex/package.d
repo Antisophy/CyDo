@@ -7,6 +7,7 @@ import std.logger : errorf, tracef, warningf;
 import std.path : buildPath, dirName;
 
 import ae.sys.data : Data;
+import ae.sys.timing : setTimeout, TimerTask;
 import ae.utils.time.types : AbsTime;
 import ae.utils.json : JSONExtras, JSONFragment, JSONOptional, JSONPartial,
 	jsonParse, toJson;
@@ -40,6 +41,7 @@ import cydo.foundation.text.title : truncateTitle;
 class CodexAgent : Agent
 {
 	private AppServerProcess[string] serverPool; // keyed by workspace+sandbox signature
+	private AppServerStartupGate[string] appServerStartupGates;
 	private string[string] modelAliasOverrides;
 	private string lastMcpConfigPath_;
 	// sessionId → rollout JSONL path. Populated lazily by populateSessionIndex
@@ -330,10 +332,83 @@ class CodexAgent : Agent
 		else
 			args = codexArgs;
 
+		auto codexHome = codexHomeForLaunch(launch);
 		auto server = new AppServerProcess(args);
 		serverPool[poolKey] = server;
-		server.onShutdown_ = { serverPool.remove(poolKey); };
+		AppServerStartupRequest startupRequest;
+		server.onShutdown_ = {
+			serverPool.remove(poolKey);
+			cancelQueuedAppServerStartup(startupRequest);
+		};
+		server.onCancelStartup_ = { cancelQueuedAppServerStartup(startupRequest); };
+		startupRequest = queueAppServerStartup(codexHome, server);
 		return server;
+	}
+
+	private AppServerStartupRequest queueAppServerStartup(string codexHome,
+		AppServerProcess server)
+	{
+		auto gate = codexHome in appServerStartupGates;
+		if (gate is null)
+		{
+			appServerStartupGates[codexHome] = new AppServerStartupGate;
+			gate = codexHome in appServerStartupGates;
+		}
+		auto request = new AppServerStartupRequest(codexHome, server);
+		(*gate).queue ~= request;
+		startNextAppServerStartup(codexHome);
+		return request;
+	}
+
+	private void startNextAppServerStartup(string codexHome)
+	{
+		auto gate = codexHome in appServerStartupGates;
+		if (gate is null || (*gate).busy)
+			return;
+		while ((*gate).queue.length > 0)
+		{
+			auto request = (*gate).queue[0];
+			(*gate).queue = (*gate).queue[1 .. $];
+			if (request.cancelled)
+				continue;
+			(*gate).busy = true;
+			auto lease = new AppServerStartupLease(codexHome, request);
+			request.lease = lease;
+			lease.timeout = setTimeout({ releaseAppServerStartup(lease); }, 30.seconds);
+			request.server.startProcess({ releaseAppServerStartup(lease); });
+			return;
+		}
+		appServerStartupGates.remove(codexHome);
+	}
+
+	private void releaseAppServerStartup(AppServerStartupLease lease)
+	{
+		if (lease.released)
+			return;
+		lease.released = true;
+		if (lease.timeout !is null)
+			lease.timeout.cancel();
+		auto gate = lease.codexHome in appServerStartupGates;
+		if (gate is null)
+			return;
+		(*gate).busy = false;
+		startNextAppServerStartup(lease.codexHome);
+	}
+
+	private void cancelQueuedAppServerStartup(AppServerStartupRequest request)
+	{
+		if (request is null || request.lease !is null)
+			return;
+		request.cancelled = true;
+		auto gate = request.codexHome in appServerStartupGates;
+		if (gate is null)
+			return;
+		foreach (i, queued; (*gate).queue)
+			if (queued is request)
+			{
+				(*gate).queue = (*gate).queue[0 .. i] ~ (*gate).queue[i + 1 .. $];
+				break;
+			}
 	}
 
 	/// Shut down all pooled server processes (safety net for app shutdown).
@@ -870,6 +945,38 @@ class CodexAgent : Agent
 
 		return OneShotHandle(promise, &cancel);
 	}
+}
+
+private class AppServerStartupGate
+{
+	bool busy;
+	AppServerStartupRequest[] queue;
+}
+
+private class AppServerStartupRequest
+{
+	this(string codexHome, AppServerProcess server)
+	{
+		this.codexHome = codexHome;
+		this.server = server;
+	}
+	string codexHome;
+	AppServerProcess server;
+	bool cancelled;
+	AppServerStartupLease lease;
+}
+
+private class AppServerStartupLease
+{
+	this(string codexHome, AppServerStartupRequest request)
+	{
+		this.codexHome = codexHome;
+		this.request = request;
+	}
+	string codexHome;
+	AppServerStartupRequest request;
+	TimerTask timeout;
+	bool released;
 }
 
 // ---------------------------------------------------------------------------
