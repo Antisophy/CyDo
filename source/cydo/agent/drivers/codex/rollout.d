@@ -1,13 +1,14 @@
 module cydo.agent.drivers.codex.rollout;
 
 import std.conv : to;
+import std.algorithm : canFind;
 import std.logger : tracef;
 import std.typecons : Nullable;
 
 import ae.utils.json : JSONFragment, JSONOptional, JSONPartial, jsonParse, toJson;
 
 import cydo.agent.contract : ForkableIdInfo;
-import cydo.protocol : ContentBlock;
+import cydo.protocol : ContentBlock, makeUnrecognizedEvent;
 
 package enum ForkableMessageRole
 {
@@ -720,13 +721,30 @@ string[] translateRolloutResponseItem(string line, string forkId = null, bool fo
 		results = translateRolloutReasoning(
 			probe.payload.summary.json !is null ? probe.payload.summary.json : "[]",
 			probe.payload.content.json);
-	else
+	else if (ptype == "ghost_snapshot")
 		return [];
+	else
+		return [makeUnrecognizedEvent("unknown Codex response_item payload type: " ~ ptype)];
 
 	if (results.length == 0)
 		return [];
 
 	return results;
+}
+
+unittest
+{
+	// Unknown response_item payload types surface as agent/unrecognized so that
+	// un-ingested Codex data is visible in dev mode rather than silently dropped.
+	auto unrecognizedPayload = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"future_codex_payload"}}`);
+	assert(unrecognizedPayload.length == 1);
+	assert(unrecognizedPayload[0].canFind(`"type":"agent/unrecognized"`));
+
+	// ghost_snapshot is a known bookkeeping item that is intentionally ignored.
+	auto ignoredPayload = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"ghost_snapshot"}}`);
+	assert(ignoredPayload.length == 0);
 }
 
 /// Translate a message response_item payload → item/started [+ item/completed].
