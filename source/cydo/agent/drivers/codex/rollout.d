@@ -632,11 +632,12 @@ string[] translateRolloutResponseItem(string line, string forkId = null, bool fo
 	}
 	else if (ptype == "custom_tool_call")
 	{
-		// custom_tool_call.input is string payload. Wrap plain string into {"input": "..."}
-		// so frontend parser can recover apply_patch text consistently.
+		// exec input is always a script string, including scripts that begin with `{`.
 		string inputJson = `{}`;
 		auto rawInput = probe.payload.input;
-		if (rawInput.length > 0)
+		if (probe.payload.name == "exec")
+			inputJson = `{"input":` ~ toJson(rawInput) ~ `}`;
+		else if (rawInput.length > 0)
 		{
 			if (rawInput[0] == '{')
 				inputJson = rawInput;
@@ -730,21 +731,6 @@ string[] translateRolloutResponseItem(string line, string forkId = null, bool fo
 		return [];
 
 	return results;
-}
-
-unittest
-{
-	// Unknown response_item payload types surface as agent/unrecognized so that
-	// un-ingested Codex data is visible in dev mode rather than silently dropped.
-	auto unrecognizedPayload = translateRolloutResponseItem(
-		`{"type":"response_item","payload":{"type":"future_codex_payload"}}`);
-	assert(unrecognizedPayload.length == 1);
-	assert(unrecognizedPayload[0].canFind(`"type":"agent/unrecognized"`));
-
-	// ghost_snapshot is a known bookkeeping item that is intentionally ignored.
-	auto ignoredPayload = translateRolloutResponseItem(
-		`{"type":"response_item","payload":{"type":"ghost_snapshot"}}`);
-	assert(ignoredPayload.length == 0);
 }
 
 /// Translate a message response_item payload → item/started [+ item/completed].
@@ -936,9 +922,104 @@ string translateRolloutToolResult(string callId, string outputJson)
 		else
 			ev.content = JSONFragment(`[{"type":"text","text":` ~ outputJson ~ `}]`);
 	}
+	else if (outputJson.length > 0 && outputJson[0] == '[')
+	{
+		@JSONPartial
+		static struct ContentItem
+		{
+			string type;
+			JSONFragment text;
+		}
+
+		ContentItem[] items;
+		try
+			items = jsonParse!(ContentItem[])(outputJson);
+		catch (Exception)
+			return makeUnrecognizedEvent("malformed Codex tool output content-item array");
+
+		string text;
+		foreach (ref item; items)
+		{
+			if (item.type != "input_text" && item.type != "output_text")
+				return makeUnrecognizedEvent(
+					"unrecognized Codex tool output content-item type: " ~ item.type);
+			if (item.text.json is null)
+				return makeUnrecognizedEvent(
+					"malformed Codex tool output content-item: " ~ item.type);
+			try
+				text ~= jsonParse!string(item.text.json);
+			catch (Exception)
+				return makeUnrecognizedEvent(
+					"malformed Codex tool output content-item: " ~ item.type);
+		}
+		ev.content = JSONFragment(`[{"type":"text","text":` ~ toJson(text) ~ `}]`);
+	}
 	else
 		ev.content = JSONFragment(outputJson);
 	return toJson(ev);
+}
+
+unittest
+{
+	@JSONPartial static struct ToolUse { string type; string item_id; string name; JSONFragment input; }
+	@JSONPartial static struct ToolCompleted { string type; string item_id; JSONFragment input; }
+	@JSONPartial static struct ToolResult { string type; string item_id; JSONFragment content; }
+	@JSONPartial static struct TextBlock { string type; string text; }
+
+	auto callId = "call_exec_history";
+	auto script = "const result = await tools.exec_command({ cmd: \"pwd\" });\ntext(result.output);";
+	auto call = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_exec_history","name":"exec","input":` ~ toJson(script) ~ `}}`);
+	assert(call.length == 3);
+	auto toolUse = jsonParse!ToolUse(call[0]);
+	assert(toolUse.type == "item/started");
+	assert(toolUse.item_id == callId);
+	assert(toolUse.name == "exec");
+	assert(jsonParse!(string[string])(toolUse.input.json)["input"] == script);
+	auto toolCompleted = jsonParse!ToolCompleted(call[1]);
+	assert(toolCompleted.type == "item/completed");
+	assert(toolCompleted.item_id == callId);
+	assert(jsonParse!(string[string])(toolCompleted.input.json)["input"] == script);
+
+	auto blockScript = `{ const result = await tools.exec_command({ cmd: "pwd" }); }`;
+	auto blockCall = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_exec_block","name":"exec","input":`
+		~ toJson(blockScript) ~ `}}`);
+	assert(blockCall.length == 3);
+	auto blockToolUse = jsonParse!ToolUse(blockCall[0]);
+	assert(jsonParse!(string[string])(blockToolUse.input.json)["input"] == blockScript);
+
+	auto result = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_exec_history","output":[{"type":"input_text","text":"first "},{"type":"input_text","text":"second"}]}}`);
+	assert(result.length == 1);
+	auto toolResult = jsonParse!ToolResult(result[0]);
+	assert(toolResult.type == "item/result");
+	assert(toolResult.item_id == callId);
+	auto blocks = jsonParse!(TextBlock[])(toolResult.content.json);
+	assert(blocks.length == 1);
+	assert(blocks[0].type == "text");
+	assert(blocks[0].text == "first second");
+
+	auto unrecognizedContent = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_exec_history","output":[{"type":"image","text":"x"}]}}`);
+	assert(unrecognizedContent.length == 1);
+	assert(unrecognizedContent[0].canFind(`"type":"agent/unrecognized"`));
+
+	auto unrecognizedPayload = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"future_codex_payload"}}`);
+	assert(unrecognizedPayload.length == 1);
+	assert(unrecognizedPayload[0].canFind(`"type":"agent/unrecognized"`));
+
+	auto ignoredPayload = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"ghost_snapshot"}}`);
+	assert(ignoredPayload.length == 0);
+
+	auto classicOutput = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_classic","output":"Output:\n{\"ok\":true}"}}`);
+	assert(classicOutput.length == 1);
+	auto classicResult = jsonParse!ToolResult(classicOutput[0]);
+	auto classicBlocks = jsonParse!(TextBlock[])(classicResult.content.json);
+	assert(classicBlocks[0].text == `{"ok":true}`);
 }
 
 /// Translate a reasoning response_item → item/started (thinking) + item/completed.

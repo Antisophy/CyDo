@@ -135,6 +135,14 @@ const test = base.extend<{ restartableBackend: RestartableBackend }>({
       "/tmp/playwright-home/.config/cydo/config.yaml",
       `${workerHome}/.config/cydo/config.yaml`,
     );
+    const configPath = `${workerHome}/.config/cydo/config.yaml`;
+    const config = readFileSync(configPath, "utf8");
+    writeFileSync(
+      configPath,
+      config.includes("dev_mode:")
+        ? config.replace(/^dev_mode:.*$/m, "dev_mode: true")
+        : `${config}\ndev_mode: true\n`,
+    );
     mkdirSync(codexHome, { recursive: true });
     mkdirSync(`${codexHome}/shell_snapshots`, { recursive: true });
     writeFileSync(
@@ -417,6 +425,116 @@ test("codex history replay keeps successful structured task rendering", { tag: "
   await expect(taskTool).toContainText("output_file:", { timeout: 15_000 });
   await expect(taskTool).toContainText("/tmp/out.md", { timeout: 15_000 });
 });
+
+test("codex history replay renders custom exec output as one expanded tool", { tag: "@codex-only" }, async ({
+  page,
+  restartableBackend,
+}) => {
+  const { taskUrl, rolloutPath } = await seedTaskAndLocateRollout(
+    page,
+    restartableBackend,
+  );
+  await restartableBackend.restart();
+  await page.goto(taskUrl);
+  await expect(assistantText(page, "seed-history")).toBeVisible({
+    timeout: 15_000,
+  });
+  const diagnostics = page
+    .locator(".message.system-message")
+    .filter({ hasText: "Unrecognized agent data" });
+  const diagnosticCount = await diagnostics.count();
+
+  const callId = "call_custom_exec_history";
+  const script =
+    'const result = await tools.exec_command({ cmd: "pwd" });\ntext(result.output);';
+  appendFileSync(
+    rolloutPath,
+    [
+      JSON.stringify({
+        timestamp: "2026-03-27T07:35:23.000Z",
+        type: "response_item",
+        payload: {
+          type: "custom_tool_call",
+          call_id: callId,
+          name: "exec",
+          input: script,
+        },
+      }),
+      JSON.stringify({
+        timestamp: "2026-03-27T07:35:23.428Z",
+        type: "response_item",
+        payload: {
+          type: "custom_tool_call_output",
+          call_id: callId,
+          output: [
+            { type: "input_text", text: "first " },
+            { type: "input_text", text: "second" },
+          ],
+        },
+      }),
+      "",
+    ].join("\n"),
+  );
+
+  await restartableBackend.restart();
+  await page.goto(taskUrl);
+  await expect(assistantText(page, "seed-history")).toBeVisible({
+    timeout: 15_000,
+  });
+
+  const execTool = page.locator(".tool-call").filter({
+    has: page.locator(".tool-name", { hasText: "exec" }),
+  });
+  await expect(execTool).toHaveCount(1);
+  await expect(execTool.locator(".write-content")).toHaveText(script);
+  await expect(execTool.locator(".field-label", { hasText: "input:" })).toHaveCount(0);
+  await expect(execTool.locator(".write-content span").first()).toBeVisible({
+    timeout: 15_000,
+  });
+  const scriptCopy = execTool
+    .locator(".code-pre-wrap")
+    .first()
+    .locator('button[title="Copy to clipboard"]');
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], {
+    origin: "http://localhost:3940",
+  });
+  await expect(scriptCopy).toBeVisible();
+  await scriptCopy.click();
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(script);
+  await expect(execTool).toContainText("first second");
+  await expect(diagnostics).toHaveCount(diagnosticCount);
+});
+
+test("codex history replay exposes unknown response-item payloads in dev mode", { tag: "@codex-only" }, async ({
+  page,
+  restartableBackend,
+}) => {
+  const { taskUrl, rolloutPath } = await seedTaskAndLocateRollout(
+    page,
+    restartableBackend,
+  );
+
+  appendFileSync(
+    rolloutPath,
+    `${JSON.stringify({
+      timestamp: "2026-03-27T07:36:23.000Z",
+      type: "response_item",
+      payload: { type: "future_codex_payload" },
+    })}\n`,
+  );
+
+  await restartableBackend.restart();
+  await page.goto(taskUrl);
+
+  const diagnostic = page
+    .locator(".message.system-message")
+    .filter({ hasText: "future_codex_payload" });
+  await expect(diagnostic).toBeVisible({ timeout: 15_000 });
+  await expect(diagnostic).toContainText("Unrecognized agent data");
+});
+
 test("codex history replay renders live task output from organic rollout", { tag: "@codex-only" }, async ({
   page,
   restartableBackend,

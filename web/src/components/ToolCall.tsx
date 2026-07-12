@@ -673,6 +673,18 @@ function ApplyPatchInput({ input }: { input: Record<string, unknown> }) {
   );
 }
 
+function ExecInput({ input }: { input: Record<string, unknown> }) {
+  const script = input.input as string;
+  const tokens = useHighlight(script, "typescript");
+  const { input: _consumed, ...remaining } = input;
+  return formatGenericInput(
+    remaining,
+    <CodePre class="write-content" copyText={script}>
+      {tokens ? renderTokenLines(tokens) : script}
+    </CodePre>,
+  );
+}
+
 function ShellCommandInput({
   input,
   result,
@@ -2245,6 +2257,12 @@ function formatInput(
     return <ApplyPatchInput input={input} />;
   }
   if (
+    toolIs(name, driver, toolServer, "codex/exec") &&
+    typeof input.input === "string"
+  ) {
+    return <ExecInput input={input} />;
+  }
+  if (
     toolIs(name, driver, toolServer, "claude/Edit") &&
     "old_string" in input &&
     "new_string" in input
@@ -2753,6 +2771,7 @@ const defaultExpandedTools = new Set([
   "claude/Write",
   "codex/fileChange",
   "codex/apply_patch",
+  "codex/exec",
   "claude/Bash",
   "codex/commandExecution",
   "codex/local_shell_call",
@@ -2783,6 +2802,7 @@ const defaultExpandedResults = new Set([
   "codex/commandExecution",
   "codex/local_shell_call",
   "codex/exec_command",
+  "codex/exec",
   "claude/Task",
   "claude/Agent",
   "cydo:Task",
