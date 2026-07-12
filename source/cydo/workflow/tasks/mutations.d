@@ -11,7 +11,7 @@ import ae.utils.json : jsonParse, toJson;
 import ae.utils.promise : Promise;
 import ae.utils.statequeue : StateQueue;
 
-import cydo.agent.contract : Agent;
+import cydo.agent.contract : Agent, PersistedHistoryBoundaryKind;
 import cydo.agent.drivers.codex : CodexActiveUserTurnsAfterStatus, CodexAgent,
 	CodexSession, ThreadForkOutcome, ThreadRollbackOutcome,
 	countActiveUserTurnsAfterForkId;
@@ -359,10 +359,10 @@ public:
 								host_.effectiveCwd(td2));
 							if (histPath.length > 0 && histPath.exists)
 							{
-								auto forkIds = ta.extractForkableIdsWithInfo(readText(histPath));
+							auto boundaries = ta.extractPersistedHistoryBoundaries(readText(histPath));
 								int remaining = 0;
-								foreach (ref f; forkIds)
-									if (f.isUser)
+								foreach (ref f; boundaries)
+									if (f.kind == PersistedHistoryBoundaryKind.user)
 										remaining++;
 								if (remaining < cast(int) td2.pendingSteeringTexts.length)
 									td2.pendingSteeringTexts =

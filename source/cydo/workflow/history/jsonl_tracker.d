@@ -8,7 +8,7 @@ import ae.sys.data : Data;
 import ae.sys.inotify : INotify;
 import ae.sys.timing : setTimeout, TimerTask;
 
-import cydo.agent.contract : Agent, ForkableIdInfo;
+import cydo.agent.contract : Agent, PersistedHistoryBoundary, PersistedHistoryBoundaryKind;
 import cydo.runtime.config : AgentDriver;
 import cydo.foundation.platform.inotify : RefCountedINotify;
 import cydo.domain.tasks.model : AssignUuidsMessage, ForkableUuidsMessage, TaskData, UuidAssignment, Watermark,
@@ -127,7 +127,7 @@ struct JsonlTracker
 			// File shrank — agent compacted the JSONL (e.g. Codex auto-compaction).
 			// The pre-compaction content was already saved to undoJsonl on the last
 			// normal-growth event, so don't overwrite it.  Just reset read position
-			// and skip broadcasting: the compacted forkIds (checkpoint only) are not
+			// and skip broadcasting: the compacted boundaries (checkpoint only) are not
 			// meaningful to the frontend and would overwrite valid prior assignments.
 			tracef("[jsonl] processNewJsonlContent tid=%d: file shrank (was %d, now %d) — compaction detected, skipping broadcast", tid, lastPos, fileSize);
 			jsonlReadPos[tid] = fileSize;
@@ -146,8 +146,8 @@ struct JsonlTracker
 
 		auto newContent = cast(string) got;
 		auto lineOffset = jsonlLineCount.get(tid, 0);
-		auto forkIds = getAgent(tid).extractForkableIdsWithInfo(newContent, lineOffset);
-		tracef("[jsonl] processNewJsonlContent tid=%d path=%s newBytes=%d forkIds=%d", tid, jsonlPath, got.length, forkIds.length);
+		auto boundaries = getAgent(tid).extractPersistedHistoryBoundaries(newContent, lineOffset);
+		tracef("[jsonl] processNewJsonlContent tid=%d path=%s newBytes=%d boundaries=%d", tid, jsonlPath, got.length, boundaries.length);
 
 		import std.string : lineSplitter;
 		int newLines = 0;
@@ -157,9 +157,9 @@ struct JsonlTracker
 
 		import std.algorithm : canFind;
 		bool hasRollback = newContent.canFind(`"thread_rolled_back"`);
-		if (forkIds.length > 0 || hasRollback)
+		if (boundaries.length > 0 || hasRollback)
 			// Read the full JSONL so computeAssignments can correlate IDs by
-			// global order (incremental forkIds start idx at 0 and would map
+			// global order (incremental boundaries start idx at 0 and would map
 			// turn-2 IDs to turn-1 seqs).
 			broadcastForkableUuidsFromFile(tid);
 	}
@@ -232,7 +232,7 @@ struct JsonlTracker
 			return;
 
 		auto content = readText(jsonlPath);
-		auto forkIds = getAgent(tid).extractForkableIdsWithInfo(content);
+		auto boundaries = getAgent(tid).extractPersistedHistoryBoundaries(content);
 		auto td = getTask(tid);
 		auto agent = td !is null ? getAgent(tid) : null;
 		auto isClaude = agent !is null && agent.driver == AgentDriver.claude;
@@ -240,18 +240,19 @@ struct JsonlTracker
 		string[] uuids;
 		if (isClaude)
 		{
+			resolveClaudeCheckpoints(td, boundaries);
 			bool[string] onDiskAnchors;
-			foreach (ref fid; forkIds)
-				onDiskAnchors[fid.id] = true;
-			assignments = resolvePendingAssignments(tid, forkIds);
+			foreach (ref fid; boundaries)
+				onDiskAnchors[fid.anchor] = true;
+			assignments = resolvePendingAssignments(tid, boundaries);
 			foreach (anchor; td.resolvedVisibleAnchors())
 				if (anchor in onDiskAnchors)
 					uuids ~= anchor;
 		}
 		else
 		{
-			assignments = computeAssignments(tid, forkIds);
-			uuids = forkIds.map!(f => f.id).array;
+			assignments = computeAssignments(tid, boundaries);
+			uuids = boundaries.map!(f => f.anchor).array;
 		}
 		if (uuids.length > 0)
 			ws.send(Data(toJson(ForkableUuidsMessage("forkable_uuids", tid, uuids)).representation));
@@ -279,10 +280,10 @@ struct JsonlTracker
 			return;
 		}
 
-		auto forkIds = ta.extractForkableIdsWithInfo(readText(jsonlPath));
-		tracef("[jsonl] broadcastForkableUuidsFromFile tid=%d forkIds=%d path=%s", tid, forkIds.length, jsonlPath);
-		if (forkIds.length > 0)
-			broadcastForkableUuidsWithAssignments(tid, forkIds);
+		auto boundaries = ta.extractPersistedHistoryBoundaries(readText(jsonlPath));
+		tracef("[jsonl] broadcastForkableUuidsFromFile tid=%d boundaries=%d path=%s", tid, boundaries.length, jsonlPath);
+		if (boundaries.length > 0)
+			broadcastForkableUuidsWithAssignments(tid, boundaries);
 	}
 
 	/// Broadcast forkable UUIDs to subscribed clients.
@@ -293,7 +294,7 @@ struct JsonlTracker
 	}
 
 	/// Broadcast forkable UUIDs and their seq assignments to subscribed clients.
-	void broadcastForkableUuidsWithAssignments(int tid, ForkableIdInfo[] forkIds)
+	void broadcastForkableUuidsWithAssignments(int tid, PersistedHistoryBoundary[] boundaries)
 	{
 		import std.algorithm : map;
 		import std.array : array;
@@ -306,18 +307,19 @@ struct JsonlTracker
 		string[] uuids;
 		if (isClaude)
 		{
+			resolveClaudeCheckpoints(td, boundaries);
 			bool[string] onDiskAnchors;
-			foreach (ref fid; forkIds)
-				onDiskAnchors[fid.id] = true;
-			assignments = resolvePendingAssignments(tid, forkIds);
+			foreach (ref fid; boundaries)
+				onDiskAnchors[fid.anchor] = true;
+			assignments = resolvePendingAssignments(tid, boundaries);
 			foreach (anchor; td.resolvedVisibleAnchors())
 				if (anchor in onDiskAnchors)
 					uuids ~= anchor;
 		}
 		else
 		{
-			assignments = computeAssignments(tid, forkIds);
-			uuids = forkIds.map!(f => f.id).array;
+			assignments = computeAssignments(tid, boundaries);
+			uuids = boundaries.map!(f => f.anchor).array;
 		}
 		sendToSubscribed(tid, toJson(ForkableUuidsMessage("forkable_uuids", tid, uuids)));
 
@@ -326,7 +328,7 @@ struct JsonlTracker
 	}
 
 	/// Compute seq→UUID assignments by correlating JSONL forkable IDs with history events.
-	UuidAssignment[] computeAssignments(int tid, ForkableIdInfo[] forkIds)
+	UuidAssignment[] computeAssignments(int tid, PersistedHistoryBoundary[] boundaries)
 	{
 		import std.algorithm : canFind;
 		import std.logger : tracef;
@@ -356,22 +358,22 @@ struct JsonlTracker
 			});
 		}
 
-		tracef("[jsonl] computeAssignments tid=%d forkIds=%d userSeqs=%s assistantSeqs=%s histLen=%d",
-			tid, forkIds.length, userSeqs, assistantSeqs, td.history.length);
+		tracef("[jsonl] computeAssignments tid=%d boundaries=%d userSeqs=%s assistantSeqs=%s histLen=%d",
+			tid, boundaries.length, userSeqs, assistantSeqs, td.history.length);
 
 		// Match forkable IDs to history seqs by order
 		size_t userForkIds;
-		foreach (ref fid; forkIds)
-			if (fid.isUser)
+		foreach (ref fid; boundaries)
+			if (fid.kind == PersistedHistoryBoundaryKind.user)
 				userForkIds++;
 		auto leadingUserForkIdsToSkip = userForkIds > userSeqs.length
 			? userForkIds - userSeqs.length : 0;
 
 		size_t userIdx, assistantIdx;
 		UuidAssignment[] result;
-		foreach (ref fid; forkIds)
+		foreach (ref fid; boundaries)
 		{
-			if (fid.isUser)
+			if (fid.kind == PersistedHistoryBoundaryKind.user)
 			{
 				if (leadingUserForkIdsToSkip > 0)
 				{
@@ -379,13 +381,13 @@ struct JsonlTracker
 					continue;
 				}
 				if (userIdx < userSeqs.length)
-					result ~= UuidAssignment(fid.id, userSeqs[userIdx]);
+					result ~= UuidAssignment(fid.anchor, userSeqs[userIdx]);
 				userIdx++;
 			}
 			else
 			{
 				if (assistantIdx < assistantSeqs.length)
-					result ~= UuidAssignment(fid.id, assistantSeqs[assistantIdx]);
+					result ~= UuidAssignment(fid.anchor, assistantSeqs[assistantIdx]);
 				assistantIdx++;
 			}
 		}
@@ -399,8 +401,15 @@ struct JsonlTracker
 			&& id[0 .. "enqueue-".length] == "enqueue-";
 	}
 
+	private void resolveClaudeCheckpoints(TaskData* task,
+		ref PersistedHistoryBoundary[] boundaries)
+	{
+		foreach (ref boundary; boundaries)
+			boundary.checkpointUuid = task.checkpointUuidForAnchor(boundary.anchor);
+	}
+
 	/// Resolve pending visible-turn anchors against enqueue IDs seen in JSONL.
-	private UuidAssignment[] resolvePendingAssignments(int tid, ForkableIdInfo[] forkIds)
+	private UuidAssignment[] resolvePendingAssignments(int tid, PersistedHistoryBoundary[] boundaries)
 	{
 		import std.algorithm : sort;
 		import std.logger : tracef;
@@ -420,16 +429,16 @@ struct JsonlTracker
 
 		string[] availableEnqueueAnchors;
 		bool[string] availableSeen;
-		foreach (ref fid; forkIds)
+		foreach (ref fid; boundaries)
 		{
-			if (!fid.isUser || !isEnqueueAnchor(fid.id))
+			if (fid.kind != PersistedHistoryBoundaryKind.user || !isEnqueueAnchor(fid.anchor))
 				continue;
-			if (fid.id in usedEnqueueAnchors)
+			if (fid.anchor in usedEnqueueAnchors)
 				continue;
-			if (fid.id in availableSeen)
+			if (fid.anchor in availableSeen)
 				continue;
-			availableSeen[fid.id] = true;
-			availableEnqueueAnchors ~= fid.id;
+			availableSeen[fid.anchor] = true;
+			availableEnqueueAnchors ~= fid.anchor;
 		}
 
 		tracef("[jsonl] resolvePendingAssignments tid=%d pending=%d availableEnqueue=%d",
@@ -455,6 +464,27 @@ struct JsonlTracker
 
 unittest
 {
+	TaskData task = TaskData(1, "", "");
+	task.registerVisibleTurnAnchor(1, true, false, "user-anchor", "user-checkpoint", false);
+	task.registerVisibleTurnAnchor(2, false, false, "agent-anchor", "agent-checkpoint", false);
+	task.registerVisibleTurnAnchor(3, true, false, "pending-anchor", "pending-checkpoint", true);
+	PersistedHistoryBoundary[] boundaries = [
+		PersistedHistoryBoundary("user-anchor", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("agent-anchor", PersistedHistoryBoundaryKind.agent_turn, null),
+		PersistedHistoryBoundary("missing-anchor", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("pending-anchor", PersistedHistoryBoundaryKind.user, null),
+	];
+
+	JsonlTracker tracker;
+	tracker.resolveClaudeCheckpoints(&task, boundaries);
+	assert(boundaries[0].checkpointUuid == "user-checkpoint");
+	assert(boundaries[1].checkpointUuid == "agent-checkpoint");
+	assert(boundaries[2].checkpointUuid.length == 0);
+	assert(boundaries[3].checkpointUuid.length == 0);
+}
+
+unittest
+{
 	import std.algorithm : canFind;
 
 	TaskData td = TaskData(1, "", "");
@@ -466,12 +496,12 @@ unittest
 	tracker.getTask = (int tid) => tid == 1 ? &td : null;
 	tracker.sendToSubscribed = (int, string) {};
 
-	ForkableIdInfo[] forkIds = [
-		ForkableIdInfo("user-one", true),
-		ForkableIdInfo("enqueue-22", true),
-		ForkableIdInfo("raw-steering", true),
+	PersistedHistoryBoundary[] boundaries = [
+		PersistedHistoryBoundary("user-one", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("enqueue-22", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("raw-steering", PersistedHistoryBoundaryKind.user, null),
 	];
-	auto assignments = tracker.resolvePendingAssignments(1, forkIds);
+	auto assignments = tracker.resolvePendingAssignments(1, boundaries);
 	assert(assignments.length == 1);
 	assert(assignments[0].seq == 13);
 	assert(assignments[0].uuid == "enqueue-22");
@@ -498,10 +528,10 @@ unittest
 		callbackAnchor = anchor;
 	};
 
-	ForkableIdInfo[] forkIds = [
-		ForkableIdInfo("enqueue-22", true),
+	PersistedHistoryBoundary[] boundaries = [
+		PersistedHistoryBoundary("enqueue-22", PersistedHistoryBoundaryKind.user, null),
 	];
-	auto assignments = tracker.resolvePendingAssignments(1, forkIds);
+	auto assignments = tracker.resolvePendingAssignments(1, boundaries);
 	assert(assignments.length == 1);
 	assert(callbackCount == 1);
 	assert(callbackSeq == 13);
@@ -525,16 +555,16 @@ unittest
 
 	// Extra raw user/assistant IDs (tool-result-only users, meta users, API-error
 	// assistant lines) must not shift pending steering anchors.
-	ForkableIdInfo[] forkIds = [
-		ForkableIdInfo("tool-result-user-uuid", true),
-		ForkableIdInfo("enqueue-3", true),   // already used, must be skipped
-		ForkableIdInfo("assistant-api-error", false),
-		ForkableIdInfo("enqueue-8", true),
-		ForkableIdInfo("meta-user-uuid", true),
-		ForkableIdInfo("enqueue-12", true),
+	PersistedHistoryBoundary[] boundaries = [
+		PersistedHistoryBoundary("tool-result-user-uuid", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("enqueue-3", PersistedHistoryBoundaryKind.user, null),   // already used, must be skipped
+		PersistedHistoryBoundary("assistant-api-error", PersistedHistoryBoundaryKind.agent_turn, null),
+		PersistedHistoryBoundary("enqueue-8", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("meta-user-uuid", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("enqueue-12", PersistedHistoryBoundaryKind.user, null),
 	];
 
-	auto assignments = tracker.resolvePendingAssignments(1, forkIds);
+	auto assignments = tracker.resolvePendingAssignments(1, boundaries);
 	assert(assignments.length == 2);
 	assignments.sort!((a, b) => a.seq < b.seq);
 	assert(assignments[0].seq == 20 && assignments[0].uuid == "enqueue-8");
@@ -553,15 +583,15 @@ unittest
 	JsonlTracker tracker;
 	tracker.getTask = (int tid) => tid == 1 ? &td : null;
 
-	ForkableIdInfo[] forkIds = [
-		ForkableIdInfo("hidden-context-user", true),
-		ForkableIdInfo("visible-user-one", true),
-		ForkableIdInfo("visible-assistant-one", false),
-		ForkableIdInfo("visible-user-two", true),
-		ForkableIdInfo("visible-assistant-two", false),
+	PersistedHistoryBoundary[] boundaries = [
+		PersistedHistoryBoundary("hidden-context-user", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("visible-user-one", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("visible-assistant-one", PersistedHistoryBoundaryKind.agent_turn, null),
+		PersistedHistoryBoundary("visible-user-two", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("visible-assistant-two", PersistedHistoryBoundaryKind.agent_turn, null),
 	];
 
-	auto assignments = tracker.computeAssignments(1, forkIds);
+	auto assignments = tracker.computeAssignments(1, boundaries);
 	assert(assignments.length == 4);
 	assert(assignments[0].uuid == "visible-user-one" && assignments[0].seq == 0);
 	assert(assignments[1].uuid == "visible-assistant-one" && assignments[1].seq == 1);

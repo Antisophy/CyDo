@@ -7,7 +7,7 @@ import std.typecons : Nullable;
 
 import ae.utils.json : JSONFragment, JSONOptional, JSONPartial, jsonParse, toJson;
 
-import cydo.agent.contract : ForkableIdInfo;
+import cydo.agent.contract : PersistedHistoryBoundary, PersistedHistoryBoundaryKind;
 import cydo.protocol : ContentBlock, makeUnrecognizedEvent;
 
 package enum ForkableMessageRole
@@ -118,8 +118,8 @@ string[] applyRollbackToIds(string[] ids, uint numTurns)
 	return ids[0 .. $ - toRemove];
 }
 
-/// Apply a rollback to a list of ForkableIdInfo: remove the last N user-turn groups.
-ForkableIdInfo[] applyRollbackToIdsWithInfo(ForkableIdInfo[] ids, uint numTurns)
+/// Apply a rollback to persisted history boundaries: remove the last N user-turn groups.
+PersistedHistoryBoundary[] applyRollbackToIdsWithInfo(PersistedHistoryBoundary[] ids, uint numTurns)
 {
 	if (numTurns == 0 || ids.length == 0)
 		return ids;
@@ -128,7 +128,7 @@ ForkableIdInfo[] applyRollbackToIdsWithInfo(ForkableIdInfo[] ids, uint numTurns)
 	uint usersSeen = 0;
 	for (size_t i = ids.length; i > 0; i--)
 	{
-		if (ids[i - 1].isUser)
+		if (ids[i - 1].kind == PersistedHistoryBoundaryKind.user)
 		{
 			usersSeen++;
 			if (usersSeen >= numTurns)
@@ -139,11 +139,11 @@ ForkableIdInfo[] applyRollbackToIdsWithInfo(ForkableIdInfo[] ids, uint numTurns)
 	return [];
 }
 
-package ForkableIdInfo[] extractForkableIdsWithInfoImpl(string content, int lineOffset = 0)
+package PersistedHistoryBoundary[] extractPersistedHistoryBoundariesImpl(string content, int lineOffset = 0)
 {
 	import std.string : lineSplitter;
 
-	ForkableIdInfo[] ids;
+	PersistedHistoryBoundary[] ids;
 	int lineNum = lineOffset;
 	// Codex prepends system context as a role=user response_item before the
 	// first task_started event. Skip role=user lines until task_started is seen
@@ -172,7 +172,8 @@ package ForkableIdInfo[] extractForkableIdsWithInfoImpl(string content, int line
 			continue;
 		if (probe.isUserMessage && isCodexContextOnlyUserMessageLine(line))
 			continue;
-		ids ~= ForkableIdInfo("line:" ~ to!string(lineNum), probe.isUserMessage);
+		ids ~= PersistedHistoryBoundary("line:" ~ to!string(lineNum),
+			probe.isUserMessage ? PersistedHistoryBoundaryKind.user : PersistedHistoryBoundaryKind.agent_turn, null);
 	}
 	return ids;
 }
@@ -242,12 +243,12 @@ struct CodexActiveUserTurnsAfterResult
 /// describing whether the target is missing from active history or non-user.
 CodexActiveUserTurnsAfterResult countActiveUserTurnsAfterForkId(string content, string forkId)
 {
-	auto ids = extractForkableIdsWithInfoImpl(content);
+	auto ids = extractPersistedHistoryBoundariesImpl(content);
 
 	size_t targetIdx = size_t.max;
 	foreach (i, ref idInfo; ids)
 	{
-		if (idInfo.id == forkId)
+		if (idInfo.anchor == forkId)
 		{
 			targetIdx = i;
 			break;
@@ -256,7 +257,7 @@ CodexActiveUserTurnsAfterResult countActiveUserTurnsAfterForkId(string content, 
 
 	if (targetIdx == size_t.max)
 		return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.targetMissing, 0, 0);
-	if (!ids[targetIdx].isUser)
+	if (ids[targetIdx].kind != PersistedHistoryBoundaryKind.user)
 		return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.targetNotUser, 0, 0);
 
 	int count = 0;
@@ -266,7 +267,7 @@ CodexActiveUserTurnsAfterResult countActiveUserTurnsAfterForkId(string content, 
 	bool inUserTurn = true;
 	foreach (ref idInfo; ids[targetIdx + 1 .. $])
 	{
-		if (idInfo.isUser)
+		if (idInfo.kind == PersistedHistoryBoundaryKind.user)
 		{
 			count++;
 			if (!inUserTurn)
@@ -392,20 +393,20 @@ unittest
 
 	// Test applyRollbackToIdsWithInfo
 	auto ids = [
-		ForkableIdInfo("line:1", true),
-		ForkableIdInfo("line:2", false),
-		ForkableIdInfo("line:3", true),
-		ForkableIdInfo("line:4", false),
-		ForkableIdInfo("line:5", true),
-		ForkableIdInfo("line:6", false),
+		PersistedHistoryBoundary("line:1", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("line:2", PersistedHistoryBoundaryKind.agent_turn, null),
+		PersistedHistoryBoundary("line:3", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("line:4", PersistedHistoryBoundaryKind.agent_turn, null),
+		PersistedHistoryBoundary("line:5", PersistedHistoryBoundaryKind.user, null),
+		PersistedHistoryBoundary("line:6", PersistedHistoryBoundaryKind.agent_turn, null),
 	];
 	auto rolled1 = applyRollbackToIdsWithInfo(ids, 1);
 	assert(rolled1.length == 4, "rollback 1 should remove last user turn group");
-	assert(rolled1[$ - 1].id == "line:4");
+	assert(rolled1[$ - 1].anchor == "line:4");
 
 	auto rolled2 = applyRollbackToIdsWithInfo(ids, 2);
 	assert(rolled2.length == 2, "rollback 2 should remove last 2 user turn groups");
-	assert(rolled2[$ - 1].id == "line:2");
+	assert(rolled2[$ - 1].anchor == "line:2");
 
 	auto rolledAll = applyRollbackToIdsWithInfo(ids, 10);
 	assert(rolledAll.length == 0, "rollback > total should remove everything");

@@ -47,10 +47,17 @@ struct SessionMeta
 	bool hasMessages;   /// Whether the session contains any user messages
 }
 
-/// Forkable ID with user/assistant classification.
-struct ForkableIdInfo {
-	string id;
-	bool isUser;  // true = user message, false = assistant
+enum PersistedHistoryBoundaryKind
+{
+	user,
+	agent_turn,
+}
+
+/// Persisted history boundary with its public kind and optional checkpoint.
+struct PersistedHistoryBoundary {
+	string anchor;
+	PersistedHistoryBoundaryKind kind;
+	string checkpointUuid;
 }
 
 /// Describes an agent type: its sandbox requirements, git identity,
@@ -138,9 +145,8 @@ interface Agent
 	/// (used when extracting from a partial read of the file).
 	string[] extractForkableIds(string content, int lineOffset = 0);
 
-	/// Extract forkable identifiers with user/assistant classification.
-	/// Same as extractForkableIds but includes whether each ID is a user message.
-	ForkableIdInfo[] extractForkableIdsWithInfo(string content, int lineOffset = 0);
+	/// Extract persisted history boundaries with explicit kinds.
+	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0);
 
 	/// Check whether a raw JSONL line (at 1-based lineNum) matches a fork ID.
 	/// Used by truncation/fork logic to find the cut point.

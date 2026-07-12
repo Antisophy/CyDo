@@ -1056,3 +1056,26 @@ unittest
 	assert(replayedDiagnostic.subject == subject && replayedDiagnostic.body == body);
 	assert(replayedDiagnostic.severity == "error");
 }
+
+unittest
+{
+	import cydo.agent.contract : PersistedHistoryBoundaryKind;
+	import cydo.agent.drivers.claude : ClaudeCodeAgent;
+
+	auto agent = new ClaudeCodeAgent();
+	auto boundaries = agent.extractPersistedHistoryBoundaries(
+		`{"type":"queue-operation","operation":"enqueue"}` ~ "\n" ~
+		`{"type":"user","uuid":"user-checkpoint"}` ~ "\n" ~
+		`{"type":"assistant","uuid":"agent-checkpoint"}`);
+
+	assert(boundaries.length == 3);
+	assert(boundaries[0].anchor == "enqueue-1");
+	assert(boundaries[0].kind == PersistedHistoryBoundaryKind.user);
+	assert(boundaries[0].checkpointUuid.length == 0);
+	assert(boundaries[1].anchor == "user-checkpoint");
+	assert(boundaries[1].kind == PersistedHistoryBoundaryKind.user);
+	assert(boundaries[1].checkpointUuid.length == 0);
+	assert(boundaries[2].anchor == "agent-checkpoint");
+	assert(boundaries[2].kind == PersistedHistoryBoundaryKind.agent_turn);
+	assert(boundaries[2].checkpointUuid.length == 0);
+}

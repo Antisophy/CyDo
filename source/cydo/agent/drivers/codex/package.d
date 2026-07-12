@@ -18,7 +18,7 @@ import ae.utils.serialization.store : SerializedObject;
 private alias SO = SerializedObject!(immutable char);
 import ae.utils.promise : Promise, resolve;
 
-import cydo.agent.contract : Agent, DiscoveredSession, ForkableIdInfo, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
+import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
 import cydo.agent.process : AgentProcess, FramingMode;
 import cydo.agent.drivers.codex.app_server : CodexSessionRouteTarget;
 public import cydo.agent.drivers.codex.process : AppServerProcess;
@@ -711,9 +711,9 @@ class CodexAgent : Agent
 		return ids;
 	}
 
-	ForkableIdInfo[] extractForkableIdsWithInfo(string content, int lineOffset = 0)
+	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0)
 	{
-		return extractForkableIdsWithInfoImpl(content, lineOffset);
+		return extractPersistedHistoryBoundariesImpl(content, lineOffset);
 	}
 
 	bool forkIdMatchesLine(string line, int lineNum, string forkId)

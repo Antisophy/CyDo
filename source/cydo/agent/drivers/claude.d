@@ -13,7 +13,7 @@ import ae.utils.json : JSONExtras, JSONFragment, JSONName, JSONOptional, JSONPar
 import ae.utils.promise : Promise;
 import ae.utils.time.types : AbsTime;
 
-import cydo.agent.contract : Agent, DiscoveredSession, ForkableIdInfo, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
+import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary, PersistedHistoryBoundaryKind, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
 import cydo.protocol;
 import cydo.agent.process : AgentProcess, FramingMode;
 import cydo.agent.session : AgentSession;
@@ -447,13 +447,13 @@ class ClaudeCodeAgent : Agent
 		return ids;
 	}
 
-	ForkableIdInfo[] extractForkableIdsWithInfo(string content, int lineOffset = 0)
+	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0)
 	{
 		import std.algorithm : canFind;
 		import std.format : format;
 		import std.string : indexOf, lineSplitter;
 
-		ForkableIdInfo[] ids;
+		PersistedHistoryBoundary[] ids;
 		int lineNum = lineOffset;
 		foreach (line; content.lineSplitter)
 		{
@@ -468,7 +468,7 @@ class ClaudeCodeAgent : Agent
 				{
 					auto qop = jsonParse!QueueOpProbe(line);
 					if (qop.operation == "enqueue")
-						ids ~= ForkableIdInfo(format!"enqueue-%d"(lineNum), true);
+						ids ~= PersistedHistoryBoundary(format!"enqueue-%d"(lineNum), PersistedHistoryBoundaryKind.user, null);
 				}
 				catch (Exception e) { tracef("history scan: queue op parse error: %s", e.msg); }
 				continue;
@@ -483,7 +483,12 @@ class ClaudeCodeAgent : Agent
 				auto start = idx + prefix.length;
 				auto end = line.indexOf('"', start);
 				if (end >= 0 && end > idx + cast(ptrdiff_t) prefix.length)
-					ids ~= ForkableIdInfo(line[start .. end], isUser);
+				{
+					auto uuid = line[start .. end];
+					ids ~= PersistedHistoryBoundary(uuid,
+						isUser ? PersistedHistoryBoundaryKind.user : PersistedHistoryBoundaryKind.agent_turn,
+						null);
+				}
 			}
 		}
 		return ids;

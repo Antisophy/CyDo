@@ -14,7 +14,7 @@ import cydo.agent.sdk : SdkProcess, SdkSessionHandler,
 	SdkPermissionRequest, SdkPermissionResult,
 	SdkToolCallRequest, SdkToolCallResult, SdkToolResult,
 	SdkEvent, EmptyResult;
-import cydo.agent.contract : Agent, DiscoveredSession, ForkableIdInfo, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
+import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary, PersistedHistoryBoundaryKind, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
 import cydo.protocol : ContentBlock, ItemCompletedEvent, ItemDeltaEvent,
 	ItemResultEvent, ItemStartedEvent, makeUnrecognizedEvent, ProcessExitEvent,
 	ProcessStderrEvent, SessionInitEvent, TranslatedEvent, TurnResultEvent,
@@ -640,13 +640,13 @@ class CopilotAgent : Agent
 		return ids;
 	}
 
-	ForkableIdInfo[] extractForkableIdsWithInfo(string content, int lineOffset = 0)
+	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0)
 	{
 		import std.string : lineSplitter;
 
 		@JSONPartial static struct TypeIdProbe { string type; string id; }
 
-		ForkableIdInfo[] ids;
+		PersistedHistoryBoundary[] ids;
 		foreach (line; content.lineSplitter)
 		{
 			if (line.length == 0)
@@ -657,7 +657,8 @@ class CopilotAgent : Agent
 				if (probe.type != "user.message" && probe.type != "assistant.message")
 					continue;
 				if (probe.id.length > 0)
-					ids ~= ForkableIdInfo(probe.id, probe.type == "user.message");
+					ids ~= PersistedHistoryBoundary(probe.id,
+						probe.type == "user.message" ? PersistedHistoryBoundaryKind.user : PersistedHistoryBoundaryKind.agent_turn, null);
 			}
 			catch (Exception) {}
 		}
