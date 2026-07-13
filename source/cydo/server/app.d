@@ -2411,6 +2411,15 @@ class App
 	private void sendKnownSystemMessage(int tid, KnownSystemMessageKind kind,
 		string body)
 	{
+		// An injected system message resumes the task's agent, so mark the task
+		// active before delivery — mirroring the user-message path. This keeps a
+		// task that is processing an injected message (and may, e.g., create
+		// sub-tasks) from being left in a non-active state.
+		auto td = tid in tasks;
+		if (td !is null && td.status != TaskStatus.active)
+			transitionTask(tid, [TaskStatus.pending, TaskStatus.alive,
+				TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
+				TaskStatus.active, TaskNotificationChange.preserve);
 		auto msg = wrapKnownSystemMessage(config.system_keyword, kind, body);
 		auto meta = systemMessageNormalizer.buildKnownSystemMessageMeta(kind);
 		sendTaskMessage(tid, [ContentBlock("text", msg)], null, meta);
