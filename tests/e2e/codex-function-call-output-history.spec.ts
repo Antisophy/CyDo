@@ -507,6 +507,98 @@ test("codex history replay renders custom exec output as one expanded tool", { t
   await expect(diagnostics).toHaveCount(diagnosticCount);
 });
 
+test("codex history replay renders wait output", { tag: "@codex-only" }, async ({
+  page,
+  restartableBackend,
+}) => {
+  const { taskUrl, rolloutPath } = await seedTaskAndLocateRollout(
+    page,
+    restartableBackend,
+  );
+  await restartableBackend.restart();
+  await page.goto(taskUrl);
+  await expect(assistantText(page, "seed-history")).toBeVisible({
+    timeout: 15_000,
+  });
+  const diagnostics = page
+    .locator(".message.system-message")
+    .filter({ hasText: "Unrecognized agent data" });
+  const diagnosticCount = await diagnostics.count();
+
+  const waitCases = [
+    ["cell_second_boundary", 999.95, "1s"],
+    ["cell_one_second", 1000, "1s"],
+    ["cell_ten_seconds", 10_000, "10s"],
+    ["cell_fractional_second", 1500, "1.5s"],
+    ["cell_minute_boundary", 59_999, "1m"],
+    ["cell_hour", 3_600_000, "1h"],
+    ["cell_hour_boundary", 3_599_999, "1h"],
+  ] as const;
+  appendFileSync(
+    rolloutPath,
+    [
+      ...waitCases.flatMap(([cellId, yieldTimeMs]) => [
+        JSON.stringify({
+          timestamp: "2026-03-27T07:35:24.000Z",
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            call_id: `call_wait_${cellId}`,
+            name: "wait",
+            arguments: JSON.stringify({
+              cell_id: cellId,
+              yield_time_ms: yieldTimeMs,
+              max_tokens: 2000,
+            }),
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-03-27T07:35:24.428Z",
+          type: "response_item",
+          payload: {
+            type: "function_call_output",
+            call_id: `call_wait_${cellId}`,
+            output: "Command finished.",
+          },
+        }),
+      ]),
+      "",
+    ].join("\n"),
+  );
+
+  await restartableBackend.restart();
+  await page.goto(taskUrl);
+  await expect(assistantText(page, "seed-history")).toBeVisible({
+    timeout: 15_000,
+  });
+
+  const waitTool = page.locator(".tool-call").filter({
+    has: page.locator(".tool-name", { hasText: "wait" }),
+  });
+  await expect(waitTool).toHaveCount(waitCases.length);
+  for (const [cellId, yieldTimeMs, duration] of waitCases) {
+    const tool = waitTool.filter({
+      has: page.locator(".tool-subtitle-tag", {
+        hasText: new RegExp(`^cell ${cellId}$`),
+      }),
+    });
+    await expect(tool.locator(".tool-subtitle-tag")).toHaveText(`cell ${cellId}`);
+    await tool.locator(".tool-header").click();
+    await expect(tool.locator(".field-label", { hasText: "cell_id:" })).toHaveCount(1);
+    await expect(tool).toContainText(cellId);
+    await expect(
+      tool.locator(".field-label", { hasText: "yield_time_ms:" }),
+    ).toHaveCount(1);
+    await expect(tool).toContainText(duration);
+    await expect(tool).not.toContainText(String(yieldTimeMs));
+    await expect(tool.locator(".field-label", { hasText: "max_tokens:" })).toHaveCount(1);
+    await expect(tool).toContainText("2000");
+    await expect(tool).toContainText("Command finished.");
+    await expect(tool.locator(".unknown-result-fields")).toHaveCount(0);
+  }
+  await expect(diagnostics).toHaveCount(diagnosticCount);
+});
+
 test("codex history replay exposes unknown response-item payloads in dev mode", { tag: "@codex-only" }, async ({
   page,
   restartableBackend,

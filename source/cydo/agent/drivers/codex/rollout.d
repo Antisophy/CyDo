@@ -965,6 +965,7 @@ unittest
 	@JSONPartial static struct ToolCompleted { string type; string item_id; JSONFragment input; }
 	@JSONPartial static struct ToolResult { string type; string item_id; JSONFragment content; }
 	@JSONPartial static struct TextBlock { string type; string text; }
+	@JSONPartial static struct WaitInput { string cell_id; uint yield_time_ms; uint max_tokens; }
 
 	auto callId = "call_exec_history";
 	auto script = "const result = await tools.exec_command({ cmd: \"pwd\" });\ntext(result.output);";
@@ -988,6 +989,33 @@ unittest
 	assert(blockCall.length == 3);
 	auto blockToolUse = jsonParse!ToolUse(blockCall[0]);
 	assert(jsonParse!(string[string])(blockToolUse.input.json)["input"] == blockScript);
+
+	// Function-call wait arguments remain structured during history replay.
+	auto waitCallId = "call_wait_history";
+	auto waitArguments = `{"cell_id":"cell_123","yield_time_ms":1000,"max_tokens":2000}`;
+	auto waitCall = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"function_call","call_id":"call_wait_history","name":"wait","arguments":`
+		~ toJson(waitArguments) ~ `}}`);
+	assert(waitCall.length == 3);
+	auto waitToolUse = jsonParse!ToolUse(waitCall[0]);
+	assert(waitToolUse.type == "item/started");
+	assert(waitToolUse.item_id == waitCallId);
+	assert(waitToolUse.name == "wait");
+	auto waitInput = jsonParse!WaitInput(waitToolUse.input.json);
+	assert(waitInput.cell_id == "cell_123");
+	assert(waitInput.yield_time_ms == 1000);
+	assert(waitInput.max_tokens == 2000);
+	auto waitCompleted = jsonParse!ToolCompleted(waitCall[1]);
+	assert(waitCompleted.item_id == waitCallId);
+
+	auto waitResult = translateRolloutResponseItem(
+		`{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_wait_history","output":"Command finished."}}`);
+	assert(waitResult.length == 1);
+	auto waitToolResult = jsonParse!ToolResult(waitResult[0]);
+	assert(waitToolResult.item_id == waitCallId);
+	auto waitBlocks = jsonParse!(TextBlock[])(waitToolResult.content.json);
+	assert(waitBlocks.length == 1);
+	assert(waitBlocks[0].text == "Command finished.");
 
 	auto result = translateRolloutResponseItem(
 		`{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_exec_history","output":[{"type":"input_text","text":"first "},{"type":"input_text","text":"second"}]}}`);

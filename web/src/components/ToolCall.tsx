@@ -685,6 +685,27 @@ function ExecInput({ input }: { input: Record<string, unknown> }) {
   );
 }
 
+function formatWaitDuration(milliseconds: number): string {
+  const rounded = (value: number) => Math.round(value * 10) / 10;
+  const roundedMilliseconds = rounded(milliseconds);
+  if (roundedMilliseconds < 1000) return `${roundedMilliseconds}ms`;
+  const seconds = rounded(milliseconds / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = rounded(milliseconds / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  return `${rounded(milliseconds / 3_600_000)}h`;
+}
+
+function WaitInput({ input }: { input: Record<string, unknown> }) {
+  const { cell_id, yield_time_ms, max_tokens, ...remaining } = input;
+  const fields: Record<string, unknown> = {};
+  if (typeof cell_id === "string") fields.cell_id = cell_id;
+  if (typeof yield_time_ms === "number")
+    fields.yield_time_ms = formatWaitDuration(yield_time_ms);
+  if (typeof max_tokens === "number") fields.max_tokens = max_tokens;
+  return formatGenericInput({ ...fields, ...remaining });
+}
+
 function ShellCommandInput({
   input,
   result,
@@ -1623,6 +1644,7 @@ const knownResultFields: Record<string, Set<string>> = {
   ]),
   "codex/local_shell_call": new Set([]),
   "codex/exec_command": new Set([]),
+  "codex/wait": new Set([]),
   "claude/Read": new Set(["type", "file"]),
   "claude/Edit": new Set([
     "filePath",
@@ -1914,6 +1936,12 @@ function getHeaderSubtitle(
     if (viewPaths.length > 1) {
       return <span class="tool-subtitle">{viewPaths.length} files</span>;
     }
+  }
+  if (
+    toolIs(name, driver, toolServer, "codex/wait") &&
+    typeof input.cell_id === "string"
+  ) {
+    return <span class="tool-subtitle-tag">cell {input.cell_id}</span>;
   }
   if (toolIs(name, driver, toolServer, "claude/Read") && filePath) {
     const offset = typeof input.offset === "number" ? input.offset : null;
@@ -2261,6 +2289,9 @@ function formatInput(
     typeof input.input === "string"
   ) {
     return <ExecInput input={input} />;
+  }
+  if (toolIs(name, driver, toolServer, "codex/wait")) {
+    return <WaitInput input={input} />;
   }
   if (
     toolIs(name, driver, toolServer, "claude/Edit") &&
@@ -2803,6 +2834,7 @@ const defaultExpandedResults = new Set([
   "codex/local_shell_call",
   "codex/exec_command",
   "codex/exec",
+  "codex/wait",
   "claude/Task",
   "claude/Agent",
   "cydo:Task",
