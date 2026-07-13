@@ -411,20 +411,31 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
     )
     .toBe(true);
 
-  const answerRouteEvents = answerEvents.slice(answerStart);
-  const waitingIndex = answerRouteEvents.findIndex(
-    (event) => event.kind === "status" && event.status === "waiting",
-  );
-  const activeIndex = answerRouteEvents.findIndex(
-    (event, index) =>
-      index > waitingIndex && event.kind === "status" && event.status === "active",
-  );
-  const firstResumedOutput = answerRouteEvents.findIndex(
-    (event, index) => index > waitingIndex && event.kind === "output",
-  );
-  expect(waitingIndex).toBeGreaterThanOrEqual(0);
-  expect(activeIndex).toBeGreaterThan(waitingIndex);
-  expect(firstResumedOutput).toBeGreaterThan(activeIndex);
+  await expect
+    .poll(
+      () => {
+        const answerRouteEvents = answerEvents.slice(answerStart);
+        const waitingIndex = answerRouteEvents.findIndex(
+          (event) => event.kind === "status" && event.status === "waiting",
+        );
+        const activeIndex = answerRouteEvents.findIndex(
+          (event, index) =>
+            index > waitingIndex &&
+            event.kind === "status" &&
+            event.status === "active",
+        );
+        const firstResumedOutput = answerRouteEvents.findIndex(
+          (event, index) => index > waitingIndex && event.kind === "output",
+        );
+        return (
+          waitingIndex >= 0 &&
+          activeIndex > waitingIndex &&
+          firstResumedOutput > activeIndex
+        );
+      },
+      { timeout: 30_000 },
+    )
+    .toBe(true);
 
   if (agentType === "claude") {
     await expect
