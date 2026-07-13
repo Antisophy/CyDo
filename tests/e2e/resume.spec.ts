@@ -677,3 +677,54 @@ test(
     await expect(page.locator(".banner-model")).toHaveText(modelBeforeRestart!);
   },
 );
+
+test("resumed waiting parent can create a sub-task after batch delivery", { tag: "@claude-only" }, async ({
+  page,
+  restartableBackend,
+}, testInfo) => {
+  test.setTimeout(150_000);
+
+  // A parent spawns 2 slow sub-tasks (in-flight at kill time) and carries a
+  // canary the mock keys off: when the resumed parent processes the batch
+  // results, the mock drives it to create another sub-task. With the fix the
+  // parent is `active` while processing the injected batch message, so the
+  // spawn succeeds; without it the parent is left `alive` and the guarded
+  // pending|active -> waiting transition fails with "origin mismatch", so the
+  // follow-up sub-task is never created.
+  await page.goto("/");
+  await page.locator('button[title="New task"]').first().click();
+  const input = page.locator(".input-textarea:visible").first();
+  await expect(input).toBeEnabled({ timeout: 15_000 });
+  await input.fill(
+    "RESPAWN-AFTER-RESUME call 2 tasks research run command sleep 30",
+  );
+  const sendBtn = page.locator(".btn-send:visible").first();
+  await expect(sendBtn).toBeEnabled({ timeout: 5_000 });
+  await sendBtn.click();
+
+  // Parent + 2 children in the sidebar, both running the slow command.
+  const allTaskItems = page.locator(".sidebar-item:not(.sidebar-new-task)");
+  await expect(allTaskItems).toHaveCount(3, { timeout: 30_000 });
+  await openRunningChildTask(page, "Test task 1", "sleep 30");
+  await openRunningChildTask(page, "Test task 2", "sleep 30");
+
+  // Restart while both sub-tasks are in-flight → the waiting parent receives
+  // batch results on resume and (with the fix) spawns the follow-up sub-task.
+  await restartableBackend.restart();
+  await page.goto("/");
+
+  // Navigate to the parent (lowest tid → last in desc-sorted sidebar).
+  const parent = page
+    .locator(".sidebar-item:not(.sidebar-new-task)")
+    .last();
+  await expect(parent).toBeVisible({ timeout: 15_000 });
+  await parent.click();
+
+  // The follow-up sub-task's result reaching the parent proves the resumed
+  // parent successfully created a new sub-task after batch delivery.
+  await expect(
+    page
+      .locator('[style*="display: contents"] .message-list')
+      .getByText("respawn-child-done", { exact: true }),
+  ).toBeVisible({ timeout: 90_000 });
+});

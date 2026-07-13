@@ -1070,6 +1070,35 @@ function handleMessages(req, res) {
       return;
     }
 
+    // Regression (resume.spec.ts "resumed waiting parent can create a sub-task"):
+    // a parent resumed to process sub-task batch results must be able to spawn
+    // another sub-task. Keyed off a canary in the parent's original message so
+    // this only affects that test's batch-result resume turn.
+    const resumeOrig = findOriginalUserText(messages);
+    if (
+      /Process these results as if they were returned normally by the Task tool/i.test(
+        userText,
+      ) &&
+      resumeOrig &&
+      resumeOrig.includes("RESPAWN-AFTER-RESUME")
+    ) {
+      streamToolUseResponse(
+        res,
+        "mcp__cydo__Task",
+        {
+          tasks: [
+            {
+              task_type: "research",
+              description: "respawn child",
+              prompt: 'reply with "respawn-child-done"',
+            },
+          ],
+        },
+        model,
+      );
+      return;
+    }
+
     const intent = matchPattern(userText);
     if (hasImages && intent.type === "text") {
       intent.text = "image received";
