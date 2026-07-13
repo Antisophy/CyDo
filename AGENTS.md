@@ -88,7 +88,7 @@ All source in `web/src/`. Pure functional components with hooks.
 
 - `useSessionManager.ts` — Central custom hook: WebSocket connection, session state map, message dispatch
 - `sessionReducer.ts` — Pure reducers for processing Claude output into display state
-- `schemas.ts` — Zod schemas validating Claude Code's stream-json wire protocol
+- Protocol DTOs are authored in `source/cydo/protocol/package.d`, generated into `web/src/generated/protocol.ts`, and assembled into the frontend event union in `protocol.ts`
 - `connection.ts` — WebSocket client class
 - `ansi.ts` — ANSI escape sequence parser for colored Bash output
 - `highlight.ts` — Shiki-based syntax highlighting for code blocks
