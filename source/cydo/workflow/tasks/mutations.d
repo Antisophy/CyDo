@@ -53,7 +53,6 @@ struct TaskMutationServiceHost
 	void delegate(int tid, string agentSessionId) setAgentSessionId;
 	void delegate(int tid, string relationType) setRelationType;
 	void delegate(int tid, string title) setTitle;
-	void delegate(int tid, string status) persistStatus;
 	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
 		TaskNotificationChange notification) transitionTask;
 	void delegate(int tid, TaskStatus[] expectedFrom, TaskStatus to,
@@ -777,13 +776,14 @@ private:
 				auto current = host_.getTask(tid);
 				assert(current !is null,
 					"Undo task must exist while auto-resume is scheduled");
-				current.status = TaskStatus.active;
-				host_.persistStatus(tid, "active");
+				host_.transitionTaskFrom(tid,
+					[TaskStatus.pending, TaskStatus.alive, TaskStatus.waiting,
+						TaskStatus.completed, TaskStatus.failed], TaskStatus.active,
+					TaskNotificationChange.preserve);
 				try
 					host_.generateSuggestions(tid);
 				catch (Exception e)
 					warningf("Error generating suggestions: %s", e.msg);
-				host_.broadcastTaskUpdate(tid);
 			}).ignoreResult();
 		}
 

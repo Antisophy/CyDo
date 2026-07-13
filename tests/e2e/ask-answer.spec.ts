@@ -420,7 +420,7 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
       index > waitingIndex && event.kind === "status" && event.status === "active",
   );
   const firstResumedOutput = answerRouteEvents.findIndex(
-    (event, index) => index > activeIndex && event.kind === "output",
+    (event, index) => index > waitingIndex && event.kind === "output",
   );
   expect(waitingIndex).toBeGreaterThanOrEqual(0);
   expect(activeIndex).toBeGreaterThan(waitingIndex);

@@ -321,9 +321,6 @@ class App
 			persistTitle: (int tid, string title) {
 				persistence.setTitle(tid, title);
 			},
-			persistStatus: (int tid, string status) {
-				persistence.setStatus(tid, status);
-			},
 			transitionTask: &transitionTask,
 			transitionTaskFrom: &transitionTask,
 			persistNeedsAttention: (int tid, bool needsAttention) {
@@ -383,6 +380,9 @@ class App
 			ensureProcessQueueAlive: (int tid) {
 				assert((tid in tasks) !is null,
 					format!"Process queue requested for missing task %d"(tid));
+				if (tasks[tid].status == TaskStatus.pending)
+					transitionTask(tid, TaskStatus.pending, TaskStatus.active,
+						TaskNotificationChange.preserve);
 				return tasks[tid].processQueue.setGoal(ProcessState.Alive);
 			},
 			sendTaskMessage: &sendTaskMessage,
@@ -417,6 +417,10 @@ class App
 					format!"WorkflowTools reactivation requested for missing task %d"(tid));
 				assert(td.processQueue !is null,
 					format!"WorkflowTools reactivation requested without process queue for task %d"(tid));
+				if (td.status != TaskStatus.active)
+					transitionTask(tid, [TaskStatus.pending, TaskStatus.alive,
+						TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
+						TaskStatus.active, TaskNotificationChange.preserve);
 				td.processQueue.setGoal(ProcessState.Alive).then(onReady).ignoreResult();
 			},
 			canSendSystemMessage: &canSendSystemMessage,
@@ -568,7 +572,7 @@ class App
 			},
 			broadcastAppendedTaskEvent: &broadcastAppendedTaskEvent,
 			sendAgentAck: &sendAgentAck,
-			broadcastTaskUpdate: &broadcastTaskUpdate,
+			publishTaskSnapshot: &broadcastTaskUpdate,
 			onTaskTurnCompletedAlive: &onTaskTurnCompletedAlive,
 			drainIdleCallbacksForTurnResult: &drainIdleCallbacksForTurnResult,
 			drainIdleCallbacksOnExit: &drainIdleCallbacksOnExit,
@@ -593,9 +597,6 @@ class App
 			touchAndPersistLastActive: &touchAndPersistLastActive,
 			findAliveAncestor: &findAliveAncestor,
 			broadcastFocusHint: &broadcastFocusHint,
-			persistStatus: (int tid, string status) {
-				persistence.setStatus(tid, status);
-			},
 			transitionTask: &transitionTask,
 			transitionTaskFrom: &transitionTask,
 			persistResultText: (int tid, string resultText) {
@@ -656,9 +657,6 @@ class App
 			},
 			setTitle: (int tid, string title) {
 				persistence.setTitle(tid, title);
-			},
-			persistStatus: (int tid, string status) {
-				persistence.setStatus(tid, status);
 			},
 			transitionTask: &transitionTask,
 			transitionTaskFrom: &transitionTask,
@@ -1594,13 +1592,11 @@ class App
 		}
 		derivedTextJobs.clearSuggestions(tid);
 		auto msgNonce = json.correlation_id;
+		if (td.status != TaskStatus.active)
+			transitionTask(tid, [TaskStatus.pending, TaskStatus.alive,
+				TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
+				TaskStatus.active, TaskNotificationChange.preserve);
 		td.processQueue.setGoal(ProcessState.Alive).then(() {
-			auto td = &tasks[tid];
-			if (td.status == "alive")
-			{
-				td.status = TaskStatus.active;
-				persistence.setStatus(tid, "active");
-			}
 			sendTaskMessage(tid, messageToSend, blocks, userMsgMeta, msgNonce);
 		}).ignoreResult();
 
@@ -1647,13 +1643,10 @@ class App
 			return;
 		if (taskAlive(tid))
 			return;
-		td.needsAttention = false;
-		persistence.setNeedsAttention(tid, false);
-		td.notificationBody = "";
+		transitionTask(tid, [TaskStatus.pending, TaskStatus.active,
+			TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
+			TaskStatus.alive, TaskNotificationChange.clearAttention);
 		td.processQueue.setGoal(ProcessState.Alive).then(() {
-			auto td = &tasks[tid];
-			td.status = TaskStatus.alive;
-			persistence.setStatus(tid, "alive");
 			try
 				derivedTextJobs.generateSuggestions(tid);
 			catch (Exception e)
@@ -1661,7 +1654,6 @@ class App
 
 			workflowTools.deliverBatchFallbackIfReady(tid);
 
-			broadcastTaskUpdate(tid);
 		}).ignoreResult();
 	}
 
@@ -2297,14 +2289,18 @@ class App
 		if (tid !in tasks)
 			return;
 		auto td = &tasks[tid];
-		td.status = TaskStatus.alive;
-		persistence.setStatus(tid, "alive");
 		td.needsAttention = true;
 		persistence.setNeedsAttention(tid, true);
 		td.notificationBody = td.resultText.length > 0
 			? truncateTitle(td.resultText, 200)
 			: extractLastAssistantText(tid);
 		touchAndPersistLastActive(tid);
+		if (td.status != TaskStatus.alive)
+				transitionTask(tid, [TaskStatus.active, TaskStatus.waiting, TaskStatus.completed,
+					TaskStatus.failed], TaskStatus.alive,
+				TaskNotificationChange.preserve);
+		else
+			broadcastTaskUpdate(tid);
 		try
 			derivedTextJobs.generateSuggestions(tid);
 		catch (Exception e)
@@ -2739,9 +2735,8 @@ class App
 		auto td = &tasks[tid];
 		if (td.status != "importable")
 			return;
-		td.status = TaskStatus.completed;
-		persistence.setStatus(tid, "completed");
-		broadcastTaskUpdate(tid);
+		transitionTask(tid, TaskStatus.importable, TaskStatus.completed,
+			TaskNotificationChange.preserve);
 	}
 
 	private void onConfigChanged()

@@ -45,7 +45,6 @@ struct WorkflowToolsHost
 	void delegate(int tid, int parentTid) persistParentTid;
 	void delegate(int tid, string relationType) persistRelationType;
 	void delegate(int tid, string title) persistTitle;
-	void delegate(int tid, string status) persistStatus;
 	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
 		TaskNotificationChange notification) transitionTask;
 	void delegate(int tid, TaskStatus[] expectedFrom, TaskStatus to,
@@ -1048,9 +1047,10 @@ public:
 		{
 			errorf("spawnContinuation: unknown task type '%s' for tid=%d",
 				td.taskType, tid);
-			td.status = TaskStatus.failed;
-			host_.persistStatus(tid, "failed");
-			host_.broadcastTaskUpdate(tid);
+			host_.transitionTaskFrom(tid,
+				[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
+					TaskStatus.waiting, TaskStatus.completed], TaskStatus.failed,
+				TaskNotificationChange.preserve);
 			return;
 		}
 
@@ -1059,9 +1059,10 @@ public:
 		{
 			errorf("spawnContinuation: unknown continuation '%s' for type '%s' tid=%d",
 				contKey, td.taskType, tid);
-			td.status = TaskStatus.failed;
-			host_.persistStatus(tid, "failed");
-			host_.broadcastTaskUpdate(tid);
+			host_.transitionTaskFrom(tid,
+				[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
+					TaskStatus.waiting, TaskStatus.completed], TaskStatus.failed,
+				TaskNotificationChange.preserve);
 			return;
 		}
 
@@ -1279,9 +1280,10 @@ private:
 		{
 			errorf("executeContinuation: unknown successor type '%s' for tid=%d",
 				contDef.task_type, tid);
-			td.status = TaskStatus.failed;
-			host_.persistStatus(tid, "failed");
-			host_.broadcastTaskUpdate(tid);
+			host_.transitionTaskFrom(tid,
+				[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
+					TaskStatus.waiting, TaskStatus.completed], TaskStatus.failed,
+				TaskNotificationChange.preserve);
 			return;
 		}
 
@@ -1293,13 +1295,16 @@ private:
 		if (contDef.keep_context)
 		{
 			auto sourceTaskType = td.taskType;
+			auto wasActive = td.status == TaskStatus.active;
 			td.taskType = contDef.task_type;
 			host_.persistTaskType(tid, contDef.task_type);
 
+			if (!wasActive)
+				host_.transitionTaskFrom(tid,
+					[TaskStatus.pending, TaskStatus.alive, TaskStatus.waiting,
+						TaskStatus.completed, TaskStatus.failed], TaskStatus.active,
+					TaskNotificationChange.preserve);
 			host_.emitTaskReload(tid, "continuation");
-
-			td.status = TaskStatus.active;
-			host_.persistStatus(tid, "active");
 
 			auto renderedContinuationPrompt = renderContinuationPrompt(contDef,
 				"Continue from where you left off.",
@@ -1328,6 +1333,8 @@ private:
 					null, contMeta, null);
 				sendPendingChildAnswerReminder(tid);
 			}).ignoreResult();
+			if (wasActive)
+				host_.broadcastTaskUpdate(tid);
 		}
 		else
 		{
@@ -1336,19 +1343,22 @@ private:
 			if (contAgent.length == 0
 				|| !host_.isRegisteredAgent(contAgent))
 			{
-				td.status = TaskStatus.failed;
 				td.error = format(
 					"Successor type '%s' resolved agent to '%s' (parent='%s') — not a registered agent",
 					contDef.task_type, contAgent, td.agentType);
-				host_.persistStatus(tid, "failed");
+				host_.transitionTaskFrom(tid,
+					[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
+						TaskStatus.waiting, TaskStatus.completed], TaskStatus.failed,
+					TaskNotificationChange.preserve);
 				host_.appendSynthesizedHistoryError(tid,
 					"Continuation failed", td.error);
-				host_.broadcastTaskUpdate(tid);
 				return;
 			}
 
-			td.status = TaskStatus.completed;
-			host_.persistStatus(tid, "completed");
+			host_.transitionTaskFrom(tid,
+				[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
+					TaskStatus.waiting, TaskStatus.failed], TaskStatus.completed,
+				TaskNotificationChange.preserve);
 			host_.emitTaskReload(tid, "continuation");
 
 			auto successorPrompt = handoffPrompt.length > 0
@@ -1414,8 +1424,6 @@ private:
 						handoffMsgSubject))],
 					null, handoffMeta, null);
 			}).ignoreResult();
-
-			host_.broadcastTaskUpdate(tid);
 		}
 	}
 }
@@ -1483,7 +1491,6 @@ unittest
 		persistParentTid: (int tid, int parentTid) {},
 		persistRelationType: (int tid, string relationType) {},
 		persistTitle: (int tid, string title) {},
-		persistStatus: (int tid, string status) {},
 		transitionTask: (int tid, TaskStatus expectedFrom, TaskStatus to,
 			TaskNotificationChange notification) {
 			assert(tasks[tid].status == expectedFrom);

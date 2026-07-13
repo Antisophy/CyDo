@@ -287,17 +287,17 @@ private:
 			~ "<task_results>\n" ~ resultsArray ~ "\n</task_results>\n\n"
 			~ "Continue from where you left off. Process these results as if they "
 			~ "were returned normally by the Task tool.";
-		host_.sendKnownSystemMessage(parentTid, KnownSystemMessageKind.subTaskResults,
-			body);
-
-		foreach (childTid; children)
-			host_.removeTaskDependency(parentTid, childTid);
-
 		auto td = requireTask(parentTid,
 			"Parent task must exist after sub-task batch result delivery");
 		if (td.status == TaskStatus.waiting)
 			host_.transitionTask(parentTid, TaskStatus.waiting, TaskStatus.alive,
 				TaskNotificationChange.preserve);
+
+		host_.sendKnownSystemMessage(parentTid, KnownSystemMessageKind.subTaskResults,
+			body);
+
+		foreach (childTid; children)
+			host_.removeTaskDependency(parentTid, childTid);
 	}
 
 	TaskData* requireTask(int tid, string message)

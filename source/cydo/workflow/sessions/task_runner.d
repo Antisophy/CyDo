@@ -57,7 +57,7 @@ struct TaskSessionRunnerHost
 	string delegate(int tid, string subject, string body) appendSynthesizedHistoryError;
 	void delegate(int tid, string translated) broadcastAppendedTaskEvent;
 	void delegate(int tid, string nonce) sendAgentAck;
-	void delegate(int tid) broadcastTaskUpdate;
+	void delegate(int tid) publishTaskSnapshot;
 	void delegate(int tid) onTaskTurnCompletedAlive;
 	bool delegate(int tid) drainIdleCallbacksForTurnResult;
 	void delegate(int tid) drainIdleCallbacksOnExit;
@@ -80,7 +80,6 @@ struct TaskSessionRunnerHost
 	void delegate(int tid) touchAndPersistLastActive;
 	int delegate(int tid) findAliveAncestor;
 	void delegate(int fromTid, int toTid) broadcastFocusHint;
-	void delegate(int tid, string status) persistStatus;
 	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
 		TaskNotificationChange notification) transitionTask;
 	void delegate(int tid, TaskStatus[] expectedFrom, TaskStatus to,
@@ -355,7 +354,7 @@ class TaskSessionRunner
 			if (!current.isProcessing && current.hadTurnResult)
 			{
 				current.isProcessing = true;
-				host_.broadcastTaskUpdate(tid);
+				host_.publishTaskSnapshot(tid);
 			}
 
 			if (!taskAgent.isTurnResult(ev.translated))
@@ -389,7 +388,7 @@ class TaskSessionRunner
 				{
 					if (host_.drainIdleCallbacksForTurnResult(tid))
 					{
-						host_.broadcastTaskUpdate(tid);
+						host_.publishTaskSnapshot(tid);
 						return;
 					}
 				}
@@ -430,10 +429,13 @@ class TaskSessionRunner
 				if (current.onIdleCallbacks.length > 0)
 					host_.drainIdleCallbacksOnExit(tid);
 				else
+				{
 					host_.onTaskTurnCompletedAlive(tid);
+					return;
+				}
 			}
 
-			host_.broadcastTaskUpdate(tid);
+			host_.publishTaskSnapshot(tid);
 		};
 
 		session.onAgentAck = (string nonce) {
@@ -487,7 +489,7 @@ class TaskSessionRunner
 
 			current.isProcessing = false;
 			current.stdinClosed = false;
-			if (exitCode != 0)
+			if (exitCode != 0 && current.status != TaskStatus.completed)
 				current.error = lastStderr;
 			cleanupTaskLaunch(current);
 			host_.stopJsonlWatch(tid);
@@ -543,21 +545,22 @@ class TaskSessionRunner
 				return;
 			}
 
-			if (!intentionalExit)
+			if (!intentionalExit && current.status != TaskStatus.completed)
 			{
-				current.status = TaskStatus.failed;
 				if (current.error.length == 0)
 					current.error = "Process exited unexpectedly";
 				current.resultText = current.error;
-				host_.persistStatus(tid, "failed");
 				host_.persistResultText(tid, current.resultText);
+				host_.transitionTaskFrom(tid,
+					[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
+						TaskStatus.waiting], TaskStatus.failed,
+					TaskNotificationChange.preserve);
 				if (current.relationType != "fork")
 				{
 					auto ancestor = host_.findAliveAncestor(tid);
 					if (ancestor >= 0)
 						host_.broadcastFocusHint(tid, ancestor);
 				}
-				host_.broadcastTaskUpdate(tid);
 				if (!host_.deliverFailedPendingSubTaskResult(tid))
 					host_.deliverWaitingParentResultsIfReady(tid);
 				return;
@@ -595,14 +598,28 @@ class TaskSessionRunner
 			}
 
 			bool deliveredPendingSubTask = false;
-			if (exitCode == 0 && host_.hasPendingSubTask(tid))
+			bool statusWasAlreadyTarget;
+			if (current.status == TaskStatus.completed)
+				statusWasAlreadyTarget = true;
+			else if (exitCode == 0 && host_.hasPendingSubTask(tid))
 				deliveredPendingSubTask = host_.finalizeCompletedSubTask(tid, false);
 			else
 			{
-				if (current.status != "completed")
-					current.status = exitCode == 0 ? TaskStatus.completed : TaskStatus.failed;
-				host_.persistStatus(tid, current.status);
+				auto targetStatus = exitCode == 0
+					? TaskStatus.completed : TaskStatus.failed;
 				host_.persistResultText(tid, current.resultText);
+				if (current.status != targetStatus)
+				{
+					host_.transitionTaskFrom(tid,
+						targetStatus == TaskStatus.completed
+							? [TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
+								TaskStatus.waiting, TaskStatus.failed]
+							: [TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
+								TaskStatus.waiting, TaskStatus.completed],
+						targetStatus, TaskNotificationChange.preserve);
+				}
+				else
+					statusWasAlreadyTarget = true;
 				if (current.status != TaskStatus.completed)
 					deliveredPendingSubTask = host_.deliverFailedPendingSubTaskResult(tid);
 			}
@@ -622,13 +639,16 @@ class TaskSessionRunner
 				if (ancestor >= 0)
 					host_.broadcastFocusHint(tid, ancestor);
 			}
-			if (!deliveredPendingSubTask)
-				host_.broadcastTaskUpdate(tid);
+			if (!deliveredPendingSubTask && statusWasAlreadyTarget)
+				host_.publishTaskSnapshot(tid);
 		};
 
-		td.status = TaskStatus.active;
-		host_.persistStatus(tid, "active");
 		td.error = null;
+		if (td.status == TaskStatus.pending)
+			host_.transitionTask(tid, TaskStatus.pending, TaskStatus.active,
+				TaskNotificationChange.preserve);
+		else
+			host_.publishTaskSnapshot(tid);
 	}
 
 	Promise!ProcessState delegate(ProcessState) makeProcessQueueSF(int tid)
@@ -651,20 +671,20 @@ class TaskSessionRunner
 			catch (Exception e)
 			{
 				td = requireTask(tid, "Task must exist when spawn fails");
-				td.status = TaskStatus.failed;
 				td.error = e.msg;
 				td.resultText = e.msg;
-				host_.persistStatus(tid, "failed");
 				host_.persistResultText(tid, td.resultText);
+				host_.transitionTaskFrom(tid,
+					[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
+						TaskStatus.waiting, TaskStatus.completed], TaskStatus.failed,
+					TaskNotificationChange.preserve);
 				auto translated = host_.appendSynthesizedHistoryError(
 					tid, "Failed to resume session", buildLaunchFailureBody(tid, e));
 				host_.broadcastAppendedTaskEvent(tid, translated);
-				host_.broadcastTaskUpdate(tid);
 				if (!host_.deliverFailedPendingSubTaskResult(tid))
 					host_.deliverWaitingParentResultsIfReady(tid);
 				return reject!ProcessState(e);
 			}
-			host_.broadcastTaskUpdate(tid);
 			return resolve(ProcessState.Alive);
 		}
 
@@ -736,17 +756,10 @@ class TaskSessionRunner
 		if (td is null)
 			return resolve();
 
-		auto savedStatus = td.status;
 		return td.processQueue.setGoal(ProcessState.Alive).then(() {
 			auto current = host_.getTask(tid);
 			if (current is null)
 				return;
-			if (savedStatus != "active")
-			{
-				current.status = savedStatus;
-				host_.persistStatus(tid, savedStatus);
-			}
-			host_.broadcastTaskUpdate(tid);
 		});
 	}
 
