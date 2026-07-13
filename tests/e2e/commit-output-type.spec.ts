@@ -1,184 +1,291 @@
 import { test, expect, enterSession, sendMessage } from "./fixtures";
+import { execFileSync } from "node:child_process";
 
-test("commit output enforcement fires when subtask exits without committing", { tag: "@claude-only" }, async ({
-  page,
-}) => {
-  test.setTimeout(120_000);
+function taskResultItems(payload: unknown): Record<string, unknown>[] | null {
+  if (Array.isArray(payload)) return payload as Record<string, unknown>[];
+  if (payload && typeof payload === "object") {
+    const value = payload as Record<string, unknown>;
+    if (value.structuredContent)
+      return taskResultItems(value.structuredContent);
+    if (Array.isArray(value.tasks))
+      return value.tasks as Record<string, unknown>[];
+    return [value];
+  }
+  return null;
+}
 
-  let childTid: number | null = null;
+test(
+  "commit output enforcement fires when subtask exits without committing",
+  { tag: "@claude-only" },
+  async ({ page }) => {
+    test.setTimeout(120_000);
 
-  page.on("websocket", (ws) => {
-    ws.on("framereceived", (event) => {
-      try {
-        const data = JSON.parse(event.payload.toString());
-        if (data.type === "task_created" && data.relation_type === "subtask") {
-          childTid = data.tid;
+    let childTid: number | null = null;
+
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", (event) => {
+        try {
+          const data = JSON.parse(event.payload.toString());
+          if (
+            data.type === "task_created" &&
+            data.relation_type === "subtask"
+          ) {
+            childTid = data.tid;
+          }
+        } catch {
+          /* ignore non-JSON frames */
         }
-      } catch {
-        /* ignore non-JSON frames */
-      }
+      });
     });
-  });
 
-  await enterSession(page);
-  await page.locator(".task-type-row", { hasText: "isolated" }).click();
-  await sendMessage(
-    page,
-    'call task test_commit_child reply with "no-commit-child"',
-  );
+    await enterSession(page);
+    await page.locator(".task-type-row", { hasText: "isolated" }).click();
+    await sendMessage(
+      page,
+      'call task test_commit_child reply with "no-commit-child"',
+    );
 
-  await expect
-    .poll(() => childTid, {
-      message: "expected subtask to be created",
-      timeout: 30_000,
-    })
-    .not.toBeNull();
+    await expect
+      .poll(() => childTid, {
+        message: "expected subtask to be created",
+        timeout: 30_000,
+      })
+      .not.toBeNull();
 
-  const parentItem = page.locator('.sidebar-item[data-tid="1"]');
-  const subtaskItem = page.locator(`.sidebar-item[data-tid="${childTid}"]`);
+    const parentItem = page.locator('.sidebar-item[data-tid="1"]');
+    const subtaskItem = page.locator(`.sidebar-item[data-tid="${childTid}"]`);
 
-  // Wait for the parent to complete first (which means the child has fully
-  // finished, including any enforcement retry). Then inspect the child's
-  // history for the enforcement message.
-  await parentItem.click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible();
-  await expect(
-    page
-      .locator('[style*="display: contents"] .message-list')
-      .getByText("Done.", { exact: true })
-      .last(),
-  ).toBeVisible({ timeout: 90_000 });
+    // Wait for the parent to complete first (which means the child has fully
+    // finished, including any enforcement retry). Then inspect the child's
+    // history for the enforcement message.
+    await parentItem.click();
+    await expect(
+      page.locator('.sidebar-item[data-tid="1"].active'),
+    ).toBeVisible();
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("Done.", { exact: true })
+        .last(),
+    ).toBeVisible({ timeout: 90_000 });
 
-  await subtaskItem.click();
-  await expect(
-    page.locator(`.sidebar-item[data-tid="${childTid}"].active`),
-  ).toBeVisible();
+    await subtaskItem.click();
+    await expect(
+      page.locator(`.sidebar-item[data-tid="${childTid}"].active`),
+    ).toBeVisible();
 
-  await expect(
-    page
-      .locator('[style*="display: contents"] .message-list')
-      .getByText("Missing required outputs")
-      .last(),
-  ).toBeVisible({ timeout: 30_000 });
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("Missing required outputs")
+        .last(),
+    ).toBeVisible({ timeout: 30_000 });
 
-  await expect(
-    subtaskItem.locator(".task-type-icon.completed, .task-type-icon.resumable"),
-  ).toBeVisible({ timeout: 15_000 });
-  await expect(subtaskItem.locator(".task-type-icon.processing")).not.toBeVisible();
-  await expect(subtaskItem.locator(".task-type-icon.alive")).not.toBeVisible();
-});
+    await expect(
+      subtaskItem.locator(
+        ".task-type-icon.completed, .task-type-icon.resumable",
+      ),
+    ).toBeVisible({ timeout: 15_000 });
+    await expect(
+      subtaskItem.locator(".task-type-icon.processing"),
+    ).not.toBeVisible();
+    await expect(
+      subtaskItem.locator(".task-type-icon.alive"),
+    ).not.toBeVisible();
+  },
+);
 
-test("commit output happy path: subtask commits and parent receives commits in result", { tag: "@claude-only" }, async ({
-  page,
-}) => {
-  test.setTimeout(120_000);
+test(
+  "commit output happy path: subtask commits and parent receives commits in result",
+  { tag: "@claude-only" },
+  async ({ page }) => {
+    test.setTimeout(120_000);
 
-  let childTid: number | null = null;
+    let childTid: number | null = null;
 
-  page.on("websocket", (ws) => {
-    ws.on("framereceived", (event) => {
-      try {
-        const data = JSON.parse(event.payload.toString());
-        if (data.type === "task_created" && data.relation_type === "subtask") {
-          childTid = data.tid;
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", (event) => {
+        try {
+          const data = JSON.parse(event.payload.toString());
+          if (
+            data.type === "task_created" &&
+            data.relation_type === "subtask"
+          ) {
+            childTid = data.tid;
+          }
+        } catch {
+          /* ignore non-JSON frames */
         }
-      } catch {
-        /* ignore non-JSON frames */
-      }
+      });
     });
-  });
 
-  await enterSession(page);
-  await page.locator(".task-type-row", { hasText: "isolated" }).click();
-  await sendMessage(
-    page,
-    "call task test_commit_child run command" +
-      " echo test > testfile.txt && git add . && git commit -m 'test commit'",
-  );
+    await enterSession(page);
+    await page.locator(".task-type-row", { hasText: "isolated" }).click();
+    await sendMessage(
+      page,
+      "call task test_commit_child run command" +
+        " echo test > testfile.txt && git add . && git commit -m 'test commit'",
+    );
 
-  await expect
-    .poll(() => childTid, {
-      message: "expected subtask to be created",
-      timeout: 30_000,
-    })
-    .not.toBeNull();
+    await expect
+      .poll(() => childTid, {
+        message: "expected subtask to be created",
+        timeout: 30_000,
+      })
+      .not.toBeNull();
 
-  const parentItem = page.locator('.sidebar-item[data-tid="1"]');
+    const parentItem = page.locator('.sidebar-item[data-tid="1"]');
 
-  // Navigate to parent and wait for it to complete. If the child committed
-  // successfully the output enforcement passes, the Task tool returns a result
-  // with commits, and the parent can finish. This exercises the full happy path.
-  await parentItem.click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible();
-  await expect(
-    page
-      .locator('[style*="display: contents"] .message-list')
-      .getByText("Done.", { exact: true })
-      .last(),
-  ).toBeVisible({ timeout: 90_000 });
-});
+    // Navigate to parent and wait for it to complete. If the child committed
+    // successfully the output enforcement passes, the Task tool returns a result
+    // with commits, and the parent can finish. This exercises the full happy path.
+    await parentItem.click();
+    await expect(
+      page.locator('.sidebar-item[data-tid="1"].active'),
+    ).toBeVisible();
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("Done.", { exact: true })
+        .last(),
+    ).toBeVisible({ timeout: 90_000 });
+  },
+);
 
-test("commit output enforcement walks past shared-worktree ancestors", { tag: "@claude-only" }, async ({
-  page,
-}) => {
-  // When a sub-task inherits its parent's worktree, the parent's HEAD is the
-  // sub-task's HEAD — comparing against it would always look empty. The
-  // enforcement check must walk up to the first ancestor with a different
-  // worktree (or the project path) and compare against that. This test
-  // commits in the shared worktree and asserts the missing-outputs prompt
-  // does not fire.
-  test.setTimeout(120_000);
-
-  let childTid: number | null = null;
-
-  page.on("websocket", (ws) => {
-    ws.on("framereceived", (event) => {
-      try {
-        const data = JSON.parse(event.payload.toString());
-        if (data.type === "task_created" && data.relation_type === "subtask") {
-          childTid = data.tid;
+test(
+  "second required-worktree child returns only its own commit",
+  { tag: "@claude-only" },
+  async ({ page }) => {
+    test.setTimeout(120_000);
+    const childTids: number[] = [];
+    const taskResults: Record<string, unknown>[] = [];
+    page.on("websocket", (ws) =>
+      ws.on("framereceived", (event) => {
+        try {
+          const data = JSON.parse(event.payload.toString());
+          if (data.tid === 1 && data.event?.type === "item/result") {
+            const items = taskResultItems(data.event.tool_result);
+            if (items) taskResults.push(...items);
+          }
+          if (data.type === "task_created" && data.relation_type === "subtask")
+            childTids.push(data.tid);
+        } catch {
+          /* ignore non-JSON frames */
         }
-      } catch {
-        /* ignore non-JSON frames */
-      }
+      }),
+    );
+
+    await enterSession(page);
+    await page.locator(".task-type-row", { hasText: "isolated" }).click();
+    await sendMessage(page, "sequential required commit children");
+    await expect.poll(() => childTids.length, { timeout: 90_000 }).toBe(2);
+    await page.locator('.sidebar-item[data-tid="1"]').click();
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("Done.", { exact: true })
+        .last(),
+    ).toBeVisible({
+      timeout: 90_000,
     });
-  });
 
-  await enterSession(page);
-  await page.locator(".task-type-row", { hasText: "isolated" }).click();
-  await sendMessage(
-    page,
-    "call task test_commit_child_inherit run command" +
-      " echo shared > sharedfile.txt && git add . && git commit -m 'shared commit'",
-  );
+    const rows = execFileSync(
+      "sqlite3",
+      [
+        "/tmp/cydo-backend/data/cydo/cydo.db",
+        `SELECT tid || '|' || worktree_tid || '|' || project_path FROM tasks WHERE tid IN (${childTids.join(",")}) ORDER BY tid;`,
+      ],
+      { encoding: "utf8" },
+    )
+      .trim()
+      .split("\n")
+      .map((row) => row.split("|"));
+    expect(rows).toHaveLength(2);
+    expect(rows[0][1]).toBe(rows[1][1]);
+    expect(Number(rows[0][1])).toBeGreaterThan(0);
+    await expect
+      .poll(() => taskResults.length, { timeout: 30_000 })
+      .toBeGreaterThan(1);
+    const secondResult = taskResults.at(-1)!;
+    const firstResult = taskResults.at(-2)!;
+    const worktree = secondResult.worktree as string;
+    const secondSha = execFileSync("git", ["-C", worktree, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+    }).trim();
+    const firstSha = (firstResult.commits as string[])[0];
+    expect(secondResult.commits).toEqual([secondSha]);
+    expect(secondResult.commits).not.toContain(firstSha);
+  },
+);
 
-  await expect
-    .poll(() => childTid, {
-      message: "expected subtask to be created",
-      timeout: 30_000,
-    })
-    .not.toBeNull();
+test(
+  "commit output enforcement walks past shared-worktree ancestors",
+  { tag: "@claude-only" },
+  async ({ page }) => {
+    // When a sub-task inherits its parent's worktree, the parent's HEAD is the
+    // sub-task's HEAD — comparing against it would always look empty. The
+    // enforcement check must walk up to the first ancestor with a different
+    // worktree (or the project path) and compare against that. This test
+    // commits in the shared worktree and asserts the missing-outputs prompt
+    // does not fire.
+    test.setTimeout(120_000);
 
-  const parentItem = page.locator('.sidebar-item[data-tid="1"]');
-  const subtaskItem = page.locator(`.sidebar-item[data-tid="${childTid}"]`);
+    let childTid: number | null = null;
 
-  await parentItem.click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible();
-  await expect(
-    page
-      .locator('[style*="display: contents"] .message-list')
-      .getByText("Done.", { exact: true })
-      .last(),
-  ).toBeVisible({ timeout: 90_000 });
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", (event) => {
+        try {
+          const data = JSON.parse(event.payload.toString());
+          if (
+            data.type === "task_created" &&
+            data.relation_type === "subtask"
+          ) {
+            childTid = data.tid;
+          }
+        } catch {
+          /* ignore non-JSON frames */
+        }
+      });
+    });
 
-  // Sub-task must complete cleanly without the enforcement prompt firing.
-  await subtaskItem.click();
-  await expect(
-    page.locator(`.sidebar-item[data-tid="${childTid}"].active`),
-  ).toBeVisible();
-  await expect(
-    page
-      .locator('[style*="display: contents"] .message-list')
-      .getByText("Missing required outputs"),
-  ).toHaveCount(0);
-});
+    await enterSession(page);
+    await page.locator(".task-type-row", { hasText: "isolated" }).click();
+    await sendMessage(
+      page,
+      "call task test_commit_child_inherit run command" +
+        " echo shared > sharedfile.txt && git add . && git commit -m 'shared commit'",
+    );
+
+    await expect
+      .poll(() => childTid, {
+        message: "expected subtask to be created",
+        timeout: 30_000,
+      })
+      .not.toBeNull();
+
+    const parentItem = page.locator('.sidebar-item[data-tid="1"]');
+    const subtaskItem = page.locator(`.sidebar-item[data-tid="${childTid}"]`);
+
+    await parentItem.click();
+    await expect(
+      page.locator('.sidebar-item[data-tid="1"].active'),
+    ).toBeVisible();
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("Done.", { exact: true })
+        .last(),
+    ).toBeVisible({ timeout: 90_000 });
+
+    // Sub-task must complete cleanly without the enforcement prompt firing.
+    await subtaskItem.click();
+    await expect(
+      page.locator(`.sidebar-item[data-tid="${childTid}"].active`),
+    ).toBeVisible();
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("Missing required outputs"),
+    ).toHaveCount(0);
+  },
+);

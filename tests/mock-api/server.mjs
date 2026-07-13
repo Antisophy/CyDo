@@ -635,10 +635,9 @@ function handleResponses(req, res) {
     const input = parsed.input || [];
     const requestedModel = parsed.model || "unknown";
     const userText = extractLastUserTextFromInput(input);
-    const intentText =
-      isResponsesContextOnlyText(userText)
-        ? (extractLastIntentUserTextFromInput(input) ?? userText)
-        : userText;
+    const intentText = isResponsesContextOnlyText(userText)
+      ? (extractLastIntentUserTextFromInput(input) ?? userText)
+      : userText;
     const isToolOutput = hasToolOutput(input);
     const intent = intentText === null ? null : matchPattern(intentText);
     console.log(
@@ -728,12 +727,18 @@ function handleResponses(req, res) {
       const needle = Buffer.from(intent.needle, "base64").toString("utf-8");
       const haystack = JSON.stringify(parsed);
       const found = haystack.includes(needle);
-      oaiStreamTextResponse(res, found ? "context-check-passed" : "context-check-failed");
+      oaiStreamTextResponse(
+        res,
+        found ? "context-check-passed" : "context-check-failed",
+      );
       return;
     } else if (intent.type === "check_user_text") {
       const needle = Buffer.from(intent.needle, "base64").toString("utf-8");
       const found = typeof userText === "string" && userText.includes(needle);
-      oaiStreamTextResponse(res, found ? "context-check-passed" : "context-check-failed");
+      oaiStreamTextResponse(
+        res,
+        found ? "context-check-passed" : "context-check-failed",
+      );
       return;
     } else if (intent.type === "stall") {
       // Send response.created to begin the stream, then stall indefinitely.
@@ -915,7 +920,9 @@ function handleMessages(req, res) {
             ? parsed.tools.map((tool) => ({
                 name: tool?.name ?? null,
                 description:
-                  typeof tool?.description === "string" ? tool.description : null,
+                  typeof tool?.description === "string"
+                    ? tool.description
+                    : null,
               }))
             : [],
         }) + "\n",
@@ -944,17 +951,48 @@ function handleMessages(req, res) {
     // before defaulting to "Done."
     if (isToolResult) {
       const origText = findOriginalUserText(messages);
+      if (
+        origText &&
+        /sequential required commit children/i.test(origText) &&
+        messages.length <= 3
+      ) {
+        streamToolUseResponse(
+          res,
+          "mcp__cydo__Task",
+          {
+            tasks: [
+              {
+                task_type: "test_commit_child_require",
+                description: "second required commit",
+                prompt:
+                  "run command echo second > second-required.txt && git add second-required.txt && git commit -m second-required",
+              },
+            ],
+          },
+          model,
+        );
+        return;
+      }
       if (origText && /run orphan then switchmode/i.test(origText)) {
         // Step 2: after the timed Bash command completes, call SwitchMode.
         // Only do this on the first tool_result (3 messages: user, assistant/bash, user/result).
         // Subsequent tool_results (from SwitchMode rejection etc.) get "Done."
         // so Claude can yield its turn and attempt to exit.
         if (messages.length <= 3) {
-          streamToolUseResponse(res, "mcp__cydo__SwitchMode", { continuation: "plan" }, model);
+          streamToolUseResponse(
+            res,
+            "mcp__cydo__SwitchMode",
+            { continuation: "plan" },
+            model,
+          );
           return;
         }
       }
-      if (origText && /switchmode after child asks/i.test(origText) && messages.length <= 3) {
+      if (
+        origText &&
+        /switchmode after child asks/i.test(origText) &&
+        messages.length <= 3
+      ) {
         // Step 2: parent receives Task tool result containing the child's question.
         // Only fire on the first tool result (messages.length == 3: initial user,
         // assistant Task call, user Task result with question). Subsequent tool results
@@ -962,12 +1000,19 @@ function handleMessages(req, res) {
         // must fall through to "Done." so the session can exit and the mode switch fires.
         // The guard also prevents the plan_mode continuation (which carries over the full
         // history) from looping back and calling SwitchMode('plan') again.
-        streamToolUseResponse(res, "mcp__cydo__SwitchMode", { continuation: "plan" }, model);
+        streamToolUseResponse(
+          res,
+          "mcp__cydo__SwitchMode",
+          { continuation: "plan" },
+          model,
+        );
         return;
       }
-      if (origText &&
-          /handoff while child asks/i.test(origText) &&
-          /Task prompt:.*test_handoff_with_children/.test(origText)) {
+      if (
+        origText &&
+        /handoff while child asks/i.test(origText) &&
+        /Task prompt:.*test_handoff_with_children/.test(origText)
+      ) {
         // This is the test_handoff_with_children child task (not the parent conversation).
         // Step 2: child receives Task result with grandchild question → try Handoff (rejected).
         // Step 3: child receives Handoff error → answer the pending question (qid=1).
@@ -1034,12 +1079,20 @@ function handleMessages(req, res) {
       const needle = Buffer.from(intent.needle, "base64").toString("utf-8");
       const haystack = JSON.stringify(parsed);
       const found = haystack.includes(needle);
-      streamTextResponse(res, found ? "context-check-passed" : "context-check-failed", model);
+      streamTextResponse(
+        res,
+        found ? "context-check-passed" : "context-check-failed",
+        model,
+      );
       return;
     } else if (intent.type === "check_user_text") {
       const needle = Buffer.from(intent.needle, "base64").toString("utf-8");
       const found = typeof userText === "string" && userText.includes(needle);
-      streamTextResponse(res, found ? "context-check-passed" : "context-check-failed", model);
+      streamTextResponse(
+        res,
+        found ? "context-check-passed" : "context-check-failed",
+        model,
+      );
       return;
     } else if (intent.type === "stall") {
       // Send message_start to begin the stream, then stall indefinitely.
@@ -1084,7 +1137,11 @@ function handleMessages(req, res) {
       streamToolUseResponse(
         res,
         "Bash",
-        { command: intent.command, timeout: intent.timeout, description: "Running command" },
+        {
+          command: intent.command,
+          timeout: intent.timeout,
+          description: "Running command",
+        },
         model,
       );
     } else if (intent.type === "shell" || intent.type === "background_shell") {

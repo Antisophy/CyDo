@@ -154,6 +154,22 @@ export function matchPattern(userText) {
 
   let match;
 
+  if (/sequential required commit children/i.test(userText))
+    return {
+      type: "tool_call",
+      name: "mcp__cydo__Task",
+      input: {
+        tasks: [
+          {
+            task_type: "test_commit_child_require",
+            description: "first required commit",
+            prompt:
+              "run command echo first > first-required.txt && git add first-required.txt && git commit -m first-required",
+          },
+        ],
+      },
+    };
+
   // Task-creation patterns must come before "reply with" and "run command"
   // because a task prompt like "call task research reply with X" contains
   // "reply with" as a substring, which would otherwise match first.
@@ -433,8 +449,7 @@ export function matchPattern(userText) {
   // "check user text contains <base64>" — check if decoded string appears in
   // the final user message text itself (proves prompt text arrived via input).
   match = userText.match(/check user text contains ([A-Za-z0-9+/]+=*)/i);
-  if (match)
-    return { type: "check_user_text", needle: match[1] };
+  if (match) return { type: "check_user_text", needle: match[1] };
 
   // Autonomous compaction reminder fixture: force a SwitchMode tool call with
   // a huge token count so the follow-up keep-context continuation compacts
@@ -502,7 +517,7 @@ export function matchPattern(userText) {
     return {
       type: "shell",
       command:
-        "python3 - <<PY\nimport json\nprint(json.dumps({\"result\": 42}))\nPY",
+        'python3 - <<PY\nimport json\nprint(json.dumps({"result": 42}))\nPY',
     };
 
   // Compatibility fixture: JSON-looking final text should remain literal
@@ -525,25 +540,25 @@ export function matchPattern(userText) {
     return {
       type: "shell",
       command:
-        '/run/current-system/sw/bin/zsh -lc "cat <<\'EOF\'\nheredoc body with \\\\\\"quotes\\\\\\" and "\'$literal\nEOF\'',
+        "/run/current-system/sw/bin/zsh -lc \"cat <<'EOF'\nheredoc body with \\\\\\\"quotes\\\\\\\" and \"'$literal\nEOF'",
     };
 
   if (/semantic shell mixed quoted markdown heredoc/i.test(userText))
     return {
       type: "shell",
       command: [
-        '/run/current-system/sw/bin/zsh -lc "cat > /tmp/cydo-heredoc-render.md <<\'EOF\'',
+        "/run/current-system/sw/bin/zsh -lc \"cat > /tmp/cydo-heredoc-render.md <<'EOF'",
         "# Heredoc Markdown Fixture",
         "",
         "This file was written by a shell heredoc.",
         "",
         '- quoted text: \\"hello world\\"',
-        '- literal dollars: "\'$CYDO_NOT_EXPANDED',
+        "- literal dollars: \"'$CYDO_NOT_EXPANDED",
         '- inline code: `program --some-flag -y "hello world"`',
         "",
         "```sh",
         'printf \'"\'%s\\\\n\' \\"nested \\\\\\"quote\\\\\\"\\"',
-        '"\'```',
+        "\"'```",
         "EOF'",
       ].join("\n"),
     };
@@ -552,7 +567,7 @@ export function matchPattern(userText) {
     return {
       type: "shell",
       command: [
-        '/run/current-system/sw/bin/zsh -lc "cat > /tmp/cydo-heredoc-render.svg <<\'EOF\'',
+        "/run/current-system/sw/bin/zsh -lc \"cat > /tmp/cydo-heredoc-render.svg <<'EOF'",
         '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><text y="20">"\'$literal</text></svg>',
         "EOF'",
       ].join("\n"),
@@ -569,7 +584,7 @@ export function matchPattern(userText) {
     return {
       type: "shell",
       command:
-        '/run/current-system/sw/bin/zsh -lc \'program --some-flag -y "hello world"\'',
+        "/run/current-system/sw/bin/zsh -lc 'program --some-flag -y \"hello world\"'",
     };
 
   if (/semantic shell rejected dynamic wrapper payload/i.test(userText))
@@ -578,7 +593,9 @@ export function matchPattern(userText) {
       command: '/run/current-system/sw/bin/zsh -lc "cat $HOME/README.md"',
     };
 
-  if (/semantic shell wrapped markdown heredoc directory listing/i.test(userText))
+  if (
+    /semantic shell wrapped markdown heredoc directory listing/i.test(userText)
+  )
     return {
       type: "shell",
       command:
@@ -595,15 +612,14 @@ export function matchPattern(userText) {
   if (/semantic shell rg structured/i.test(userText))
     return {
       type: "shell",
-      command:
-        "grep -n \"semantic shell\" /tmp/tests/e2e/semantic-shell.spec.ts",
+      command: 'grep -n "semantic shell" /tmp/tests/e2e/semantic-shell.spec.ts',
     };
 
   if (/semantic shell rg fallback/i.test(userText))
     return {
       type: "shell",
       command:
-        "rg -n --context=3 \"semantic shell\" /tmp/tests/e2e/semantic-shell.spec.ts",
+        'rg -n --context=3 "semantic shell" /tmp/tests/e2e/semantic-shell.spec.ts',
     };
 
   // "reply with "<text>""
