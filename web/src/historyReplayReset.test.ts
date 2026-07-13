@@ -145,6 +145,42 @@ describe("history replay reset", () => {
     expect(reset.historyLoaded).toBe(false);
   });
 
+  it("rebuilds init and metadata session state during history replay", () => {
+    const reset = resetTaskForHistoryReplay(makeRichState(), 2);
+    const initialized = reduceMessage(
+      reset,
+      asEvent({
+        type: "session/init",
+        session_id: "replayed-sid",
+        model: "codex-mini",
+        cwd: "/tmp/replayed-project",
+        tools: ["Read"],
+        agent_version: "2.0.0",
+        permission_mode: "default",
+        agent: "codex",
+        supports_file_revert: true,
+      }),
+    );
+    const replayed = reduceMessage(
+      initialized,
+      asEvent({ type: "session/metadata", model: "codex-max" }),
+    );
+
+    expect(replayed.agentType).toBe("codex");
+    expect(replayed.sessionInfo).toMatchObject({
+      sessionId: "replayed-sid",
+      cwd: "/tmp/replayed-project",
+      tools: ["Read"],
+      version: "2.0.0",
+      model: "codex-max",
+    });
+    expect(replayed.messages.map((message) => message.subtype)).toEqual([
+      undefined,
+      "init",
+      "metadata",
+    ]);
+  });
+
   it("does not duplicate replayed user/system messages across full bundles", () => {
     const userEvent = asEvent({
       type: "item/started",

@@ -91,6 +91,13 @@ struct SessionInitEvent
 	@JSONOptional JSONFragment extras;
 }
 
+/// session/metadata
+struct SessionMetadataEvent
+{
+	string type = "session/metadata";
+	string model;
+}
+
 /// session/status
 struct SessionStatusEvent
 {

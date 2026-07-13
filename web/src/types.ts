@@ -32,6 +32,7 @@ export interface DisplayMessage {
   /** System message subtype — routes to the correct view component. */
   subtype?:
     | "init"
+    | "metadata"
     | "status"
     | "compact_boundary"
     | "task_lifecycle"

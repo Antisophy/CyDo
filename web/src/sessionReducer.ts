@@ -23,6 +23,7 @@ import type {
   AssistantContentBlock,
   ResultMessage,
   SystemInitMessage,
+  SystemMetadataMessage,
   SystemStatusMessage,
   SystemCompactBoundaryMessage,
   SystemTaskStartedMessage,
@@ -247,19 +248,10 @@ export function reduceParseError(
   };
 }
 
-export function reduceSystemInit(
+function reduceSessionInitBootstrap(
   s: SessionState,
   msg: SystemInitMessage,
-  seq?: number,
 ): SessionState {
-  const initMsg: DisplayMessage = {
-    id: `init-${++s.msgIdCounter}`,
-    type: "system" as const,
-    subtype: "init" as const,
-    content: [],
-    rawSource: msg,
-    seq,
-  };
   return {
     ...s,
     // Propagate agent type from init message so blocks created before task_updated
@@ -283,8 +275,47 @@ export function reduceSystemInit(
       supports_file_revert: msg.supports_file_revert,
     },
     sessionStatus: null,
-    messages: [...s.messages, initMsg],
   };
+}
+
+export function reduceSessionMetadata(
+  s: SessionState,
+  msg: SystemMetadataMessage,
+  seq?: number,
+): SessionState {
+  if (!s.sessionInfo) {
+    throw new Error("session/metadata received before session/init");
+  }
+  const metadataMsg: DisplayMessage = {
+    id: `metadata-${++s.msgIdCounter}`,
+    type: "system" as const,
+    subtype: "metadata" as const,
+    content: [],
+    rawSource: msg,
+    seq,
+  };
+  return {
+    ...s,
+    sessionInfo: { ...s.sessionInfo, model: msg.model },
+    messages: [...s.messages, metadataMsg],
+  };
+}
+
+export function reduceSystemInit(
+  s: SessionState,
+  msg: SystemInitMessage,
+  seq?: number,
+): SessionState {
+  const initMsg: DisplayMessage = {
+    id: `init-${++s.msgIdCounter}`,
+    type: "system" as const,
+    subtype: "init" as const,
+    content: [],
+    rawSource: msg,
+    seq,
+  };
+  const bootstrapped = reduceSessionInitBootstrap(s, msg);
+  return { ...bootstrapped, messages: [...bootstrapped.messages, initMsg] };
 }
 
 export function reduceSystemStatus(
@@ -1371,6 +1402,9 @@ export function reduceMessage(
   switch (msg.type) {
     case "session/init":
       return reduceSystemInit(s, msg, seq);
+
+    case "session/metadata":
+      return reduceSessionMetadata(s, msg, seq);
 
     case "session/status":
       return reduceSystemStatus(s, msg, seq);

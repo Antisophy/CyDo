@@ -601,6 +601,9 @@ test(
       timeout: 90_000,
     });
 
+    const modelBeforeRestart = await page.locator(".banner-model").textContent();
+    expect(modelBeforeRestart).toBeTruthy();
+
     // Brief pause for JSONL to finish writing before killing.
     await page.waitForTimeout(2_000);
 
@@ -611,6 +614,7 @@ test(
     // task_history_start and task_history_end are counted.
     let inReplay = false;
     let sessionInitInReplay = 0;
+    const sessionMetadataInReplay: Record<string, unknown>[] = [];
     let replayDone = false;
     page.on("websocket", (ws) => {
       ws.on("framereceived", (frame) => {
@@ -622,6 +626,7 @@ test(
           if (data.type === "task_history_start") {
             inReplay = true;
             sessionInitInReplay = 0;
+            sessionMetadataInReplay.length = 0;
             replayDone = false;
           } else if (data.type === "task_history_end") {
             inReplay = false;
@@ -634,6 +639,8 @@ test(
             const ev = data.event as Record<string, unknown>;
             if (ev.type === "session/init") {
               sessionInitInReplay++;
+            } else if (ev.type === "session/metadata") {
+              sessionMetadataInReplay.push(ev);
             }
           }
         } catch {
@@ -664,5 +671,9 @@ test(
     // A second synthetic one would appear if onThreadStarted emitted
     // a synthetic init on resume (gated by resumeId.length == 0).
     expect(sessionInitInReplay).toBe(1);
+    expect(sessionMetadataInReplay).toContainEqual(
+      expect.objectContaining({ model: modelBeforeRestart }),
+    );
+    await expect(page.locator(".banner-model")).toHaveText(modelBeforeRestart!);
   },
 );

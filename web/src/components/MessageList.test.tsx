@@ -72,3 +72,49 @@ describe("MessageList parse-error rendering", () => {
     expect(devHtml).toContain("Unknown system subtype: thinking_tokens");
   });
 });
+
+describe("MessageList metadata rendering", () => {
+  const metadata: DisplayMessage = {
+    id: "metadata-1",
+    type: "system",
+    subtype: "metadata",
+    content: [],
+    rawSource: { type: "session/metadata", model: "gpt-5.6-sol" },
+  };
+
+  it("omits metadata records entirely outside dev mode", () => {
+    const html = renderToString(
+      <DevModeContext.Provider value={false}>
+        <MessageList
+          taskTid={1}
+          messages={[metadata]}
+          blocks={new Map()}
+          isProcessing={false}
+          bandStatus=""
+        />
+      </DevModeContext.Provider>,
+    );
+
+    expect(html).not.toContain("msg-metadata-1");
+    expect(html).not.toContain("view-source-btn");
+    expect(html).not.toContain("Session metadata");
+  });
+
+  it("renders metadata records with their source viewer in dev mode", () => {
+    const html = renderToString(
+      <DevModeContext.Provider value={true}>
+        <MessageList
+          taskTid={1}
+          messages={[metadata]}
+          blocks={new Map()}
+          isProcessing={false}
+          bandStatus=""
+        />
+      </DevModeContext.Provider>,
+    );
+
+    expect(html).toContain("msg-metadata-1");
+    expect(html).toContain("Session metadata");
+    expect(html).toContain("view-source-btn");
+  });
+});

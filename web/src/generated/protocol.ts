@@ -64,6 +64,11 @@ export interface SessionInitEvent {
   extras?: Record<string, unknown>;
 }
 
+export interface SessionMetadataEvent {
+  type: "session/metadata";
+  model: string;
+}
+
 export interface SessionStatusEvent {
   type: "session/status";
   status?: string;

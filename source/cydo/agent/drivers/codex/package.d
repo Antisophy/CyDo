@@ -607,6 +607,11 @@ class CodexAgent : Agent
 			auto t = translateRolloutSessionMeta(line);
 			return t !is null ? [TranslatedEvent(t, line, ts)] : [];
 		}
+		else if (probe.isTurnContext)
+		{
+			auto t = translateRolloutTurnContext(line);
+			return t !is null ? [TranslatedEvent(t, line, ts)] : [];
+		}
 		else if (probe.isResponseItem)
 		{
 			// Pass line-number fork ID for user/assistant messages
@@ -628,7 +633,7 @@ class CodexAgent : Agent
 			auto t = translateRolloutEventMsg(line);
 			return t !is null ? [TranslatedEvent(t, line, ts)] : [];
 		}
-		// Skip turn_context, compacted, unknown
+		// Skip compacted, unknown
 		return [];
 	}
 
@@ -1074,7 +1079,7 @@ class CodexSession : AgentSession
 		server.registerSession(threadId, asRouteTarget());
 
 		// Emit synthetic session/init with raw RPC response as _raw.
-		import cydo.protocol : SessionInitEvent;
+		import cydo.protocol : SessionInitEvent, SessionMetadataEvent;
 		SessionInitEvent initEv;
 		initEv.session_id      = threadId;
 		initEv.model           = model;
@@ -1089,6 +1094,13 @@ class CodexSession : AgentSession
 		// session/init; a second synthetic one here would duplicate it.
 		if (outputHandler_ && resumeId.length == 0)
 			outputHandler_(TranslatedEvent(toJson(initEv), rawResultJson.length > 0 ? rawResultJson : null));
+
+		if (outputHandler_)
+		{
+			SessionMetadataEvent metadataEv;
+			metadataEv.model = model;
+			outputHandler_(TranslatedEvent(toJson(metadataEv), null));
+		}
 
 		// Drain queued messages now that the thread is ready.
 		drainPendingMessages();

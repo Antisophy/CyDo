@@ -20,6 +20,7 @@ package enum ForkableMessageRole
 package struct RolloutLineProbe
 {
 	bool isSessionMeta;
+	bool isTurnContext;
 	bool isResponseItem;
 	bool isEventMsg;
 	bool isTaskStarted;
@@ -67,6 +68,7 @@ package RolloutLineProbe parseRolloutLineProbe(string line)
 	{
 		auto top = jsonParse!TopLevelProbe(line);
 		result.isSessionMeta = top.type == "session_meta";
+		result.isTurnContext = top.type == "turn_context";
 		result.isResponseItem = top.type == "response_item";
 		result.isEventMsg = top.type == "event_msg";
 
@@ -567,6 +569,63 @@ string translateRolloutSessionMeta(string line)
 	ev.permission_mode = "dangerously-skip-permissions";
 	ev.agent           = "codex";
 	return toJson(ev);
+}
+
+/// Translate a turn_context rollout line → session/metadata agnostic event.
+string translateRolloutTurnContext(string line)
+{
+	@JSONPartial
+	static struct Probe
+	{
+		@JSONPartial
+		static struct Payload
+		{
+			string model;
+		}
+		Payload payload;
+	}
+
+	Probe probe;
+	try
+		probe = jsonParse!Probe(line);
+	catch (Exception e)
+	{ tracef("translateHistoryEvent: turn_context parse error: %s", e.msg); return null; }
+
+	if (probe.payload.model.length == 0)
+		return null;
+
+	import cydo.protocol : SessionMetadataEvent;
+
+	SessionMetadataEvent ev;
+	ev.model = probe.payload.model;
+	return toJson(ev);
+}
+
+unittest
+{
+	@JSONPartial static struct MetadataEvent { string type; string model; }
+	@JSONPartial static struct InitEvent { string type; string session_id; }
+
+	auto init = translateRolloutSessionMeta(
+		`{"type":"session_meta","payload":{"id":"thread-1","cwd":"/tmp","cli_version":"1.0"}}`);
+	auto initEvent = jsonParse!InitEvent(init);
+	assert(initEvent.type == "session/init");
+	assert(initEvent.session_id == "thread-1");
+
+	auto first = translateRolloutTurnContext(
+		`{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}`);
+	auto firstEvent = jsonParse!MetadataEvent(first);
+	assert(firstEvent.type == "session/metadata");
+	assert(firstEvent.model == "gpt-5.6-sol");
+
+	assert(translateRolloutTurnContext(`{"type":"turn_context","payload":{}}`) is null);
+	assert(translateRolloutTurnContext(`{"type":"turn_context","payload":{"model":""}}`) is null);
+
+	auto second = translateRolloutTurnContext(
+		`{"type":"turn_context","payload":{"model":"gpt-5.7"}}`);
+	auto secondEvent = jsonParse!MetadataEvent(second);
+	assert(secondEvent.type == "session/metadata");
+	assert(secondEvent.model == "gpt-5.7");
 }
 
 /// Translate a response_item rollout line → item-based protocol events.

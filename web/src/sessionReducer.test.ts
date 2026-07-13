@@ -84,6 +84,86 @@ describe("session/status reducer", () => {
   });
 });
 
+describe("session init and metadata reducers", () => {
+  it("bootstraps session state from init, then applies metadata as a model update", () => {
+    const init = {
+      type: "session/init" as const,
+      session_id: "sid-2",
+      model: "codex-mini",
+      cwd: "/tmp/replay-project",
+      tools: ["Read", "Write"],
+      agent_version: "2.0.0",
+      permission_mode: "acceptEdits",
+      agent: "codex",
+      agent_name: "reviewer",
+      supports_file_revert: true,
+    };
+    const initialized = reduceMessage(
+      { ...makeTaskState(1), sessionStatus: "requesting" },
+      init,
+      10,
+    );
+
+    expect(initialized.agentType).toBe("codex");
+    expect(initialized.sessionStatus).toBeNull();
+    expect(initialized.sessionInfo).toMatchObject({
+      model: "codex-mini",
+      version: "2.0.0",
+      sessionId: "sid-2",
+      cwd: "/tmp/replay-project",
+      tools: ["Read", "Write"],
+      permission_mode: "acceptEdits",
+      agent: "codex",
+      agent_name: "reviewer",
+      supports_file_revert: true,
+    });
+    expect(initialized.messages).toEqual([
+      expect.objectContaining({
+        type: "system",
+        subtype: "init",
+        rawSource: init,
+        seq: 10,
+      }),
+    ]);
+
+    const metadata = { type: "session/metadata", model: "codex-max" };
+    const updated = reduceMessage(initialized, asEvent(metadata), 11);
+
+    expect(updated.sessionInfo).toMatchObject({
+      ...initialized.sessionInfo,
+      model: "codex-max",
+    });
+    expect(updated.messages).toHaveLength(2);
+    expect(updated.messages[1]).toEqual(
+      expect.objectContaining({
+        type: "system",
+        subtype: "metadata",
+        rawSource: metadata,
+        seq: 11,
+      }),
+    );
+
+    const latest = reduceMessage(
+      updated,
+      asEvent({ type: "session/metadata", model: "codex-latest" }),
+    );
+    expect(latest.sessionInfo?.model).toBe("codex-latest");
+    expect(latest.messages.filter((m) => m.subtype === "init")).toHaveLength(1);
+    expect(
+      latest.messages.filter((m) => m.subtype === "metadata"),
+    ).toHaveLength(2);
+  });
+
+  it("rejects metadata received before session init", () => {
+    expect(() =>
+      reduceMessage(
+        makeTaskState(1),
+        asEvent({ type: "session/metadata", model: "codex-max" }),
+      ),
+    ).toThrow("session/metadata received before session/init");
+  });
+});
+
 describe("system event suppression", () => {
   it("ignores thinking_tokens system events without adding parse errors", () => {
     const s = makeState();

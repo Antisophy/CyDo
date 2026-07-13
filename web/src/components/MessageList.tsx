@@ -528,6 +528,8 @@ const MessageView = memo(
       setEditing(false);
     }, [uuid, onEdit, editText]);
 
+    if (msg.subtype === "metadata" && !devMode) return null;
+
     let inner;
     switch (msg.type) {
       case "user":
@@ -566,6 +568,14 @@ const MessageView = memo(
       case "system": {
         if (msg.subtype === "init") {
           inner = <SystemInitView message={msg} />;
+        } else if (msg.subtype === "metadata") {
+          inner = (
+            <div class="message system-message">
+              <details open={devMode}>
+                <summary>Session metadata</summary>
+              </details>
+            </div>
+          );
         } else if (msg.subtype === "task_lifecycle") {
           inner = <TaskLifecycleView message={msg} />;
         } else if (msg.subtype === "control_response") {

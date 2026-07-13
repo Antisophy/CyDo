@@ -15,6 +15,7 @@ export type {
   RateLimitInfo,
   ControlResponse,
   SessionInitEvent,
+  SessionMetadataEvent,
   SessionStatusEvent,
   SessionCompactedEvent,
   TurnResultEvent,
@@ -40,6 +41,7 @@ export type {
 import type {
   UsageInfo,
   SessionInitEvent,
+  SessionMetadataEvent,
   SessionStatusEvent,
   SessionCompactedEvent,
   TurnResultEvent,
@@ -69,6 +71,7 @@ import type { TaskStatus } from "./types";
 
 export type Usage = UsageInfo;
 export type SystemInitMessage = SessionInitEvent;
+export type SystemMetadataMessage = SessionMetadataEvent;
 export type SystemStatusMessage = SessionStatusEvent;
 export type SystemCompactBoundaryMessage = SessionCompactedEvent;
 export type ResultMessage = TurnResultEvent;
@@ -146,6 +149,7 @@ export interface SystemStopHookSummaryMessage {
 // Agent-agnostic event union (live stream + JSONL history)
 export type AgnosticEvent =
   | SessionInitEvent
+  | SessionMetadataEvent
   | SessionStatusEvent
   | SessionCompactedEvent
   | SystemApiErrorMessage
