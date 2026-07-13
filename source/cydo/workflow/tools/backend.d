@@ -935,12 +935,6 @@ public:
 			"prompts/sub_task_waiting_for_answer.md",
 			parentTd.projectPath,
 			["question": question, "qid": to!string(qid)]);
-		if (reminderBody.length == 0)
-		{
-			reminderBody = "Question: " ~ question ~ "\n\n"
-				~ "Use mcp__cydo__Answer(" ~ to!string(qid)
-				~ ", \"your answer\") to respond. You must answer before you can complete your turn.";
-		}
 		auto reminder = wrapKnownSystemMessage(
 			host_.systemKeyword(),
 			KnownSystemMessageKind.subTaskWaitingForAnswer,

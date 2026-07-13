@@ -9,7 +9,7 @@ import std.file : exists, isFile, thisExePath;
 import std.format : format;
 import std.logger : tracef, infof, warningf, errorf, fatalf;
 import std.stdio : File, stderr;
-import std.string : representation;
+import std.string : representation, strip;
 
 import ae.utils.funopt : funopt, funoptDispatch, funoptDispatchUsage, FunOptConfig, Option, Parameter;
 import ae.utils.main : main;
@@ -2838,10 +2838,12 @@ class App
 		{
 			auto path = buildPath(dir, relativePath);
 			if (exists(path))
-				return substituteVars(readText(path), vars);
+			{
+				auto prompt = substituteVars(readText(path), vars);
+				return prompt.strip.length == 0 ? "" : prompt;
+			}
 		}
-		warningf("Prompt file not found: %s", relativePath);
-		return "";
+		throw new Exception("Prompt file not found: " ~ relativePath);
 	}
 
 	/// Read a prompt template file from the search path without variable substitution.
@@ -3193,6 +3195,23 @@ version (unittest) private void writePromptParityFixture(string root)
 		~ "    model_class: large\n"
 		~ "    agent_description: GUIDANCE HANDOFF MARKER\n"
 		~ "    tool_guidance: GUIDANCE HANDOFF TOOL MARKER\n");
+}
+
+unittest
+{
+	auto tmp = buildPath("/tmp", "cydo-app-empty-prompt");
+	scope (exit)
+	{
+		if (exists(tmp))
+			rmdirRecurse(tmp);
+	}
+	mkdirRecurse(buildPath(tmp, "prompts"));
+	write(buildPath(tmp, "prompts", "empty.md"), " \n\t");
+
+	auto app = new App();
+	app.taskTypeCatalog = new TaskTypeCatalog(tmp,
+		buildPath(tmp, "task-types.yaml"), &isKnownPromptParityAgent);
+	assert(app.readPromptFile("prompts/empty.md", "", null) == "");
 }
 
 unittest

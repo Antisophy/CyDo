@@ -409,9 +409,6 @@ private:
 		auto body = host_.readPromptFile("prompts/question_from_task.md",
 			answererProjectPath,
 			["message": message, "qid": to!string(qid)]);
-		if (body.length == 0)
-			body = message ~ "\n\nAnswer with mcp__cydo__Answer(" ~ to!string(qid)
-				~ ", \"your response\").";
 		return wrapKnownSystemMessage(host_.systemKeyword(),
 			KnownSystemMessageKind.questionFromTask, body, subject);
 	}
@@ -450,12 +447,6 @@ private:
 						"message": message,
 						"qid": to!string(currentRoute.qid),
 					]);
-				if (followUpBody.length == 0)
-				{
-					followUpBody = message
-						~ "\n\nAnswer with mcp__cydo__Answer("
-						~ to!string(currentRoute.qid) ~ ", \"your response\").";
-				}
 				prompt = wrapKnownSystemMessage(host_.systemKeyword(),
 					KnownSystemMessageKind.followUpFromParent, followUpBody,
 					followUpMsgSubject);

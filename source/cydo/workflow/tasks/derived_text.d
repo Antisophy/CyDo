@@ -111,6 +111,7 @@ public:
 		auto msg = userMessage.length > 500 ? userMessage[0 .. 500] : userMessage;
 		auto prompt = host_.readPromptFile(tid, "prompts/generate-title.md",
 			["user_message": msg]);
+		// An intentionally empty template disables title generation.
 		if (prompt.length == 0)
 			return;
 
@@ -174,9 +175,10 @@ public:
 
 		auto prompt = host_.readPromptFile(tid, "prompts/generate-suggestions.md",
 			["conversation": history]);
+		// An intentionally empty template disables suggestion generation.
 		if (prompt.length == 0)
 		{
-			warningf("generateSuggestions[%d]: prompt file not found or empty", tid);
+			warningf("generateSuggestions[%d]: prompt template is empty", tid);
 			return;
 		}
 		tracef("generateSuggestions[%d]: spawning one-shot (history.length=%d)", tid, history.length);
