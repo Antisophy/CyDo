@@ -120,6 +120,8 @@ struct Persistence
 			"  WHERE title GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]…';",
 			// Migration 19: persist needs_attention flag
 			"ALTER TABLE tasks ADD COLUMN needs_attention INTEGER NOT NULL DEFAULT 0;",
+			// Migration 20: immutable task-local commit collection boundary
+			"ALTER TABLE tasks ADD COLUMN task_start_head TEXT NOT NULL DEFAULT '';",
 		]);
 
 		// In CI, disable durability to speed up tests. This trades crash-safety
@@ -234,6 +236,11 @@ struct Persistence
 		db.stmt!"UPDATE tasks SET worktree_tid = ? WHERE tid = ?".exec(worktreeTid, tid);
 	}
 
+	void setTaskStartHead(int tid, string sha)
+	{
+		db.stmt!"UPDATE tasks SET task_start_head = ? WHERE tid = ?".exec(sha, tid);
+	}
+
 	void setArchived(int tid, bool archived)
 	{
 		db.stmt!"UPDATE tasks SET archived = ? WHERE tid = ?".exec(archived ? 1 : 0, tid);
@@ -255,6 +262,7 @@ struct Persistence
 		string workspace;
 		string projectPath;
 		int worktreeTid;
+		string taskStartHead;
 		string title;
 		string status;
 		string agentType;
@@ -272,11 +280,11 @@ struct Persistence
 		TaskRow[] result;
 		foreach (int tid, string agentSessionId, string description, string taskType,
 			int parentTid, string relationType, string workspace, string projectPath,
-			int worktreeTid, string title, string status, string agentType, int archived, string draft,
+			int worktreeTid, string taskStartHead, string title, string status, string agentType, int archived, string draft,
 			string resultText, long createdAt, long lastActive, string entryPoint, int needsAttention;
-			db.stmt!"SELECT tid, COALESCE(agent_session_id,''), COALESCE(description,''), COALESCE(task_type,'blank'), COALESCE(parent_tid,0), COALESCE(relation_type,''), COALESCE(workspace,''), COALESCE(project_path,''), COALESCE(worktree_tid,0), COALESCE(title,''), COALESCE(status,'completed'), COALESCE(agent_type,'claude'), COALESCE(archived,0), COALESCE(draft,''), COALESCE(result_text,''), COALESCE(created_at,0), COALESCE(last_active,0), COALESCE(entry_point,''), COALESCE(needs_attention,0) FROM tasks".iterate())
+			db.stmt!"SELECT tid, COALESCE(agent_session_id,''), COALESCE(description,''), COALESCE(task_type,'blank'), COALESCE(parent_tid,0), COALESCE(relation_type,''), COALESCE(workspace,''), COALESCE(project_path,''), COALESCE(worktree_tid,0), COALESCE(task_start_head,''), COALESCE(title,''), COALESCE(status,'completed'), COALESCE(agent_type,'claude'), COALESCE(archived,0), COALESCE(draft,''), COALESCE(result_text,''), COALESCE(created_at,0), COALESCE(last_active,0), COALESCE(entry_point,''), COALESCE(needs_attention,0) FROM tasks".iterate())
 		{
-			result ~= TaskRow(tid, agentSessionId, description, taskType, parentTid, relationType, workspace, projectPath, worktreeTid, title, status, agentType, archived != 0, draft, resultText, createdAt, lastActive, entryPoint, needsAttention != 0);
+			result ~= TaskRow(tid, agentSessionId, description, taskType, parentTid, relationType, workspace, projectPath, worktreeTid, taskStartHead, title, status, agentType, archived != 0, draft, resultText, createdAt, lastActive, entryPoint, needsAttention != 0);
 		}
 		return result;
 	}

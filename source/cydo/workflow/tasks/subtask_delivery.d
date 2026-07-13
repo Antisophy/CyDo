@@ -25,7 +25,6 @@ struct SubtaskResultDeliveryHost
 	TaskData* delegate(int tid) getTask;
 	string delegate(const TaskData* td) outputPath;
 	string delegate(const TaskData* td) worktreePath;
-	string delegate(int tid) worktreeForkBaseHead;
 	bool delegate(string projectPath, string taskTypeName) taskProducesCommitOutput;
 	void delegate(int tid, TaskStatus expectedFrom, TaskStatus to,
 		TaskNotificationChange notification) transitionTask;
@@ -223,17 +222,26 @@ private:
 
 		if (host_.taskProducesCommitOutput(td.projectPath, td.taskType) && td.hasWorktree)
 		{
-			auto parentHead = host_.worktreeForkBaseHead(tid);
-			if (parentHead.length > 0)
+			if (td.taskStartHead.length == 0)
+			{
+				warningf("Task %d has no task start HEAD; commit list is unavailable for pre-upgrade task", tid);
+				result.commits = ["(not available - check git log)"];
+				note = "The commit list is unavailable for this pre-upgrade task. Check git log in the worktree." ~ talkNote;
+			}
+			else
 			{
 				auto logResult = execute(["git", "-C", host_.worktreePath(td),
-					"log", "--format=%H", parentHead ~ "..HEAD"]);
-				if (logResult.status == 0 && logResult.output.strip.length > 0)
+					"log", "--format=%H", td.taskStartHead ~ "..HEAD"]);
+				enforce(logResult.status == 0,
+					"Failed to collect commits for task " ~ to!string(tid)
+					~ " (git status " ~ to!string(logResult.status) ~ "): "
+					~ logResult.output.strip);
+				if (logResult.output.strip.length > 0)
 					result.commits = logResult.output.strip.splitLines;
+				if (result.commits.length > 0)
+					note = "Cherry-pick commits from the worktree: git cherry-pick "
+						~ result.commits.retro.join(" ") ~ talkNote;
 			}
-			if (result.commits.length > 0)
-				note = "Cherry-pick commits from the worktree: git cherry-pick "
-					~ result.commits.retro.join(" ") ~ talkNote;
 			result.note = note.length > 0 ? note : td.resultNote;
 		}
 

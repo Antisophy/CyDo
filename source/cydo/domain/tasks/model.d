@@ -511,6 +511,7 @@ struct TaskData
 	string workspace;
 	string projectPath;
 	int worktreeTid;  // 0 = no worktree; own tid = owns worktree; other tid = shares worktree
+	string taskStartHead;
 	string title;
 	TaskStatus status = TaskStatus.pending;
 	bool archived;

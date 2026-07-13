@@ -2,6 +2,8 @@ module cydo.workflow.tools.backend;
 
 import std.format : format;
 import std.logger : errorf, infof, tracef, warningf;
+import std.process : execute;
+import std.string : strip;
 
 import ae.utils.json : JSONFragment, jsonParse, toJson;
 import ae.utils.promise : Promise, resolve;
@@ -52,6 +54,7 @@ struct WorkflowToolsHost
 	void delegate(int tid, bool needsAttention) persistNeedsAttention;
 	void delegate(int tid, long lastActive) persistLastActive;
 	void delegate(int tid, string resultText) persistResultText;
+	void delegate(int tid, string taskStartHead) persistTaskStartHead;
 	void delegate(int tid) touchTask;
 
 	TaskTypeDef[] delegate(string projectPath) taskTypesForProject;
@@ -71,7 +74,6 @@ struct WorkflowToolsHost
 	string delegate(const TaskData* td) taskDir;
 	string delegate(const TaskData* td) outputPath;
 	string delegate(const TaskData* td) worktreePath;
-	string delegate(int tid) worktreeForkBaseHead;
 	bool delegate(string projectPath, string taskTypeName) taskProducesCommitOutput;
 	void delegate(int childTid, int parentTid, WorktreeMode mode) setupWorktreeForEdge;
 	Promise!void delegate(int tid) ensureProcessQueueAlive;
@@ -137,7 +139,6 @@ public:
 				getTask: host_.getTask,
 				outputPath: host_.outputPath,
 				worktreePath: host_.worktreePath,
-				worktreeForkBaseHead: host_.worktreeForkBaseHead,
 				taskProducesCommitOutput: host_.taskProducesCommitOutput,
 				transitionTask: host_.transitionTask,
 				transitionTaskFrom: host_.transitionTaskFrom,
@@ -329,6 +330,31 @@ public:
 					host_.setupWorktreeForEdge(childTid, parentTid,
 						edge.worktree);
 				}
+			}
+
+			if (host_.taskProducesCommitOutput(childTd.projectPath,
+				childTd.taskType) && childTd.hasWorktree)
+			{
+				auto headResult = execute(["git", "-C", host_.worktreePath(childTd),
+					"rev-parse", "HEAD"]);
+				auto taskStartHead = headResult.output.strip;
+				if (headResult.status != 0 || taskStartHead.length == 0)
+				{
+					childTd.error = "Failed to capture task start HEAD in "
+						~ host_.worktreePath(childTd) ~ " (status "
+						~ format!"%d"(headResult.status) ~ "): "
+						~ headResult.output.strip;
+					childTd.resultText = childTd.error;
+					host_.persistResultText(childTid, childTd.resultText);
+					host_.transitionTaskFrom(childTid,
+						[TaskStatus.pending, TaskStatus.active], TaskStatus.failed,
+						TaskNotificationChange.preserve);
+					if (hasPendingSubTask(childTid))
+						deliverFailedPendingSubTaskResult(childTid);
+					return LaunchedTask(childTid, promise);
+				}
+				childTd.taskStartHead = taskStartHead;
+				host_.persistTaskStartHead(childTid, childTd.taskStartHead);
 			}
 
 			auto renderedPrompt = renderPrompt(*ctd, prompt,
@@ -1530,7 +1556,6 @@ unittest
 			"tasks", td.tid.to!string, "output.md"),
 		worktreePath: (const TaskData* td) => buildPath("/tmp", "cydo-task-startup-failure",
 			"tasks", td.tid.to!string, "worktree"),
-		worktreeForkBaseHead: (int tid) => "",
 		taskProducesCommitOutput: (string projectPath, string taskTypeName) => false,
 		setupWorktreeForEdge: (int childTid, int parentTid, WorktreeMode mode) {},
 		ensureProcessQueueAlive: (int tid) => tid == 2

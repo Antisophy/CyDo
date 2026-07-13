@@ -332,6 +332,9 @@ class App
 			persistResultText: (int tid, string resultText) {
 				persistence.setResultText(tid, resultText);
 			},
+			persistTaskStartHead: (int tid, string taskStartHead) {
+				persistence.setTaskStartHead(tid, taskStartHead);
+			},
 			touchTask: &touchTask,
 			taskTypesForProject: (string projectPath) {
 				return taskTypeCatalog.getTaskTypesForProject(projectPath);
@@ -363,12 +366,6 @@ class App
 			taskDir: &taskPathResolver.taskDir,
 			outputPath: &taskPathResolver.outputPath,
 			worktreePath: &taskPathResolver.worktreePath,
-			worktreeForkBaseHead: (int tid) {
-				auto td = tid in tasks;
-				assert(td !is null,
-					format!"Worktree fork base requested for missing task %d"(tid));
-				return getWorktreeForkBaseHead(*td);
-			},
 			taskProducesCommitOutput: (string projectPath, string taskTypeName) {
 				import std.algorithm : canFind;
 
@@ -720,6 +717,7 @@ class App
 			td.parentTid = row.parentTid;
 			td.relationType = row.relationType;
 			td.worktreeTid = row.worktreeTid;
+			td.taskStartHead = row.taskStartHead;
 			td.title = row.title;
 			td.status = parseTaskStatus(row.status);
 			td.archived = row.archived;
