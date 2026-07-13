@@ -429,6 +429,21 @@ export function matchPattern(userText) {
       },
     };
 
+  if (/call waiting background resume fixture/i.test(userText))
+    return {
+      type: "tool_call",
+      name: "mcp__cydo__Task",
+      input: {
+        tasks: [
+          {
+            task_type: "research",
+            prompt: "run command sleep 20 && echo waiting-child-done",
+            description: "Slow child",
+          },
+        ],
+      },
+    };
+
   // "spawn task <prompt>" → Claude's built-in Task tool (triggers native sub-agent)
   match = userText.match(/spawn task (.*)/is);
   if (match)

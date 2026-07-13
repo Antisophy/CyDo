@@ -3,19 +3,21 @@ module cydo.workflow.sessions.task_runner;
 import core.time : seconds;
 
 import std.file : mkdirRecurse;
+import std.exception : assertThrown;
 import std.path : absolutePath, buildPath, dirName;
 import std.process : execute;
 import std.string : strip;
 import std.logger : infof, tracef, warningf;
 
-import ae.utils.json : toJson;
+import ae.utils.json : JSONPartial, jsonParse, toJson;
 import ae.utils.promise : Promise, reject, resolve;
 
 import cydo.agent.contract : Agent, SessionConfig;
 import cydo.agent.session : AgentSession;
 import cydo.mcp.tool_descriptions : RenderedCydoToolsOptions,
 	ToolDescriptionViolation, checkRenderedCydoToolDescriptionViolations;
-import cydo.protocol : ProcessExitEvent, ProcessStderrEvent, TranslatedEvent;
+import cydo.protocol : ItemDeltaEvent, ItemStartedEvent, ProcessExitEvent,
+	ProcessStderrEvent, TranslatedEvent;
 import cydo.runtime.config : AgentDriver, PathMode, SandboxConfig;
 import cydo.runtime.launch.types : AgentSandboxConfig, ProcessLaunch;
 import launchSandbox = cydo.runtime.launch.sandbox;
@@ -27,6 +29,73 @@ import cydo.domain.task_types.definition : TaskTypeDef,
 	isInteractive, formatCompactSwitchModeToolSummary, loadTaskTypeSystemPrompt, byName;
 
 package(cydo):
+
+private bool isAssistantTurnWork(TranslatedEvent ev)
+{
+	@JSONPartial struct EventType
+	{
+		string type;
+	}
+
+	auto eventType = jsonParse!EventType(ev.translated).type;
+	if (eventType == "item/started")
+	{
+		auto started = jsonParse!ItemStartedEvent(ev.translated);
+		if (started.is_replay || started.is_synthetic || started.is_meta)
+			return false;
+		return started.item_type == "text"
+			|| started.item_type == "thinking"
+			|| started.item_type == "tool_use";
+	}
+	if (eventType == "item/delta")
+	{
+		auto delta = jsonParse!ItemDeltaEvent(ev.translated);
+		return delta.delta_type == "text_delta"
+			|| delta.delta_type == "thinking_delta"
+			|| delta.delta_type == "input_json_delta";
+	}
+	return false;
+}
+
+unittest
+{
+	foreach (eventJson; [
+		`{"type":"item/started","item_id":"text","item_type":"text"}`,
+		`{"type":"item/started","item_id":"thinking","item_type":"thinking"}`,
+		`{"type":"item/started","item_id":"tool","item_type":"tool_use"}`,
+		`{"type":"item/delta","item_id":"text","delta_type":"text_delta","content":"work"}`,
+		`{"type":"item/delta","item_id":"thinking","delta_type":"thinking_delta","content":"work"}`,
+		`{"type":"item/delta","item_id":"tool","delta_type":"input_json_delta","content":"{}"}`,
+	])
+		assert(isAssistantTurnWork(TranslatedEvent(eventJson, null)), eventJson);
+}
+
+unittest
+{
+	foreach (eventJson; [
+		`{"type":"session/init","session_id":"session"}`,
+		`{"type":"session/status","status":"idle"}`,
+		`{"type":"session/compacted"}`,
+		`{"type":"item/started","item_id":"user","item_type":"user_message"}`,
+		`{"type":"item/started","item_id":"replay","item_type":"text","is_replay":true}`,
+		`{"type":"item/started","item_id":"synthetic","item_type":"thinking","is_synthetic":true}`,
+		`{"type":"item/started","item_id":"meta","item_type":"tool","is_meta":true}`,
+		`{"type":"item/delta","item_id":"background","delta_type":"output_delta","content":"late output"}`,
+		`{"type":"item/completed","item_id":"text","text":"done"}`,
+		`{"type":"item/result","item_id":"tool","content":"done"}`,
+		`{"type":"turn/result","subtype":"success"}`,
+		`{"type":"process/stderr","text":"warning"}`,
+		`{"type":"process/exit","code":0}`,
+		`{"type":"task/notification","message":"waiting"}`,
+	])
+		assert(!isAssistantTurnWork(TranslatedEvent(eventJson, null)), eventJson);
+}
+
+unittest
+{
+	assertThrown!Exception(isAssistantTurnWork(
+		TranslatedEvent(`{"type":"item/started"`, null)));
+}
 
 struct TaskSessionLaunch
 {
@@ -351,10 +420,16 @@ class TaskSessionRunner
 			if (current is null)
 				return;
 
-			if (!current.isProcessing && current.hadTurnResult)
+			if (isAssistantTurnWork(ev))
 			{
-				current.isProcessing = true;
-				host_.publishTaskSnapshot(tid);
+				bool processingChanged = !current.isProcessing;
+				if (processingChanged)
+					current.isProcessing = true;
+				if (current.status == TaskStatus.waiting)
+					host_.transitionTask(tid, TaskStatus.waiting, TaskStatus.active,
+						TaskNotificationChange.preserve);
+				else if (processingChanged)
+					host_.publishTaskSnapshot(tid);
 			}
 
 			if (!taskAgent.isTurnResult(ev.translated))

@@ -37,8 +37,15 @@ function sendJson(socket, statusCode, statusText, body) {
   socket.write(response);
 }
 
-function sendSse(socket, chunks) {
-  const body = chunks.map((c) => `data: ${typeof c === "string" ? c : JSON.stringify(c)}\n\n`).join("");
+function sendSse(socket, chunks, delayBeforeLast = 0) {
+  const writeChunks = (parts, terminate) => {
+    const body = parts.map((c) => `data: ${typeof c === "string" ? c : JSON.stringify(c)}\n\n`).join("");
+    const bodyBuf = Buffer.from(body);
+    socket.write(`${bodyBuf.length.toString(16)}\r\n`);
+    socket.write(bodyBuf);
+    socket.write(`\r\n`);
+    if (terminate) socket.write(`0\r\n\r\n`);
+  };
   const response =
     `HTTP/1.1 200 OK\r\n` +
     `Content-Type: text/event-stream\r\n` +
@@ -46,11 +53,12 @@ function sendSse(socket, chunks) {
     `Transfer-Encoding: chunked\r\n` +
     `\r\n`;
   socket.write(response);
-  // Write body as a single chunk then terminate chunked encoding
-  const bodyBuf = Buffer.from(body);
-  socket.write(`${bodyBuf.length.toString(16)}\r\n`);
-  socket.write(bodyBuf);
-  socket.write(`\r\n0\r\n\r\n`);
+  if (delayBeforeLast === 0) {
+    writeChunks(chunks, true);
+    return;
+  }
+  writeChunks(chunks.slice(0, -1), false);
+  setTimeout(() => writeChunks(chunks.slice(-1), true), delayBeforeLast);
 }
 
 function handleTokenExchange(socket) {
@@ -257,7 +265,8 @@ function handleChatCompletions(socket, body) {
       { id: chatId, object: "chat.completion.chunk", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: JSON.stringify(intent.input) } }] }, finish_reason: null }] },
       { id: chatId, object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
       "[DONE]",
-    ]);
+    // Let the real client deliver Answer before its canonical idle event.
+    ], toolName === "cydo-Answer" ? 500 : 0);
   }
 }
 
