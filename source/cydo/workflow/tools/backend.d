@@ -115,6 +115,128 @@ struct WorkflowToolsHost
 	void delegate(int tid, string prompt) generateTitle;
 }
 
+unittest
+{
+	import ae.net.asockets : onNextTick, socketManager;
+	import ae.utils.promise : reject;
+	import ae.utils.promise.await : async;
+	import cydo.domain.task_types.definition : CreatableTaskDef;
+	import cydo.protocol : BatchResultEnvelope;
+	import cydo.mcp.tools : CydoToolsImpl, TaskSpec;
+	import cydo.runtime.config : SandboxConfig;
+	import std.conv : to;
+	import std.path : buildPath;
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager, "nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	TaskTypeDef parentType;
+	parentType.name = "parent";
+	parentType.agent = "fake";
+	CreatableTaskDef edge;
+	edge.name = "child";
+	edge.worktree = WorktreeMode.fork;
+	parentType.creatable_tasks = [edge];
+	TaskTypeDef childType;
+	childType.name = "child";
+	childType.agent = "fake";
+	ContinuationDef continuation;
+	continuation.task_type = "child";
+	parentType.continuations["continue"] = continuation;
+	auto taskTypes = [parentType, childType];
+
+	TaskData[int] tasks;
+	tasks[1] = TaskData(1, "local", "/tmp/cydo-task-startup-failure");
+	tasks[1].taskType = "parent";
+	tasks[1].agentType = "fake";
+	int nextTid = 2;
+
+	auto backend = new WorkflowToolsBackend(WorkflowToolsHost(
+		getTask: (int tid) { auto td = tid in tasks; return td is null ? null : td; },
+		createTask: (string workspace, string projectPath, string agentName) {
+			auto tid = nextTid++; tasks[tid] = TaskData(tid, workspace, projectPath);
+			tasks[tid].agentType = agentName; return tid;
+		},
+		persistTaskType: (int tid, string taskType) {},
+		persistDescription: (int tid, string description) {},
+		persistParentTid: (int tid, int parentTid) {},
+		persistRelationType: (int tid, string relationType) {},
+		persistTitle: (int tid, string title) {},
+		transitionTask: (int tid, TaskStatus expectedFrom, TaskStatus to, TaskNotificationChange notification) {
+			assert(tasks[tid].status == expectedFrom); tasks[tid].status = to;
+		},
+		transitionTaskFrom: (int tid, TaskStatus[] expectedFrom, TaskStatus to, TaskNotificationChange notification) {
+			bool expected; foreach (from; expectedFrom) expected = expected || tasks[tid].status == from;
+			assert(expected); tasks[tid].status = to;
+		},
+		persistNeedsAttention: (int tid, bool needsAttention) {},
+		persistLastActive: (int tid, long lastActive) {},
+		persistResultText: (int tid, string resultText) {},
+		touchTask: (int tid) {},
+		taskTypesForProject: (string projectPath) => taskTypes,
+		entryPointsForProject: (string projectPath) => cast(UserEntryPointDef[]) null,
+		promptSearchPath: (string projectPath) => cast(string[]) null,
+		treeReadOnlyForProject: (string projectPath) => cast(bool[string]) null,
+		resolveTaskAgent: (string requestedAgent, string parentAgent) => "fake",
+		isRegisteredAgent: (string agentName) => agentName == "fake",
+		agentForTask: (int tid) { assert(0); return cast(Agent) null; },
+		taskSystemPromptForMessage: (int tid, TaskTypeDef* typeDef) => "",
+		readPromptFile: (string relativePath, string projectPath, string[string] vars) => "",
+		buildKnownSystemMessageMeta: (KnownSystemMessageKind kind, string subject, string[string] vars, string bodyVar) => "{}",
+		systemKeyword: () => "SYSTEM",
+		taskDir: (const TaskData* td) => buildPath("/tmp", "cydo-task-startup-failure", "tasks", td.tid.to!string),
+		outputPath: (const TaskData* td) => buildPath("/tmp", "cydo-task-startup-failure", "tasks", td.tid.to!string, "output.md"),
+		worktreePath: (const TaskData* td) => buildPath("/tmp", "cydo-task-startup-failure", "tasks", td.tid.to!string, "worktree"),
+		taskProducesCommitOutput: (string projectPath, string taskTypeName) => false,
+		setupWorktreeForEdge: (int childTid, int parentTid, WorktreeMode mode) {},
+		ensureProcessQueueAlive: (int tid) => tid == 2 ? reject!void(new Exception("simulated child session startup failure")) : resolve(),
+		sendTaskMessage: (int tid, const(ContentBlock)[] content, const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) { assert(tid == 3); },
+		emitTaskReload: (int tid, string reason) {},
+		appendSynthesizedHistoryError: (int tid, string subject, string body) {},
+		taskAlive: (int tid) => false, tasksShareWorkspace: (int aTid, int bTid) => true,
+		taskWorkspaceLabel: (int tid) => "local", addIdleCallback: (int tid, void delegate() cb) {},
+		reactivateTask: (int tid, void delegate() onReady) {},
+		canSendSystemMessage: (int tid, out string sessionState) { sessionState = "dead"; return false; },
+		sendKnownSystemMessage: (int tid, KnownSystemMessageKind kind, string body) {},
+		persistAddTaskDep: (int parentTid, int childTid) {}, persistRemoveTaskDep: (int parentTid, int childTid) {},
+		persistRemoveAllChildDeps: (int childTid) {}, loadTaskDeps: () => cast(int[][int]) null,
+		broadcastTaskUpdate: (int tid) {}, broadcastFocusHint: (int fromTid, int toTid) {},
+		sendAskUserQuestionPrompt: (int tid, JSONFragment questions, string toolUseId) {},
+		clearAskUserQuestionPrompt: (int tid) {},
+		sendPermissionPrompt: (int tid, string toolUseId, string toolName, JSONFragment input) {},
+		clearPermissionPrompt: (int tid) {}, appendTaskSpawnedEvent: (int parentTid, int childTid, int specIndex) {},
+		broadcastTaskCreated: (TaskCreatedMessage message) {}, workspacePermissionPolicy: (string workspaceName) => "",
+		onNextTick: (void delegate() cb) { onNextTick(socketManager, cb); }, generateTitle: (int tid, string prompt) {},
+	));
+
+	auto tools = new CydoToolsImpl(backend, "1");
+	bool resolved;
+	McpResult result;
+	async({ return tools.createTasks([TaskSpec("child startup", "child", "trigger child startup failure")]); }).then((McpResult r) { resolved = true; result = r; });
+	drainPromiseNextTicks();
+	assert(resolved);
+	assert(result.isError);
+	auto batch = jsonParse!BatchResultEnvelope(result.text);
+	auto taskResult = jsonParse!TaskResult(batch.tasks[0].json);
+	assert(taskResult.status == "error");
+	assert(taskResult.summary == "simulated child session startup failure");
+	assert(taskResult.error == "simulated child session startup failure");
+	assert(tasks[2].projectPath == "/tmp/cydo-task-startup-failure");
+	tasks[1].pendingContinuation = new PendingContinuation(PendingContinuation.Kind.handoff, "continue", "follow-up");
+	backend.spawnContinuation(1);
+	assert(tasks[3].projectPath == "/tmp/cydo-task-startup-failure");
+}
+
 final class WorkflowToolsBackend : ToolsBackend
 {
 private:
@@ -1464,7 +1586,11 @@ unittest
 	import cydo.mcp.tools : CydoToolsImpl, TaskSpec;
 	import cydo.runtime.config : SandboxConfig;
 	import std.conv : to;
+	import std.algorithm.searching : canFind;
+	import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir;
 	import std.path : buildPath;
+	import std.process : execute;
+	import std.string : strip;
 
 	void drainPromiseNextTicks()
 	{
@@ -1495,11 +1621,23 @@ unittest
 	parentType.continuations["continue"] = continuation;
 	auto taskTypes = [parentType, childType];
 
+	auto taskRoot = buildPath(tempDir(), "cydo-task-start-head-capture");
+	if (exists(taskRoot))
+		rmdirRecurse(taskRoot);
+	mkdirRecurse(taskRoot);
+	scope(exit) rmdirRecurse(taskRoot);
+
 	TaskData[int] tasks;
-	tasks[1] = TaskData(1, "local", "/tmp/cydo-task-startup-failure");
+	tasks[1] = TaskData(1, "local", taskRoot);
 	tasks[1].taskType = "parent";
 	tasks[1].agentType = "fake";
 	int nextTid = 2;
+	string persistedTaskStartHead;
+	int launchCalls;
+	bool producesCommitOutput = true;
+	bool assignWorktree = true;
+	bool initializeWorktree;
+	string expectedTaskStartHead;
 
 	auto backend = new WorkflowToolsBackend(WorkflowToolsHost(
 		getTask: (int tid) {
@@ -1533,6 +1671,9 @@ unittest
 		persistNeedsAttention: (int tid, bool needsAttention) {},
 		persistLastActive: (int tid, long lastActive) {},
 		persistResultText: (int tid, string resultText) {},
+		persistTaskStartHead: (int tid, string taskStartHead) {
+			persistedTaskStartHead = taskStartHead;
+		},
 		touchTask: (int tid) {},
 		taskTypesForProject: (string projectPath) => taskTypes,
 		entryPointsForProject: (string projectPath) => cast(UserEntryPointDef[]) null,
@@ -1550,17 +1691,36 @@ unittest
 		buildKnownSystemMessageMeta: (KnownSystemMessageKind kind,
 			string subject, string[string] vars, string bodyVar) => "{}",
 		systemKeyword: () => "SYSTEM",
-		taskDir: (const TaskData* td) => buildPath("/tmp", "cydo-task-startup-failure",
+		taskDir: (const TaskData* td) => buildPath(taskRoot,
 			"tasks", td.tid.to!string),
-		outputPath: (const TaskData* td) => buildPath("/tmp", "cydo-task-startup-failure",
+		outputPath: (const TaskData* td) => buildPath(taskRoot,
 			"tasks", td.tid.to!string, "output.md"),
-		worktreePath: (const TaskData* td) => buildPath("/tmp", "cydo-task-startup-failure",
+		worktreePath: (const TaskData* td) => buildPath(taskRoot,
 			"tasks", td.tid.to!string, "worktree"),
-		taskProducesCommitOutput: (string projectPath, string taskTypeName) => false,
-		setupWorktreeForEdge: (int childTid, int parentTid, WorktreeMode mode) {},
-		ensureProcessQueueAlive: (int tid) => tid == 2
-			? reject!void(new Exception("simulated child session startup failure"))
-			: resolve(),
+		taskProducesCommitOutput: (string projectPath, string taskTypeName) => producesCommitOutput,
+		setupWorktreeForEdge: (int childTid, int parentTid, WorktreeMode mode) {
+			auto worktree = buildPath(taskRoot, "tasks", childTid.to!string, "worktree");
+			mkdirRecurse(worktree);
+			if (assignWorktree)
+				tasks[childTid].worktreeTid = childTid;
+			if (initializeWorktree)
+			{
+				execute(["git", "-C", worktree, "init", "-q"]);
+				execute(["git", "-C", worktree, "config", "user.email", "test@test"]);
+				execute(["git", "-C", worktree, "config", "user.name", "Test"]);
+				execute(["git", "-C", worktree, "commit", "--allow-empty", "-qm", "base"]);
+				expectedTaskStartHead = execute(["git", "-C", worktree, "rev-parse", "HEAD"]).output.strip;
+			}
+		},
+		ensureProcessQueueAlive: (int tid) {
+			launchCalls++;
+			if (tid == 4)
+			{
+				assert(tasks[tid].taskStartHead == expectedTaskStartHead);
+				assert(persistedTaskStartHead == expectedTaskStartHead);
+			}
+			return reject!void(new Exception("process launch should not run"));
+		},
 		sendTaskMessage: (int tid, const(ContentBlock)[] content,
 			const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) {
 			assert(tid == 3,
@@ -1619,14 +1779,43 @@ unittest
 	assert(batch.tasks.length == 1);
 	auto taskResult = jsonParse!TaskResult(batch.tasks[0].json);
 	assert(taskResult.status == "error");
-	assert(taskResult.summary == "simulated child session startup failure");
-	assert(taskResult.error == "simulated child session startup failure");
-	assert(tasks[2].projectPath == "/tmp/cydo-task-startup-failure");
+	assert(taskResult.summary.canFind("Failed to capture task start HEAD"));
+	assert(taskResult.error.canFind("Failed to capture task start HEAD"));
+	assert(tasks[2].status == "failed");
+	assert(tasks[2].error.canFind("status"));
+	assert(launchCalls == 0);
+	assert(persistedTaskStartHead.length == 0);
 
-	// A non-keep-context continuation creates a new TaskData through the
-	// same host seam as a subtask and must retain the parent's identity.
-	tasks[1].pendingContinuation = new PendingContinuation(
-		PendingContinuation.Kind.handoff, "continue", "follow-up");
-	backend.spawnContinuation(1);
-	assert(tasks[3].projectPath == "/tmp/cydo-task-startup-failure");
+	producesCommitOutput = false;
+	assignWorktree = false;
+	resolved = false;
+	async({
+		return tools.createTasks([
+			TaskSpec("no worktree", "child", "launch without worktree"),
+		]);
+	}).then((McpResult r) {
+		resolved = true;
+		result = r;
+	});
+	drainPromiseNextTicks();
+	assert(resolved);
+	assert(launchCalls == 1);
+	assert(tasks[3].taskStartHead.length == 0);
+	assert(persistedTaskStartHead.length == 0);
+
+	producesCommitOutput = true;
+	assignWorktree = true;
+	initializeWorktree = true;
+	resolved = false;
+	async({
+		return tools.createTasks([
+			TaskSpec("successful capture", "child", "launch with worktree"),
+		]);
+	}).then((McpResult r) {
+		resolved = true;
+		result = r;
+	});
+	drainPromiseNextTicks();
+	assert(resolved);
+	assert(tasks[4].taskStartHead == expectedTaskStartHead);
 }

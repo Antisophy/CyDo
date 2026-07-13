@@ -315,3 +315,93 @@ private:
 		return td;
 	}
 }
+
+unittest
+{
+	import std.algorithm.searching : canFind;
+	import std.file : exists, mkdirRecurse, remove, rmdirRecurse, tempDir, write;
+	import std.path : buildPath;
+	import std.process : execute;
+	import cydo.domain.storage.persistence : Persistence;
+
+	auto repo = buildPath(tempDir(), "cydo-subtask-delivery-commit-range");
+	if (exists(repo))
+		rmdirRecurse(repo);
+	mkdirRecurse(repo);
+	scope(exit) rmdirRecurse(repo);
+
+	execute(["git", "-C", repo, "init", "-q"]);
+	execute(["git", "-C", repo, "config", "user.email", "test@test"]);
+	execute(["git", "-C", repo, "config", "user.name", "Test"]);
+	write(buildPath(repo, "work.txt"), "base\n");
+	execute(["git", "-C", repo, "add", "work.txt"]);
+	execute(["git", "-C", repo, "commit", "-qm", "base"]);
+	auto taskStartHead = execute(["git", "-C", repo, "rev-parse", "HEAD"]).output.strip;
+	auto dbPath = buildPath(tempDir(), "cydo-subtask-delivery-reload.sqlite");
+	if (exists(dbPath)) remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+	auto persistence = Persistence(dbPath);
+	auto persistedTid = persistence.createTask();
+	persistence.setTaskStartHead(persistedTid, taskStartHead);
+	auto reloadedTaskStartHead = persistence.loadTasks()[0].taskStartHead;
+	write(buildPath(repo, "work.txt"), "first\n");
+	execute(["git", "-C", repo, "commit", "-am", "first", "-q"]);
+	auto firstCommit = execute(["git", "-C", repo, "rev-parse", "HEAD"]).output.strip;
+	write(buildPath(repo, "work.txt"), "second\n");
+	execute(["git", "-C", repo, "commit", "-am", "second", "-q"]);
+	auto secondCommit = execute(["git", "-C", repo, "rev-parse", "HEAD"]).output.strip;
+
+	TaskData[int] tasks;
+	tasks[2] = TaskData(2, "local", repo);
+	tasks[2].taskType = "implementation";
+	tasks[2].worktreeTid = 2;
+	tasks[2].taskStartHead = reloadedTaskStartHead;
+
+	auto delivery = new SubtaskResultDelivery(SubtaskResultDeliveryHost(
+		getTask: (int tid) {
+			auto td = tid in tasks;
+			return td is null ? null : td;
+		},
+		outputPath: (const TaskData* td) => "",
+		worktreePath: (const TaskData* td) => repo,
+		taskProducesCommitOutput: (string projectPath, string taskType) => true,
+	));
+
+	auto result = delivery.buildTaskResult(2);
+	assert(result.commits == [secondCommit, firstCommit]);
+	assert(result.note.canFind("git cherry-pick " ~ firstCommit ~ " " ~ secondCommit));
+}
+
+unittest
+{
+	import std.algorithm.searching : canFind;
+	import std.file : remove, write;
+	import std.path : buildPath;
+
+	auto output = buildPath("/tmp", "cydo-legacy-subtask-output.md");
+	write(output, "legacy output");
+	scope(exit) remove(output);
+	TaskData[int] tasks;
+	tasks[2] = TaskData(2, "local", "/tmp/cydo-legacy-subtask");
+	tasks[2].taskType = "implementation";
+	tasks[2].worktreeTid = 2;
+	tasks[2].resultText = "legacy summary";
+
+	auto delivery = new SubtaskResultDelivery(SubtaskResultDeliveryHost(
+		getTask: (int tid) {
+			auto td = tid in tasks;
+			return td is null ? null : td;
+		},
+		outputPath: (const TaskData* td) => output,
+		worktreePath: (const TaskData* td) => "/tmp/cydo-legacy-subtask",
+		taskProducesCommitOutput: (string projectPath, string taskType) => true,
+	));
+
+	auto result = delivery.buildTaskResult(2);
+	assert(result.commits == ["(not available - check git log)"]);
+	assert(result.note.canFind("pre-upgrade task"));
+	assert(!result.note.canFind("git cherry-pick"));
+	assert(result.summary == "legacy summary");
+	assert(result.output_file == output);
+	assert(result.worktree == "/tmp/cydo-legacy-subtask");
+}

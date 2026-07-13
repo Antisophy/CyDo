@@ -471,3 +471,62 @@ int createForkTask(ref Persistence persistence, int sourceTid, string agentSessi
 			Clock.currStdTime, Clock.currStdTime);
 	return cast(int) persistence.db.db.lastInsertRowID;
 }
+
+unittest
+{
+	import std.file : exists, remove, tempDir;
+	import std.path : buildPath;
+
+	auto dbPath = buildPath(tempDir(), "cydo-task-start-head-round-trip.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+
+	auto persistence = Persistence(dbPath);
+	auto tid = persistence.createTask();
+	persistence.setTaskStartHead(tid, "7f3a9c2");
+	auto rows = persistence.loadTasks();
+
+	assert(rows.length == 1);
+	assert(rows[0].taskStartHead == "7f3a9c2");
+}
+
+unittest
+{
+	import std.file : exists, remove, tempDir;
+	import std.path : buildPath;
+
+	auto dbPath = buildPath(tempDir(), "cydo-task-start-head-migration.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+
+	{
+		auto legacy = Database(dbPath);
+		legacy.db.exec("CREATE TABLE tasks (" ~
+			"tid INTEGER PRIMARY KEY AUTOINCREMENT, agent_session_id TEXT, " ~
+			"description TEXT NOT NULL DEFAULT '', task_type TEXT NOT NULL DEFAULT 'blank', " ~
+			"parent_tid INTEGER, relation_type TEXT NOT NULL DEFAULT '', " ~
+			"workspace TEXT NOT NULL DEFAULT '', project_path TEXT NOT NULL DEFAULT '', " ~
+			"title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', " ~
+			"worktree_path TEXT NOT NULL DEFAULT '', has_worktree INTEGER NOT NULL DEFAULT 0, " ~
+			"agent_type TEXT NOT NULL DEFAULT 'claude', archived INTEGER NOT NULL DEFAULT 0, " ~
+			"draft TEXT NOT NULL DEFAULT '', result_text TEXT DEFAULT '', created_at INTEGER, " ~
+			"last_active INTEGER, worktree_tid INTEGER NOT NULL DEFAULT 0, " ~
+			"entry_point TEXT NOT NULL DEFAULT '');"
+		);
+		legacy.db.exec("CREATE TABLE session_meta_cache (" ~
+			"agent_type TEXT NOT NULL, session_id TEXT NOT NULL, mtime INTEGER NOT NULL, " ~
+			"project_path TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', " ~
+			"has_messages INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (agent_type, session_id));"
+		);
+		legacy.db.exec("INSERT INTO tasks (tid, workspace, project_path) VALUES (1, 'ws', 'project');");
+		legacy.db.exec("PRAGMA user_version = 18;");
+	}
+
+	auto persistence = Persistence(dbPath);
+	auto rows = persistence.loadTasks();
+
+	assert(rows.length == 1);
+	assert(rows[0].taskStartHead == "");
+}
