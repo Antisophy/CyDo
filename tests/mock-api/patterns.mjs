@@ -431,17 +431,9 @@ export function matchPattern(userText) {
 
   if (/call waiting background resume fixture/i.test(userText))
     return {
-      type: "tool_call",
-      name: "mcp__cydo__Task",
-      input: {
-        tasks: [
-          {
-            task_type: "research",
-            prompt: "run command sleep 20 && echo waiting-child-done",
-            description: "Slow child",
-          },
-        ],
-      },
+      type: "background_shell",
+      command:
+        "rm -f /tmp/cydo-test-workspace/waiting-background-resume.fifo && mkfifo /tmp/cydo-test-workspace/waiting-background-resume.fifo && read release < /tmp/cydo-test-workspace/waiting-background-resume.fifo && rm -f /tmp/cydo-test-workspace/waiting-background-resume.fifo && echo waiting-background-released",
     };
 
   // "spawn task <prompt>" → Claude's built-in Task tool (triggers native sub-agent)

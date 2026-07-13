@@ -683,6 +683,23 @@ function handleResponses(req, res) {
           return;
         }
       }
+      if (
+        origText &&
+        /call waiting background resume fixture/i.test(origText) &&
+        input.filter((item) => item.type === "function_call_output").length ===
+          1
+      ) {
+        oaiStreamFunctionCallResponse(res, "mcp__cydo__Task", {
+          tasks: [
+            {
+              task_type: "research",
+              prompt: "run command sleep 20 && echo waiting-child-done",
+              description: "Slow child",
+            },
+          ],
+        });
+        return;
+      }
       if (origText && /codex filechange update fixture/i.test(origText)) {
         // Keep this path malformed on purpose: stderr-handling.spec.ts relies on
         // Codex surfacing a process/stderr payload for this fixture.
