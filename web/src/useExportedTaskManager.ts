@@ -222,6 +222,7 @@ export function useExportedTaskManager(): TaskManager {
     interrupt: noop,
     stop: noop,
     closeStdin: noop,
+    renameTask: noop,
     resume: noop,
     promote: noop,
     fork: noop,

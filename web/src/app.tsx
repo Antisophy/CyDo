@@ -30,6 +30,7 @@ function AppContent() {
     interrupt,
     stop,
     closeStdin,
+    renameTask,
     resume,
     promote,
     fork,
@@ -458,6 +459,7 @@ function AppContent() {
                     onInterrupt={interrupt}
                     onStop={stop}
                     onCloseStdin={closeStdin}
+                    onRename={renameTask}
                     onResume={resume}
                     onPromote={promote}
                     onFork={fork}
