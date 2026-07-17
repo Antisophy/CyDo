@@ -214,6 +214,21 @@ struct ProcessExitEvent
 	@JSONOptional bool is_continuation;
 }
 
+enum TaskDiagnosticSeverity : string
+{
+	info = "info",
+	warning = "warning",
+	error = "error",
+}
+
+struct TaskDiagnosticEvent
+{
+	string type = "cydo/task_diagnostic";
+	TaskDiagnosticSeverity severity;
+	string subject;
+	string body;
+}
+
 /// item/started — a new content item begins streaming.
 struct ItemStartedEvent
 {
@@ -481,4 +496,24 @@ void decomposeToolName(string rawName, ref string name, ref string tool_server, 
 		}
 	}
 	name = rawName;
+}
+
+unittest
+{
+	import std.algorithm : canFind;
+
+	foreach (severity; [TaskDiagnosticSeverity.info, TaskDiagnosticSeverity.warning,
+		TaskDiagnosticSeverity.error])
+	{
+		TaskDiagnosticEvent event;
+		event.severity = severity;
+		event.subject = "Subject";
+		event.body = "Body";
+		auto json = toJson(event);
+		assert(json == `{"type":"cydo/task_diagnostic","severity":"` ~ severity
+			~ `","subject":"Subject","body":"Body"}`);
+		assert(!json.canFind(`"item_id"`) && !json.canFind(`"item_type"`)
+			&& !json.canFind(`"user_message"`) && !json.canFind(`"is_meta"`)
+			&& !json.canFind(`"meta"`));
+	}
 }

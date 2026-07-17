@@ -3,7 +3,8 @@
 module cydo.agent.protocol_codegen;
 
 import std.meta : AliasSeq, Filter, staticIndexOf, templateNot;
-import std.traits : Fields, FieldNameTuple, isArray, ForeachType;
+import std.string : indexOf;
+import std.traits : EnumMembers, Fields, FieldNameTuple, isArray, ForeachType;
 import ae.utils.json : JSONFragment, JSONName, JSONOptional, JSONExtras;
 import cydo.protocol;
 
@@ -23,6 +24,8 @@ template tsTypeName(T)
 		enum tsTypeName = "unknown";
 	else static if (is(T == JSONExtras))
 		enum tsTypeName = "__jsonextras__";
+	else static if (is(T == enum))
+		enum tsTypeName = T.stringof;
 	else static if (is(T == V[K], V, K))
 		enum tsTypeName = "Record<" ~ tsTypeName!K ~ ", " ~ tsTypeName!V ~ ">";
 	else static if (isArray!T && !is(T == string))
@@ -95,6 +98,22 @@ private template _buildProtocolStructList(names...)
 
 alias allProtocolStructs = _buildProtocolStructList!(__traits(allMembers, cydo.protocol));
 
+private template _buildProtocolEnumList(names...)
+{
+	static if (names.length == 0)
+		alias _buildProtocolEnumList = AliasSeq!();
+	else
+	{
+		alias _T = __traits(getMember, cydo.protocol, names[0]);
+		static if (is(_T == enum))
+			alias _buildProtocolEnumList = AliasSeq!(_T, _buildProtocolEnumList!(names[1 .. $]));
+		else
+			alias _buildProtocolEnumList = _buildProtocolEnumList!(names[1 .. $]);
+	}
+}
+
+alias allProtocolEnums = _buildProtocolEnumList!(__traits(allMembers, cydo.protocol));
+
 // Filter to event structs only.
 alias EventStructs = Filter!(isEventStruct, allProtocolStructs);
 
@@ -122,6 +141,7 @@ template isReferencedByEvents(T)
 
 // Non-event protocol structs that are referenced by event structs (deps).
 alias DepStructs = Filter!(isReferencedByEvents, Filter!(templateNot!isEventStruct, allProtocolStructs));
+alias DepEnums = Filter!(isReferencedByEvents, allProtocolEnums);
 
 // ---------------------------------------------------------------------------
 // Code generation
@@ -177,9 +197,24 @@ string generateStruct(S)() pure
 	return out_;
 }
 
+string generateEnum(E)() pure
+{
+	string out_ = "export type " ~ E.stringof ~ " = ";
+	static foreach (i, member; EnumMembers!E)
+	{
+		static if (i > 0)
+			out_ ~= " | ";
+		out_ ~= `"` ~ member ~ `"`;
+	}
+	return out_ ~ ";\n";
+}
+
 string generateAll() pure
 {
 	string out_;
+
+	static foreach (E; DepEnums)
+		out_ ~= generateEnum!E() ~ "\n";
 
 	// Dependency structs first (so they're declared before event structs reference them)
 	static foreach (S; DepStructs)
@@ -194,6 +229,8 @@ string generateAll() pure
 
 // Compute the entire output at compile time.
 enum tsOutput = generateAll();
+static assert(tsOutput.indexOf(`export type TaskDiagnosticSeverity = "info" | "warning" | "error";`) >= 0);
+static assert(tsOutput.indexOf("severity: TaskDiagnosticSeverity;") >= 0);
 
 // ---------------------------------------------------------------------------
 // Entry point

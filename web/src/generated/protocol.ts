@@ -1,3 +1,5 @@
+export type TaskDiagnosticSeverity = "info" | "warning" | "error";
+
 export interface ContentBlock {
   type: string;
   text?: string;
@@ -140,6 +142,13 @@ export interface ProcessExitEvent {
   type: "process/exit";
   code: number;
   is_continuation?: boolean;
+}
+
+export interface TaskDiagnosticEvent {
+  type: "cydo/task_diagnostic";
+  severity: TaskDiagnosticSeverity;
+  subject: string;
+  body: string;
 }
 
 export interface ItemStartedEvent {
