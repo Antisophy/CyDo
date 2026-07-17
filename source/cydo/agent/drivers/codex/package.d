@@ -1,6 +1,6 @@
 module cydo.agent.drivers.codex;
 
-import core.time : Duration, seconds;
+import core.time : Duration, msecs, seconds;
 
 import std.conv : to;
 import std.logger : errorf, tracef, warningf;
@@ -296,6 +296,44 @@ class CodexAgent : Agent
 		auto server = getOrCreateServer(serverPoolKey(ws, launch), launch);
 
 		server.onReady(() {
+			import std.file : exists, getSize;
+			size_t rollbackStart;
+			auto initialPath = historyPath(threadId, workspace);
+			if (initialPath.length > 0 && exists(initialPath))
+				rollbackStart = getSize(initialPath);
+
+			void waitForRollbackMarker(uint attemptsRemaining)
+			{
+				import std.file : exists, readText;
+				import std.string : lineSplitter;
+
+				auto path = historyPath(threadId, workspace);
+				if (path.length > 0 && exists(path))
+				{
+					auto content = readText(path);
+					if (content.length < rollbackStart)
+						rollbackStart = 0;
+					foreach (line; content[rollbackStart .. $].lineSplitter)
+					{
+						auto probe = parseRolloutLineProbe(line);
+						if (probe.isThreadRolledBack && probe.rollbackNumTurns == numTurns)
+						{
+							tracef("Codex rollback marker observed: thread=%s turns=%d offset=%d",
+								threadId, numTurns, rollbackStart);
+							outcome.fulfill(ThreadRollbackOutcome(true, ""));
+							return;
+						}
+					}
+				}
+				if (attemptsRemaining == 0)
+				{
+					outcome.fulfill(ThreadRollbackOutcome(false,
+						"thread/rollback completed without a persisted thread_rolled_back marker"));
+					return;
+				}
+				setTimeout({ waitForRollbackMarker(attemptsRemaining - 1); }, 10.msecs);
+			}
+
 			ThreadRollbackParams params;
 			params.threadId = threadId;
 			params.numTurns = numTurns;
@@ -309,7 +347,7 @@ class CodexAgent : Agent
 						outcome.fulfill(ThreadRollbackOutcome(false, e.msg));
 						return;
 					}
-					outcome.fulfill(ThreadRollbackOutcome(true, ""));
+					waitForRollbackMarker(500);
 				});
 		});
 
@@ -1306,8 +1344,6 @@ class CodexSession : AgentSession
 			return;
 		}
 
-		hadItemsSinceLastStop_ = true;
-
 		// Assign item ID: use native id if available, else generate one.
 		auto itemId = item.id.length > 0 ? item.id : "codex-item-" ~ to!string(itemCounter_++);
 		activeItemId_ = itemId;
@@ -1382,6 +1418,7 @@ class CodexSession : AgentSession
 				ev.item_type = "text";
 				break;
 		}
+		hadItemsSinceLastStop_ = true;
 
 		ev.item_id = itemId;
 
@@ -1789,6 +1826,36 @@ string buildConfigOverride(int tid, string creatableTaskTypes,
 	}
 
 	return toJson(config);
+}
+
+unittest
+{
+	@JSONPartial struct StartedNotification { ItemStartedParams params; }
+	@JSONPartial struct CompletedNotification { ItemCompletedParams params; }
+	import cydo.protocol : TurnStopEvent;
+
+	auto session = new CodexSession(cast(AppServerProcess) null, 1, SessionConfig.init);
+	string[] emitted;
+	void sink(TranslatedEvent ev) { emitted ~= ev.translated; }
+	session.onOutput(&sink);
+	session.handleTurnStarted(TurnRef("turn"));
+	auto compactStarted = jsonParse!StartedNotification(
+		`{"params":{"turnId":"turn","item":{"id":"compact","type":"contextCompaction"}}}`);
+	session.handleItemStarted(compactStarted.params, "compact-start");
+	session.handleTokenUsageUpdated(TokenUsageUpdatedParams.init, "usage");
+	auto compactCompleted = jsonParse!CompletedNotification(
+		`{"params":{"item":{"id":"compact","type":"contextCompaction"}}}`);
+	session.handleItemCompleted(compactCompleted.params, "compact-complete");
+	import std.algorithm : canFind;
+	assert(!emitted.canFind!(event => event.canFind(`"type":"turn/stop"`)));
+	auto realStarted = jsonParse!StartedNotification(
+		`{"params":{"turnId":"turn","item":{"id":"message","type":"agentMessage"}}}`);
+	session.handleItemStarted(realStarted.params, "message-start");
+	session.handleTurnCompleted("turn-complete");
+	int stops;
+	foreach (event; emitted)
+		if (event.canFind(`"type":"turn/stop"`)) stops++;
+	assert(stops == 1);
 }
 
 unittest

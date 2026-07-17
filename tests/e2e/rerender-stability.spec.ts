@@ -11,6 +11,14 @@ test("completed messages are not recreated when new messages arrive", { tag: "@c
   page,
   agentType,
 }) => {
+  const frames: any[] = [];
+  page.on("websocket", (ws) => {
+    ws.on("framereceived", (event) => {
+      try {
+        frames.push(JSON.parse(event.payload.toString()));
+      } catch {}
+    });
+  });
 
   // Hook into Preact's render pipeline via window.__preactOptions to count
   // MessageView renders. MessageView is memo-wrapped; when memo works, only
@@ -79,6 +87,15 @@ test("completed messages are not recreated when new messages arrive", { tag: "@c
   await expect(page.locator(".assistant-message.streaming")).toHaveCount(0, {
     timeout,
   });
+  await expect(async () => {
+    const kinds = new Set(
+      frames
+        .filter((frame) => frame?.type === "task_event_replaced")
+        .map((frame) => frame?.event?.history_boundary?.kind),
+    );
+    expect(kinds).toEqual(new Set(["agent_turn"]));
+  }).toPass({ timeout });
+
   // Wait for forkable_uuids control message to arrive — under heavy CPU
   // load, this can arrive in a separate render cycle after the turn completes,
   // changing the `forkable` prop and causing spurious memo-breaking re-renders.

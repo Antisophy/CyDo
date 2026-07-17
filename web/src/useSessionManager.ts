@@ -22,7 +22,7 @@ import type {
 } from "./protocol";
 import type { CydoMeta, TaskState } from "./types";
 import { makeTaskState } from "./types";
-import { reduceMessage } from "./sessionReducer";
+import { reduceMessage, replaceHistoryBoundary } from "./sessionReducer";
 import { drafts as inputDrafts } from "./components/InputBox";
 import { outbox } from "./outbox";
 import {
@@ -1257,47 +1257,6 @@ export function useTaskManager(
           });
           break;
         }
-        case "assign_uuids": {
-          const { tid, assignments } = msg;
-          const t = findByTid(tid);
-          if (!t) break;
-
-          let changed = false;
-          const messages = [...t.messages];
-          const forkable = new Set(t.forkableUuids);
-
-          for (const { uuid: msgUuid, seq } of assignments) {
-            forkable.add(msgUuid);
-            for (let i = messages.length - 1; i >= 0; i--) {
-              const m = messages[i];
-              if (!m) continue;
-              if (m.type !== "user" && m.type !== "assistant") continue; // only patch forkable message types
-              if (m.uuid) continue;
-              const mSeq = m.seq;
-              const seqMatch =
-                typeof mSeq === "number"
-                  ? mSeq === seq
-                  : Array.isArray(mSeq) && mSeq.includes(seq);
-              if (seqMatch) {
-                messages[i] = { ...m, uuid: msgUuid } as typeof m;
-                changed = true;
-                break;
-              }
-            }
-          }
-
-          if (changed) {
-            const updated = { ...t, messages, forkableUuids: forkable };
-            liveStates.set(t.uuid, updated);
-            setTasks((prev) => {
-              if (!prev.has(t.uuid)) return prev;
-              const next = new Map(prev);
-              next.set(t.uuid, updated);
-              return next;
-            });
-          }
-          break;
-        }
         case "undo_preview": {
           const { tid, messages_removed } = msg;
           const t = findByTid(tid);
@@ -1470,6 +1429,7 @@ export function useTaskManager(
           seq?: number;
           ts?: number;
         }
+      | { kind: "replacement"; tid: number; msg: AgnosticEvent; seq: number }
       | {
           kind: "unconfirmed";
           tid: number;
@@ -1518,7 +1478,15 @@ export function useTaskManager(
         else if (item.kind === "unconfirmed")
           handleUnconfirmedUserMessage(item.tid, item.msg, item.correlationId);
         else if (item.kind === "agentAck") handleAgentAck(item.tid, item.nonce);
-        else handleTaskMessage(item.tid, item.msg, item.seq, item.ts);
+        else if (item.kind === "replacement") {
+          const uuid = tidToUuid.get(item.tid);
+          const task = uuid ? liveStates.get(uuid) : undefined;
+          if (!task)
+            throw new Error(`Replacement for unknown task ${item.tid}`);
+          const updated = replaceHistoryBoundary(task, item.msg, item.seq);
+          liveStates.set(uuid!, updated);
+          setTasks((prev) => new Map(prev).set(uuid!, updated));
+        } else handleTaskMessage(item.tid, item.msg, item.seq, item.ts);
       }
     };
 
@@ -1584,6 +1552,10 @@ export function useTaskManager(
 
     conn.onTaskMessage = (tid, msg, seq, ts) => {
       buffer.push({ kind: "task", tid, msg, seq, ts });
+      scheduleFlush();
+    };
+    conn.onTaskEventReplaced = (tid, msg, seq) => {
+      buffer.push({ kind: "replacement", tid, msg, seq });
       scheduleFlush();
     };
     conn.onUnconfirmedUserMessage = (tid, msg, correlationId) => {

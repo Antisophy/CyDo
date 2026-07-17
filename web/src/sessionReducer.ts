@@ -17,6 +17,7 @@ import type {
   Block,
   CydoMeta,
 } from "./types";
+import type { HistoryBoundary } from "./types";
 import { toolIs } from "./toolIdentity";
 import type {
   AgnosticEvent,
@@ -886,6 +887,78 @@ function tryParseJson(text: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+export function replaceHistoryBoundary(
+  s: SessionState,
+  event: AgnosticEvent & { history_boundary?: HistoryBoundary },
+  seq: number,
+): SessionState {
+  const boundary = event.history_boundary;
+  if (!boundary) throw new Error("Replacement event has no history boundary");
+  const expectedType = boundary.kind === "user" ? "user" : "assistant";
+  const eventMatchesBoundary =
+    boundary.kind === "user"
+      ? event.type === "item/started" && event.item_type === "user_message"
+      : event.type === "turn/stop";
+  if (!eventMatchesBoundary)
+    throw new Error(
+      "Replacement event identity does not match history boundary",
+    );
+  const matches = s.messages
+    .map((message, index) => ({ message, index }))
+    .filter(
+      ({ message }) =>
+        message.type === expectedType &&
+        (message.seq === seq ||
+          (Array.isArray(message.seq) && message.seq.includes(seq))),
+    );
+  if (matches.length !== 1)
+    throw new Error(
+      `History replacement matched ${matches.length} messages at seq ${seq}`,
+    );
+  const { message } = matches[0]!;
+  const raw = Array.isArray(message.rawSource)
+    ? message.rawSource.slice()
+    : [message.rawSource];
+  const seqs = Array.isArray(message.seq) ? message.seq : [message.seq];
+  const rawMatches = seqs
+    .map((value, rawIndex) => ({ value, rawIndex }))
+    .filter(({ value }) => value === seq);
+  if (rawMatches.length !== 1)
+    throw new Error(
+      `History replacement matched ${rawMatches.length} raw contributions at seq ${seq}`,
+    );
+  const rawIndex = rawMatches[0]!.rawIndex;
+  const existing = raw[rawIndex] as {
+    type?: string;
+    item_type?: string;
+    item_id?: string;
+    uuid?: string;
+  };
+  const existingMatchesBoundary =
+    boundary.kind === "user"
+      ? existing.type === "item/started" &&
+        existing.item_type === "user_message"
+      : existing.type === "turn/stop";
+  if (!existingMatchesBoundary)
+    throw new Error(
+      "Replacement target identity does not match history boundary",
+    );
+  if (
+    boundary.kind === "user" &&
+    !boundary.anchor.startsWith("line:") &&
+    existing.item_id !== (event as { item_id?: string }).item_id
+  )
+    throw new Error("Replacement target item identity does not match");
+  if (
+    boundary.kind === "agent_turn" &&
+    existing.uuid !== (event as { uuid?: string }).uuid
+  )
+    throw new Error("Replacement target turn identity does not match");
+  const replacementEvents = new Map(s.replacementEvents);
+  replacementEvents.set(seq, event);
+  return { ...s, replacementEvents };
 }
 
 function reduceItemStartedUserMessage(

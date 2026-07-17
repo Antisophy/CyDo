@@ -14,7 +14,7 @@ import { AssistantMessage } from "./AssistantMessage";
 import { UserMessage } from "./UserMessage";
 import { useDevMode } from "../devMode";
 import { Markdown } from "./Markdown";
-import { SourceView } from "./SourceView";
+import { ReplacementEventsContext, SourceView } from "./SourceView";
 import { StatusBand } from "./StatusBand";
 import editIcon from "../icons/edit.svg?raw";
 import viewSourceIcon from "../icons/view-source.svg?raw";
@@ -27,6 +27,7 @@ import errorIcon from "../icons/error.svg?raw";
 interface Props {
   taskTid: number;
   messages: DisplayMessage[];
+  replacementEvents: Map<number, import("../protocol").AgnosticEvent>;
   blocks: Map<string, Block>;
   isProcessing: boolean;
   bandStatus: string;
@@ -514,6 +515,7 @@ const MessageView = memo(
     onUndo,
     onEdit,
     onEditRaw,
+    actionUuid,
     forkable,
     spawnedTidsByItemId,
     getTaskHref,
@@ -528,6 +530,7 @@ const MessageView = memo(
     onUndo?: (afterUuid: string) => void;
     onEdit?: (uuid: string, content: string) => void;
     onEditRaw?: (seq: number, content: string) => void;
+    actionUuid?: string;
     forkable?: boolean;
     spawnedTidsByItemId?: Map<string, Map<number, number>>;
     getTaskHref?: (id: string) => string;
@@ -536,7 +539,7 @@ const MessageView = memo(
     const [showSource, setShowSource] = useState(false);
     const [editing, setEditing] = useState(false);
     const [editText, setEditText] = useState("");
-    const uuid = msg.uuid;
+    const uuid = actionUuid ?? msg.uuid;
 
     const startEdit = useCallback(() => {
       let text: string;
@@ -800,6 +803,7 @@ const MessageView = memo(
     prev.onUndo === next.onUndo &&
     prev.onEdit === next.onEdit &&
     prev.forkable === next.forkable &&
+    prev.actionUuid === next.actionUuid &&
     prev.spawnedTidsByItemId === next.spawnedTidsByItemId &&
     prev.getTaskHref === next.getTaskHref,
 );
@@ -820,6 +824,7 @@ function makeOutboxPlaceholder(entry: OutboxEntry): DisplayMessage {
 export function MessageList({
   taskTid,
   messages,
+  replacementEvents,
   blocks,
   bandStatus,
   onFork,
@@ -1007,39 +1012,61 @@ export function MessageList({
     }, [composedMessages, blocks]);
 
   return (
-    <div class="message-list" ref={containerRef}>
-      <StatusBand status={bandStatus} />
-      <div class="message-list-inner">
-        {topLevelMessages.map((msg) => {
-          const resolvedBlocks =
-            msg.type === "assistant"
-              ? ((msg.blockIds ?? [])
-                  .map((id) => blocks.get(id))
-                  .filter(Boolean) as Block[])
-              : [];
-          const msgUuid = msg.uuid;
-          const isForkable =
-            !!msgUuid && !!forkableUuids && forkableUuids.has(msgUuid);
-          return (
-            <MessageView
-              key={msg.id}
-              msg={msg}
-              tid={taskTid}
-              resolvedBlocks={resolvedBlocks}
-              childrenByParent={childrenByParent}
-              resolvedBlocksByMsg={resolvedBlocksByMsg}
-              onViewFile={onViewFile}
-              onFork={handleFork}
-              onUndo={msg.type === "user" ? handleUndo : undefined}
-              onEdit={msg.type === "user" ? handleEditMessage : undefined}
-              onEditRaw={handleEditRawEvent}
-              forkable={isForkable}
-              spawnedTidsByItemId={spawnedTidsByItemId}
-              getTaskHref={getTaskHref}
-            />
-          );
-        })}
+    <ReplacementEventsContext.Provider value={replacementEvents}>
+      <div class="message-list" ref={containerRef}>
+        <StatusBand status={bandStatus} />
+        <div class="message-list-inner">
+          {topLevelMessages.map((msg) => {
+            const resolvedBlocks =
+              msg.type === "assistant"
+                ? ((msg.blockIds ?? [])
+                    .map((id) => blocks.get(id))
+                    .filter(Boolean) as Block[])
+                : [];
+            const seqs =
+              msg.seq == null
+                ? []
+                : Array.isArray(msg.seq)
+                  ? msg.seq
+                  : [msg.seq];
+            const boundaries = seqs
+              .map((seq) => replacementEvents.get(seq))
+              .filter(
+                (event) =>
+                  event?.type === "item/started" &&
+                  event.history_boundary?.kind === "user",
+              );
+            const actionUuid =
+              msg.uuid ??
+              (boundaries.length === 1
+                ? (boundaries[0] as { history_boundary: { anchor: string } })
+                    .history_boundary.anchor
+                : undefined);
+            const msgUuid = actionUuid;
+            const isForkable =
+              !!msgUuid && !!forkableUuids && forkableUuids.has(msgUuid);
+            return (
+              <MessageView
+                key={msg.id}
+                msg={msg}
+                tid={taskTid}
+                resolvedBlocks={resolvedBlocks}
+                childrenByParent={childrenByParent}
+                resolvedBlocksByMsg={resolvedBlocksByMsg}
+                onViewFile={onViewFile}
+                onFork={handleFork}
+                onUndo={msg.type === "user" ? handleUndo : undefined}
+                onEdit={msg.type === "user" ? handleEditMessage : undefined}
+                onEditRaw={handleEditRawEvent}
+                actionUuid={actionUuid}
+                forkable={isForkable}
+                spawnedTidsByItemId={spawnedTidsByItemId}
+                getTaskHref={getTaskHref}
+              />
+            );
+          })}
+        </div>
       </div>
-    </div>
+    </ReplacementEventsContext.Provider>
   );
 }

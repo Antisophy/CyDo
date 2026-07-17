@@ -1,8 +1,20 @@
-import { useState, useMemo, useRef, useCallback } from "preact/hooks";
+import { createContext } from "preact";
+import {
+  useState,
+  useMemo,
+  useRef,
+  useCallback,
+  useContext,
+} from "preact/hooks";
 import type { DisplayMessage } from "../types";
+import type { AgnosticEvent } from "../protocol";
 import { useHighlight, renderTokens } from "../highlight";
 import { CopyButton } from "./CopyButton";
 import editIcon from "../icons/edit.svg?raw";
+
+export const ReplacementEventsContext = createContext<
+  Map<number, AgnosticEvent>
+>(new Map());
 
 function jsonReplacer(_key: string, value: unknown) {
   return value instanceof Map
@@ -266,6 +278,7 @@ export function SourceView({
   tid: number;
   onEditRaw?: (seq: number, content: string) => void;
 }) {
+  const replacementEvents = useContext(ReplacementEventsContext);
   const seqs = useMemo(
     () => (msg.seq == null ? [] : Array.isArray(msg.seq) ? msg.seq : [msg.seq]),
     [msg.seq],
@@ -295,7 +308,7 @@ export function SourceView({
       {events.map((event, i) => (
         <EventItem
           key={seqs[i] ?? i}
-          event={event}
+          event={replacementEvents.get(seqs[i]!) ?? event}
           seq={seqs[i]!}
           tid={tid}
           rawSource={null}

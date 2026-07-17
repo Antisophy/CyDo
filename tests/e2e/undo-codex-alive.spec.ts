@@ -70,7 +70,11 @@ test("codex alive-path undo: session stays alive after undo", { tag: "@codex-onl
     timeout: 15_000,
   });
 
-  await undoUserMessage(page, 'Please reply with "alive-three"');
+  await openUndoDialogForUserMessage(page, 'Please reply with "alive-three"');
+  await expect(page.locator(".undo-dialog-count:visible")).toContainText(
+    "3 messages will be removed.",
+  );
+  await page.locator(".btn-undo:visible").click();
 
   // After undo: exactly turns 1-2 remain.
   await expect(

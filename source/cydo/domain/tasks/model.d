@@ -208,6 +208,8 @@ Watermark watermarkFromPath(string path)
 ///     at a known byte offset.
 struct HistoryStore
 {
+	private ulong generation_;
+	@property ulong generation() const { return generation_; }
 private:
     DataVec  history_;
     string[] rawSource_;
@@ -367,8 +369,9 @@ public:
     /// Re-resetting an already-initialized store is legal and used by truncation
     /// paths (performUndoExecution, handleEditMessage, thread/rollback, etc.) to
     /// discard in-memory state and re-snapshot the post-truncation JSONL size.
-    void reset(Watermark wm)
-    {
+	void reset(Watermark wm)
+	{
+		generation_++;
         history_ = DataVec();
         rawSource_ = null;
         sourceLine_ = null;
@@ -1028,19 +1031,6 @@ struct ForkableUuidsMessage
 	string type = "forkable_uuids";
 	int tid;
 	string[] uuids;
-}
-
-struct UuidAssignment
-{
-	string uuid;
-	size_t seq;
-}
-
-struct AssignUuidsMessage
-{
-	string type = "assign_uuids";
-	int tid;
-	UuidAssignment[] assignments;
 }
 
 struct ErrorMessage

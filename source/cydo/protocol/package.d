@@ -230,6 +230,19 @@ struct TaskDiagnosticEvent
 }
 
 /// item/started — a new content item begins streaming.
+enum HistoryBoundaryKind
+{
+	user,
+	agent_turn,
+}
+
+struct HistoryBoundary
+{
+	string anchor;
+	HistoryBoundaryKind kind;
+	@JSONOptional string checkpoint_uuid;
+}
+
 struct ItemStartedEvent
 {
 	string type = "item/started";
@@ -247,6 +260,7 @@ struct ItemStartedEvent
 	@JSONOptional bool is_steering;
 	@JSONOptional bool pending;
 	@JSONOptional string uuid;
+	@JSONOptional HistoryBoundary history_boundary;
 	@JSONOptional bool isCompactSummary;
 	@JSONOptional string parent_tool_use_id;
 	@JSONOptional bool is_sidechain;
@@ -295,6 +309,7 @@ struct TurnStopEvent
 	@JSONOptional string parent_tool_use_id;
 	@JSONOptional bool is_sidechain;
 	@JSONOptional string uuid;
+	@JSONOptional HistoryBoundary history_boundary;
 	@JSONOptional JSONFragment extras;
 }
 
@@ -410,6 +425,16 @@ struct TaskEventSeqEnvelope
 	JSONFragment event;
 }
 
+/// Explicit replacement of a canonical sequenced event after persistence correlation.
+struct TaskEventReplacedEnvelope
+{
+	string type = "task_event_replaced";
+	int tid;
+	int seq;
+	long ts;
+	JSONFragment event;
+}
+
 /// Envelope for an unconfirmed user event broadcast.
 /// For type:"message" sends, correlation_id is the message nonce (optional).
 struct UnconfirmedUserEventEnvelope
@@ -516,4 +541,16 @@ unittest
 			&& !json.canFind(`"user_message"`) && !json.canFind(`"is_meta"`)
 			&& !json.canFind(`"meta"`));
 	}
+}
+
+unittest
+{
+	import ae.utils.json : toJson;
+	auto boundary = HistoryBoundary("anchor", HistoryBoundaryKind.user, "checkpoint");
+	auto replacement = toJson(TaskEventReplacedEnvelope("task_event_replaced", 7, 4, 9,
+		JSONFragment(`{"type":"item/started","item_type":"user_message","history_boundary":` ~ toJson(boundary) ~ `}`)));
+	auto ordinary = toJson(TaskEventSeqEnvelope(7, 4, 9,
+		JSONFragment(`{"type":"item/started","item_type":"user_message"}`)));
+	assert(replacement == `{"type":"task_event_replaced","tid":7,"seq":4,"ts":9,"event":{"type":"item/started","item_type":"user_message","history_boundary":{"anchor":"anchor","kind":"user","checkpoint_uuid":"checkpoint"}}}`);
+	assert(ordinary == `{"tid":7,"seq":4,"ts":9,"event":{"type":"item/started","item_type":"user_message"}}`);
 }

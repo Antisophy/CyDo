@@ -109,4 +109,27 @@ describe("Connection client error reporting", () => {
 
     expect(controls).toEqual(["agent_usage"]);
   });
+
+  it("routes replacements separately from ordinary task events", () => {
+    const conn = new Connection();
+    const ordinary = vi.fn();
+    const replacement = vi.fn();
+    conn.onTaskMessage = ordinary;
+    conn.onTaskEventReplaced = replacement;
+    conn.connect();
+    MockWebSocket.instances[0]!.emitMessage(
+      JSON.stringify({
+        type: "task_event_replaced",
+        tid: 7,
+        seq: 4,
+        ts: 9,
+        event: {
+          type: "turn/stop",
+          history_boundary: { anchor: "a", kind: "agent_turn" },
+        },
+      }),
+    );
+    expect(replacement).toHaveBeenCalledOnce();
+    expect(ordinary).not.toHaveBeenCalled();
+  });
 });

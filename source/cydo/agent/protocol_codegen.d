@@ -22,6 +22,8 @@ template tsTypeName(T)
 		enum tsTypeName = "number";
 	else static if (is(T == JSONFragment))
 		enum tsTypeName = "unknown";
+	else static if (is(T == HistoryBoundaryKind))
+		enum tsTypeName = `"user" | "agent_turn"`;
 	else static if (is(T == JSONExtras))
 		enum tsTypeName = "__jsonextras__";
 	else static if (is(T == enum))

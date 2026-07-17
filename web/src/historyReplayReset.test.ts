@@ -193,6 +193,7 @@ describe("history replay reset", () => {
         pending: true,
       },
     ]);
+    expect(reset.replacementEvents.size).toBe(0);
     expect(reset.sessionInfo).toBeNull();
     expect(reset.totalCost).toBe(0);
     expect(reset.msgIdCounter).toBe(before.msgIdCounter);

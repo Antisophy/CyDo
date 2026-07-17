@@ -66,4 +66,9 @@ test("undo while session is running stops session and removes message", async ({
   await expect(page.locator(".input-textarea:visible").first()).toBeVisible({
     timeout: 15_000,
   });
+
+  await sendMessage(page, 'Please reply with "third-reply"');
+  await expect(assistantText(page, "third-reply")).toBeVisible({
+    timeout: 30_000,
+  });
 });

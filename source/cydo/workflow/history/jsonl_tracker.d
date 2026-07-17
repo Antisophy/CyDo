@@ -9,27 +9,128 @@ import ae.sys.inotify : INotify;
 import ae.sys.timing : setTimeout, TimerTask;
 
 import cydo.agent.contract : Agent, PersistedHistoryBoundary, PersistedHistoryBoundaryKind;
+import cydo.protocol : HistoryBoundary, HistoryBoundaryKind;
 import cydo.runtime.config : AgentDriver;
 import cydo.foundation.platform.inotify : RefCountedINotify;
-import cydo.domain.tasks.model : AssignUuidsMessage, ForkableUuidsMessage, TaskData, UuidAssignment, Watermark,
+import cydo.domain.tasks.model : TaskData, Watermark,
 	extractEventFromEnvelope;
 
 struct JsonlTracker
 {
+	struct LiveBoundaryCandidate { size_t seq; PersistedHistoryBoundaryKind kind; string identity; ulong generation; }
+	struct PersistedBoundaryCandidate { PersistedHistoryBoundary boundary; size_t sourceLine; bool requiresIdentity; ulong generation; }
+	struct BoundaryReconcileState {
+		size_t readPos;
+		size_t lineCount;
+		LiveBoundaryCandidate[][PersistedHistoryBoundaryKind] liveByKind;
+		PersistedBoundaryCandidate[][PersistedHistoryBoundaryKind] persistedByKind;
+		ubyte[] partialLine;
+	}
 	Agent delegate(int tid) getAgent;
 	TaskData* delegate(int tid) getTask;
+	ulong delegate(int tid) historyGeneration;
 	string delegate(int tid) getEffectiveCwd;
 	void delegate(int tid, string msg) sendToSubscribed;
-	void delegate(int tid, size_t seq, string anchor) onAnchorResolved;
+	void delegate(int tid, size_t seq, HistoryBoundary boundary, bool publish, ulong generation) onBoundaryResolved;
+	void delegate(int tid) onLineageInvalidated;
 
 	private RefCountedINotify rcINotify;
 	private RefCountedINotify.Handle[int] jsonlWatches;
 	private size_t[int] jsonlReadPos;
+	private string[int] jsonlPaths;
 	private int[int] jsonlLineCount;
+	private BoundaryReconcileState[int] boundaryState;
+	private ulong[int] lineageGeneration;
 	private TimerTask[int] jsonlRetryTimers;
 	// Snapshot of JSONL content taken just before broadcast, used for undo
 	// when the agent compacts the file (e.g. Codex auto-compaction).
 	private string[int] undoJsonl;
+
+	void noteLiveBoundaryCandidate(int tid, size_t seq, string event)
+	{
+		import ae.utils.json : JSONFragment, JSONOptional, JSONPartial, jsonParse;
+		@JSONPartial static struct Probe { string type; @JSONOptional string item_type;
+			@JSONOptional string uuid; @JSONOptional string item_id; @JSONOptional JSONFragment meta;
+			@JSONOptional bool is_synthetic; @JSONOptional bool pending; @JSONOptional bool is_sidechain;
+			@JSONOptional string parent_tool_use_id; }
+		auto p = jsonParse!Probe(event);
+		PersistedHistoryBoundaryKind kind;
+		if (p.type == "item/started" && p.item_type == "user_message"
+			&& (p.meta.json.length == 0 || p.meta.json == "null")
+			&& !p.is_synthetic && !p.pending && !p.is_sidechain && p.parent_tool_use_id.length == 0)
+			kind = PersistedHistoryBoundaryKind.user;
+		else if (p.type == "turn/stop" && !p.is_sidechain && p.parent_tool_use_id.length == 0)
+			kind = PersistedHistoryBoundaryKind.agent_turn;
+		else return;
+		if (tid !in boundaryState)
+			boundaryState[tid] = BoundaryReconcileState.init;
+		boundaryState[tid].liveByKind[kind] ~= LiveBoundaryCandidate(seq, kind,
+			p.uuid.length > 0 ? p.uuid : p.item_id, historyGeneration(tid));
+		drainLiveBoundaries(tid, kind);
+	}
+
+	private void drainLiveBoundaries(int tid, PersistedHistoryBoundaryKind kind)
+	{
+		while (true)
+		{
+			auto state = tid in boundaryState;
+			if (state is null) return;
+			auto lives = kind in (*state).liveByKind;
+			auto persistedCandidates = kind in (*state).persistedByKind;
+			if (lives is null || persistedCandidates is null || lives.length == 0
+				|| persistedCandidates.length == 0) return;
+			auto live = (*lives)[0];
+			auto persisted = (*persistedCandidates)[0];
+			auto current = historyGeneration(tid);
+			assert(live.generation <= current && persisted.generation <= current,
+				"history boundary candidate belongs to a future generation");
+			if (live.generation < current)
+			{
+				(*state).liveByKind[kind] = (*state).liveByKind[kind][1 .. $];
+				continue;
+			}
+			if (persisted.generation < current)
+			{
+				(*state).persistedByKind[kind] = (*state).persistedByKind[kind][1 .. $];
+				continue;
+			}
+			if (persisted.requiresIdentity && live.identity != persisted.boundary.anchor) return;
+			(*state).liveByKind[kind] = (*state).liveByKind[kind][1 .. $];
+			(*state).persistedByKind[kind] = (*state).persistedByKind[kind][1 .. $];
+			resolveBoundary(tid, live.seq, persisted.boundary, true, live.generation);
+		}
+	}
+
+	private static size_t completeJsonlByteCount(string content)
+	{
+		import std.string : lastIndexOf;
+		auto lastNewline = content.lastIndexOf('\n');
+		return lastNewline < 0 ? 0 : lastNewline + 1;
+	}
+
+	void invalidateLineage(int tid)
+	{
+		lineageGeneration[tid]++;
+		stopJsonlWatch(tid);
+	}
+
+	void finalReconcileJsonlIfPresent(int tid)
+	{
+		auto td = getTask(tid);
+		assert(td !is null && td.history.isLoaded,
+			"final JSONL reconciliation requires a loaded current task history");
+		auto path = tid in jsonlPaths;
+		if (path is null)
+		{
+			if (td.agentSessionId.length == 0) return;
+			auto resolved = getAgent(tid).historyPath(td.agentSessionId, getEffectiveCwd(tid));
+			import std.file : exists;
+			if (resolved.length == 0 || !exists(resolved)) return;
+			attachAndCatchUp(tid, resolved, false);
+			return;
+		}
+		attachAndCatchUp(tid, *path, false);
+	}
 
 	/// Start watching the JSONL file (or directory if file doesn't exist yet).
 	void startJsonlWatch(int tid)
@@ -55,10 +156,14 @@ struct JsonlTracker
 			// Schedule a retry so the watch gets established once the file appears.
 			import core.time : seconds;
 			if (tid !in jsonlRetryTimers)
+			{
+				auto generation = lineageGeneration.get(tid, 0);
 				jsonlRetryTimers[tid] = setTimeout({
 					jsonlRetryTimers.remove(tid);
-					startJsonlWatch(tid);
+					if (lineageGeneration.get(tid, 0) == generation)
+						startJsonlWatch(tid);
 				}, 2.seconds);
+			}
 			return;
 		}
 
@@ -78,10 +183,11 @@ struct JsonlTracker
 			auto dirPath = dirName(jsonlPath);
 			auto fileName = baseName(jsonlPath);
 			mkdirRecurse(dirPath);
+			auto generation = lineageGeneration.get(tid, 0);
 			jsonlWatches[tid] = rcINotify.add(dirPath, INotify.Mask.create,
 				(in char[] name, INotify.Mask mask, uint cookie)
 				{
-					if (name == fileName)
+					if (lineageGeneration.get(tid, 0) == generation && name == fileName)
 					{
 						// File appeared — switch to file watch
 						if (auto h = tid in jsonlWatches)
@@ -96,20 +202,51 @@ struct JsonlTracker
 		}
 	}
 
-	/// Start watching a JSONL file for modifications.
-	void watchJsonlFile(int tid, string jsonlPath)
+	/// Establish the lineage cursor, register the watch, then consume every
+	/// complete line visible after registration.  Watching is an optimization
+	/// for later growth; this catch-up is the correctness boundary.
+	private void attachAndCatchUp(int tid, string jsonlPath, bool installWatch = true)
 	{
-		processNewJsonlContent(tid, jsonlPath);
-
-		jsonlWatches[tid] = rcINotify.add(jsonlPath, INotify.Mask.modify,
-			(in char[] name, INotify.Mask mask, uint cookie)
+		jsonlPaths[tid] = jsonlPath;
+		if (tid !in jsonlReadPos)
+		{
+			if (tid in boundaryState)
 			{
-				processNewJsonlContent(tid, jsonlPath);
+				// A live candidate predates attachment, so this lineage must
+				// consume all persisted complete lines.
+				jsonlReadPos[tid] = 0;
+				jsonlLineCount[tid] = 0;
 			}
-		);
+			else
+			{
+				// A resumed lineage cannot pair a newly emitted live event with
+				// any pre-existing persisted turn.
+				import std.file : getSize;
+				jsonlReadPos[tid] = getSize(jsonlPath);
+				jsonlLineCount[tid] = 0;
+				boundaryState[tid] = BoundaryReconcileState.init;
+			}
+		}
+		if (installWatch && tid !in jsonlWatches)
+		{
+			auto generation = lineageGeneration.get(tid, 0);
+			jsonlWatches[tid] = rcINotify.add(jsonlPath, INotify.Mask.modify,
+				(in char[] name, INotify.Mask mask, uint cookie)
+				{
+					if (lineageGeneration.get(tid, 0) == generation)
+						processNewJsonlContent(tid, jsonlPath);
+				}
+			);
+		}
+		processNewJsonlContent(tid, jsonlPath);
 	}
 
-	/// Read new content from the JSONL file and broadcast forkable UUIDs.
+	void watchJsonlFile(int tid, string jsonlPath)
+	{
+		attachAndCatchUp(tid, jsonlPath);
+	}
+
+	/// Read new content from the JSONL file and reconcile persisted boundaries.
 	void processNewJsonlContent(int tid, string jsonlPath)
 	{
 		import std.file : exists, getSize;
@@ -124,14 +261,8 @@ struct JsonlTracker
 		auto lastPos = jsonlReadPos.get(tid, 0);
 		if (fileSize < lastPos)
 		{
-			// File shrank — agent compacted the JSONL (e.g. Codex auto-compaction).
-			// The pre-compaction content was already saved to undoJsonl on the last
-			// normal-growth event, so don't overwrite it.  Just reset read position
-			// and skip broadcasting: the compacted boundaries (checkpoint only) are not
-			// meaningful to the frontend and would overwrite valid prior assignments.
-			tracef("[jsonl] processNewJsonlContent tid=%d: file shrank (was %d, now %d) — compaction detected, skipping broadcast", tid, lastPos, fileSize);
-			jsonlReadPos[tid] = fileSize;
-			jsonlLineCount[tid] = 0;
+			tracef("[jsonl] processNewJsonlContent tid=%d: file shrank (was %d, now %d)", tid, lastPos, fileSize);
+			onLineageInvalidated(tid);
 			return;
 		}
 		if (fileSize <= lastPos)
@@ -142,26 +273,49 @@ struct JsonlTracker
 		char[] buf;
 		buf.length = cast(size_t)(fileSize - lastPos);
 		auto got = f.rawRead(buf);
-		jsonlReadPos[tid] = cast(size_t) fileSize;
-
 		auto newContent = cast(string) got;
+		auto completeBytes = completeJsonlByteCount(newContent);
+		if (completeBytes == 0)
+			return;
+		auto completeContent = newContent[0 .. completeBytes];
+		jsonlReadPos[tid] = lastPos + completeContent.length;
+		if (tid !in boundaryState)
+			boundaryState[tid] = BoundaryReconcileState.init;
+		boundaryState[tid].partialLine = cast(ubyte[]) newContent[completeBytes .. $].dup;
+
 		auto lineOffset = jsonlLineCount.get(tid, 0);
-		auto boundaries = getAgent(tid).extractPersistedHistoryBoundaries(newContent, lineOffset);
+		auto boundaries = getAgent(tid).extractPersistedHistoryBoundaries(completeContent, lineOffset);
 		tracef("[jsonl] processNewJsonlContent tid=%d path=%s newBytes=%d boundaries=%d", tid, jsonlPath, got.length, boundaries.length);
 
 		import std.string : lineSplitter;
 		int newLines = 0;
-		foreach (_; newContent.lineSplitter)
+		foreach (_; completeContent.lineSplitter)
 			newLines++;
 		jsonlLineCount[tid] = lineOffset + newLines;
 
 		import std.algorithm : canFind;
-		bool hasRollback = newContent.canFind(`"thread_rolled_back"`);
-		if (boundaries.length > 0 || hasRollback)
-			// Read the full JSONL so computeAssignments can correlate IDs by
-			// global order (incremental boundaries start idx at 0 and would map
-			// turn-2 IDs to turn-1 seqs).
-			broadcastForkableUuidsFromFile(tid);
+		bool hasRollback = completeContent.canFind(`"thread_rolled_back"`);
+		if (hasRollback)
+		{
+			onLineageInvalidated(tid);
+			return;
+		}
+		foreach (boundary; boundaries)
+		{
+			import std.algorithm : startsWith;
+			if (tid !in boundaryState)
+				boundaryState[tid] = BoundaryReconcileState.init;
+			auto task = getTask(tid);
+			boundary.checkpointUuid = task.checkpointUuidForAnchor(boundary.anchor);
+			auto requiresIdentity = !boundary.anchor.startsWith("line:")
+				&& !boundary.anchor.startsWith("enqueue-")
+				&& !(getAgent(tid).driver == AgentDriver.claude
+					&& boundary.kind == PersistedHistoryBoundaryKind.agent_turn);
+			boundaryState[tid].persistedByKind[boundary.kind] ~= PersistedBoundaryCandidate(boundary,
+				0, requiresIdentity,
+				historyGeneration(tid));
+			drainLiveBoundaries(tid, boundary.kind);
+		}
 	}
 
 	/// Stop all JSONL watches and clear all snapshots (used during shutdown).
@@ -188,7 +342,9 @@ struct JsonlTracker
 			jsonlWatches.remove(tid);
 		}
 		jsonlReadPos.remove(tid);
+		jsonlPaths.remove(tid);
 		jsonlLineCount.remove(tid);
+		boundaryState.remove(tid);
 		// Do NOT remove undoJsonl here: for agents that auto-restart (e.g. Codex
 		// exits with SIGTERM and is restarted), the snapshot captured before the
 		// stall message is still valid and must survive the restart cycle.
@@ -218,383 +374,400 @@ struct JsonlTracker
 		tracef("[jsonl] captureUndoSnapshot tid=%d path=%s bytes=%d", tid, jsonlPath, undoJsonl[tid].length);
 	}
 
-	/// Send forkable UUIDs from the full JSONL file to a single client.
-	void sendForkableUuidsFromFile(WebSocketAdapter ws, int tid,
-		string agentSessionId, string projectPath)
+	void sendForkableUuidsFromFile(WebSocketAdapter ws, int tid, string agentSessionId, string projectPath)
 	{
 		import std.algorithm : map;
 		import std.array : array;
 		import std.file : exists, readText;
 		import ae.utils.json : toJson;
-
-		auto jsonlPath = getAgent(tid).historyPath(agentSessionId, projectPath);
-		if (jsonlPath.length == 0 || !exists(jsonlPath))
-			return;
-
-		auto content = readText(jsonlPath);
-		auto boundaries = getAgent(tid).extractPersistedHistoryBoundaries(content);
-		auto td = getTask(tid);
-		auto agent = td !is null ? getAgent(tid) : null;
-		auto isClaude = agent !is null && agent.driver == AgentDriver.claude;
-		UuidAssignment[] assignments;
-		string[] uuids;
-		if (isClaude)
-		{
-			resolveClaudeCheckpoints(td, boundaries);
-			bool[string] onDiskAnchors;
-			foreach (ref fid; boundaries)
-				onDiskAnchors[fid.anchor] = true;
-			assignments = resolvePendingAssignments(tid, boundaries);
-			foreach (anchor; td.resolvedVisibleAnchors())
-				if (anchor in onDiskAnchors)
-					uuids ~= anchor;
-		}
-		else
-		{
-			assignments = computeAssignments(tid, boundaries);
-			uuids = boundaries.map!(f => f.anchor).array;
-		}
-		if (uuids.length > 0)
-			ws.send(Data(toJson(ForkableUuidsMessage("forkable_uuids", tid, uuids)).representation));
-		if (assignments.length > 0)
-			ws.send(Data(toJson(AssignUuidsMessage("assign_uuids", tid, assignments)).representation));
+		import cydo.domain.tasks.model : ForkableUuidsMessage;
+		auto path = getAgent(tid).historyPath(agentSessionId, projectPath);
+		if (path.length > 0 && exists(path))
+			ws.send(Data(toJson(ForkableUuidsMessage("forkable_uuids", tid,
+				getAgent(tid).extractPersistedHistoryBoundaries(readText(path)).map!(b => b.anchor).array)).representation));
 	}
 
-	/// Broadcast forkable UUIDs from the full JSONL file to subscribed clients.
 	void broadcastForkableUuidsFromFile(int tid)
 	{
 		import std.file : exists, readText;
-		import std.logger : tracef;
-
-		auto td = getTask(tid);
-		if (td is null)
-			return;
-		if (td.agentSessionId.length == 0)
-			return;
-
-		auto ta = getAgent(tid);
-		auto jsonlPath = ta.historyPath(td.agentSessionId, getEffectiveCwd(tid));
-		if (jsonlPath.length == 0 || !exists(jsonlPath))
-		{
-			tracef("[jsonl] broadcastForkableUuidsFromFile tid=%d: path missing/nonexistent: %s", tid, jsonlPath);
-			return;
-		}
-
-		auto boundaries = ta.extractPersistedHistoryBoundaries(readText(jsonlPath));
-		tracef("[jsonl] broadcastForkableUuidsFromFile tid=%d boundaries=%d path=%s", tid, boundaries.length, jsonlPath);
-		if (boundaries.length > 0)
-			broadcastForkableUuidsWithAssignments(tid, boundaries);
-	}
-
-	/// Broadcast forkable UUIDs to subscribed clients.
-	void broadcastForkableUuids(int tid, string[] uuids)
-	{
-		import ae.utils.json : toJson;
-		sendToSubscribed(tid, toJson(ForkableUuidsMessage("forkable_uuids", tid, uuids)));
-	}
-
-	/// Broadcast forkable UUIDs and their seq assignments to subscribed clients.
-	void broadcastForkableUuidsWithAssignments(int tid, PersistedHistoryBoundary[] boundaries)
-	{
 		import std.algorithm : map;
 		import std.array : array;
 		import ae.utils.json : toJson;
-
+		import cydo.domain.tasks.model : ForkableUuidsMessage;
 		auto td = getTask(tid);
-		auto agent = td !is null ? getAgent(tid) : null;
-		auto isClaude = agent !is null && agent.driver == AgentDriver.claude;
-		UuidAssignment[] assignments;
-		string[] uuids;
-		if (isClaude)
-		{
-			resolveClaudeCheckpoints(td, boundaries);
-			bool[string] onDiskAnchors;
-			foreach (ref fid; boundaries)
-				onDiskAnchors[fid.anchor] = true;
-			assignments = resolvePendingAssignments(tid, boundaries);
-			foreach (anchor; td.resolvedVisibleAnchors())
-				if (anchor in onDiskAnchors)
-					uuids ~= anchor;
-		}
-		else
-		{
-			assignments = computeAssignments(tid, boundaries);
-			uuids = boundaries.map!(f => f.anchor).array;
-		}
-		sendToSubscribed(tid, toJson(ForkableUuidsMessage("forkable_uuids", tid, uuids)));
-
-		if (assignments.length > 0)
-			sendToSubscribed(tid, toJson(AssignUuidsMessage("assign_uuids", tid, assignments)));
+		if (td is null) return;
+		auto path = getAgent(tid).historyPath(td.agentSessionId, getEffectiveCwd(tid));
+		if (path.length > 0 && exists(path))
+			sendToSubscribed(tid, toJson(ForkableUuidsMessage("forkable_uuids", tid,
+				getAgent(tid).extractPersistedHistoryBoundaries(readText(path)).map!(b => b.anchor).array)));
 	}
 
-	/// Compute seq→UUID assignments by correlating JSONL forkable IDs with history events.
-	UuidAssignment[] computeAssignments(int tid, PersistedHistoryBoundary[] boundaries)
+
+	private void resolveBoundary(int tid, size_t seq, PersistedHistoryBoundary boundary,
+		bool publish, ulong generation)
 	{
-		import std.algorithm : canFind;
-		import std.logger : tracef;
-
-		auto td = getTask(tid);
-		if (td is null) return null;
-		if (!td.history.isLoaded) return null;
-
-		// Count user and assistant events in history, recording their seqs
-		size_t[] userSeqs, assistantSeqs;
-		foreach (i, ref entry; td.history)
-		{
-			import ae.utils.array : as;
-			entry.enter((scope ubyte[] bytes) {
-				// Only look inside regular events (skip unconfirmedUserEvent and other envelopes).
-				// `as!(char[])` is a no-copy view; `as!string` would hard-cast to immutable.
-				auto content = extractEventFromEnvelope(bytes.as!(char[]));
-				if (content.length == 0)
-					return;
-				// User message: item/started with user_message type
-				if (content.canFind(`"item_type":"user_message"`) && content.canFind(`"type":"item/started"`)
-					&& !content.canFind(`"is_meta":true`))
-					userSeqs ~= i;
-				// Assistant turn: turn/stop
-				else if (content.canFind(`"type":"turn/stop"`))
-					assistantSeqs ~= i;
-			});
-		}
-
-		tracef("[jsonl] computeAssignments tid=%d boundaries=%d userSeqs=%s assistantSeqs=%s histLen=%d",
-			tid, boundaries.length, userSeqs, assistantSeqs, td.history.length);
-
-		// Match forkable IDs to history seqs by order
-		size_t userForkIds;
-		foreach (ref fid; boundaries)
-			if (fid.kind == PersistedHistoryBoundaryKind.user)
-				userForkIds++;
-		auto leadingUserForkIdsToSkip = userForkIds > userSeqs.length
-			? userForkIds - userSeqs.length : 0;
-
-		size_t userIdx, assistantIdx;
-		UuidAssignment[] result;
-		foreach (ref fid; boundaries)
-		{
-			if (fid.kind == PersistedHistoryBoundaryKind.user)
-			{
-				if (leadingUserForkIdsToSkip > 0)
-				{
-					leadingUserForkIdsToSkip--;
-					continue;
-				}
-				if (userIdx < userSeqs.length)
-					result ~= UuidAssignment(fid.anchor, userSeqs[userIdx]);
-				userIdx++;
-			}
-			else
-			{
-				if (assistantIdx < assistantSeqs.length)
-					result ~= UuidAssignment(fid.anchor, assistantSeqs[assistantIdx]);
-				assistantIdx++;
-			}
-		}
-		tracef("[jsonl] computeAssignments tid=%d result=%d assignments", tid, result.length);
-		return result;
+		if (onBoundaryResolved is null)
+			return;
+		onBoundaryResolved(tid, seq, HistoryBoundary(boundary.anchor,
+			boundary.kind == PersistedHistoryBoundaryKind.user
+				? HistoryBoundaryKind.user : HistoryBoundaryKind.agent_turn,
+			boundary.checkpointUuid), publish, generation);
 	}
+}
 
-	private bool isEnqueueAnchor(string id)
-	{
-		return id.length > "enqueue-".length
-			&& id[0 .. "enqueue-".length] == "enqueue-";
-	}
-
-	private void resolveClaudeCheckpoints(TaskData* task,
-		ref PersistedHistoryBoundary[] boundaries)
-	{
-		foreach (ref boundary; boundaries)
-			boundary.checkpointUuid = task.checkpointUuidForAnchor(boundary.anchor);
-	}
-
-	/// Resolve pending visible-turn anchors against enqueue IDs seen in JSONL.
-	private UuidAssignment[] resolvePendingAssignments(int tid, PersistedHistoryBoundary[] boundaries)
-	{
-		import std.algorithm : sort;
-		import std.logger : tracef;
-
-		auto td = getTask(tid);
-		if (td is null)
-			return null;
-
-		auto pendingSeqs = td.pendingVisibleTurnSeqs();
-		if (pendingSeqs.length == 0)
-			return null;
-		pendingSeqs.sort();
-
-		bool[string] usedEnqueueAnchors;
-		foreach (anchor; td.resolvedEnqueueAnchors())
-			usedEnqueueAnchors[anchor] = true;
-
-		string[] availableEnqueueAnchors;
-		bool[string] availableSeen;
-		foreach (ref fid; boundaries)
-		{
-			if (fid.kind != PersistedHistoryBoundaryKind.user || !isEnqueueAnchor(fid.anchor))
-				continue;
-			if (fid.anchor in usedEnqueueAnchors)
-				continue;
-			if (fid.anchor in availableSeen)
-				continue;
-			availableSeen[fid.anchor] = true;
-			availableEnqueueAnchors ~= fid.anchor;
-		}
-
-		tracef("[jsonl] resolvePendingAssignments tid=%d pending=%d availableEnqueue=%d",
-			tid, pendingSeqs.length, availableEnqueueAnchors.length);
-		UuidAssignment[] result;
-		size_t enqueueIdx = 0;
-		foreach (seq; pendingSeqs)
-		{
-			if (enqueueIdx >= availableEnqueueAnchors.length)
-				break;
-			auto anchor = availableEnqueueAnchors[enqueueIdx++];
-			if (td.resolveVisibleTurnAnchor(seq, anchor))
-			{
-				if (onAnchorResolved !is null)
-					onAnchorResolved(tid, seq, anchor);
-				result ~= UuidAssignment(anchor, seq);
-			}
-		}
-		tracef("[jsonl] resolvePendingAssignments tid=%d result=%d", tid, result.length);
-		return result;
-	}
+unittest
+{
+	import std.file : remove, write;
+	import cydo.agent.drivers.codex : CodexAgent;
+	auto path = "/tmp/cydo-jsonl-tracker-attach.jsonl";
+	write(path, `{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n"
+		~ `{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n");
+	TaskData task = TaskData(1, "", "");
+	task.history.reset(Watermark.none());
+	JsonlTracker tracker;
+	tracker.getTask = (int) => &task;
+	tracker.getAgent = (int) => cast(Agent) new CodexAgent();
+	tracker.historyGeneration = (int) => task.history.generation;
+	string[] resolved;
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary b, bool, ulong) { resolved ~= b.anchor; };
+	tracker.boundaryState[1] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.LiveBoundaryCandidate(0, PersistedHistoryBoundaryKind.user, "", task.history.generation);
+	tracker.attachAndCatchUp(1, path, false);
+	assert(resolved == ["line:2"]);
+	tracker.stopJsonlWatch(1);
+	tracker.attachAndCatchUp(1, path, false);
+	assert(tracker.jsonlReadPos[1] > 0);
+	assert(resolved == ["line:2"]);
+	remove(path);
 }
 
 unittest
 {
 	TaskData task = TaskData(1, "", "");
-	task.registerVisibleTurnAnchor(1, true, false, "user-anchor", "user-checkpoint", false);
-	task.registerVisibleTurnAnchor(2, false, false, "agent-anchor", "agent-checkpoint", false);
-	task.registerVisibleTurnAnchor(3, true, false, "pending-anchor", "pending-checkpoint", true);
-	PersistedHistoryBoundary[] boundaries = [
-		PersistedHistoryBoundary("user-anchor", PersistedHistoryBoundaryKind.user, null),
-		PersistedHistoryBoundary("agent-anchor", PersistedHistoryBoundaryKind.agent_turn, null),
-		PersistedHistoryBoundary("missing-anchor", PersistedHistoryBoundaryKind.user, null),
-		PersistedHistoryBoundary("pending-anchor", PersistedHistoryBoundaryKind.user, null),
-	];
-
+	task.history.reset(Watermark.none());
 	JsonlTracker tracker;
-	tracker.resolveClaudeCheckpoints(&task, boundaries);
-	assert(boundaries[0].checkpointUuid == "user-checkpoint");
-	assert(boundaries[1].checkpointUuid == "agent-checkpoint");
-	assert(boundaries[2].checkpointUuid.length == 0);
-	assert(boundaries[3].checkpointUuid.length == 0);
+	tracker.getTask = (int) => &task;
+	tracker.historyGeneration = (int) => task.history.generation;
+	tracker.finalReconcileJsonlIfPresent(1);
+	assert(1 !in tracker.jsonlPaths);
 }
 
 unittest
 {
-	import std.algorithm : canFind;
-
-	TaskData td = TaskData(1, "", "");
-	td.registerVisibleTurnAnchor(4, true, false, "user-one", "user-one", false);
-	td.registerVisibleTurnAnchor(13, true, true, null, "raw-steering", true);
-
+	import std.file : getSize, readText, remove, write;
+	import std.conv : to;
+	import cydo.agent.drivers.codex : CodexAgent;
+	import ae.utils.json : JSONFragment, toJson;
+	import cydo.protocol : TaskEventEnvelope;
+	auto path = "/tmp/cydo-jsonl-tracker-final-flush.jsonl";
+	write(path, `{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n");
+	TaskData task = TaskData(1, "", "");
+	task.agentSessionId = "session";
+	task.history.reset(Watermark.none());
+	task.history.appendLive(Data(toJson(TaskEventEnvelope(1, 1,
+		JSONFragment(`{"type":"item/started","item_type":"user_message"}`))).representation), null);
 	JsonlTracker tracker;
-	tracker.getAgent = (int) => cast(Agent) null;
-	tracker.getTask = (int tid) => tid == 1 ? &td : null;
-	tracker.sendToSubscribed = (int, string) {};
-
-	PersistedHistoryBoundary[] boundaries = [
-		PersistedHistoryBoundary("user-one", PersistedHistoryBoundaryKind.user, null),
-		PersistedHistoryBoundary("enqueue-22", PersistedHistoryBoundaryKind.user, null),
-		PersistedHistoryBoundary("raw-steering", PersistedHistoryBoundaryKind.user, null),
-	];
-	auto assignments = tracker.resolvePendingAssignments(1, boundaries);
-	assert(assignments.length == 1);
-	assert(assignments[0].seq == 13);
-	assert(assignments[0].uuid == "enqueue-22");
-	assert(td.resolvedVisibleAnchors().canFind("enqueue-22"));
-}
-
-unittest
-{
-	TaskData td = TaskData(1, "", "");
-	td.registerVisibleTurnAnchor(13, true, true, null, "raw-steering", true);
-
-	JsonlTracker tracker;
-	tracker.getAgent = (int) => cast(Agent) null;
-	tracker.getTask = (int tid) => tid == 1 ? &td : null;
-	tracker.sendToSubscribed = (int, string) {};
-	int callbackCount;
-	size_t callbackSeq;
-	string callbackAnchor;
-	tracker.onAnchorResolved = (int tid, size_t seq, string anchor)
-	{
-		assert(tid == 1);
-		callbackCount++;
-		callbackSeq = seq;
-		callbackAnchor = anchor;
+	tracker.getTask = (int) => &task;
+	tracker.getAgent = (int) => cast(Agent) new CodexAgent();
+	tracker.getEffectiveCwd = (int) => "";
+	tracker.historyGeneration = (int) => task.history.generation;
+	string[] resolved;
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
+		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
 	};
-
-	PersistedHistoryBoundary[] boundaries = [
-		PersistedHistoryBoundary("enqueue-22", PersistedHistoryBoundaryKind.user, null),
-	];
-	auto assignments = tracker.resolvePendingAssignments(1, boundaries);
-	assert(assignments.length == 1);
-	assert(callbackCount == 1);
-	assert(callbackSeq == 13);
-	assert(callbackAnchor == "enqueue-22");
+	tracker.jsonlReadPos[1] = getSize(path);
+	tracker.jsonlPaths[1] = path;
+	tracker.jsonlLineCount[1] = 1;
+	tracker.boundaryState[1] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.LiveBoundaryCandidate(0, PersistedHistoryBoundaryKind.user, "", task.history.generation);
+	write(path, readText(path) ~ `{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n");
+	tracker.finalReconcileJsonlIfPresent(1);
+	assert(resolved == ["line:2:0"]);
+	tracker.finalReconcileJsonlIfPresent(1);
+	assert(resolved == ["line:2:0"]);
+	remove(path);
 }
 
 unittest
 {
-	import std.algorithm : sort;
-
-	TaskData td = TaskData(1, "", "");
-	td.registerVisibleTurnAnchor(2, true, false, "user-two", "user-two", false);
-	td.registerVisibleTurnAnchor(10, true, true, "enqueue-3", null, false); // already resolved
-	td.registerVisibleTurnAnchor(20, true, true, null, "raw-tool-only", true);
-	td.registerVisibleTurnAnchor(30, true, true, null, "raw-meta", true);
-
+	import std.exception : assertThrown;
+	import core.exception : AssertError;
+	import std.conv : to;
 	JsonlTracker tracker;
-	tracker.getAgent = (int) => cast(Agent) null;
-	tracker.getTask = (int tid) => tid == 1 ? &td : null;
-	tracker.sendToSubscribed = (int, string) {};
-
-	// Extra raw user/assistant IDs (tool-result-only users, meta users, API-error
-	// assistant lines) must not shift pending steering anchors.
-	PersistedHistoryBoundary[] boundaries = [
-		PersistedHistoryBoundary("tool-result-user-uuid", PersistedHistoryBoundaryKind.user, null),
-		PersistedHistoryBoundary("enqueue-3", PersistedHistoryBoundaryKind.user, null),   // already used, must be skipped
-		PersistedHistoryBoundary("assistant-api-error", PersistedHistoryBoundaryKind.agent_turn, null),
-		PersistedHistoryBoundary("enqueue-8", PersistedHistoryBoundaryKind.user, null),
-		PersistedHistoryBoundary("meta-user-uuid", PersistedHistoryBoundaryKind.user, null),
-		PersistedHistoryBoundary("enqueue-12", PersistedHistoryBoundaryKind.user, null),
-	];
-
-	auto assignments = tracker.resolvePendingAssignments(1, boundaries);
-	assert(assignments.length == 2);
-	assignments.sort!((a, b) => a.seq < b.seq);
-	assert(assignments[0].seq == 20 && assignments[0].uuid == "enqueue-8");
-	assert(assignments[1].seq == 30 && assignments[1].uuid == "enqueue-12");
+	ulong current = 2;
+	tracker.historyGeneration = (int) => current;
+	string[] resolved;
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
+		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
+	};
+	tracker.boundaryState[1] = JsonlTracker.BoundaryReconcileState.init;
+	auto staleLive = JsonlTracker.LiveBoundaryCandidate(1, PersistedHistoryBoundaryKind.user, "old", 1);
+	auto currentLive = JsonlTracker.LiveBoundaryCandidate(2, PersistedHistoryBoundaryKind.user, "new", 2);
+	auto stalePersisted = JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("old", PersistedHistoryBoundaryKind.user, null), 1, true, 1);
+	auto currentPersisted = JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("new", PersistedHistoryBoundaryKind.user, null), 2, true, 2);
+	tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user] ~= [staleLive, currentLive];
+	tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user] ~= [stalePersisted, currentPersisted];
+	tracker.drainLiveBoundaries(1, PersistedHistoryBoundaryKind.user);
+	assert(resolved == ["new:2"]);
+	tracker.boundaryState[2] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[2].liveByKind[PersistedHistoryBoundaryKind.user] ~= currentLive;
+	tracker.boundaryState[2].persistedByKind[PersistedHistoryBoundaryKind.user] ~= stalePersisted;
+	tracker.boundaryState[2].persistedByKind[PersistedHistoryBoundaryKind.user] ~= currentPersisted;
+	tracker.drainLiveBoundaries(2, PersistedHistoryBoundaryKind.user);
+	assert(resolved == ["new:2", "new:2"]);
+	tracker.boundaryState[3] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[3].liveByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.LiveBoundaryCandidate(3, PersistedHistoryBoundaryKind.user, "future", 3);
+	tracker.boundaryState[3].persistedByKind[PersistedHistoryBoundaryKind.user] ~= currentPersisted;
+	assertThrown!AssertError(tracker.drainLiveBoundaries(3, PersistedHistoryBoundaryKind.user));
 }
 
 unittest
 {
-	TaskData td = TaskData(1, "", "");
-	td.history.reset(Watermark.none());
-	td.history.appendLive(Data(`{"tid":1,"event":{"type":"item/started","item_type":"user_message"}}`.representation), null);
-	td.history.appendLive(Data(`{"tid":1,"event":{"type":"turn/stop"}}`.representation), null);
-	td.history.appendLive(Data(`{"tid":1,"event":{"type":"item/started","item_type":"user_message"}}`.representation), null);
-	td.history.appendLive(Data(`{"tid":1,"event":{"type":"turn/stop"}}`.representation), null);
-
+	import std.conv : to;
+	// A boundary pair can be captured before a reset but resolved only after it.
+	// Publication must reject that old lineage and accept a replacement pair.
 	JsonlTracker tracker;
-	tracker.getTask = (int tid) => tid == 1 ? &td : null;
+	TaskData task = TaskData(1, "", "");
+	task.history.reset(Watermark.none());
+	tracker.historyGeneration = (int) => task.history.generation;
+	string[] resolved;
+	tracker.onBoundaryResolved = (int tid, size_t seq, HistoryBoundary boundary, bool,
+		ulong generation) {
+		if (tracker.historyGeneration(tid) == generation)
+			resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
+	};
+	auto stale = task.history.generation;
+	tracker.boundaryState[1] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.LiveBoundaryCandidate(12, PersistedHistoryBoundaryKind.user, "stale", stale);
+	tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("stale",
+			PersistedHistoryBoundaryKind.user, null), 1, true, stale);
+	task.history.reset(Watermark.none());
+	tracker.drainLiveBoundaries(1, PersistedHistoryBoundaryKind.user);
+	assert(resolved.length == 0);
 
-	PersistedHistoryBoundary[] boundaries = [
-		PersistedHistoryBoundary("hidden-context-user", PersistedHistoryBoundaryKind.user, null),
-		PersistedHistoryBoundary("visible-user-one", PersistedHistoryBoundaryKind.user, null),
-		PersistedHistoryBoundary("visible-assistant-one", PersistedHistoryBoundaryKind.agent_turn, null),
-		PersistedHistoryBoundary("visible-user-two", PersistedHistoryBoundaryKind.user, null),
-		PersistedHistoryBoundary("visible-assistant-two", PersistedHistoryBoundaryKind.agent_turn, null),
-	];
+	auto current = task.history.generation;
+	tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.LiveBoundaryCandidate(1, PersistedHistoryBoundaryKind.user, "current", current);
+	tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("current",
+			PersistedHistoryBoundaryKind.user, null), 2, true, current);
+	tracker.drainLiveBoundaries(1, PersistedHistoryBoundaryKind.user);
+	assert(resolved == ["current:1"]);
+}
 
-	auto assignments = tracker.computeAssignments(1, boundaries);
-	assert(assignments.length == 4);
-	assert(assignments[0].uuid == "visible-user-one" && assignments[0].seq == 0);
-	assert(assignments[1].uuid == "visible-assistant-one" && assignments[1].seq == 1);
-	assert(assignments[2].uuid == "visible-user-two" && assignments[2].seq == 2);
-	assert(assignments[3].uuid == "visible-assistant-two" && assignments[3].seq == 3);
+unittest
+{
+	import std.conv : to;
+	string[] resolved;
+	JsonlTracker tracker;
+	tracker.historyGeneration = (int) => 0;
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
+		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
+	};
+	// Live callback first: the canonical persisted identity resolves the queued live event.
+	tracker.noteLiveBoundaryCandidate(1, 7,
+		`{"type":"item/started","item_type":"user_message","uuid":"u"}`);
+	assert(tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user].length == 1);
+	tracker.invalidateLineage(1);
+	tracker.historyGeneration = (int) => 0;
+	tracker.noteLiveBoundaryCandidate(1, 7,
+		`{"type":"item/started","item_type":"user_message","uuid":"u","meta":{"system":true}}`);
+		assert(1 !in tracker.boundaryState
+			|| PersistedHistoryBoundaryKind.user !in tracker.boundaryState[1].liveByKind);
+	tracker.noteLiveBoundaryCandidate(1, 7,
+		`{"type":"item/started","item_type":"user_message","uuid":"u","meta":null}`);
+	assert(tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user].length == 1);
+	tracker.invalidateLineage(1);
+	tracker.historyGeneration = (int) => 0;
+
+	// Live callback first: the canonical persisted identity resolves the queued live event.
+	tracker.noteLiveBoundaryCandidate(1, 7,
+		`{"type":"item/started","item_type":"user_message","uuid":"u"}`);
+	tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("u", PersistedHistoryBoundaryKind.user, null), 1, true, 0);
+	tracker.drainLiveBoundaries(1, PersistedHistoryBoundaryKind.user);
+	assert(resolved == ["u:7"]);
+	assert(tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user].length == 0);
+	assert(tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user].length == 0);
+
+	// Persisted callback first: noteLiveBoundaryCandidate drains the matching canonical queue.
+	tracker.boundaryState[2] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[2].persistedByKind[PersistedHistoryBoundaryKind.agent_turn] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("turn", PersistedHistoryBoundaryKind.agent_turn, null), 1, true, 0);
+	tracker.noteLiveBoundaryCandidate(2, 8, `{"type":"turn/stop","uuid":"turn"}`);
+	assert(resolved == ["u:7", "turn:8"]);
+	assert(tracker.boundaryState[2].liveByKind[PersistedHistoryBoundaryKind.agent_turn].length == 0);
+	assert(tracker.boundaryState[2].persistedByKind[PersistedHistoryBoundaryKind.agent_turn].length == 0);
+
+	// Line anchors have no shared identity and drain FIFO in either callback order.
+	tracker.boundaryState[3] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[3].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("line:10", PersistedHistoryBoundaryKind.user, null), 10, false, 0);
+	tracker.noteLiveBoundaryCandidate(3, 9,
+		`{"type":"item/started","item_type":"user_message"}`);
+	assert(resolved == ["u:7", "turn:8", "line:10:9"]);
+
+	// Claude assistant message_stop has no UUID in its live turn/stop event;
+	// its persisted assistant UUID must therefore resolve FIFO, unlike users.
+	tracker.boundaryState[4] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[4].liveByKind[PersistedHistoryBoundaryKind.agent_turn] ~=
+		JsonlTracker.LiveBoundaryCandidate(10, PersistedHistoryBoundaryKind.agent_turn, "", 0);
+	tracker.boundaryState[4].persistedByKind[PersistedHistoryBoundaryKind.agent_turn] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("assistant", PersistedHistoryBoundaryKind.agent_turn, null), 1, false, 0);
+	tracker.drainLiveBoundaries(4, PersistedHistoryBoundaryKind.agent_turn);
+	assert(resolved[$ - 1] == "assistant:10");
+
+	tracker.boundaryState[5] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[5].liveByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.LiveBoundaryCandidate(11, PersistedHistoryBoundaryKind.user, "user-a", 0);
+	tracker.boundaryState[5].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("user-b", PersistedHistoryBoundaryKind.user, null), 1, true, 0);
+	tracker.drainLiveBoundaries(5, PersistedHistoryBoundaryKind.user);
+	assert(tracker.boundaryState[5].liveByKind[PersistedHistoryBoundaryKind.user].length == 1);
+}
+
+unittest
+{
+	JsonlTracker tracker;
+	tracker.historyGeneration = (int) => 0;
+	tracker.boundaryState[1] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.LiveBoundaryCandidate(4, PersistedHistoryBoundaryKind.user, "user", 0);
+	tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("user",
+			PersistedHistoryBoundaryKind.user, null), 1, true, 0);
+	tracker.jsonlReadPos[1] = 42;
+	tracker.jsonlLineCount[1] = 3;
+
+	tracker.stopJsonlWatch(1);
+
+	assert(1 !in tracker.boundaryState);
+	assert(1 !in tracker.jsonlReadPos);
+	assert(1 !in tracker.jsonlLineCount);
+
+	// Invalidation advances the watch generation, so a callback captured by the
+	// old watch cannot process the replacement lineage.
+	tracker.lineageGeneration[2] = 4;
+	auto staleGeneration = tracker.lineageGeneration[2];
+	tracker.invalidateLineage(2);
+	assert(tracker.lineageGeneration[2] != staleGeneration);
+}
+
+unittest
+{
+	import std.string : lineSplitter;
+	import cydo.agent.drivers.codex : CodexAgent;
+
+	auto firstNotification = `{"type":"user.message","id":"u"}`;
+	assert(JsonlTracker.completeJsonlByteCount(firstNotification) == 0);
+	int incompleteLines;
+	foreach (_; firstNotification.lineSplitter)
+		incompleteLines++;
+	assert(incompleteLines == 1);
+
+	auto completedNotification = firstNotification ~ "\n";
+	auto completeBytes = JsonlTracker.completeJsonlByteCount(completedNotification);
+	assert(completeBytes == completedNotification.length);
+	auto completeContent = completedNotification[0 .. completeBytes];
+	int completeLines;
+	foreach (_; completeContent.lineSplitter)
+		completeLines++;
+	assert(completeLines == 1);
+
+	auto startup = `{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n"
+		~ `{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}`;
+	auto startupBytes = JsonlTracker.completeJsonlByteCount(startup);
+	assert(startupBytes > 0 && startupBytes < startup.length);
+	int committedLines;
+	foreach (_; startup[0 .. startupBytes].lineSplitter)
+		committedLines++;
+	Agent agent = new CodexAgent();
+	auto completed = startup[startupBytes .. $] ~ "\n";
+	auto boundaries = agent.extractPersistedHistoryBoundaries(completed, committedLines);
+	assert(boundaries.length == 1);
+	assert(boundaries[0].anchor == "line:2");
+}
+
+unittest
+{
+	import std.conv : to;
+	import std.file : remove, write;
+	import cydo.agent.drivers.codex : CodexAgent;
+
+	// A notification may arrive after stdout supplied the live candidate but
+	// before the writer has finished its JSONL line.  The completed line must
+	// be consumed once, rather than losing or replaying its boundary.
+	auto path = "/tmp/cydo-jsonl-tracker-split-tail.jsonl";
+	auto taskStarted = `{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n";
+	auto line = `{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}`;
+	write(path, taskStarted ~ line[0 .. 20]);
+
+	TaskData task = TaskData(1, "", "");
+	task.history.reset(Watermark.none());
+	JsonlTracker tracker;
+	tracker.getAgent = (int) => cast(Agent) new CodexAgent();
+	tracker.getTask = (int) => &task;
+	tracker.historyGeneration = (int) => task.history.generation;
+	string[] resolved;
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
+		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
+	};
+	tracker.noteLiveBoundaryCandidate(1, 12,
+		`{"type":"item/started","item_type":"user_message"}`);
+
+	tracker.processNewJsonlContent(1, path);
+	assert(resolved.length == 0);
+	File(path, "a").write(line[20 .. $] ~ "\n");
+	tracker.processNewJsonlContent(1, path);
+	tracker.processNewJsonlContent(1, path);
+	assert(resolved.length == 1);
+	assert(resolved[0] == "line:2:12");
+	remove(path);
+}
+
+unittest
+{
+	import std.conv : to;
+
+	// When both queues already contain consecutive compatible boundaries, one
+	// reconciliation pass preserves their full FIFO order.
+	JsonlTracker tracker;
+	tracker.historyGeneration = (int) => 0;
+	string[] resolved;
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
+		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
+	};
+	tracker.boundaryState[1] = JsonlTracker.BoundaryReconcileState.init;
+	foreach (i; 0 .. 2)
+	{
+		tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user] ~=
+			JsonlTracker.LiveBoundaryCandidate(10 + i, PersistedHistoryBoundaryKind.user, "", 0);
+		tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
+			JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("line:" ~ to!string(i + 1),
+				PersistedHistoryBoundaryKind.user, null), i + 1, false, 0);
+	}
+
+	tracker.drainLiveBoundaries(1, PersistedHistoryBoundaryKind.user);
+	assert(resolved == ["line:1:10", "line:2:11"]);
+	assert(tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user].length == 0);
+	assert(tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user].length == 0);
+}
+
+unittest
+{
+	import cydo.agent.drivers.codex : computeRollbackSkipLines;
+	auto jsonl =
+		`{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n" ~
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+		`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+		`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`;
+	auto skipped = computeRollbackSkipLines(jsonl);
+	assert(4 in skipped && 5 in skipped);
 }

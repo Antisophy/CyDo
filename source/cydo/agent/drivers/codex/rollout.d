@@ -184,7 +184,8 @@ package bool isCodexContextOnlyUserText(string text)
 
 	auto trimmed = text.stripLeft;
 	return trimmed.startsWith("<permissions instructions>")
-		|| trimmed.startsWith("<environment_context>");
+		|| trimmed.startsWith("<environment_context>")
+		|| trimmed.startsWith("[SYSTEM:");
 }
 
 package bool isCodexContextOnlyUserMessageLine(string line)
@@ -216,7 +217,7 @@ package bool isCodexContextOnlyUserMessageLine(string line)
 			return false;
 		string text;
 		foreach (ref block; jsonParse!(TextBlock[])(probe.payload.content.json))
-			if (block.type == "text")
+			if (block.type == "input_text" || block.type == "text")
 				text ~= block.text;
 		return isCodexContextOnlyUserText(text);
 	}
@@ -235,7 +236,6 @@ struct CodexActiveUserTurnsAfterResult
 {
 	CodexActiveUserTurnsAfterStatus status;
 	int count;
-	int visibleCount;
 }
 
 /// Count active (marker-aware) user turns after `forkId` in Codex JSONL content.
@@ -256,30 +256,17 @@ CodexActiveUserTurnsAfterResult countActiveUserTurnsAfterForkId(string content, 
 	}
 
 	if (targetIdx == size_t.max)
-		return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.targetMissing, 0, 0);
+		return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.targetMissing, 0);
 	if (ids[targetIdx].kind != PersistedHistoryBoundaryKind.user)
-		return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.targetNotUser, 0, 0);
+		return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.targetNotUser, 0);
 
 	int count = 0;
-	int visibleCount = 0;
-	// Codex rollback counts active user segments. For UI preview, also provide
-	// visible-turn counting where consecutive user lines are collapsed.
-	bool inUserTurn = true;
 	foreach (ref idInfo; ids[targetIdx + 1 .. $])
 	{
 		if (idInfo.kind == PersistedHistoryBoundaryKind.user)
-		{
 			count++;
-			if (!inUserTurn)
-				visibleCount++;
-			inUserTurn = true;
-		}
-		else
-		{
-			inUserTurn = false;
-		}
 	}
-	return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.ok, count, visibleCount);
+	return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.ok, count);
 }
 
 /// Check if a JSONL line is a ThreadRolledBack event_msg.
@@ -428,7 +415,6 @@ unittest
 		auto ok = countActiveUserTurnsAfterForkId(jsonl, "line:4");
 		assert(ok.status == CodexActiveUserTurnsAfterStatus.ok);
 		assert(ok.count == 1, "only visible user turn after line:4 should be counted");
-		assert(ok.visibleCount == 1, "visible turn count should match collapsed user runs");
 
 		auto hidden = countActiveUserTurnsAfterForkId(jsonl, "line:6");
 		assert(hidden.status == CodexActiveUserTurnsAfterStatus.targetMissing);
@@ -456,8 +442,30 @@ unittest
 		assert(afterSecond.status == CodexActiveUserTurnsAfterStatus.ok);
 		assert(afterSecond.count == 2,
 			"rollback count should include all active user segments");
-		assert(afterSecond.visibleCount == 1,
-			"consecutive user lines for one turn must collapse in preview count");
+	}
+
+	// CyDo's injected session instruction is persisted as a user response_item,
+	// but it has no visible user-message counterpart and must not shift line
+	// boundary correlation for subsequent visible turns.
+	{
+		string jsonl =
+			`{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"[SYSTEM: Session start]"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alive-one"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alive-two"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alive-three"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alive-four"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alive-five"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}`;
+
+		auto afterThird = countActiveUserTurnsAfterForkId(jsonl, "line:8");
+		assert(afterThird.status == CodexActiveUserTurnsAfterStatus.ok);
+		assert(afterThird.count == 2);
 	}
 
 	// Test isRollbackMarker

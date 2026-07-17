@@ -9,6 +9,7 @@
 
 export type {
   ContentBlock,
+  HistoryBoundary,
   UsageInfo,
   ModelUsageInfo,
   CompactMetadata,
@@ -332,11 +333,6 @@ export interface ForkableUuidsMessage {
   tid: number;
   uuids: string[];
 }
-export interface AssignUuidsMessage {
-  type: "assign_uuids";
-  tid: number;
-  assignments: Array<{ uuid: string; seq: number }>;
-}
 export interface ErrorMessage {
   type: "error";
   message: string;
@@ -437,7 +433,6 @@ export type ControlMessage =
   | ProjectTaskTypesListMessage
   | AgentsListMessage
   | ForkableUuidsMessage
-  | AssignUuidsMessage
   | ErrorMessage
   | UndoPreviewMessage
   | UndoResultMessage

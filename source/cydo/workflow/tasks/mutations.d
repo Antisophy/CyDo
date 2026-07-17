@@ -61,6 +61,7 @@ struct TaskMutationServiceHost
 	void delegate(int tid) ensureHistoryLoaded;
 	string delegate(int tid) getUndoJsonl;
 	void delegate(int tid) clearUndoJsonl;
+	void delegate(int tid) invalidateJsonlLineage;
 	void delegate(int tid) stopJsonlWatch;
 
 	void delegate(int tid) generateSuggestions;
@@ -275,7 +276,7 @@ public:
 						break;
 				}
 				ws.send(Data(toJson(UndoPreviewMessage("undo_preview", tid,
-					result.visibleCount + 1)).representation));
+					result.count + 1)).representation));
 				return;
 			}
 
@@ -349,7 +350,6 @@ public:
 							host_.effectiveCwd(td2));
 						td2.history.reset(watermarkFromPath(jp));
 						host_.unsubscribeTaskHistorySubscribers(tid);
-						host_.stopJsonlWatch(tid);
 
 						if (td2.pendingSteeringTexts.length > 0)
 						{
@@ -434,6 +434,7 @@ public:
 			return;
 		}
 
+		host_.invalidateJsonlLineage(tid);
 		td.history.reset(watermarkFromPath(jsonlPath));
 		host_.unsubscribeTaskHistorySubscribers(tid);
 		host_.emitTaskReload(tid, "edit");
@@ -494,6 +495,7 @@ public:
 			return;
 		}
 
+		host_.invalidateJsonlLineage(tid);
 		td.history.reset(watermarkFromPath(jsonlPath));
 		host_.unsubscribeTaskHistorySubscribers(tid);
 		host_.emitTaskReload(tid, "edit");
@@ -746,6 +748,7 @@ private:
 				ws.send(Data(toJson(ErrorMessage("error", "UUID not found for truncation", tid)).representation));
 				return;
 			}
+			host_.invalidateJsonlLineage(tid);
 			td.history.reset(watermarkFromPath(histJsonlPath));
 			host_.unsubscribeTaskHistorySubscribers(tid);
 

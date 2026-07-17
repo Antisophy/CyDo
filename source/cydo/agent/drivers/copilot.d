@@ -618,9 +618,12 @@ class CopilotAgent : Agent
 
 	string[] extractForkableIds(string content, int lineOffset = 0)
 	{
+		import std.algorithm : startsWith;
 		import std.string : lineSplitter;
 
-		@JSONPartial static struct TypeIdProbe { string type; string id; }
+		@JSONPartial static struct TypeIdProbe { string type; string id;
+			@JSONPartial static struct Data { string content; }
+			Data data; }
 
 		string[] ids;
 		foreach (line; content.lineSplitter)
@@ -632,6 +635,8 @@ class CopilotAgent : Agent
 				auto probe = jsonParse!TypeIdProbe(line);
 				if (probe.type != "user.message" && probe.type != "assistant.message")
 					continue;
+				if (probe.type == "user.message" && probe.data.content.startsWith("[SYSTEM:"))
+					continue;
 				if (probe.id.length > 0)
 					ids ~= probe.id;
 			}
@@ -642,9 +647,12 @@ class CopilotAgent : Agent
 
 	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0)
 	{
+		import std.algorithm : startsWith;
 		import std.string : lineSplitter;
 
-		@JSONPartial static struct TypeIdProbe { string type; string id; }
+		@JSONPartial static struct TypeIdProbe { string type; string id;
+			@JSONPartial static struct Data { string content; }
+			Data data; }
 
 		PersistedHistoryBoundary[] ids;
 		foreach (line; content.lineSplitter)
@@ -655,6 +663,8 @@ class CopilotAgent : Agent
 			{
 				auto probe = jsonParse!TypeIdProbe(line);
 				if (probe.type != "user.message" && probe.type != "assistant.message")
+					continue;
+				if (probe.type == "user.message" && probe.data.content.startsWith("[SYSTEM:"))
 					continue;
 				if (probe.id.length > 0)
 					ids ~= PersistedHistoryBoundary(probe.id,
@@ -815,13 +825,26 @@ class CopilotSession : AgentSession, SdkSessionHandler
 	private string currentRawJson_; // raw event data.json from handleEvent, for _raw injection
 	private AbsTime currentEventTs_; // timestamp of the current live event
 	private string currentSubagentParent_;  // toolCallId of current sub-agent parent (task tool)
+	private string currentAssistantMessageId_;
+	private string activeTurnNamespace_;
 
 	private bool sessionReady_; // true after session.create/resume response
 	private string agentName_;
 	private string copilotVersion_;
 
 	// Queued messages waiting for the current turn to finish.
-	private ContentBlock[][] pendingMessages;
+	private struct PendingMessage
+	{
+		ContentBlock[] content;
+		string correlationId;
+	}
+	private PendingMessage[] pendingMessages;
+	private struct ExpectedUserMessage
+	{
+		string content;
+		string correlationId;
+	}
+	private ExpectedUserMessage[] expectedUserMessages;
 
 	// Callbacks
 	package void delegate(TranslatedEvent) outputHandler_;
@@ -876,7 +899,7 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		auto queued = pendingMessages;
 		pendingMessages = null;
 		foreach (msg; queued)
-			sendMessage(msg);
+			sendMessage(msg.content, msg.correlationId);
 	}
 
 	// ----- AgentSession interface -----
@@ -897,14 +920,14 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		// Queue message if session hasn't been created yet.
 		if (!sessionReady_)
 		{
-			pendingMessages ~= content.dup;
+			pendingMessages ~= PendingMessage(content.dup, correlationId);
 			return;
 		}
 
 		if (turnInProgress)
 		{
 			// Steering: buffer message; send after current turn completes.
-			pendingMessages ~= content.dup;
+			pendingMessages ~= PendingMessage(content.dup, correlationId);
 		}
 		else
 		{
@@ -915,11 +938,11 @@ class CopilotSession : AgentSession, SdkSessionHandler
 			hadItemsSinceLastStop_ = false;
 
 			// SDK session.send returns immediately with messageId.
-			// Emit the synthetic user-echo and agent-ack only after the server
-			// accepts the message so we don't orphan a bubble on error.
+			expectedUserMessages ~= ExpectedUserMessage(text, correlationId);
+			// The pending user echo is emitted by the task runner.  The native
+			// user.message notification confirms it with the persisted identity.
 			// Turn completion comes via session.idle event.
 			auto sendCid = correlationId;
-			auto sendText = text;
 			SessionSendParams sendP;
 			sendP.sessionId = sessionId;
 			sendP.prompt    = text;
@@ -927,6 +950,10 @@ class CopilotSession : AgentSession, SdkSessionHandler
 			.then((JsonRpcResponse resp) {
 				if (resp.isError)
 				{
+					assert(expectedUserMessages.length > 0
+						&& expectedUserMessages[0].correlationId == sendCid,
+						"Copilot send failure lost its expected user nonce");
+					expectedUserMessages = expectedUserMessages[1 .. $];
 					ProcessStderrEvent sendErrEv;
 					sendErrEv.text = "session.send error: " ~ resp.error.get.message;
 					emitEvent(toJson(sendErrEv));
@@ -935,15 +962,6 @@ class CopilotSession : AgentSession, SdkSessionHandler
 				{
 					if (sendCid.length > 0 && agentAckHandler_)
 						agentAckHandler_(sendCid);
-					ContentBlock userCb;
-					userCb.type = "text";
-					userCb.text = sendText;
-					ItemStartedEvent userMsgEv;
-					userMsgEv.item_id        = "cp-user-msg";
-					userMsgEv.item_type      = "user_message";
-					userMsgEv.content        = [userCb];
-					userMsgEv.correlation_id = sendCid;
-					emitEvent(toJson(userMsgEv));
 				}
 			});
 		}
@@ -1031,13 +1049,13 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		switch (event.type)
 		{
 			case "assistant.turn_start":
-				handleTurnStart(data);
+				handleTurnStart(event.id, data);
 				break;
 			case "assistant.message_delta":
 				handleMessageDelta(data);
 				break;
 			case "assistant.message":
-				handleAssistantMessage(data);
+				handleAssistantMessage(event.id, data);
 				break;
 			case "assistant.reasoning_delta":
 				handleReasoningDelta(data);
@@ -1049,7 +1067,7 @@ class CopilotSession : AgentSession, SdkSessionHandler
 				handleToolExecutionComplete(data);
 				break;
 			case "user.message":
-				handleUserMessage(data);
+				handleUserMessage(event.id, data);
 				break;
 			case "assistant.turn_end":
 				handleAssistantTurnEnd();
@@ -1310,14 +1328,18 @@ class CopilotSession : AgentSession, SdkSessionHandler
 			outputHandler_(TranslatedEvent(translated, rawJson.length > 0 ? rawJson : null, currentEventTs_));
 	}
 
-	private void handleTurnStart(JSONFragment data)
+	private void handleTurnStart(string eventId, JSONFragment data)
 	{
+		assert(eventId.length > 0, "Copilot assistant.turn_start has no native ID");
+		assert(currentAssistantMessageId_.length == 0,
+			"Copilot assistant message ID leaked into the next sub-turn");
 		turnInProgress = true;
 		nextItemIndex = 0;
 		activeTextItem = ActiveTextItem.init;
 		activeTools = null;
 		hadItemsSinceLastStop_ = false;
 		currentSubagentParent_ = null;
+		activeTurnNamespace_ = sessionId ~ "-" ~ eventId;
 	}
 
 	private void handleMessageDelta(JSONFragment data)
@@ -1333,7 +1355,8 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		if (activeTextItem.type != "text")
 		{
 			finalizeActiveTextItem();
-			auto id = "cp-text-" ~ to!string(nextItemIndex++);
+			assert(activeTurnNamespace_.length > 0, "Copilot text delta has no active turn namespace");
+			auto id = "cp-text-" ~ activeTurnNamespace_ ~ "-" ~ to!string(nextItemIndex++);
 			activeTextItem = ActiveTextItem(id, "text", "", currentSubagentParent_);
 			ItemStartedEvent textStartEv;
 			textStartEv.item_id            = id;
@@ -1368,7 +1391,8 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		if (activeTextItem.type != "thinking")
 		{
 			finalizeActiveTextItem();
-			auto id = "cp-think-" ~ to!string(nextItemIndex++);
+			assert(activeTurnNamespace_.length > 0, "Copilot thinking delta has no active turn namespace");
+			auto id = "cp-think-" ~ activeTurnNamespace_ ~ "-" ~ to!string(nextItemIndex++);
 			activeTextItem = ActiveTextItem(id, "thinking", "", currentSubagentParent_);
 			ItemStartedEvent thinkStartEv;
 			thinkStartEv.item_id            = id;
@@ -1485,17 +1509,35 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		activeTools.remove(tc.toolCallId);
 	}
 
-	private void handleAssistantMessage(JSONFragment data)
+	private void handleAssistantMessage(string eventId, JSONFragment data)
 	{
-		// Option B: synthesize message/assistant from completedItems in handleTurnCompleted.
-		// The SDK assistant.message event is not used directly.
+		assert(eventId.length > 0, "Copilot assistant.message has no native ID");
+		assert(currentAssistantMessageId_.length == 0,
+			"Copilot sub-turn produced multiple assistant.message events");
+		currentAssistantMessageId_ = eventId;
 	}
 
-	private void handleUserMessage(JSONFragment data)
+	private void handleUserMessage(string eventId, JSONFragment data)
 	{
-		// Suppress: sendMessage() already emits the user echo.  Copilot's
-		// user.message event is a redundant echo that would create a
-		// duplicate user message in the frontend.
+		@JSONPartial static struct UserMessage { string content; }
+		assert(eventId.length > 0, "Copilot user.message has no native ID");
+		assert(expectedUserMessages.length > 0,
+			"Copilot user.message has no queued originating send");
+		auto message = jsonParse!UserMessage(data.json);
+		auto expected = expectedUserMessages[0];
+		assert(message.content == expected.content,
+			"Copilot user.message content differs from its originating send");
+		expectedUserMessages = expectedUserMessages[1 .. $];
+		ContentBlock content;
+		content.type = "text";
+		content.text = message.content;
+		ItemStartedEvent userEv;
+		userEv.item_id = "cp-user-" ~ eventId;
+		userEv.item_type = "user_message";
+		userEv.content = [content];
+		userEv.uuid = eventId;
+		userEv.correlation_id = expected.correlationId;
+		emitEvent(toJson(userEv), currentRawJson_);
 	}
 
 	private void handleSessionStart(JSONFragment data)
@@ -1533,7 +1575,7 @@ class CopilotSession : AgentSession, SdkSessionHandler
 
 	// ----- Turn completion -----
 
-	private void finalizeTurnItemsAndEmitStop()
+	private void finalizeTurnItemsAndEmitStop(string uuid)
 	{
 		// Finalize any still-active text/thinking item.
 		finalizeActiveTextItem();
@@ -1541,23 +1583,34 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		// but cleans up if turn ends before tool.execution_complete arrives).
 		finalizeAllTools();
 
-		if (!hadItemsSinceLastStop_)
-			return;
-
 		TurnStopEvent tsEv;
 		tsEv.model = model;
+		tsEv.uuid = uuid;
 		emitEvent(toJson(tsEv), currentRawJson_);
 		hadItemsSinceLastStop_ = false;
 	}
 
 	private void handleAssistantTurnEnd()
 	{
-		finalizeTurnItemsAndEmitStop();
+		assert(currentAssistantMessageId_.length > 0,
+			"Copilot assistant.turn_end has no assistant.message identity");
+		finalizeTurnItemsAndEmitStop(currentAssistantMessageId_);
+		currentAssistantMessageId_ = null;
 	}
 
 	private void handleSessionIdle()
 	{
-		finalizeTurnItemsAndEmitStop();
+		if (currentAssistantMessageId_.length > 0)
+		{
+			finalizeTurnItemsAndEmitStop(currentAssistantMessageId_);
+			currentAssistantMessageId_ = null;
+		}
+		else
+		{
+			finalizeActiveTextItem();
+			finalizeAllTools();
+			hadItemsSinceLastStop_ = false;
+		}
 		turnInProgress = false;
 
 		// Include the last text item as "result" so extractResultText can retrieve it.
@@ -1577,7 +1630,7 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		{
 			auto next = pendingMessages[0];
 			pendingMessages = pendingMessages[1 .. $];
-			sendMessage(next);
+			sendMessage(next.content, next.correlationId);
 		}
 	}
 
@@ -1802,6 +1855,7 @@ unittest
 
 unittest
 {
+	import std.algorithm : canFind;
 	auto session = new CopilotSession(null, 1, "session-123", "", ".");
 	session.startReplay();
 
@@ -1811,6 +1865,68 @@ unittest
 	session.handleEvent(event);
 
 	assert(session.copilotVersion_ == "1.0.39");
+}
+
+unittest
+{
+	import std.algorithm : canFind;
+	auto session = new CopilotSession(null, 1, "session-123", "", ".");
+	string[] output;
+	session.outputHandler_ = (event) { output ~= event.translated; };
+	session.expectedUserMessages = [
+		CopilotSession.ExpectedUserMessage("[SYSTEM: internal]", null),
+		CopilotSession.ExpectedUserMessage("ordinary", "nonce-1"),
+	];
+
+	SdkEvent internal;
+	internal.id = "native-system-1";
+	internal.type = "user.message";
+	internal.data = jsonParse!(typeof(internal.data))(`{"content":"[SYSTEM: internal]"}`);
+	session.handleEvent(internal);
+	assert(output.length == 1);
+	assert(output[0].canFind(`"uuid":"native-system-1"`));
+	assert(!output[0].canFind(`"correlation_id"`));
+
+	SdkEvent user;
+	user.id = "native-user-1";
+	user.type = "user.message";
+	user.data = jsonParse!(typeof(user.data))(`{"content":"ordinary"}`);
+	session.handleEvent(user);
+	assert(output.length == 2);
+	assert(output[1].canFind(`"uuid":"native-user-1"`));
+	assert(output[1].canFind(`"correlation_id":"nonce-1"`));
+
+	SdkEvent start;
+	start.id = "native-turn-start-1";
+	start.type = "assistant.turn_start";
+	start.data = jsonParse!(typeof(start.data))(`{}`);
+	session.handleEvent(start);
+	SdkEvent message;
+	message.id = "native-assistant-1";
+	message.type = "assistant.message";
+	message.data = jsonParse!(typeof(message.data))(`{"content":""}`);
+	session.handleEvent(message);
+	SdkEvent end;
+	end.type = "assistant.turn_end";
+	end.data = jsonParse!(typeof(end.data))(`{}`);
+	session.handleEvent(end);
+	assert(output.length == 3);
+	assert(output[2].canFind(`"type":"turn/stop"`));
+	assert(output[2].canFind(`"uuid":"native-assistant-1"`));
+}
+
+unittest
+{
+	auto agent = new CopilotAgent;
+	auto content = `{"type":"user.message","id":"system-id","data":{"content":"[SYSTEM: bootstrap"}}`
+		~ "\n"
+		~ `{"type":"user.message","id":"native-user-id","data":{"content":"ordinary"}}`
+		~ "\n";
+	assert(agent.extractForkableIds(content) == ["native-user-id"]);
+	auto boundaries = agent.extractPersistedHistoryBoundaries(content);
+	assert(boundaries.length == 1);
+	assert(boundaries[0].anchor == "native-user-id");
+	assert(boundaries[0].kind == PersistedHistoryBoundaryKind.user);
 }
 
 unittest

@@ -3,8 +3,50 @@ import renderToString from "preact-render-to-string";
 import { MessageList } from "./MessageList";
 import { DevModeContext } from "../devMode";
 import type { DisplayMessage } from "../types";
+import type { AgnosticEvent } from "../protocol";
 
 describe("MessageList parse-error rendering", () => {
+  it("derives user actions from one matching replacement boundary", () => {
+    const user: DisplayMessage = { id: "u", type: "user", content: [], seq: 7 };
+    const replacementEvents: Map<number, AgnosticEvent> = new Map([
+      [
+        7,
+        {
+          type: "item/started",
+          item_type: "user_message",
+          item_id: "",
+          history_boundary: { anchor: "anchor", kind: "user" },
+        },
+      ],
+    ]);
+    const html = renderToString(
+      <MessageList
+        taskTid={1}
+        messages={[user]}
+        replacementEvents={replacementEvents}
+        blocks={new Map()}
+        isProcessing={false}
+        bandStatus=""
+        forkableUuids={new Set(["anchor"])}
+        onUndo={() => {}}
+      />,
+    );
+    expect(html).toContain("undo-btn");
+    const noIdentity = renderToString(
+      <MessageList
+        taskTid={1}
+        messages={[user]}
+        replacementEvents={new Map()}
+        blocks={new Map()}
+        isProcessing={false}
+        bandStatus=""
+        forkableUuids={new Set(["anchor"])}
+        onUndo={() => {}}
+      />,
+    );
+    expect(noIdentity).not.toContain("undo-btn");
+  });
+
   it("shows parse_error system messages in normal mode", () => {
     const parseError: DisplayMessage = {
       id: "msg-1",
@@ -23,6 +65,7 @@ describe("MessageList parse-error rendering", () => {
         taskTid={1}
         messages={[parseError]}
         blocks={new Map()}
+        replacementEvents={new Map()}
         isProcessing={false}
         bandStatus=""
       />,
@@ -51,6 +94,7 @@ describe("MessageList parse-error rendering", () => {
           taskTid={1}
           messages={[parseError]}
           blocks={new Map()}
+          replacementEvents={new Map()}
           isProcessing={false}
           bandStatus=""
         />
@@ -62,6 +106,7 @@ describe("MessageList parse-error rendering", () => {
           taskTid={1}
           messages={[parseError]}
           blocks={new Map()}
+          replacementEvents={new Map()}
           isProcessing={false}
           bandStatus=""
         />
@@ -89,6 +134,7 @@ describe("MessageList metadata rendering", () => {
           taskTid={1}
           messages={[metadata]}
           blocks={new Map()}
+          replacementEvents={new Map()}
           isProcessing={false}
           bandStatus=""
         />
@@ -107,6 +153,7 @@ describe("MessageList metadata rendering", () => {
           taskTid={1}
           messages={[metadata]}
           blocks={new Map()}
+          replacementEvents={new Map()}
           isProcessing={false}
           bandStatus=""
         />

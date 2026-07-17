@@ -562,6 +562,7 @@ function SessionViewInner({
         <MessageList
           taskTid={tid}
           messages={task.messages}
+          replacementEvents={task.replacementEvents}
           blocks={task.blocks}
           isProcessing={task.isProcessing}
           bandStatus={deriveBandStatus(

@@ -61,7 +61,7 @@ import cydo.domain.usage.tracker : AgentUsageTracker;
 
 import cydo.agent.contract : Agent;
 import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
-	ItemStartedEvent, SessionRateLimitEvent, TaskDiagnosticEvent, TaskDiagnosticSeverity,
+	HistoryBoundary, ItemStartedEvent, SessionRateLimitEvent, TaskDiagnosticEvent, TaskDiagnosticSeverity,
 	TaskEventEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
 	UnconfirmedUserEventEnvelope, extractContentText;
 import cydo.agent.drivers.registry : isRegisteredAgent;
@@ -500,13 +500,15 @@ class App
 			},
 			sendForkableUuids: (WebSocketAdapter ws, int tid) {
 				auto td = tid in tasks;
-				assert(td !is null,
-					format!"Forkable UUID replay requested for missing task %d"(tid));
+				assert(td !is null);
 				jsonlTracker.sendForkableUuidsFromFile(ws, tid, td.agentSessionId,
 					taskPathResolver.effectiveCwd(td));
 			},
 			broadcastForkableUuids: (int tid) {
 				jsonlTracker.broadcastForkableUuidsFromFile(tid);
+			},
+			noteLiveBoundaryCandidate: (int tid, size_t seq, string event) {
+				jsonlTracker.noteLiveBoundaryCandidate(tid, seq, event);
 			},
 			sendReplaySupplementalState: &sendHistoryReplaySupplementalState,
 			onHistorySubscribed: &onHistorySubscribed,
@@ -609,6 +611,12 @@ class App
 			startJsonlWatch: (int tid) {
 				jsonlTracker.startJsonlWatch(tid);
 			},
+			ensureHistoryLoaded: (int tid) {
+				historyPipeline.ensureHistoryLoaded(tid);
+			},
+			finalReconcileJsonlIfPresent: (int tid) {
+				jsonlTracker.finalReconcileJsonlIfPresent(tid);
+			},
 			stopJsonlWatch: (int tid) {
 				jsonlTracker.stopJsonlWatch(tid);
 			},
@@ -665,6 +673,9 @@ class App
 			clearUndoJsonl: (int tid) {
 				jsonlTracker.clearUndoJsonl(tid);
 			},
+			invalidateJsonlLineage: (int tid) {
+				jsonlTracker.invalidateLineage(tid);
+			},
 			stopJsonlWatch: (int tid) {
 				jsonlTracker.stopJsonlWatch(tid);
 			},
@@ -684,14 +695,34 @@ class App
 		));
 		jsonlTracker.getAgent = &agentForTask;
 		jsonlTracker.getTask = (int tid) => tid in tasks ? &tasks[tid] : null;
+		jsonlTracker.historyGeneration = (int tid) {
+			auto td = tid in tasks;
+			assert(td !is null, "history generation requested for missing task");
+			return td.history.generation;
+		};
 		jsonlTracker.getEffectiveCwd = (int tid) {
 			auto td = tid in tasks;
 			return taskPathResolver.effectiveCwd(td);
 		};
 		jsonlTracker.sendToSubscribed = (int tid, string msg) =>
 			clientHub.sendToSubscribed(tid, Data(msg.representation));
-		jsonlTracker.onAnchorResolved = (int tid, size_t seq, string anchor) =>
-			historyPipeline.backfillHistoryAnchor(tid, seq, anchor);
+		jsonlTracker.onBoundaryResolved = (int tid, size_t seq, HistoryBoundary boundary,
+			bool publish, ulong generation) {
+			auto td = tid in tasks;
+			if (td is null || td.history.generation != generation)
+				return;
+			historyPipeline.backfillHistoryBoundary(tid, seq, boundary, publish);
+		};
+		jsonlTracker.onLineageInvalidated = (int tid) {
+			auto td = tid in tasks;
+			assert(td !is null, "history lineage invalidated for missing task");
+			jsonlTracker.invalidateLineage(tid);
+			auto path = agentForTask(tid).historyPath(td.agentSessionId,
+				taskPathResolver.effectiveCwd(td));
+			td.history.reset(watermarkFromPath(path));
+			emitTaskReload(tid, "history_lineage");
+			jsonlTracker.startJsonlWatch(tid);
+		};
 
 		// Load task type definitions
 		auto types = taskTypeCatalog.getTaskTypes();
@@ -2358,6 +2389,7 @@ class App
 	{
 		if (tid !in tasks)
 			return;
+		jsonlTracker.invalidateLineage(tid);
 		auto ta = tryAgentForTask(tid);
 		{
 			Watermark wm;
@@ -2667,6 +2699,7 @@ class App
 
 		if (tid !in tasks)
 			return;
+		jsonlTracker.invalidateLineage(tid);
 		clientHub.unsubscribeAll(tid);
 		derivedTextJobs.invalidateSuggestions(tid);
 		clientHub.broadcast(toJson(TaskReloadMessage("task_reload", tid, reason)));

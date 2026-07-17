@@ -14,9 +14,10 @@ import ae.utils.array : as;
 import ae.utils.json : JSONFragment, JSONOptional, JSONPartial, jsonParse, toJson;
 import ae.utils.time.types : AbsTime;
 
-import cydo.agent.contract : Agent;
+import cydo.agent.contract : Agent, PersistedHistoryBoundaryKind;
 import cydo.protocol : ContentBlock, ItemStartedEvent, TaskEventEnvelope,
-	TaskEventSeqEnvelope, TranslatedEvent, UnconfirmedUserEventEnvelope,
+	TaskEventReplacedEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
+	UnconfirmedUserEventEnvelope, HistoryBoundary, HistoryBoundaryKind,
 	extractContentText;
 import cydo.runtime.config : AgentDriver;
 import cydo.domain.storage.persistence : LoadedHistory;
@@ -46,6 +47,7 @@ struct HistoryEventPipelineHost
 	void delegate(WebSocketAdapter ws, int tid) subscribe;
 	void delegate(WebSocketAdapter ws, int tid) sendForkableUuids;
 	void delegate(int tid) broadcastForkableUuids;
+	void delegate(int tid, size_t seq, string event) noteLiveBoundaryCandidate;
 	void delegate(WebSocketAdapter ws, int tid) sendReplaySupplementalState;
 	void delegate(int tid) onHistorySubscribed;
 	void delegate(int tid, string line) ensureAgentSessionIdFromEvent;
@@ -253,9 +255,56 @@ class HistoryEventPipeline
 					toJson(TaskEventEnvelope(tid, Clock.currStdTime,
 						JSONFragment(toJsonWithSyntheticUserMeta(text, synEv, tid)))).representation), null);
 			}
-			host_.broadcastForkableUuids(tid);
 		}
 		rebuildVisibleTurnAnchors(tid);
+		foreach (i, ref entry; td.history)
+		{
+			import ae.utils.array : as;
+			import ae.utils.json : JSONOptional, JSONPartial, jsonParse;
+			auto raw = td.history.rawAt(i);
+			auto line = td.history.sourceLineAt(i);
+			if (raw.length == 0 || line == 0)
+				continue;
+			auto boundaries = ta.extractPersistedHistoryBoundaries(raw, line - 1);
+			if (boundaries.length != 1)
+				continue;
+			@JSONPartial static struct Probe {
+				string type; @JSONOptional string item_type; @JSONOptional string uuid;
+				@JSONOptional string item_id; @JSONOptional bool is_meta;
+				@JSONOptional bool is_synthetic; @JSONOptional bool pending;
+				@JSONOptional bool is_sidechain; @JSONOptional string parent_tool_use_id;
+			}
+			Probe probe;
+			entry.enter((scope const(ubyte)[] bytes) {
+				auto event = extractEventFromEnvelope(bytes.as!(char[]));
+				probe = jsonParse!Probe(event);
+			});
+			auto isUser = probe.type == "item/started" && probe.item_type == "user_message"
+				&& !probe.is_meta && !probe.is_synthetic && !probe.pending && !probe.is_sidechain
+				&& probe.parent_tool_use_id.length == 0;
+			auto isTurn = probe.type == "turn/stop" && !probe.is_sidechain
+				&& probe.parent_tool_use_id.length == 0;
+			if ((boundaries[0].kind == PersistedHistoryBoundaryKind.user && !isUser)
+				|| (boundaries[0].kind == PersistedHistoryBoundaryKind.agent_turn && !isTurn))
+				continue;
+			assertReplayNativeIdentity(ta.driver,
+				probe.uuid.length > 0 ? probe.uuid : probe.item_id, boundaries[0].anchor);
+			boundaries[0].checkpointUuid = td.checkpointUuidForAnchor(boundaries[0].anchor);
+			backfillHistoryBoundary(tid, i, HistoryBoundary(boundaries[0].anchor,
+				boundaries[0].kind == PersistedHistoryBoundaryKind.user
+					? HistoryBoundaryKind.user : HistoryBoundaryKind.agent_turn,
+				boundaries[0].checkpointUuid), false);
+		}
+		if (!orphan)
+			host_.broadcastForkableUuids(tid);
+	}
+
+	private static void assertReplayNativeIdentity(AgentDriver driver, string identity,
+		string anchor)
+	{
+		if (driver == AgentDriver.claude || driver == AgentDriver.copilot)
+			assert(identity == anchor,
+				"replayed native history identity does not match its persisted boundary");
 	}
 
 	void handleRequestHistory(WebSocketAdapter ws, int tid)
@@ -291,7 +340,6 @@ class HistoryEventPipeline
 			else
 				ws.send(msg);
 		}
-
 		if (td.agentSessionId.length > 0 && host_.tryAgentForTask(tid))
 			host_.sendForkableUuids(ws, tid);
 
@@ -383,10 +431,14 @@ class HistoryEventPipeline
 			return seq;
 
 		if (!merged)
+		{
 			registerVisibleTurnAnchorFromEvent(tid, seq, ev.translated, ev.raw);
+		}
 		host_.sendToSubscribed(tid, Data(
 			toJson(TaskEventSeqEnvelope(tid, cast(int) seq, ev.ts.stdTime,
 				JSONFragment(ev.translated))).representation));
+		if (!merged && host_.noteLiveBoundaryCandidate !is null)
+			host_.noteLiveBoundaryCandidate(tid, seq, ev.translated);
 		return seq;
 	}
 
@@ -410,37 +462,61 @@ class HistoryEventPipeline
 		appendAndBroadcastTaskEvent(tid, plan.currentEvent);
 	}
 
-	void backfillHistoryAnchor(int tid, size_t seq, string anchor)
+	void backfillHistoryBoundary(int tid, size_t seq, HistoryBoundary boundary,
+		bool publish = true)
 	{
-		import cydo.protocol : ItemStartedEvent;
+		import cydo.protocol : ItemStartedEvent, TurnStopEvent;
 
 		auto td = host_.getTask(tid);
-		if (td is null || anchor.length == 0 || seq >= td.history.length)
-			return;
+		assert(td !is null, "history boundary resolved for missing task");
+		assert(boundary.anchor.length > 0, "history boundary anchor must be non-empty");
+		assert(seq < td.history.length, "history boundary sequence is out of range");
 
 		Data replacement;
+		bool alreadyResolved;
 		td.history[seq].enter((scope const(ubyte)[] bytes) {
 			auto envelope = bytes.as!(char[]);
 			auto event = extractEventFromEnvelope(envelope);
-			if (event.length == 0
-				|| !event.canFind(`"type":"item/started"`)
-				|| !event.canFind(`"item_type":"user_message"`))
+			assert(event.length > 0, "history boundary target has no event");
+			auto timestamp = extractTsFromEnvelope(envelope);
+			@JSONPartial static struct Probe {
+				string type; @JSONOptional string item_type; @JSONOptional bool is_meta;
+				@JSONOptional bool is_synthetic; @JSONOptional bool pending;
+				@JSONOptional bool is_sidechain; @JSONOptional string parent_tool_use_id;
+				@JSONOptional HistoryBoundary history_boundary;
+			}
+			auto probe = jsonParse!Probe(event);
+			assert((boundary.kind == HistoryBoundaryKind.user
+				&& probe.type == "item/started" && probe.item_type == "user_message"
+				&& !probe.is_meta && !probe.is_synthetic && !probe.pending && !probe.is_sidechain
+				&& probe.parent_tool_use_id.length == 0)
+				|| (boundary.kind == HistoryBoundaryKind.agent_turn && probe.type == "turn/stop"
+				&& !probe.is_sidechain && probe.parent_tool_use_id.length == 0),
+				"history boundary target is ineligible");
+			if (probe.history_boundary.anchor.length > 0)
+			{
+				assert(toJson(probe.history_boundary) == toJson(boundary),
+					"history boundary resolution conflicts with canonical event");
+				alreadyResolved = true;
 				return;
-
-			ItemStartedEvent userEv;
-			try
-				userEv = jsonParse!ItemStartedEvent(event);
-			catch (Exception)
-				return;
-			if (userEv.uuid == anchor)
-				return;
-			userEv.uuid = anchor;
-			replacement = Data(toJson(TaskEventEnvelope(tid,
-				extractTsFromEnvelope(envelope),
-				JSONFragment(toJson(userEv)))).representation);
+			}
+			auto enriched = event[0 .. $ - 1] ~ `,"history_boundary":` ~ toJson(boundary) ~ `}`;
+			replacement = Data(toJson(TaskEventEnvelope(tid, timestamp,
+				JSONFragment(enriched.idup))).representation);
 		});
-		if (replacement.length > 0)
-			td.history.replaceAt(seq, replacement);
+		if (alreadyResolved)
+			return;
+		assert(replacement.length > 0, "history boundary replacement was not produced");
+		td.history.replaceAt(seq, replacement);
+		if (!publish)
+			return;
+		td.history[seq].enter((scope const(ubyte)[] bytes) {
+			auto envelope = bytes.as!(char[]);
+			host_.sendToSubscribed(tid, Data(toJson(TaskEventReplacedEnvelope(
+				"task_event_replaced", tid, cast(int) seq, extractTsFromEnvelope(envelope),
+				JSONFragment(extractEventFromEnvelope(envelope).idup))).representation));
+		});
+		host_.broadcastForkableUuids(tid);
 	}
 
 private:
@@ -738,6 +814,130 @@ private:
 // "Unknown field tool_result" and the task could never open.
 unittest
 {
+	import std.exception : assertThrown;
+	import core.exception : AssertError;
+	import ae.utils.json : JSONFragment, toJson;
+	import cydo.domain.tasks.model : Watermark;
+	import cydo.protocol : HistoryBoundary, HistoryBoundaryKind;
+	foreach (suffix; [
+		`"is_meta":true`, `"is_synthetic":true`, `"pending":true`,
+		`"is_sidechain":true`, `"parent_tool_use_id":"tool"`])
+	{
+		TaskData td = TaskData(1, "", "");
+		td.history.reset(Watermark.none());
+		td.history.appendLive(Data(toJson(TaskEventEnvelope(1, 1,
+			JSONFragment(`{"type":"item/started","item_id":"u","item_type":"user_message",` ~ suffix ~ `}`))).representation), null);
+		HistoryEventPipelineHost host;
+		host.getTask = (int tid) => tid == 1 ? &td : null;
+		host.sendToSubscribed = (int, Data) {};
+		host.broadcastForkableUuids = (int) {};
+		auto pipeline = new HistoryEventPipeline(host);
+		assertThrown!AssertError(pipeline.backfillHistoryBoundary(1, 0,
+			HistoryBoundary("a", HistoryBoundaryKind.user, null)));
+	}
+}
+
+unittest
+{
+	import ae.utils.json : JSONFragment, toJson;
+	import cydo.domain.tasks.model : Watermark;
+	import cydo.protocol : HistoryBoundary, HistoryBoundaryKind, TurnStopEvent;
+	import std.exception : assertThrown;
+	import core.exception : AssertError;
+
+	TaskData td = TaskData(1, "", "");
+	td.history.reset(Watermark.none());
+	TurnStopEvent turn;
+	turn.uuid = "turn";
+	td.history.appendLive(Data(toJson(TaskEventEnvelope(1, 7,
+		JSONFragment(toJson(turn)))).representation), null);
+	HistoryEventPipelineHost host;
+	host.getTask = (int tid) => tid == 1 ? &td : null;
+	host.sendToSubscribed = (int, Data) {};
+	host.broadcastForkableUuids = (int) {};
+	auto pipeline = new HistoryEventPipeline(host);
+	pipeline.backfillHistoryBoundary(1, 0,
+		HistoryBoundary("agent-anchor", HistoryBoundaryKind.agent_turn, null));
+	assert((cast(string) td.history[0].toGC()).canFind(`"history_boundary":{"anchor":"agent-anchor","kind":"agent_turn"}`));
+
+	td.history.reset(Watermark.none());
+	TurnStopEvent nested;
+	nested.parent_tool_use_id = "tool";
+	nested.uuid = "nested";
+	td.history.appendLive(Data(toJson(TaskEventEnvelope(1, 8,
+		JSONFragment(toJson(nested)))).representation), null);
+	assertThrown!AssertError(pipeline.backfillHistoryBoundary(1, 0,
+		HistoryBoundary("nested-anchor", HistoryBoundaryKind.agent_turn, null)));
+}
+
+unittest
+{
+	import ae.utils.json : JSONFragment, toJson;
+	import cydo.domain.tasks.model : Watermark;
+	import cydo.protocol : HistoryBoundary, HistoryBoundaryKind, ItemStartedEvent;
+
+	TaskData td = TaskData(1, "", "");
+	td.history.reset(Watermark.none());
+	auto original = toJson(TaskEventEnvelope(1, 123,
+		JSONFragment(`{"type":"item/started","item_id":"u","item_type":"user_message","meta":{"codex":true}}`)));
+	td.history.appendLive(Data(original.representation), null);
+	string[] published;
+	string[] publicationOrder;
+	HistoryEventPipelineHost host;
+	host.getTask = (int tid) => tid == 1 ? &td : null;
+	host.sendToSubscribed = (int, Data data) {
+		published ~= cast(string) data.toGC();
+		publicationOrder ~= "replacement";
+	};
+	host.broadcastForkableUuids = (int tid) {
+		assert(tid == 1);
+		publicationOrder ~= "forkable";
+	};
+	auto pipeline = new HistoryEventPipeline(host);
+	auto boundary = HistoryBoundary("anchor", HistoryBoundaryKind.user, null);
+	pipeline.backfillHistoryBoundary(1, 0, boundary);
+	assert(published.length == 1);
+	assert(publicationOrder == ["replacement", "forkable"]);
+	assert(published[0].canFind(`"type":"task_event_replaced","tid":1,"seq":0,"ts":123`));
+	auto stored = cast(string) td.history[0].toGC();
+	assert(stored.canFind(`"meta":{"codex":true}`));
+	assert(stored.canFind(`"history_boundary":{"anchor":"anchor","kind":"user"}`));
+	pipeline.backfillHistoryBoundary(1, 0, boundary);
+	assert(published.length == 1);
+	import std.exception : assertThrown;
+	import core.exception : AssertError;
+	assertThrown!AssertError(pipeline.backfillHistoryBoundary(1, 0,
+		HistoryBoundary("other", HistoryBoundaryKind.user, null)));
+}
+
+// Replay reconciliation enriches the canonical event before serialization, but
+// does not emit a live replacement frame for a client that has just reset.
+unittest
+{
+	import ae.utils.json : JSONFragment, toJson;
+	import cydo.domain.tasks.model : Watermark;
+	import cydo.protocol : HistoryBoundary, HistoryBoundaryKind;
+
+	TaskData td = TaskData(1, "", "");
+	td.history.reset(Watermark.none());
+	td.history.appendLive(Data(toJson(TaskEventEnvelope(1, 123,
+		JSONFragment(`{"type":"item/started","item_id":"u","item_type":"user_message"}`))).representation), null);
+	string[] published;
+	HistoryEventPipelineHost host;
+	host.getTask = (int tid) => tid == 1 ? &td : null;
+	host.sendToSubscribed = (int, Data data) { published ~= cast(string) data.toGC(); };
+	host.broadcastForkableUuids = (int) {};
+	auto pipeline = new HistoryEventPipeline(host);
+	pipeline.backfillHistoryBoundary(1, 0,
+		HistoryBoundary("replay-anchor", HistoryBoundaryKind.user, null), false);
+	assert(published.length == 0);
+	auto stored = cast(string) td.history[0].toGC();
+	assert(stored.canFind(`"ts":123`));
+	assert(stored.canFind(`"history_boundary":{"anchor":"replay-anchor","kind":"user"}`));
+}
+
+unittest
+{
 	import std.algorithm : canFind;
 	import std.array : join;
 	import std.file : exists, getSize, mkdirRecurse, rmdirRecurse, write;
@@ -818,7 +1018,7 @@ unittest
 	// The tool_result must survive translation as an item/result event rather
 	// than being dropped by the (mis)parse as a steering echo.
 	bool sawToolResult = false;
-	foreach (ref ev; td.history)
+	foreach (i, ref ev; td.history)
 	{
 		auto s = cast(string) ev.toGC();
 		if (s.canFind(`"item/result"`) && s.canFind("tool_result"))
@@ -868,7 +1068,7 @@ unittest
 
 	auto enqueueLine = `{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-11T06:00:00Z","sessionId":"S","content":"queued steering"}`;
 	auto assistantLine =
-		`{"type":"assistant","message":{"id":"msg-1","content":[{"type":"text","text":"assistant after steering"}],"model":"claude-3-5-sonnet-20241022","usage":{"input_tokens":1,"output_tokens":1}}}`;
+		`{"type":"assistant","uuid":"msg-1","message":{"id":"msg-1","content":[{"type":"text","text":"assistant after steering"},{"type":"text","text":"second content"}],"model":"claude-3-5-sonnet-20241022","usage":{"input_tokens":1,"output_tokens":1}}}`;
 	auto jsonl = [
 		enqueueLine,
 		`{"type":"queue-operation","operation":"dequeue","timestamp":"2026-06-11T06:00:01Z","sessionId":"S"}`,
@@ -911,6 +1111,18 @@ unittest
 			"queued steering event must keep the enqueue physical line");
 	}
 	assert(sawQueuedSteering, "queued steering replay event missing from loaded history");
+	int assistantBoundaries;
+	foreach (i, ref ev; td.history)
+	{
+		auto s = cast(string) ev.toGC();
+		if (td.history.rawAt(i) == assistantLine && s.canFind(`"history_boundary"`))
+		{
+			assistantBoundaries++;
+			assert(s.canFind(`"type":"turn/stop"`));
+		}
+	}
+	assert(assistantBoundaries == 1,
+		"multi-content assistant replay enriches only its final top-level turn");
 }
 
 unittest
@@ -1078,4 +1290,16 @@ unittest
 	assert(boundaries[2].anchor == "agent-checkpoint");
 	assert(boundaries[2].kind == PersistedHistoryBoundaryKind.agent_turn);
 	assert(boundaries[2].checkpointUuid.length == 0);
+}
+
+unittest
+{
+	import std.exception : assertThrown;
+	import core.exception : AssertError;
+	import cydo.runtime.config : AgentDriver;
+
+	assertThrown!AssertError(HistoryEventPipeline.assertReplayNativeIdentity(
+		AgentDriver.claude, "canonical-uuid", "persisted-uuid"));
+	HistoryEventPipeline.assertReplayNativeIdentity(
+		AgentDriver.claude, "same-uuid", "same-uuid");
 }

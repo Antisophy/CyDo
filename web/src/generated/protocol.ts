@@ -46,6 +46,12 @@ export interface ControlResponse {
   [key: string]: unknown;
 }
 
+export interface HistoryBoundary {
+  anchor: string;
+  kind: "user" | "agent_turn";
+  checkpoint_uuid?: string;
+}
+
 export interface SessionInitEvent {
   type: "session/init";
   session_id: string;
@@ -167,6 +173,7 @@ export interface ItemStartedEvent {
   is_steering?: boolean;
   pending?: boolean;
   uuid?: string;
+  history_boundary?: HistoryBoundary;
   isCompactSummary?: boolean;
   parent_tool_use_id?: string;
   is_sidechain?: boolean;
@@ -207,6 +214,7 @@ export interface TurnStopEvent {
   parent_tool_use_id?: string;
   is_sidechain?: boolean;
   uuid?: string;
+  history_boundary?: HistoryBoundary;
   extras?: Record<string, unknown>;
 }
 

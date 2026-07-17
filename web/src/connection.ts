@@ -12,6 +12,9 @@ export class Connection {
   onTaskMessage:
     | ((tid: number, event: AgnosticEvent, seq?: number, ts?: number) => void)
     | null = null;
+  onTaskEventReplaced:
+    | ((tid: number, event: AgnosticEvent, seq: number, ts?: number) => void)
+    | null = null;
   onUnconfirmedUserMessage:
     | ((tid: number, msg: AgnosticEvent, correlationId?: string) => void)
     | null = null;
@@ -60,7 +63,20 @@ export class Connection {
         const text =
           typeof data === "string" ? data : new TextDecoder().decode(data);
         const raw = JSON.parse(text) as Record<string, unknown>;
-        if (
+        if (raw.type === "task_event_replaced") {
+          if (
+            typeof raw.tid !== "number" ||
+            typeof raw.seq !== "number" ||
+            !raw.event
+          )
+            throw new Error("Invalid task replacement envelope");
+          this.onTaskEventReplaced?.(
+            raw.tid,
+            raw.event as AgnosticEvent,
+            raw.seq,
+            typeof raw.ts === "number" && raw.ts !== 0 ? raw.ts : undefined,
+          );
+        } else if (
           raw.type === "task_created" ||
           raw.type === "tasks_list" ||
           raw.type === "task_updated" ||
@@ -73,7 +89,6 @@ export class Connection {
           raw.type === "project_task_types_list" ||
           raw.type === "agents_list" ||
           raw.type === "forkable_uuids" ||
-          raw.type === "assign_uuids" ||
           raw.type === "error" ||
           raw.type === "undo_preview" ||
           raw.type === "undo_result" ||

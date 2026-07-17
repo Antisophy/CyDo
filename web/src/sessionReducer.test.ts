@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { reduceMessage, reduceCydoTaskSpawned } from "./sessionReducer";
+import {
+  reduceMessage,
+  reduceCydoTaskSpawned,
+  replaceHistoryBoundary,
+} from "./sessionReducer";
 import { makeTaskState, TaskState } from "./types";
 
 function asEvent(event: object): Parameters<typeof reduceMessage>[1] {
@@ -206,6 +210,145 @@ describe("session init and metadata reducers", () => {
         asEvent({ type: "session/metadata", model: "codex-max" }),
       ),
     ).toThrow("session/metadata received before session/init");
+  });
+});
+
+describe("history boundary replacement", () => {
+  it("replaces only the matching raw contribution", () => {
+    const at4 = {
+      type: "item/started",
+      item_type: "user_message",
+      item_id: "u",
+    };
+    const at5 = {
+      type: "item/started",
+      item_type: "user_message",
+      item_id: "u2",
+    };
+    const state = {
+      ...makeState(),
+      messages: [
+        {
+          id: "u",
+          type: "user" as const,
+          content: [],
+          seq: [4, 5],
+          rawSource: [at4, at5],
+        },
+      ],
+    };
+    const replacement = {
+      type: "item/started" as const,
+      item_type: "user_message",
+      item_id: "u",
+      history_boundary: { anchor: "anchor", kind: "user" as const },
+    };
+    const next = replaceHistoryBoundary(state, replacement, 4);
+    expect(next.messages).toBe(state.messages);
+    expect(next.messages[0]?.rawSource).toBe(state.messages[0]?.rawSource);
+    expect(next.replacementEvents.get(4)).toEqual(replacement);
+  });
+
+  it("rejects invalid replacement targets", () => {
+    const state = makeState();
+    expect(() =>
+      replaceHistoryBoundary(
+        state,
+        {
+          type: "turn/stop",
+          history_boundary: { anchor: "a", kind: "agent_turn" },
+        },
+        4,
+      ),
+    ).toThrow("matched 0");
+  });
+
+  it("rejects mismatched canonical identity", () => {
+    const state = {
+      ...makeState(),
+      messages: [
+        {
+          id: "u",
+          type: "user" as const,
+          content: [],
+          seq: 4,
+          rawSource: {
+            type: "item/started",
+            item_type: "user_message",
+            item_id: "original",
+          },
+        },
+      ],
+    };
+    expect(() =>
+      replaceHistoryBoundary(
+        state,
+        {
+          type: "item/started",
+          item_type: "user_message",
+          item_id: "different",
+          history_boundary: { anchor: "a", kind: "user" },
+        },
+        4,
+      ),
+    ).toThrow("item identity");
+  });
+
+  it("accepts differing Codex item IDs for line boundaries", () => {
+    const state = {
+      ...makeState(),
+      messages: [
+        {
+          id: "u",
+          type: "user" as const,
+          content: [],
+          seq: 4,
+          rawSource: {
+            type: "item/started",
+            item_type: "user_message",
+            item_id: "codex-user-1",
+          },
+        },
+      ],
+    };
+    const replacement = {
+      type: "item/started" as const,
+      item_type: "user_message",
+      item_id: "codex-user-hist",
+      history_boundary: { anchor: "line:12", kind: "user" as const },
+    };
+    expect(
+      replaceHistoryBoundary(state, replacement, 4).replacementEvents.get(4),
+    ).toEqual(replacement);
+  });
+
+  it("replaces an assistant turn without changing display state", () => {
+    const raw = { type: "turn/stop", uuid: "turn" };
+    const state = {
+      ...makeState(),
+      pendingHistoryReplies: 2,
+      messages: [
+        {
+          id: "a",
+          type: "assistant" as const,
+          content: [{ type: "text", text: "answer" }],
+          blockIds: ["b"],
+          streaming: false,
+          seq: 7,
+          rawSource: raw,
+        },
+      ],
+    };
+    const replacement = {
+      type: "turn/stop" as const,
+      uuid: "turn",
+      history_boundary: { anchor: "a", kind: "agent_turn" as const },
+    };
+    const next = replaceHistoryBoundary(state, replacement, 7);
+    expect(next.messages).toHaveLength(1);
+    expect(next.messages[0]?.content).toEqual(state.messages[0]?.content);
+    expect(next.messages[0]?.blockIds).toEqual(["b"]);
+    expect(next.pendingHistoryReplies).toBe(2);
   });
 });
 

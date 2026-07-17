@@ -109,8 +109,23 @@ test("tool result with Bash output renders correctly", async ({
 });
 
 test("fork stays focused on forked session", async ({ page, agentType }) => {
+  const frames: any[] = [];
+  page.on("websocket", (ws) => {
+    ws.on("framereceived", (event) => {
+      try {
+        frames.push(JSON.parse(event.payload.toString()));
+      } catch {}
+    });
+  });
   await enterSession(page);
-  await sendMessage(page, 'Please reply with "fork-source"');
+  await sendMessage(page, 'Please reply with "fork-bootstrap"');
+
+  await expect(assistantText(page, "fork-bootstrap")).toBeVisible({
+    timeout: responseTimeout(agentType),
+  });
+
+  const targetPrompt = 'Please reply with "fork-source"';
+  await sendMessage(page, targetPrompt);
 
   await expect(assistantText(page, "fork-source")).toBeVisible({
     timeout: responseTimeout(agentType),
@@ -125,9 +140,51 @@ test("fork stays focused on forked session", async ({ page, agentType }) => {
     });
   }
 
-  const userMsg = page.locator(".message-wrapper").filter({
-    has: page.locator(".message.user-message", { hasText: "fork-source" }),
+  const metaUserMsg = page.locator(".message-wrapper").filter({
+    has: page.locator(".message.user-message.meta-message", {
+      hasText: "fork-source",
+    }),
   });
+  await expect(metaUserMsg).toHaveCount(0);
+
+  const userMsg = page.locator(".message-wrapper").filter({
+    has: page.locator(
+      ".message.user-message:not(.meta-message):not(.system-user-message):not(.pending)",
+      { hasText: "fork-source" },
+    ),
+  });
+  await expect(userMsg).toHaveCount(1);
+  await expect(async () => {
+    const targetUsers = frames.filter(
+      (frame) =>
+        frame?.type !== "task_event_replaced" &&
+        frame?.event?.type === "item/started" &&
+        frame?.event?.item_type === "user_message" &&
+        !frame?.event?.is_meta &&
+        !frame?.event?.is_synthetic &&
+        !frame?.event?.pending &&
+        !frame?.event?.history_boundary &&
+        frame?.event?.content?.[0]?.text === targetPrompt,
+    );
+    expect(targetUsers).toHaveLength(1);
+    const target = targetUsers[0];
+    const targetReplacements = frames.filter(
+      (frame) =>
+        frame?.type === "task_event_replaced" &&
+        frame?.seq === target.seq &&
+        frame?.event?.history_boundary?.kind === "user",
+    );
+    expect(targetReplacements).toHaveLength(1);
+    expect(
+      frames.some(
+        (frame) =>
+          frame?.type === "forkable_uuids" &&
+          frame?.uuids?.includes(
+            targetReplacements[0].event.history_boundary.anchor,
+          ),
+      ),
+    ).toBe(true);
+  }).toPass({ timeout: 15_000 });
   await userMsg.hover();
   const forkBtn = userMsg.locator(".fork-btn");
   await expect(forkBtn).toBeVisible({ timeout: 15_000 });

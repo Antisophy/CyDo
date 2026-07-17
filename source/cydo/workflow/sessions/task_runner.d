@@ -159,6 +159,8 @@ struct TaskSessionRunnerHost
 	void delegate(int tid) spawnOnYieldContinuation;
 	void delegate(int tid) emitTaskReload;
 	void delegate(int tid) startJsonlWatch;
+	void delegate(int tid) ensureHistoryLoaded;
+	void delegate(int tid) finalReconcileJsonlIfPresent;
 	void delegate(int tid) stopJsonlWatch;
 	void delegate(int tid) broadcastForkableUuidsFromFile;
 	void delegate(int tid) sendSystemRestartNudge;
@@ -567,6 +569,8 @@ class TaskSessionRunner
 			if (exitCode != 0 && current.status != TaskStatus.completed)
 				current.error = lastStderr;
 			cleanupTaskLaunch(current);
+			host_.ensureHistoryLoaded(tid);
+			host_.finalReconcileJsonlIfPresent(tid);
 			host_.stopJsonlWatch(tid);
 
 			host_.failPendingAskUserQuestionOnExit(tid);
@@ -587,6 +591,8 @@ class TaskSessionRunner
 				host_.broadcastAppendedTaskEvent(tid, translated);
 				host_.unsubscribeTaskHistorySubscribers(tid);
 			}
+			else if (current.undoStopInProgress)
+				host_.resetHistoryWatermarkOnly(tid);
 			else
 				host_.resetHistoryWatermarkAfterExit(tid);
 

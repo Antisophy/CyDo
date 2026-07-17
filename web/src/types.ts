@@ -10,6 +10,8 @@ import type {
   TaskDiagnosticEvent,
 } from "./protocol";
 
+export type { HistoryBoundary } from "./protocol";
+
 /** Metadata for system-generated user messages (prompt templates, nudges). */
 export interface CydoMeta {
   label: string;
@@ -211,6 +213,7 @@ export interface TaskState {
   tid: number | null;
   status: TaskStatus;
   messages: DisplayMessage[];
+  replacementEvents: Map<number, import("./protocol").AgnosticEvent>;
   sessionInfo: SessionInfo | null;
   sessionStatus?: string | null;
   isProcessing: boolean;
@@ -332,6 +335,7 @@ export function makeTaskState(
     tid,
     status,
     messages: [],
+    replacementEvents: new Map(),
     sessionInfo: null,
     sessionStatus: null,
     isProcessing,
