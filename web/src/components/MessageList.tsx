@@ -762,6 +762,8 @@ const MessageView = memo(
             {onFork && (
               <button
                 class="msg-action-btn fork-btn"
+                data-fork-tid={tid}
+                data-fork-anchor={uuid}
                 onClick={() => {
                   onFork(uuid);
                 }}

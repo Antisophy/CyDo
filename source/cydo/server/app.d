@@ -690,6 +690,11 @@ class App
 			ensureHistoryLoaded: (int tid) {
 				historyPipeline.ensureHistoryLoaded(tid);
 			},
+			resolveFreshPersistedBoundary: (int tid, string requestedAnchor,
+				out HistoryBoundary boundary) {
+				return historyPipeline.resolveFreshPersistedBoundary(tid, requestedAnchor,
+					boundary);
+			},
 			getUndoJsonl: (int tid) => jsonlTracker.getUndoJsonl(tid),
 			clearUndoJsonl: (int tid) {
 				jsonlTracker.clearUndoJsonl(tid);

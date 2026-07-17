@@ -12,6 +12,7 @@ import { WelcomePage } from "./components/WelcomePage";
 import { SearchPopup } from "./components/SearchPopup";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Toast } from "./components/Toast";
+import "./e2e";
 
 function shortProjectName(projectName: string): string {
   const slash = projectName.lastIndexOf("/");
@@ -70,6 +71,13 @@ function AppContent() {
     refreshWorkspaces,
     scanState,
   } = useTaskManager(addToast);
+  useEffect(() => {
+    if (!window.__cydoE2e) return;
+    window.__cydoE2e.fork = fork;
+    return () => {
+      delete window.__cydoE2e?.fork;
+    };
+  }, [fork]);
   const mergedNotices = useMemo(
     () => ({ ...notices, ...localNotices }),
     [notices, localNotices],

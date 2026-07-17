@@ -22,7 +22,10 @@ import cydo.domain.tasks.model : ArchiveState, ErrorMessage, ProcessState,
 	TaskCreatedMessage, TaskData, TaskStatus, UndoPreviewMessage, UndoResultMessage,
 	Watermark, WsMessage, watermarkFromPath;
 import cydo.domain.tasks.lifecycle : TaskNotificationChange;
+import cydo.protocol : HistoryBoundary, HistoryBoundaryKind;
 import cydo.workflow.history.jsonl_edit : replaceUserMessageContent;
+import cydo.workflow.history.operations : HistoryOperation, HistoryOperationMechanism,
+	allowsOperation, selectHistoryOperations;
 import cydo.workflow.history.jsonl_store : countLinesAfterForkId,
 	editJsonlMessage, forkTask, lastForkIdInJsonl, spliceJsonlByLine,
 	truncateJsonl, writeJsonlPrefix;
@@ -59,6 +62,8 @@ struct TaskMutationServiceHost
 		TaskNotificationChange notification) transitionTaskFrom;
 
 	void delegate(int tid) ensureHistoryLoaded;
+	bool delegate(int tid, string requestedAnchor, out HistoryBoundary boundary)
+		resolveFreshPersistedBoundary;
 	string delegate(int tid) getUndoJsonl;
 	void delegate(int tid) clearUndoJsonl;
 	void delegate(int tid) invalidateJsonlLineage;
@@ -97,8 +102,28 @@ public:
 		}
 
 		auto ta = host_.agentForTask(tid);
-		if (auto ca = cast(CodexAgent) ta)
+		HistoryBoundary boundary;
+		if (!host_.resolveFreshPersistedBoundary(tid, json.after_uuid, boundary))
 		{
+			ws.send(Data(toJson(ErrorMessage("error",
+				"Fork failed: message UUID not found in task history", tid)).representation));
+			return;
+		}
+		auto codexSession = cast(CodexSession) host_.sessionForTask(tid);
+		auto operations = selectHistoryOperations(ta.driver, host_.taskAlive(tid),
+			codexSession !is null && codexSession.canRollbackThread);
+		if (!allowsOperation(boundary, operations, HistoryOperation.fork))
+		{
+			ws.send(Data(toJson(ErrorMessage("error",
+				"Fork failed: message UUID not found in task history", tid)).representation));
+			return;
+		}
+		auto mechanism = boundary.kind == HistoryBoundaryKind.user
+			? operations.fork.user : operations.fork.agent_turn;
+		if (mechanism == HistoryOperationMechanism.codex_native)
+		{
+			auto ca = cast(CodexAgent) ta;
+			assert(ca !is null, "Codex-native fork requires Codex agent");
 			import std.datetime : Clock;
 			import std.file : exists, remove;
 			import std.path : baseName, buildPath, dirName;
@@ -112,9 +137,18 @@ public:
 				return;
 			}
 
+			auto forkSourcePath = buildPath(dirName(sourcePath),
+				"fork-source-" ~ randomUUID().toString() ~ "-" ~ baseName(sourcePath));
+			if (!writeJsonlPrefix(sourcePath, forkSourcePath, boundary.anchor,
+				&ta.forkIdMatchesLine))
+			{
+				ws.send(Data(toJson(ErrorMessage("error",
+					"Fork failed: message UUID not found in task history", tid)).representation));
+				return;
+			}
+
 			auto childTid = createForkTask(*host_.persistence(), tid, "", td.projectPath,
 				td.workspace, td.title, td.description, td.taskType, td.agentType);
-
 			auto newTd = TaskData(childTid, td.workspace, td.projectPath);
 			newTd.title = td.title.length > 0 ? td.title ~ " (fork)" : "(fork)";
 			newTd.parentTid = tid;
@@ -133,18 +167,6 @@ public:
 			auto childAgent = host_.agentForTask(childTid);
 			auto childTypeDef = host_.taskTypeForProject(child.projectPath, child.taskType);
 			auto launch = host_.prepareTaskSessionLaunch(childTid, childAgent, childTypeDef);
-
-			auto forkSourcePath = buildPath(dirName(sourcePath),
-				"fork-source-" ~ randomUUID().toString() ~ "-" ~ baseName(sourcePath));
-			if (!writeJsonlPrefix(sourcePath, forkSourcePath, json.after_uuid,
-				&ta.forkIdMatchesLine))
-			{
-				host_.removeTask(childTid);
-				host_.deleteTask(childTid);
-				ws.send(Data(toJson(ErrorMessage("error",
-					"Fork failed: message UUID not found in task history", tid)).representation));
-				return;
-			}
 
 			ca.forkSession(childTid, td.agentSessionId, launch.processLaunch,
 				launch.sessionConfig, forkSourcePath)
@@ -191,7 +213,7 @@ public:
 			return;
 		}
 
-		auto result = forkTask(*host_.persistence(), tid, td.agentSessionId, json.after_uuid,
+		auto result = forkTask(*host_.persistence(), tid, td.agentSessionId, boundary.anchor,
 			td.projectPath, td.workspace, td.title,
 			(string sid) => ta.historyPath(sid,
 				sid == td.agentSessionId ? host_.effectiveCwd(td) : td.projectPath),

@@ -23,7 +23,7 @@ import cydo.runtime.config : AgentDriver;
 import cydo.domain.storage.persistence : LoadedHistory;
 import cydo.domain.tasks.model : QueueOperationProbe, TaskData, TaskHistoryEndMessage,
 	TaskHistoryStartMessage, buildSyntheticUserEvent, extractEventFromEnvelope,
-	extractTsFromEnvelope;
+	extractTsFromEnvelope, watermarkFromPath;
 import cydo.workflow.history.jsonl_store : loadTaskHistory;
 
 package(cydo):
@@ -298,6 +298,52 @@ class HistoryEventPipeline
 		}
 		if (!orphan)
 			host_.broadcastHistoryOperations(tid);
+	}
+
+	bool resolveFreshPersistedBoundary(int tid, string requestedAnchor,
+		out HistoryBoundary boundary)
+	{
+		if (requestedAnchor.length == 0)
+			return false;
+		auto source = host_.getTask(tid);
+		if (source is null || source.agentSessionId.length == 0)
+			return false;
+		auto agent = host_.tryAgentForTask(tid);
+		if (!agent)
+			return false;
+		auto path = agent.historyPath(source.agentSessionId, host_.effectiveCwd(tid));
+		if (path.length == 0 || !exists(path))
+			return false;
+
+		auto snapshot = TaskData(tid, source.workspace, source.projectPath);
+		snapshot.agentSessionId = source.agentSessionId;
+		snapshot.agentType = source.agentType;
+		snapshot.worktreeTid = source.worktreeTid;
+		snapshot.history.reset(watermarkFromPath(path));
+
+		auto snapshotHost = host_;
+		snapshotHost.getTask = (int candidateTid) => candidateTid == tid ? &snapshot : null;
+		snapshotHost.sendToSubscribed = (int, Data) {};
+		snapshotHost.broadcastHistoryOperations = (int) {};
+		auto pipeline = new HistoryEventPipeline(snapshotHost);
+		pipeline.ensureHistoryLoaded(tid);
+
+		bool found;
+		foreach (ref entry; snapshot.history)
+		{
+			HistoryBoundary candidate;
+			entry.enter((scope const(ubyte)[] bytes) {
+				@JSONPartial static struct Probe { @JSONOptional HistoryBoundary history_boundary; }
+				auto event = extractEventFromEnvelope(bytes.as!(char[]));
+				candidate = jsonParse!Probe(event).history_boundary;
+			});
+			if (candidate.anchor != requestedAnchor)
+				continue;
+			assert(!found, "persisted history boundary anchor must be unique");
+			boundary = candidate;
+			found = true;
+		}
+		return found;
 	}
 
 	private static void assertReplayNativeIdentity(AgentDriver driver, string identity,
