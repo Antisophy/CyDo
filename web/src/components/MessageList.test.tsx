@@ -24,10 +24,10 @@ describe("MessageList parse-error rendering", () => {
         taskTid={1}
         messages={[user]}
         replacementEvents={replacementEvents}
+        historyOperations={{ fork: { user: "jsonl" }, undo: { user: "jsonl" } }}
         blocks={new Map()}
         isProcessing={false}
         bandStatus=""
-        forkableUuids={new Set(["anchor"])}
         onUndo={() => {}}
       />,
     );
@@ -40,11 +40,47 @@ describe("MessageList parse-error rendering", () => {
         blocks={new Map()}
         isProcessing={false}
         bandStatus=""
-        forkableUuids={new Set(["anchor"])}
         onUndo={() => {}}
       />,
     );
     expect(noIdentity).not.toContain("undo-btn");
+  });
+
+  it("derives assistant actions from a turn-stop boundary", () => {
+    const assistant: DisplayMessage = {
+      id: "a",
+      type: "assistant",
+      content: [],
+      seq: 9,
+    };
+    const html = renderToString(
+      <MessageList
+        taskTid={1}
+        messages={[assistant]}
+        replacementEvents={
+          new Map([
+            [
+              9,
+              {
+                type: "turn/stop",
+                history_boundary: { anchor: "line:9", kind: "agent_turn" },
+              },
+            ],
+          ])
+        }
+        historyOperations={{
+          fork: { agent_turn: "jsonl" },
+          undo: { agent_turn: "jsonl" },
+        }}
+        blocks={new Map()}
+        isProcessing={false}
+        bandStatus=""
+        onFork={() => {}}
+        onUndo={() => {}}
+      />,
+    );
+    expect(html).toContain("fork-btn");
+    expect(html).toContain("undo-btn");
   });
 
   it("shows parse_error system messages in normal mode", () => {

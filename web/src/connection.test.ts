@@ -110,6 +110,25 @@ describe("Connection client error reporting", () => {
     expect(controls).toEqual(["agent_usage"]);
   });
 
+  it("rejects malformed history operation policies", () => {
+    const conn = new Connection();
+    const errors: string[] = [];
+    conn.onClientError = (message) => errors.push(message);
+    conn.connect();
+    MockWebSocket.instances[0]!.emitMessage(
+      JSON.stringify({
+        type: "history_operations",
+        tid: 1,
+        history_operations: {
+          fork: { user: "unknown" },
+          undo: { user: "jsonl" },
+        },
+      }),
+    );
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("Failed to parse WebSocket message");
+  });
+
   it("routes replacements separately from ordinary task events", () => {
     const conn = new Connection();
     const ordinary = vi.fn();

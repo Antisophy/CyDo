@@ -1055,6 +1055,7 @@ function reduceItemStartedUserMessage(
       rawSource: event,
       seq,
       uuid: event.uuid,
+      nonce: event.is_replay ? undefined : pendingMsg?.nonce,
       cydoMeta: pendingMsg?.cydoMeta ?? eventCydoMeta,
       ts,
     };
@@ -1062,11 +1063,11 @@ function reduceItemStartedUserMessage(
     // Match the placeholder by nonce. If the event carries a nonce and a
     // pending message with that nonce exists, replace it. Otherwise append
     // a fresh ack-1 message without disturbing other pending placeholders.
-    const matchIdx = eventNonce
-      ? state.messages.findIndex(
-          (m) => isPendingUserMsg(m) && m.nonce === eventNonce,
-        )
-      : -1;
+    const matchIdx = state.messages.findIndex(
+      (m) =>
+        isPendingUserMsg(m) &&
+        (eventNonce ? m.nonce === eventNonce : hasSameContent(m)),
+    );
 
     const filtered =
       matchIdx >= 0
@@ -1081,6 +1082,23 @@ function reduceItemStartedUserMessage(
   }
 
   return state;
+}
+
+export function reduceAgentAck(s: SessionState, nonce: string): SessionState {
+  const idx = s.messages.findIndex(
+    (m) =>
+      m.type === "user" &&
+      m.nonce === nonce &&
+      m.ackState !== undefined &&
+      m.ackState > 1,
+  );
+  if (idx < 0) return s;
+  return {
+    ...s,
+    messages: s.messages.map((m, i) =>
+      i === idx ? { ...m, ackState: 2 as const } : m,
+    ),
+  };
 }
 
 export function reduceItemStarted(

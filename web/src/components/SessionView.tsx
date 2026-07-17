@@ -563,6 +563,7 @@ function SessionViewInner({
           taskTid={tid}
           messages={task.messages}
           replacementEvents={task.replacementEvents}
+          historyOperations={task.historyOperations}
           blocks={task.blocks}
           isProcessing={task.isProcessing}
           bandStatus={deriveBandStatus(
@@ -575,7 +576,6 @@ function SessionViewInner({
           onUndo={onUndo}
           onEditMessage={!task.alive ? onEditMessage : undefined}
           onEditRawEvent={!task.alive ? onEditRawEvent : undefined}
-          forkableUuids={task.forkableUuids}
           onViewFile={openFileViewer}
           spawnedTidsByItemId={task.spawnedTidsByItemId}
           getTaskHref={getTaskHref}

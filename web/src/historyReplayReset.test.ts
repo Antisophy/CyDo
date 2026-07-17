@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { reduceMessage } from "./sessionReducer";
 import {
+  beginTaskHistoryReplay,
   reconcileInputDraft,
   resetTaskForHistoryReplay,
   snapshotUserDrafts,
@@ -157,6 +158,27 @@ describe("history replay reset", () => {
     expect(reconcileInputDraft(replayed)).toBe("unreplayed input");
   });
 
+  it("keeps live events that arrive after reload before its replay starts", () => {
+    const reloaded = {
+      ...makeTaskState(1, true, true),
+      pendingHistoryReplies: 1,
+      messages: [
+        {
+          id: "live-third",
+          type: "assistant" as const,
+          content: [{ type: "text" as const, text: "third-reply" }],
+        },
+      ],
+    };
+
+    const started = beginTaskHistoryReplay(reloaded, 4);
+
+    expect(started.messages).toEqual(reloaded.messages);
+    expect(started.historyLoaded).toBe(false);
+    expect(started.historyTotal).toBe(4);
+    expect(started.historyReceived).toBe(0);
+  });
+
   it("preserves task metadata but clears replay-derived timeline state", () => {
     const before = makeRichState();
     const reset = resetTaskForHistoryReplay(before, 12);
@@ -197,7 +219,7 @@ describe("history replay reset", () => {
     expect(reset.sessionInfo).toBeNull();
     expect(reset.totalCost).toBe(0);
     expect(reset.msgIdCounter).toBe(before.msgIdCounter);
-    expect(reset.forkableUuids.size).toBe(0);
+    expect(reset.historyOperations).toBeNull();
     expect(reset.trackedFiles.size).toBe(0);
     expect(reset.blocks.size).toBe(0);
     expect(reset.itemIdMap.size).toBe(0);

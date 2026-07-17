@@ -28,6 +28,7 @@ interface Props {
   taskTid: number;
   messages: DisplayMessage[];
   replacementEvents: Map<number, import("../protocol").AgnosticEvent>;
+  historyOperations?: import("../protocol").HistoryOperations | null;
   blocks: Map<string, Block>;
   isProcessing: boolean;
   bandStatus: string;
@@ -35,7 +36,6 @@ interface Props {
   onUndo?: (tid: number, afterUuid: string) => void;
   onEditMessage?: (tid: number, uuid: string, content: string) => void;
   onEditRawEvent?: (tid: number, seq: number, content: string) => void;
-  forkableUuids?: Set<string>;
   onViewFile?: (filePath: string) => void;
   spawnedTidsByItemId?: Map<string, Map<number, number>>;
   getTaskHref?: (id: string) => string;
@@ -825,13 +825,13 @@ export function MessageList({
   taskTid,
   messages,
   replacementEvents,
+  historyOperations,
   blocks,
   bandStatus,
   onFork,
   onUndo,
   onEditMessage,
   onEditRawEvent,
-  forkableUuids,
   onViewFile,
   spawnedTidsByItemId,
   getTaskHref,
@@ -1033,18 +1033,26 @@ export function MessageList({
               .map((seq) => replacementEvents.get(seq))
               .filter(
                 (event) =>
-                  event?.type === "item/started" &&
-                  event.history_boundary?.kind === "user",
+                  (event?.type === "item/started" ||
+                    event?.type === "turn/stop") &&
+                  event.history_boundary,
               );
-            const actionUuid =
-              msg.uuid ??
-              (boundaries.length === 1
-                ? (boundaries[0] as { history_boundary: { anchor: string } })
-                    .history_boundary.anchor
-                : undefined);
-            const msgUuid = actionUuid;
+            const boundary =
+              boundaries.length === 1
+                ? (
+                    boundaries[0] as {
+                      history_boundary: {
+                        anchor: string;
+                        kind: "user" | "agent_turn";
+                      };
+                    }
+                  ).history_boundary
+                : undefined;
+            const actionUuid = msg.uuid ?? boundary?.anchor;
             const isForkable =
-              !!msgUuid && !!forkableUuids && forkableUuids.has(msgUuid);
+              !!boundary && !!historyOperations?.fork[boundary.kind];
+            const isUndoable =
+              !!boundary && !!historyOperations?.undo[boundary.kind];
             return (
               <MessageView
                 key={msg.id}
@@ -1054,12 +1062,12 @@ export function MessageList({
                 childrenByParent={childrenByParent}
                 resolvedBlocksByMsg={resolvedBlocksByMsg}
                 onViewFile={onViewFile}
-                onFork={handleFork}
-                onUndo={msg.type === "user" ? handleUndo : undefined}
+                onFork={isForkable ? handleFork : undefined}
+                onUndo={isUndoable ? handleUndo : undefined}
                 onEdit={msg.type === "user" ? handleEditMessage : undefined}
                 onEditRaw={handleEditRawEvent}
                 actionUuid={actionUuid}
-                forkable={isForkable}
+                forkable={isForkable || isUndoable}
                 spawnedTidsByItemId={spawnedTidsByItemId}
                 getTaskHref={getTaskHref}
               />

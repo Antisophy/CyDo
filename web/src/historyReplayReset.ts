@@ -89,3 +89,23 @@ export function resetTaskForHistoryReplay(
     pendingPermission: task.pendingPermission,
   };
 }
+
+/**
+ * A task_reload has already reset the old lineage before it asks for history.
+ * Keep live events received between that reset and task_history_start: the
+ * replay response is a snapshot and cannot contain those newer events.
+ */
+export function beginTaskHistoryReplay(
+  task: TaskState,
+  total: number,
+): TaskState {
+  if (task.pendingHistoryReplies === 0)
+    return resetTaskForHistoryReplay(task, total);
+
+  return {
+    ...task,
+    historyLoaded: false,
+    historyTotal: total,
+    historyReceived: 0,
+  };
+}

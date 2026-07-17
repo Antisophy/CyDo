@@ -46,31 +46,37 @@ struct JsonlTracker
 	// when the agent compacts the file (e.g. Codex auto-compaction).
 	private string[int] undoJsonl;
 
-	void noteLiveBoundaryCandidate(int tid, size_t seq, string event)
+	void noteLiveBoundaryCandidate(int tid, size_t seq, string event,
+		string raw = null, int sourceLine = 0, bool isContextBootstrap = false)
 	{
-		import ae.utils.json : JSONFragment, JSONOptional, JSONPartial, jsonParse;
+		import ae.utils.json : JSONOptional, JSONPartial, jsonParse;
 		@JSONPartial static struct Probe { string type; @JSONOptional string item_type;
-			@JSONOptional string uuid; @JSONOptional string item_id; @JSONOptional JSONFragment meta;
-			@JSONOptional bool is_synthetic; @JSONOptional bool pending; @JSONOptional bool is_sidechain;
+			@JSONOptional string uuid; @JSONOptional string item_id;
+			@JSONOptional bool is_meta; @JSONOptional bool is_synthetic; @JSONOptional bool pending; @JSONOptional bool is_sidechain;
 			@JSONOptional string parent_tool_use_id; }
 		auto p = jsonParse!Probe(event);
 		PersistedHistoryBoundaryKind kind;
 		if (p.type == "item/started" && p.item_type == "user_message"
-			&& (p.meta.json.length == 0 || p.meta.json == "null")
-			&& !p.is_synthetic && !p.pending && !p.is_sidechain && p.parent_tool_use_id.length == 0)
+			&& !p.is_synthetic && !p.pending && !p.is_sidechain
+			&& p.parent_tool_use_id.length == 0)
 			kind = PersistedHistoryBoundaryKind.user;
 		else if (p.type == "turn/stop" && !p.is_sidechain && p.parent_tool_use_id.length == 0)
 			kind = PersistedHistoryBoundaryKind.agent_turn;
 		else return;
 		if (tid !in boundaryState)
 			boundaryState[tid] = BoundaryReconcileState.init;
+		if (getAgent(tid).driver == AgentDriver.codex && isContextBootstrap
+			&& kind == PersistedHistoryBoundaryKind.user)
+			return;
+		auto identity = p.uuid.length > 0 ? p.uuid : p.item_id;
 		boundaryState[tid].liveByKind[kind] ~= LiveBoundaryCandidate(seq, kind,
-			p.uuid.length > 0 ? p.uuid : p.item_id, historyGeneration(tid));
+			identity, historyGeneration(tid));
 		drainLiveBoundaries(tid, kind);
 	}
 
 	private void drainLiveBoundaries(int tid, PersistedHistoryBoundaryKind kind)
 	{
+		import std.algorithm : startsWith;
 		while (true)
 		{
 			auto state = tid in boundaryState;
@@ -79,24 +85,69 @@ struct JsonlTracker
 			auto persistedCandidates = kind in (*state).persistedByKind;
 			if (lives is null || persistedCandidates is null || lives.length == 0
 				|| persistedCandidates.length == 0) return;
-			auto live = (*lives)[0];
-			auto persisted = (*persistedCandidates)[0];
+			auto liveCandidates = (*lives).dup;
+			auto candidates = (*persistedCandidates).dup;
 			auto current = historyGeneration(tid);
-			assert(live.generation <= current && persisted.generation <= current,
-				"history boundary candidate belongs to a future generation");
-			if (live.generation < current)
+			foreach (live; liveCandidates)
+				assert(live.generation <= current,
+					"history boundary candidate belongs to a future generation");
+			ptrdiff_t liveIndex = -1;
+			ptrdiff_t persistedIndex = -1;
+			foreach (i, persisted; candidates)
 			{
-				(*state).liveByKind[kind] = (*state).liveByKind[kind][1 .. $];
-				continue;
+				assert(persisted.generation <= current,
+					"history boundary candidate belongs to a future generation");
+				if (persisted.generation < current)
+					continue;
+				foreach (j, live; liveCandidates)
+					if (live.generation == current && live.identity.length > 0
+						&& persisted.boundary.anchor == live.identity)
+					{
+						liveIndex = cast(ptrdiff_t) j;
+						persistedIndex = cast(ptrdiff_t) i;
+						break;
+					}
+				if (persistedIndex >= 0)
+					break;
 			}
-			if (persisted.generation < current)
+			if (persistedIndex < 0)
 			{
-				(*state).persistedByKind[kind] = (*state).persistedByKind[kind][1 .. $];
-				continue;
+				auto live = liveCandidates[0];
+				if (live.generation < current)
+				{
+					(*state).liveByKind[kind] = liveCandidates[1 .. $];
+					continue;
+				}
+				foreach (i, persisted; candidates)
+				{
+					if (persisted.generation < current)
+						continue;
+					auto nativeRecord = !persisted.boundary.anchor.startsWith("enqueue-");
+					if ((nativeRecord && persisted.boundary.anchor.startsWith("line:"))
+						|| (nativeRecord && getAgent(tid).driver == AgentDriver.claude
+							&& kind == PersistedHistoryBoundaryKind.user)
+						|| (kind == PersistedHistoryBoundaryKind.agent_turn
+							&& live.identity.length == 0))
+					{
+						liveIndex = 0;
+						persistedIndex = cast(ptrdiff_t) i;
+						break;
+					}
+				}
 			}
-			if (persisted.requiresIdentity && live.identity != persisted.boundary.anchor) return;
-			(*state).liveByKind[kind] = (*state).liveByKind[kind][1 .. $];
-			(*state).persistedByKind[kind] = (*state).persistedByKind[kind][1 .. $];
+			if (persistedIndex < 0) return;
+			auto live = liveCandidates[cast(size_t) liveIndex];
+			auto persisted = (*persistedCandidates)[cast(size_t) persistedIndex];
+			LiveBoundaryCandidate[] remainingLives;
+			foreach (i, candidate; liveCandidates)
+				if (i != liveIndex)
+					remainingLives ~= candidate;
+			(*state).liveByKind[kind] = remainingLives;
+			PersistedBoundaryCandidate[] remaining;
+			foreach (i, candidate; candidates)
+				if (i != persistedIndex)
+					remaining ~= candidate;
+			(*state).persistedByKind[kind] = remaining;
 			resolveBoundary(tid, live.seq, persisted.boundary, true, live.generation);
 		}
 	}
@@ -302,18 +353,12 @@ struct JsonlTracker
 		}
 		foreach (boundary; boundaries)
 		{
-			import std.algorithm : startsWith;
 			if (tid !in boundaryState)
 				boundaryState[tid] = BoundaryReconcileState.init;
 			auto task = getTask(tid);
 			boundary.checkpointUuid = task.checkpointUuidForAnchor(boundary.anchor);
-			auto requiresIdentity = !boundary.anchor.startsWith("line:")
-				&& !boundary.anchor.startsWith("enqueue-")
-				&& !(getAgent(tid).driver == AgentDriver.claude
-					&& boundary.kind == PersistedHistoryBoundaryKind.agent_turn);
 			boundaryState[tid].persistedByKind[boundary.kind] ~= PersistedBoundaryCandidate(boundary,
-				0, requiresIdentity,
-				historyGeneration(tid));
+				cast(size_t) boundary.sourceLine, true, historyGeneration(tid));
 			drainLiveBoundaries(tid, boundary.kind);
 		}
 	}
@@ -374,34 +419,6 @@ struct JsonlTracker
 		tracef("[jsonl] captureUndoSnapshot tid=%d path=%s bytes=%d", tid, jsonlPath, undoJsonl[tid].length);
 	}
 
-	void sendForkableUuidsFromFile(WebSocketAdapter ws, int tid, string agentSessionId, string projectPath)
-	{
-		import std.algorithm : map;
-		import std.array : array;
-		import std.file : exists, readText;
-		import ae.utils.json : toJson;
-		import cydo.domain.tasks.model : ForkableUuidsMessage;
-		auto path = getAgent(tid).historyPath(agentSessionId, projectPath);
-		if (path.length > 0 && exists(path))
-			ws.send(Data(toJson(ForkableUuidsMessage("forkable_uuids", tid,
-				getAgent(tid).extractPersistedHistoryBoundaries(readText(path)).map!(b => b.anchor).array)).representation));
-	}
-
-	void broadcastForkableUuidsFromFile(int tid)
-	{
-		import std.file : exists, readText;
-		import std.algorithm : map;
-		import std.array : array;
-		import ae.utils.json : toJson;
-		import cydo.domain.tasks.model : ForkableUuidsMessage;
-		auto td = getTask(tid);
-		if (td is null) return;
-		auto path = getAgent(tid).historyPath(td.agentSessionId, getEffectiveCwd(tid));
-		if (path.length > 0 && exists(path))
-			sendToSubscribed(tid, toJson(ForkableUuidsMessage("forkable_uuids", tid,
-				getAgent(tid).extractPersistedHistoryBoundaries(readText(path)).map!(b => b.anchor).array)));
-	}
-
 
 	private void resolveBoundary(int tid, size_t seq, PersistedHistoryBoundary boundary,
 		bool publish, ulong generation)
@@ -413,6 +430,96 @@ struct JsonlTracker
 				? HistoryBoundaryKind.user : HistoryBoundaryKind.agent_turn,
 			boundary.checkpointUuid), publish, generation);
 	}
+}
+
+unittest
+{
+	import std.conv : to;
+	JsonlTracker tracker;
+	tracker.historyGeneration = (int) => 0;
+	string[] resolved;
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
+		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
+	};
+	tracker.boundaryState[1] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user] = [
+		JsonlTracker.LiveBoundaryCandidate(3, PersistedHistoryBoundaryKind.user, "bootstrap", 0),
+		JsonlTracker.LiveBoundaryCandidate(10, PersistedHistoryBoundaryKind.user, "second", 0),
+		JsonlTracker.LiveBoundaryCandidate(17, PersistedHistoryBoundaryKind.user, "third", 0),
+	];
+	tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user] = [
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("second", PersistedHistoryBoundaryKind.user, null), 2, true, 0),
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("third", PersistedHistoryBoundaryKind.user, null), 3, true, 0),
+	];
+	tracker.drainLiveBoundaries(1, PersistedHistoryBoundaryKind.user);
+	assert(resolved == ["second:10", "third:17"]);
+	auto pending = tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user];
+	assert(pending.length == 1 && pending[0].identity == "bootstrap");
+}
+
+unittest
+{
+	import cydo.agent.drivers.codex : CodexAgent;
+	import std.conv : to;
+	JsonlTracker tracker;
+	tracker.getAgent = (int) => cast(Agent) new CodexAgent();
+	tracker.historyGeneration = (int) => 0;
+	string[] resolved;
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
+		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
+	};
+	tracker.noteLiveBoundaryCandidate(1, 4,
+		`{"type":"item/started","item_type":"user_message","item_id":"codex-user-0"}`,
+		null, 0, true);
+	tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("line:18",
+			PersistedHistoryBoundaryKind.user, null), 18, true, 0);
+	tracker.noteLiveBoundaryCandidate(1, 11,
+		`{"type":"item/started","item_type":"user_message","item_id":"codex-user-1"}`);
+	assert(resolved == ["line:18:11"]);
+}
+
+unittest
+{
+	import cydo.agent.drivers.codex : CodexAgent;
+	import std.conv : to;
+	JsonlTracker tracker;
+	tracker.getAgent = (int) => cast(Agent) new CodexAgent();
+	tracker.historyGeneration = (int) => 0;
+	string[] resolved;
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
+		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
+	};
+	tracker.noteLiveBoundaryCandidate(1, 4,
+		`{"type":"item/started","item_type":"user_message","item_id":"codex-user-0"}`,
+		null, 0, true);
+	tracker.noteLiveBoundaryCandidate(1, 11,
+		`{"type":"item/started","item_type":"user_message","item_id":"codex-user-1"}`);
+	tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("line:18",
+			PersistedHistoryBoundaryKind.user, null), 18, true, 0);
+	tracker.drainLiveBoundaries(1, PersistedHistoryBoundaryKind.user);
+	assert(resolved == ["line:18:11"]);
+}
+
+unittest
+{
+	import cydo.agent.drivers.claude : ClaudeCodeAgent;
+	import std.conv : to;
+	JsonlTracker tracker;
+	tracker.getAgent = (int) => cast(Agent) new ClaudeCodeAgent();
+	tracker.historyGeneration = (int) => 0;
+	string[] resolved;
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
+		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
+	};
+	tracker.boundaryState[1] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("line:4",
+			PersistedHistoryBoundaryKind.user, null, 4), 4, false, 0);
+	tracker.noteLiveBoundaryCandidate(1, 4,
+		`{"type":"item/started","item_type":"user_message","uuid":"live-user","meta":{"label":"Session start: agentic"}}`);
+	assert(resolved == ["line:4:4"]);
 }
 
 unittest
@@ -563,8 +670,10 @@ unittest
 unittest
 {
 	import std.conv : to;
+	import cydo.agent.drivers.claude : ClaudeCodeAgent;
 	string[] resolved;
 	JsonlTracker tracker;
+	tracker.getAgent = (int) => cast(Agent) new ClaudeCodeAgent();
 	tracker.historyGeneration = (int) => 0;
 	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
 		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
@@ -575,10 +684,6 @@ unittest
 	assert(tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user].length == 1);
 	tracker.invalidateLineage(1);
 	tracker.historyGeneration = (int) => 0;
-	tracker.noteLiveBoundaryCandidate(1, 7,
-		`{"type":"item/started","item_type":"user_message","uuid":"u","meta":{"system":true}}`);
-		assert(1 !in tracker.boundaryState
-			|| PersistedHistoryBoundaryKind.user !in tracker.boundaryState[1].liveByKind);
 	tracker.noteLiveBoundaryCandidate(1, 7,
 		`{"type":"item/started","item_type":"user_message","uuid":"u","meta":null}`);
 	assert(tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user].length == 1);
@@ -628,7 +733,7 @@ unittest
 	tracker.boundaryState[5].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
 		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("user-b", PersistedHistoryBoundaryKind.user, null), 1, true, 0);
 	tracker.drainLiveBoundaries(5, PersistedHistoryBoundaryKind.user);
-	assert(tracker.boundaryState[5].liveByKind[PersistedHistoryBoundaryKind.user].length == 1);
+	assert(resolved[$ - 1] == "user-b:11");
 }
 
 unittest

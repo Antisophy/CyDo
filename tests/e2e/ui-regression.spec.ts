@@ -178,10 +178,8 @@ test("fork stays focused on forked session", async ({ page, agentType }) => {
     expect(
       frames.some(
         (frame) =>
-          frame?.type === "forkable_uuids" &&
-          frame?.uuids?.includes(
-            targetReplacements[0].event.history_boundary.anchor,
-          ),
+          frame?.type === "history_operations" &&
+          frame?.history_operations?.fork?.user === "jsonl",
       ),
     ).toBe(true);
   }).toPass({ timeout: 15_000 });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   reduceMessage,
+  reduceAgentAck,
   reduceCydoTaskSpawned,
   replaceHistoryBoundary,
 } from "./sessionReducer";
@@ -349,6 +350,74 @@ describe("history boundary replacement", () => {
     expect(next.messages[0]?.content).toEqual(state.messages[0]?.content);
     expect(next.messages[0]?.blockIds).toEqual(["b"]);
     expect(next.pendingHistoryReplies).toBe(2);
+  });
+});
+
+describe("live user echo reconciliation", () => {
+  it("keeps a confirmed echo non-pending when its agent acknowledgement arrives late", () => {
+    const nonce = "steering-nonce";
+    const placeholder = {
+      ...makeState(),
+      messages: [
+        {
+          id: "pending",
+          type: "user" as const,
+          content: [{ type: "text" as const, text: "steered-reply" }],
+          ackState: 3 as const,
+          pending: true,
+          nonce,
+        },
+      ],
+    };
+    const echoed = reduceMessage(
+      placeholder,
+      asEvent({
+        type: "item/started",
+        item_type: "user_message",
+        item_id: "native-user",
+        content: [{ type: "text", text: "steered-reply" }],
+        correlation_id: nonce,
+      }),
+    );
+    const afterAck = reduceAgentAck(echoed, nonce);
+    expect(afterAck).toBe(echoed);
+    expect(afterAck.messages[0]).not.toHaveProperty("ackState");
+  });
+
+  it("replaces a nonce-less pending placeholder before boundary reconciliation", () => {
+    const state = {
+      ...makeState(),
+      messages: [
+        {
+          id: "pending",
+          type: "user" as const,
+          content: [{ type: "text" as const, text: "live-three" }],
+          ackState: 3 as const,
+          pending: true,
+          nonce: "local-nonce",
+        },
+      ],
+    };
+    const echo = {
+      type: "item/started" as const,
+      item_type: "user_message",
+      item_id: "user-item",
+      content: [{ type: "text" as const, text: "live-three" }],
+    };
+    const echoed = reduceMessage(state, echo, 12);
+    expect(echoed.messages).toHaveLength(1);
+    expect(echoed.messages[0]?.seq).toBe(12);
+    expect(echoed.messages[0]?.nonce).toBe("local-nonce");
+    expect(
+      replaceHistoryBoundary(
+        echoed,
+        {
+          ...echo,
+          history_boundary: { anchor: "anchor", kind: "user" as const },
+        },
+        12,
+      ).replacementEvents.get(12),
+    ).toMatchObject({ history_boundary: { anchor: "anchor" } });
   });
 });
 

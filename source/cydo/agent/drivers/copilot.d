@@ -904,7 +904,8 @@ class CopilotSession : AgentSession, SdkSessionHandler
 
 	// ----- AgentSession interface -----
 
-	void sendMessage(const(ContentBlock)[] content, string correlationId = null)
+	void sendMessage(const(ContentBlock)[] content, string correlationId = null,
+		bool isContextBootstrap = false)
 	{
 		// Extract text (only text blocks supported; throw on others).
 		string text;
@@ -965,6 +966,12 @@ class CopilotSession : AgentSession, SdkSessionHandler
 				}
 			});
 		}
+	}
+
+	void invalidatePendingSubmittedMessages()
+	{
+		pendingMessages = null;
+		expectedUserMessages = null;
 	}
 
 	@property bool supportsImages() const { return false; }
@@ -1843,6 +1850,23 @@ private PermissionDecision permissionDecisionForCopilotVersion(string versionTex
 	return copilotVersionUsesApproveOnce(versionText)
 		? PermissionDecisionApproveOnce
 		: PermissionDecisionApproved;
+}
+
+unittest
+{
+	auto session = new CopilotSession(null, 1, "session-123", "", ".");
+	session.pendingMessages = [
+		CopilotSession.PendingMessage([ContentBlock("text", "id4")], "id4"),
+		CopilotSession.PendingMessage([ContentBlock("text", "id5")], "id5"),
+	];
+	session.expectedUserMessages = [
+		CopilotSession.ExpectedUserMessage("id4", "id4"),
+		CopilotSession.ExpectedUserMessage("id5", "id5"),
+	];
+	session.invalidatePendingSubmittedMessages();
+	assert(session.pendingMessages.length == 0);
+	assert(session.expectedUserMessages.length == 0);
+	assert(CopilotSession.PendingMessage([ContentBlock("text", "id6")], "id6").correlationId == "id6");
 }
 
 unittest

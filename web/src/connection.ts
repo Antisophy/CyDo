@@ -1,5 +1,28 @@
 import type { AgnosticEvent, ControlMessage, ContentBlock } from "./protocol";
 
+function isHistoryOperationsMessage(raw: Record<string, unknown>): boolean {
+  if (
+    typeof raw.tid !== "number" ||
+    typeof raw.history_operations !== "object" ||
+    raw.history_operations === null
+  )
+    return false;
+  return ["fork", "undo"].every((operation) => {
+    const kinds = (raw.history_operations as Record<string, unknown>)[
+      operation
+    ];
+    return (
+      typeof kinds === "object" &&
+      kinds !== null &&
+      Object.entries(kinds).every(
+        ([kind, mechanism]) =>
+          (kind === "user" || kind === "agent_turn") &&
+          (mechanism === "jsonl" || mechanism === "codex_native"),
+      )
+    );
+  });
+}
+
 // This module holds stateful class instances that can't be hot-replaced.
 // Force a full page reload when it changes.
 if (import.meta.hot) import.meta.hot.invalidate();
@@ -76,6 +99,10 @@ export class Connection {
             raw.seq,
             typeof raw.ts === "number" && raw.ts !== 0 ? raw.ts : undefined,
           );
+        } else if (raw.type === "history_operations") {
+          if (!isHistoryOperationsMessage(raw))
+            throw new Error("Invalid history operations message");
+          this.onControlMessage?.(raw as unknown as ControlMessage);
         } else if (
           raw.type === "task_created" ||
           raw.type === "tasks_list" ||
@@ -88,7 +115,6 @@ export class Connection {
           raw.type === "task_types_list" ||
           raw.type === "project_task_types_list" ||
           raw.type === "agents_list" ||
-          raw.type === "forkable_uuids" ||
           raw.type === "error" ||
           raw.type === "undo_preview" ||
           raw.type === "undo_result" ||

@@ -394,14 +394,16 @@ struct TranslatedEvent
 	string raw;         // original agent output line (null for synthetic events)
 	AbsTime ts;         // AbsTime.init (stdTime == 0) means "not available"
 	int sourceLine;     // 1-based physical JSONL line for raw, 0 when not file-backed
+	bool isContextBootstrap; // internal submission provenance, never sent on the wire
 
 	this(string translated, string raw, AbsTime ts = AbsTime.init,
-		int sourceLine = 0) @safe nothrow
+		int sourceLine = 0, bool isContextBootstrap = false) @safe nothrow
 	{
 		this.translated = translated;
 		this.raw = raw;
 		this.ts = ts;
 		this.sourceLine = sourceLine;
+		this.isContextBootstrap = isContextBootstrap;
 	}
 }
 

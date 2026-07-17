@@ -45,9 +45,10 @@ struct HistoryEventPipelineHost
 	string delegate(string subject, string body) makeTaskDiagnosticEventJson;
 	void delegate(int tid, Data data) sendToSubscribed;
 	void delegate(WebSocketAdapter ws, int tid) subscribe;
-	void delegate(WebSocketAdapter ws, int tid) sendForkableUuids;
-	void delegate(int tid) broadcastForkableUuids;
-	void delegate(int tid, size_t seq, string event) noteLiveBoundaryCandidate;
+	void delegate(WebSocketAdapter ws, int tid) sendHistoryOperations;
+	void delegate(int tid) broadcastHistoryOperations;
+	void delegate(int tid, size_t seq, string event, string raw, int sourceLine,
+		bool isContextBootstrap) noteLiveBoundaryCandidate;
 	void delegate(WebSocketAdapter ws, int tid) sendReplaySupplementalState;
 	void delegate(int tid) onHistorySubscribed;
 	void delegate(int tid, string line) ensureAgentSessionIdFromEvent;
@@ -296,12 +297,15 @@ class HistoryEventPipeline
 				boundaries[0].checkpointUuid), false);
 		}
 		if (!orphan)
-			host_.broadcastForkableUuids(tid);
+			host_.broadcastHistoryOperations(tid);
 	}
 
 	private static void assertReplayNativeIdentity(AgentDriver driver, string identity,
 		string anchor)
 	{
+		import std.algorithm : startsWith;
+		if (identity.length == 0 || anchor.startsWith("line:") || anchor.startsWith("enqueue-"))
+			return;
 		if (driver == AgentDriver.claude || driver == AgentDriver.copilot)
 			assert(identity == anchor,
 				"replayed native history identity does not match its persisted boundary");
@@ -341,7 +345,7 @@ class HistoryEventPipeline
 				ws.send(msg);
 		}
 		if (td.agentSessionId.length > 0 && host_.tryAgentForTask(tid))
-			host_.sendForkableUuids(ws, tid);
+			host_.sendHistoryOperations(ws, tid);
 
 		ws.send(Data(toJson(TaskHistoryEndMessage("task_history_end", tid)).representation));
 		host_.sendReplaySupplementalState(ws, tid);
@@ -438,7 +442,8 @@ class HistoryEventPipeline
 			toJson(TaskEventSeqEnvelope(tid, cast(int) seq, ev.ts.stdTime,
 				JSONFragment(ev.translated))).representation));
 		if (!merged && host_.noteLiveBoundaryCandidate !is null)
-			host_.noteLiveBoundaryCandidate(tid, seq, ev.translated);
+			host_.noteLiveBoundaryCandidate(tid, seq, ev.translated, ev.raw, ev.sourceLine,
+				ev.isContextBootstrap);
 		return seq;
 	}
 
@@ -514,9 +519,9 @@ class HistoryEventPipeline
 			auto envelope = bytes.as!(char[]);
 			host_.sendToSubscribed(tid, Data(toJson(TaskEventReplacedEnvelope(
 				"task_event_replaced", tid, cast(int) seq, extractTsFromEnvelope(envelope),
-				JSONFragment(extractEventFromEnvelope(envelope).idup))).representation));
+			JSONFragment(extractEventFromEnvelope(envelope).idup))).representation));
 		});
-		host_.broadcastForkableUuids(tid);
+		host_.broadcastHistoryOperations(tid);
 	}
 
 private:
@@ -830,7 +835,7 @@ unittest
 		HistoryEventPipelineHost host;
 		host.getTask = (int tid) => tid == 1 ? &td : null;
 		host.sendToSubscribed = (int, Data) {};
-		host.broadcastForkableUuids = (int) {};
+		host.broadcastHistoryOperations = (int) {};
 		auto pipeline = new HistoryEventPipeline(host);
 		assertThrown!AssertError(pipeline.backfillHistoryBoundary(1, 0,
 			HistoryBoundary("a", HistoryBoundaryKind.user, null)));
@@ -854,7 +859,7 @@ unittest
 	HistoryEventPipelineHost host;
 	host.getTask = (int tid) => tid == 1 ? &td : null;
 	host.sendToSubscribed = (int, Data) {};
-	host.broadcastForkableUuids = (int) {};
+	host.broadcastHistoryOperations = (int) {};
 	auto pipeline = new HistoryEventPipeline(host);
 	pipeline.backfillHistoryBoundary(1, 0,
 		HistoryBoundary("agent-anchor", HistoryBoundaryKind.agent_turn, null));
@@ -889,15 +894,15 @@ unittest
 		published ~= cast(string) data.toGC();
 		publicationOrder ~= "replacement";
 	};
-	host.broadcastForkableUuids = (int tid) {
+	host.broadcastHistoryOperations = (int tid) {
 		assert(tid == 1);
-		publicationOrder ~= "forkable";
+		publicationOrder ~= "operations";
 	};
 	auto pipeline = new HistoryEventPipeline(host);
 	auto boundary = HistoryBoundary("anchor", HistoryBoundaryKind.user, null);
 	pipeline.backfillHistoryBoundary(1, 0, boundary);
 	assert(published.length == 1);
-	assert(publicationOrder == ["replacement", "forkable"]);
+	assert(publicationOrder == ["replacement", "operations"]);
 	assert(published[0].canFind(`"type":"task_event_replaced","tid":1,"seq":0,"ts":123`));
 	auto stored = cast(string) td.history[0].toGC();
 	assert(stored.canFind(`"meta":{"codex":true}`));
@@ -926,7 +931,7 @@ unittest
 	HistoryEventPipelineHost host;
 	host.getTask = (int tid) => tid == 1 ? &td : null;
 	host.sendToSubscribed = (int, Data data) { published ~= cast(string) data.toGC(); };
-	host.broadcastForkableUuids = (int) {};
+	host.broadcastHistoryOperations = (int) {};
 	auto pipeline = new HistoryEventPipeline(host);
 	pipeline.backfillHistoryBoundary(1, 0,
 		HistoryBoundary("replay-anchor", HistoryBoundaryKind.user, null), false);
@@ -1000,8 +1005,8 @@ unittest
 	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";
 	host.sendToSubscribed = (int t, Data d) {};
 	host.subscribe = (WebSocketAdapter ws, int t) {};
-	host.sendForkableUuids = (WebSocketAdapter ws, int t) {};
-	host.broadcastForkableUuids = (int t) {};
+	host.sendHistoryOperations = (WebSocketAdapter ws, int t) {};
+	host.broadcastHistoryOperations = (int t) {};
 	host.sendReplaySupplementalState = (WebSocketAdapter ws, int t) {};
 	host.onHistorySubscribed = (int t) {};
 	host.ensureAgentSessionIdFromEvent = (int t, string line) {};
@@ -1087,8 +1092,8 @@ unittest
 	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";
 	host.sendToSubscribed = (int t, Data d) {};
 	host.subscribe = (WebSocketAdapter ws, int t) {};
-	host.sendForkableUuids = (WebSocketAdapter ws, int t) {};
-	host.broadcastForkableUuids = (int t) {};
+	host.sendHistoryOperations = (WebSocketAdapter ws, int t) {};
+	host.broadcastHistoryOperations = (int t) {};
 	host.sendReplaySupplementalState = (WebSocketAdapter ws, int t) {};
 	host.onHistorySubscribed = (int t) {};
 	host.ensureAgentSessionIdFromEvent = (int t, string line) {};
@@ -1302,4 +1307,6 @@ unittest
 		AgentDriver.claude, "canonical-uuid", "persisted-uuid"));
 	HistoryEventPipeline.assertReplayNativeIdentity(
 		AgentDriver.claude, "same-uuid", "same-uuid");
+	HistoryEventPipeline.assertReplayNativeIdentity(
+		AgentDriver.claude, "", "line:2");
 }

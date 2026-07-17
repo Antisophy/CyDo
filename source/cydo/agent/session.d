@@ -10,7 +10,11 @@ interface AgentSession
 {
 	/// Send a user message to the agent.
 	/// correlationId is the nonce from the originating UI send (may be null).
-	void sendMessage(const(ContentBlock)[] content, string correlationId = null);
+	void sendMessage(const(ContentBlock)[] content, string correlationId = null,
+		bool isContextBootstrap = false);
+
+	/// Discard submitted messages buffered locally across a history-lineage reset.
+	void invalidatePendingSubmittedMessages();
 
 	/// Whether this agent supports image content blocks.
 	@property bool supportsImages() const;

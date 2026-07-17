@@ -1049,9 +1049,11 @@ class CodexSession : AgentSession
 
 	// Queued messages waiting for thread to be ready.
 	private ContentBlock[][] pendingMessages;
+	private bool[] pendingContextBootstraps;
 
 	// Nonce of the in-flight user message; tagged onto the user_message echo.
 	private string pendingTurnCorrelationId_;
+	private bool pendingTurnContextBootstrap_;
 
 	// Callbacks
 	package void delegate(TranslatedEvent) outputHandler_;
@@ -1147,9 +1149,11 @@ class CodexSession : AgentSession
 	private void drainPendingMessages()
 	{
 		auto queued = pendingMessages;
+		auto queuedContextBootstraps = pendingContextBootstraps;
 		pendingMessages = null;
-		foreach (msg; queued)
-			sendMessage(msg);
+		pendingContextBootstraps = null;
+		foreach (i, msg; queued)
+			sendMessage(msg, null, queuedContextBootstraps[i]);
 	}
 
 	package void handleTurnStarted(TurnRef turn)
@@ -1174,7 +1178,8 @@ class CodexSession : AgentSession
 
 	// ----- AgentSession interface -----
 
-	void sendMessage(const(ContentBlock)[] content, string correlationId = null)
+	void sendMessage(const(ContentBlock)[] content, string correlationId = null,
+		bool isContextBootstrap = false)
 	{
 		// Extract text (only text blocks supported; throw on others).
 		string text;
@@ -1191,6 +1196,7 @@ class CodexSession : AgentSession
 		if (threadId.length == 0)
 		{
 			pendingMessages ~= content.dup;
+			pendingContextBootstraps ~= isContextBootstrap;
 			return;
 		}
 
@@ -1199,9 +1205,11 @@ class CodexSession : AgentSession
 			if (activeTurnId_.length == 0)
 			{
 				pendingMessages ~= content.dup;
+				pendingContextBootstraps ~= isContextBootstrap;
 				return;
 			}
 			pendingTurnCorrelationId_ = correlationId;
+			pendingTurnContextBootstrap_ = isContextBootstrap;
 			auto steerCid = correlationId;
 			server.sendRequest("turn/steer",
 				toJson(TurnSteerParams(
@@ -1220,6 +1228,7 @@ class CodexSession : AgentSession
 			activeItemTypes_ = null;
 			hadItemsSinceLastStop_ = false;
 			pendingTurnCorrelationId_ = correlationId;
+			pendingTurnContextBootstrap_ = isContextBootstrap;
 
 			auto startCid = correlationId;
 			server.sendRequest("turn/start",
@@ -1242,6 +1251,8 @@ class CodexSession : AgentSession
 			});
 		}
 	}
+
+	void invalidatePendingSubmittedMessages() {}
 
 	@property bool supportsImages() const { return false; }
 
@@ -1338,8 +1349,11 @@ class CodexSession : AgentSession
 				cb.text = userText;
 				ev.content = [cb];
 				ev.correlation_id = pendingTurnCorrelationId_;
+				auto isContextBootstrap = pendingTurnContextBootstrap_;
 				pendingTurnCorrelationId_ = null;
-				outputHandler_(TranslatedEvent(toJson(ev), rawNotification));
+				pendingTurnContextBootstrap_ = false;
+				outputHandler_(TranslatedEvent(toJson(ev), rawNotification,
+					AbsTime.init, 0, isContextBootstrap));
 			}
 			return;
 		}
@@ -1980,6 +1994,25 @@ unittest
 		input.command == userCommand && input.description == "",
 		"expected multiline commandAction to preserve semantic command; actual=" ~ input.command,
 	);
+}
+
+unittest
+{
+	@JSONPartial struct StartedNotification { ItemStartedParams params; }
+	auto session = new CodexSession(cast(AppServerProcess) null, 1, SessionConfig.init);
+	TranslatedEvent[] emitted;
+	void sink(TranslatedEvent ev) { emitted ~= ev; }
+	session.onOutput(&sink);
+	session.pendingTurnContextBootstrap_ = true;
+	auto bootstrap = jsonParse!StartedNotification(
+		`{"params":{"item":{"id":"bootstrap","type":"userMessage","content":[{"type":"text","text":"ignored"}]}}}`);
+	session.handleItemStarted(bootstrap.params, "bootstrap");
+	assert(emitted.length == 1 && emitted[0].isContextBootstrap);
+	session.pendingTurnContextBootstrap_ = false;
+	auto ordinary = jsonParse!StartedNotification(
+		`{"params":{"item":{"id":"ordinary","type":"userMessage","content":[{"type":"text","text":"ordinary"}]}}}`);
+	session.handleItemStarted(ordinary.params, "ordinary");
+	assert(emitted.length == 2 && !emitted[1].isContextBootstrap);
 }
 
 unittest

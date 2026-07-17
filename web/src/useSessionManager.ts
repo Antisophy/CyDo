@@ -18,16 +18,21 @@ import type {
   AgnosticEvent,
   ControlMessage,
   ContentBlock,
+  HistoryBoundary,
   Notice,
 } from "./protocol";
 import type { CydoMeta, TaskState } from "./types";
 import { makeTaskState } from "./types";
-import { reduceMessage, replaceHistoryBoundary } from "./sessionReducer";
+import {
+  reduceAgentAck,
+  reduceMessage,
+  replaceHistoryBoundary,
+} from "./sessionReducer";
 import { drafts as inputDrafts } from "./components/InputBox";
 import { outbox } from "./outbox";
 import {
+  beginTaskHistoryReplay,
   reconcileInputDraft,
-  resetTaskForHistoryReplay,
   snapshotUserDrafts,
 } from "./historyReplayReset";
 
@@ -60,6 +65,23 @@ type DraftPhase =
       };
     }
   | { phase: "promoted"; uuid: string };
+
+type HistoryBoundaryEvent =
+  | (Extract<AgnosticEvent, { type: "item/started" }> & {
+      history_boundary: HistoryBoundary;
+    })
+  | (Extract<AgnosticEvent, { type: "turn/stop" }> & {
+      history_boundary: HistoryBoundary;
+    });
+
+function hasHistoryBoundary(
+  event: AgnosticEvent,
+): event is HistoryBoundaryEvent {
+  return (
+    (event.type === "item/started" || event.type === "turn/stop") &&
+    event.history_boundary !== undefined
+  );
+}
 
 function buildContentBlocks(
   text: string,
@@ -661,6 +683,8 @@ export function useTaskManager(
         uuid,
       };
       let updated = reduceMessage(prev, msg, seq, ts);
+      if (hasHistoryBoundary(msg) && seq !== undefined)
+        updated = replaceHistoryBoundary(updated, msg, seq);
       if (!updated.historyLoaded && updated.historyTotal !== undefined) {
         updated = {
           ...updated,
@@ -1051,6 +1075,7 @@ export function useTaskManager(
           const { tid } = msg;
           const t = findByTid(tid);
           if (!t) break;
+          outbox.removeForTask(tid);
           requestedHistoryRef.current.delete(t.uuid);
 
           const isEdit = msg.reason === "edit";
@@ -1117,7 +1142,7 @@ export function useTaskManager(
           const { tid, total } = msg;
           const t0 = findByTid(tid);
           if (!t0) break;
-          const t = resetTaskForHistoryReplay(t0, total);
+          const t = beginTaskHistoryReplay(t0, total);
           liveStates.set(t0.uuid, t);
           setTasks((prev) => {
             if (!prev.has(t0.uuid)) return prev;
@@ -1237,17 +1262,11 @@ export function useTaskManager(
           });
           break;
         }
-        case "forkable_uuids": {
-          const { tid, uuids } = msg;
+        case "history_operations": {
+          const { tid, history_operations } = msg;
           const t = findByTid(tid);
           if (!t) break;
-          // Skip update if all UUIDs are already present — avoids
-          // creating a new TaskState reference that would break memo
-          // equality for MessageView components.
-          if (uuids.every((u: string) => t.forkableUuids.has(u))) break;
-          const merged = new Set(t.forkableUuids);
-          for (const u of uuids) merged.add(u);
-          const updated = { ...t, forkableUuids: merged };
+          const updated = { ...t, historyOperations: history_operations };
           liveStates.set(t.uuid, updated);
           setTasks((prev) => {
             if (!prev.has(t.uuid)) return prev;
@@ -1429,7 +1448,12 @@ export function useTaskManager(
           seq?: number;
           ts?: number;
         }
-      | { kind: "replacement"; tid: number; msg: AgnosticEvent; seq: number }
+      | {
+          kind: "replacement";
+          tid: number;
+          msg: HistoryBoundaryEvent;
+          seq: number;
+        }
       | {
           kind: "unconfirmed";
           tid: number;
@@ -1439,6 +1463,10 @@ export function useTaskManager(
       | { kind: "agentAck"; tid: number; nonce: string }
       | { kind: "control"; msg: ControlMessage };
     let buffer: BufferedMsg[] = [];
+    const pendingReplacements = new Map<
+      number,
+      { msg: HistoryBoundaryEvent; seq: number }[]
+    >();
     let flushId: number | null = null;
     let flushTimerId: ReturnType<typeof setTimeout> | null = null;
 
@@ -1447,16 +1475,8 @@ export function useTaskManager(
       if (!uuid) return;
       const t = liveStates.get(uuid);
       if (!t) return;
-      const idx = t.messages.findIndex(
-        (m) => m.type === "user" && m.nonce === nonce,
-      );
-      if (idx < 0) return;
-      const updated = {
-        ...t,
-        messages: t.messages.map((m, i) =>
-          i === idx ? { ...m, ackState: 2 as const } : m,
-        ),
-      };
+      const updated = reduceAgentAck(t, nonce);
+      if (updated === t) return;
       liveStates.set(uuid, updated);
       setTasks((map) => {
         const next = new Map(map);
@@ -1480,13 +1500,57 @@ export function useTaskManager(
         else if (item.kind === "agentAck") handleAgentAck(item.tid, item.nonce);
         else if (item.kind === "replacement") {
           const uuid = tidToUuid.get(item.tid);
-          const task = uuid ? liveStates.get(uuid) : undefined;
-          if (!task)
+          if (uuid === undefined)
             throw new Error(`Replacement for unknown task ${item.tid}`);
+          const task = liveStates.get(uuid);
+          if (task === undefined)
+            throw new Error(`Replacement for unknown task ${item.tid}`);
+          const hasTarget = task.messages.some(
+            (message) =>
+              message.seq === item.seq ||
+              (Array.isArray(message.seq) && message.seq.includes(item.seq)),
+          );
+          if (!hasTarget) {
+            const pending = pendingReplacements.get(item.tid) ?? [];
+            pending.push({ msg: item.msg, seq: item.seq });
+            pendingReplacements.set(item.tid, pending);
+            continue;
+          }
           const updated = replaceHistoryBoundary(task, item.msg, item.seq);
-          liveStates.set(uuid!, updated);
-          setTasks((prev) => new Map(prev).set(uuid!, updated));
-        } else handleTaskMessage(item.tid, item.msg, item.seq, item.ts);
+          liveStates.set(uuid, updated);
+          setTasks((prev) => new Map(prev).set(uuid, updated));
+        } else {
+          handleTaskMessage(item.tid, item.msg, item.seq, item.ts);
+          const pending = pendingReplacements.get(item.tid);
+          if (pending && item.seq !== undefined) {
+            const matching = pending.filter(
+              (replacement) => replacement.seq === item.seq,
+            );
+            if (matching.length > 0) {
+              const uuid = tidToUuid.get(item.tid);
+              if (uuid === undefined)
+                throw new Error(`Replacement for unknown task ${item.tid}`);
+              const initialTask = liveStates.get(uuid);
+              if (initialTask === undefined)
+                throw new Error(`Replacement for unknown task ${item.tid}`);
+              let updated = initialTask;
+              for (const replacement of matching)
+                updated = replaceHistoryBoundary(
+                  updated,
+                  replacement.msg,
+                  replacement.seq,
+                );
+              liveStates.set(uuid, updated);
+              setTasks((prev) => new Map(prev).set(uuid, updated));
+              const remaining = pending.filter(
+                (replacement) => replacement.seq !== item.seq,
+              );
+              if (remaining.length > 0)
+                pendingReplacements.set(item.tid, remaining);
+              else pendingReplacements.delete(item.tid);
+            }
+          }
+        }
       }
     };
 
@@ -1555,6 +1619,8 @@ export function useTaskManager(
       scheduleFlush();
     };
     conn.onTaskEventReplaced = (tid, msg, seq) => {
+      if (!hasHistoryBoundary(msg))
+        throw new Error("Replacement event has no history boundary");
       buffer.push({ kind: "replacement", tid, msg, seq });
       scheduleFlush();
     };

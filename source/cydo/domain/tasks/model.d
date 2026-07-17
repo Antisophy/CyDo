@@ -1026,11 +1026,12 @@ struct SuggestionsUpdateMessage
 	string[] suggestions;
 }
 
-struct ForkableUuidsMessage
+struct HistoryOperationsMessage
 {
-	string type = "forkable_uuids";
+	string type = "history_operations";
 	int tid;
-	string[] uuids;
+	import cydo.workflow.history.operations : HistoryOperations;
+	HistoryOperations history_operations;
 }
 
 struct ErrorMessage

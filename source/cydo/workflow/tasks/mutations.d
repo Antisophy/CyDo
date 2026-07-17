@@ -373,6 +373,8 @@ public:
 						}
 
 						ws.send(Data(toJson(UndoResultMessage("undo_result", tid, "")).representation));
+						if (auto session = host_.sessionForTask(tid))
+							session.invalidatePendingSubmittedMessages();
 						host_.emitTaskReload(tid, "");
 						host_.startJsonlWatch(tid);
 						host_.broadcastTaskUpdate(tid);
@@ -384,6 +386,8 @@ public:
 			return;
 		}
 
+		if (auto session = host_.sessionForTask(tid))
+			session.invalidatePendingSubmittedMessages();
 		performUndoExecution(ws, tid, json);
 	}
 
@@ -642,6 +646,8 @@ private:
 		}
 
 		td.undoStopInProgress = true;
+		if (auto session = host_.sessionForTask(tid))
+			session.invalidatePendingSubmittedMessages();
 		td.processQueue.setGoal(ProcessState.Dead).then(() {
 			if (jsonlSnap.length > 0 && jsonlPathSnap.length > 0 &&
 				snapshotContainsUndoAnchor(jsonlSnap, json.after_uuid))

@@ -58,6 +58,7 @@ struct PersistedHistoryBoundary {
 	string anchor;
 	PersistedHistoryBoundaryKind kind;
 	string checkpointUuid;
+	int sourceLine;
 }
 
 /// Describes an agent type: its sandbox requirements, git identity,

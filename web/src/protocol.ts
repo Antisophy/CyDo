@@ -328,10 +328,19 @@ export interface AgentsListMessage {
   }[];
   default_agent?: string;
 }
-export interface ForkableUuidsMessage {
-  type: "forkable_uuids";
+export type HistoryOperationMechanism = "jsonl" | "codex_native";
+export interface HistoryOperationKinds {
+  user?: HistoryOperationMechanism;
+  agent_turn?: HistoryOperationMechanism;
+}
+export interface HistoryOperations {
+  fork: HistoryOperationKinds;
+  undo: HistoryOperationKinds;
+}
+export interface HistoryOperationsMessage {
+  type: "history_operations";
   tid: number;
-  uuids: string[];
+  history_operations: HistoryOperations;
 }
 export interface ErrorMessage {
   type: "error";
@@ -432,7 +441,7 @@ export type ControlMessage =
   | TaskTypesListMessage
   | ProjectTaskTypesListMessage
   | AgentsListMessage
-  | ForkableUuidsMessage
+  | HistoryOperationsMessage
   | ErrorMessage
   | UndoPreviewMessage
   | UndoResultMessage

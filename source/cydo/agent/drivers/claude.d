@@ -468,7 +468,7 @@ class ClaudeCodeAgent : Agent
 				{
 					auto qop = jsonParse!QueueOpProbe(line);
 					if (qop.operation == "enqueue")
-						ids ~= PersistedHistoryBoundary(format!"enqueue-%d"(lineNum), PersistedHistoryBoundaryKind.user, null);
+						ids ~= PersistedHistoryBoundary(format!"enqueue-%d"(lineNum), PersistedHistoryBoundaryKind.user, null, lineNum);
 				}
 				catch (Exception e) { tracef("history scan: queue op parse error: %s", e.msg); }
 				continue;
@@ -478,6 +478,7 @@ class ClaudeCodeAgent : Agent
 				continue;
 			enum prefix = `"uuid":"`;
 			auto idx = line.indexOf(prefix);
+			bool hasUuid;
 			if (idx >= 0)
 			{
 				auto start = idx + prefix.length;
@@ -487,9 +488,14 @@ class ClaudeCodeAgent : Agent
 					auto uuid = line[start .. end];
 					ids ~= PersistedHistoryBoundary(uuid,
 						isUser ? PersistedHistoryBoundaryKind.user : PersistedHistoryBoundaryKind.agent_turn,
-						null);
+						null, lineNum);
+					hasUuid = true;
 				}
 			}
+			if (!hasUuid)
+				ids ~= PersistedHistoryBoundary(format!"line:%d"(lineNum),
+					isUser ? PersistedHistoryBoundaryKind.user : PersistedHistoryBoundaryKind.agent_turn,
+					null, lineNum);
 		}
 		return ids;
 	}
@@ -516,6 +522,11 @@ class ClaudeCodeAgent : Agent
 			}
 			catch (Exception e)
 			{ tracef("matchesForkId: error: %s", e.msg); return false; }
+		}
+		if (forkId.startsWith("line:"))
+		{
+			import std.conv : to;
+			return lineNum == forkId["line:".length .. $].to!int;
 		}
 		return line.canFind(`"uuid":"` ~ forkId ~ `"`);
 	}
@@ -791,7 +802,8 @@ class ClaudeCodeSession : AgentSession
 	/// correlationId is accepted for interface compatibility but not used:
 	/// claude has no separable agent-ack signal between stdin-write and the
 	/// user-line echo, so state 2 is intentionally skipped.
-	void sendMessage(const(ContentBlock)[] content, string correlationId = null)
+	void sendMessage(const(ContentBlock)[] content, string correlationId = null,
+		bool isContextBootstrap = false)
 	{
 		// Use plain string content when possible (single text block) for backward
 		// compatibility with Claude CLI's JSONL format.  Array content is only
@@ -809,6 +821,8 @@ class ClaudeCodeSession : AgentSession
 		);
 		process.sendMessage(toJson(input));
 	}
+
+	void invalidatePendingSubmittedMessages() {}
 
 	@property bool supportsImages() const { return true; }
 

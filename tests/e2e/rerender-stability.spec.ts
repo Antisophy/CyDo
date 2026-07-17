@@ -93,16 +93,24 @@ test("completed messages are not recreated when new messages arrive", { tag: "@c
         .filter((frame) => frame?.type === "task_event_replaced")
         .map((frame) => frame?.event?.history_boundary?.kind),
     );
-    expect(kinds).toEqual(new Set(["agent_turn"]));
+    expect(kinds).toEqual(new Set(["user", "agent_turn"]));
   }).toPass({ timeout });
 
-  // Wait for forkable_uuids control message to arrive — under heavy CPU
-  // load, this can arrive in a separate render cycle after the turn completes,
-  // changing the `forkable` prop and causing spurious memo-breaking re-renders.
-  // The fork button is rendered (though hidden) for forkable messages.
+  // Wait for the replace-style policy publication. Rendering actions from this
+  // policy is intentionally deferred, so assert the protocol boundary rather
+  // than the removed fork button.
   await expect(
-    page.locator("[style*='display: contents'] .fork-btn"),
-  ).not.toHaveCount(0, { timeout: 5_000 });
+    async () => {
+      const policies = frames.filter(
+        (frame) => frame?.type === "history_operations",
+      );
+      expect(policies).not.toHaveLength(0);
+      expect(policies.at(-1)?.history_operations).toEqual({
+        fork: { user: "jsonl", agent_turn: "jsonl" },
+        undo: { user: "jsonl", agent_turn: "jsonl" },
+      });
+    },
+  ).toPass({ timeout });
 
   // Verify hook is working
   const totalCalls = await page.evaluate(

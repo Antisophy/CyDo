@@ -46,6 +46,7 @@ import cydo.web.snapshots : buildAgentsList, buildNoticesList,
 import cydo.workflow.history.pipeline : HistoryBroadcastPlan, HistoryEventPipeline,
 	HistoryEventPipelineHost;
 import cydo.workflow.history.abbrev : extractMessageText;
+import cydo.workflow.history.operations : selectHistoryOperations;
 import cydo.runtime.logging : installRobustLogger;
 import cydo.workflow.system_message_normalizer : SystemMessageNormalizer,
 	SystemMessageNormalizerHost;
@@ -66,6 +67,7 @@ import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
 	UnconfirmedUserEventEnvelope, extractContentText;
 import cydo.agent.drivers.registry : isRegisteredAgent;
 import cydo.agent.session : AgentSession;
+import cydo.agent.drivers.codex : CodexSession;
 import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
 import cydo.domain.storage.persistence : Persistence, openDatabase;
 import cydo.server.config_resolution : loadRuntimeConfig, reloadRuntimeConfig;
@@ -383,7 +385,10 @@ class App
 						TaskNotificationChange.preserve);
 				return tasks[tid].processQueue.setGoal(ProcessState.Alive);
 			},
-			sendTaskMessage: &sendTaskMessage,
+			sendTaskMessage: (int tid, const(ContentBlock)[] content,
+				const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) {
+				sendTaskMessage(tid, content, broadcastContent, cydoMeta, nonce);
+			},
 			emitTaskReload: &emitTaskReload,
 			appendTaskDiagnostic: (int tid, string subject, string body) {
 				historyPipeline.appendTaskDiagnostic(tid, subject, body);
@@ -498,17 +503,27 @@ class App
 			subscribe: (WebSocketAdapter ws, int tid) {
 				clientHub.subscribe(ws, tid);
 			},
-			sendForkableUuids: (WebSocketAdapter ws, int tid) {
-				auto td = tid in tasks;
-				assert(td !is null);
-				jsonlTracker.sendForkableUuidsFromFile(ws, tid, td.agentSessionId,
-					taskPathResolver.effectiveCwd(td));
+			sendHistoryOperations: (WebSocketAdapter ws, int tid) {
+				import cydo.domain.tasks.model : HistoryOperationsMessage;
+				auto session = sessionForTask(tid);
+				auto codex = cast(CodexSession) session;
+				ws.send(Data(toJson(HistoryOperationsMessage("history_operations", tid,
+					selectHistoryOperations(agentForTask(tid).driver, taskAlive(tid),
+						codex !is null && codex.canRollbackThread))).representation));
 			},
-			broadcastForkableUuids: (int tid) {
-				jsonlTracker.broadcastForkableUuidsFromFile(tid);
+			broadcastHistoryOperations: (int tid) {
+				import cydo.domain.tasks.model : HistoryOperationsMessage;
+				auto session = sessionForTask(tid);
+				auto codex = cast(CodexSession) session;
+				auto message = HistoryOperationsMessage("history_operations", tid,
+					selectHistoryOperations(agentForTask(tid).driver, taskAlive(tid),
+						codex !is null && codex.canRollbackThread));
+				clientHub.sendToSubscribed(tid, Data(toJson(message).representation));
 			},
-			noteLiveBoundaryCandidate: (int tid, size_t seq, string event) {
-				jsonlTracker.noteLiveBoundaryCandidate(tid, seq, event);
+			noteLiveBoundaryCandidate: (int tid, size_t seq, string event, string raw, int sourceLine,
+				bool isContextBootstrap) {
+				jsonlTracker.noteLiveBoundaryCandidate(tid, seq, event, raw, sourceLine,
+					isContextBootstrap);
 			},
 			sendReplaySupplementalState: &sendHistoryReplaySupplementalState,
 			onHistorySubscribed: &onHistorySubscribed,
@@ -620,8 +635,14 @@ class App
 			stopJsonlWatch: (int tid) {
 				jsonlTracker.stopJsonlWatch(tid);
 			},
-			broadcastForkableUuidsFromFile: (int tid) {
-				jsonlTracker.broadcastForkableUuidsFromFile(tid);
+			broadcastHistoryOperations: (int tid) {
+				import cydo.domain.tasks.model : HistoryOperationsMessage;
+				auto session = sessionForTask(tid);
+				auto codex = cast(CodexSession) session;
+				auto message = HistoryOperationsMessage("history_operations", tid,
+					selectHistoryOperations(agentForTask(tid).driver, taskAlive(tid),
+						codex !is null && codex.canRollbackThread));
+				clientHub.sendToSubscribed(tid, Data(toJson(message).representation));
 			},
 			sendSystemRestartNudge: &workflowTools.sendSystemRestartNudge,
 			loadPersistedTaskDeps: &workflowTools.loadPersistedTaskDeps,
@@ -1346,7 +1367,7 @@ class App
 					["task_description": textContent], "task_description")
 				: null;
 			tasks[tid].processQueue.setGoal(ProcessState.Alive).then(() {
-				sendTaskMessage(tid, messageToSend, msgContent, msgMeta);
+				sendTaskMessage(tid, messageToSend, msgContent, msgMeta, null, true);
 			}).ignoreResult();
 
 			td.description = textContent;
@@ -1629,8 +1650,13 @@ class App
 			transitionTask(tid, [TaskStatus.pending, TaskStatus.alive,
 				TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
 				TaskStatus.active, TaskNotificationChange.preserve);
+		auto submissionGeneration = td.history.generation;
 		td.processQueue.setGoal(ProcessState.Alive).then(() {
-			sendTaskMessage(tid, messageToSend, blocks, userMsgMeta, msgNonce);
+			auto td = &tasks[tid];
+			if (td.history.generation != submissionGeneration)
+				return;
+			sendTaskMessage(tid, messageToSend, blocks, userMsgMeta, msgNonce,
+				userMsgMeta.length > 0);
 		}).ignoreResult();
 
 		// Store first message as task description
@@ -1829,9 +1855,10 @@ class App
 	/// but the UI should display the user's original text.
 	private void sendTaskMessage(int tid, const(ContentBlock)[] content,
 		const(ContentBlock)[] broadcastContent = null, string cydoMeta = null,
-		string nonce = null)
+		string nonce = null, bool isContextBootstrap = false)
 	{
-		sendPreparedTaskMessage(tid, content, broadcastContent, cydoMeta, true, nonce);
+		sendPreparedTaskMessage(tid, content, broadcastContent, cydoMeta, true, nonce,
+			isContextBootstrap);
 	}
 
 	/// Send a prepared message to the agent and emit the matching pending UI echo.
@@ -1840,7 +1867,8 @@ class App
 	/// and CyDo metadata for collapsed rendering.
 	private void sendPreparedTaskMessage(int tid, const(ContentBlock)[] content,
 		const(ContentBlock)[] broadcastContent = null, string cydoMeta = null,
-		bool captureUndoSnapshot = true, string nonce = null)
+		bool captureUndoSnapshot = true, string nonce = null,
+		bool isContextBootstrap = false)
 	{
 		import std.algorithm : min, filter;
 		import std.array : array;
@@ -1863,7 +1891,7 @@ class App
 		const(ContentBlock)[] toSend = session.supportsImages
 			? content
 			: content.filter!(b => b.type != "image").array;
-		session.sendMessage(toSend, nonce);
+		session.sendMessage(toSend, nonce, isContextBootstrap);
 		td.isProcessing = true;
 		touchTask(tid);
 		td.needsAttention = false;

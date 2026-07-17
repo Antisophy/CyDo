@@ -162,7 +162,7 @@ struct TaskSessionRunnerHost
 	void delegate(int tid) ensureHistoryLoaded;
 	void delegate(int tid) finalReconcileJsonlIfPresent;
 	void delegate(int tid) stopJsonlWatch;
-	void delegate(int tid) broadcastForkableUuidsFromFile;
+	void delegate(int tid) broadcastHistoryOperations;
 	void delegate(int tid) sendSystemRestartNudge;
 	void delegate() loadPersistedTaskDeps;
 	int[] delegate() snapshotTaskIds;
@@ -448,7 +448,7 @@ class TaskSessionRunner
 			if (!host_.shuttingDown())
 				host_.startJsonlWatch(tid);
 			if (!host_.shuttingDown())
-				host_.broadcastForkableUuidsFromFile(tid);
+				host_.broadcastHistoryOperations(tid);
 
 			current = host_.getTask(tid);
 			if (current is null)
@@ -531,9 +531,10 @@ class TaskSessionRunner
 		};
 
 		session.onExit = (int exitCode) {
-			if (auto stored = tid in sessions_)
-				if (*stored is session)
-					sessions_.remove(tid);
+			auto stored = tid in sessions_;
+			if (stored is null || *stored !is session)
+				return;
+			sessions_.remove(tid);
 			if (host_.shuttingDown())
 				return;
 

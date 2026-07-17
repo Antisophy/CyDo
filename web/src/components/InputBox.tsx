@@ -7,6 +7,7 @@ import {
   useMemo,
 } from "preact/hooks";
 import type { ImageAttachment } from "../useSessionManager";
+import { applyRecoveredInputDraft } from "./inputDraft";
 
 export const drafts = new Map<string, string>();
 
@@ -183,9 +184,13 @@ export function InputBox({
   // Pre-fill with unsaved user messages recovered after session reload
   useEffect(() => {
     if (!inputDraft) return;
-    setText((prev) => (prev ? inputDraft + "\n\n" + prev : inputDraft));
+    const next = applyRecoveredInputDraft(inputDraft, textRef.current);
+    if (next !== textRef.current) {
+      setText(next);
+      drafts.set(sessionId, next);
+    }
     onInputDraftConsumed?.();
-  }, [inputDraft]);
+  }, [inputDraft, onInputDraftConsumed, sessionId]);
 
   const handleChange = (newText: string) => {
     const wasEmpty = textRef.current.trim() === "";

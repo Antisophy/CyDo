@@ -99,6 +99,14 @@ test(
   { tag: "@claude-only" },
   async ({ page, agentType }) => {
     const timeout = responseTimeout(agentType);
+    const frames: any[] = [];
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", (event) => {
+        try {
+          frames.push(JSON.parse(event.payload.toString()));
+        } catch {}
+      });
+    });
     await enterSession(page);
 
     await sendMessage(page, 'Please reply with "alert-one"');
@@ -106,7 +114,6 @@ test(
 
     await sendMessage(page, 'Please reply with "alert-two"');
     await expect(assistantText(page, "alert-two")).toBeVisible({ timeout });
-
     const dialogs: string[] = [];
     page.on("dialog", (dialog) => {
       dialogs.push(dialog.message());
@@ -276,16 +283,15 @@ test(
   "claude live idle undo on turn three removes only turns three through five",
   { tag: "@claude-only" },
   async ({ page, agentType }) => {
-    const turns = [
+  const turns = [
       "live-one",
       "live-two",
       "live-three",
       "live-four",
       "live-five",
-    ];
-    const timeout = responseTimeout(agentType);
-
-    await enterSession(page);
+  ];
+  const timeout = responseTimeout(agentType);
+  await enterSession(page);
     for (const turn of turns) {
       await sendMessage(page, `Please reply with "${turn}"`);
       await expect(assistantText(page, turn)).toBeVisible({ timeout });
@@ -293,7 +299,6 @@ test(
 
     const input = page.locator(".input-textarea:visible").first();
     await expect(input).toBeEnabled({ timeout: 15_000 });
-
     await openUndoDialogForTurn(page, "live-three");
     await page.locator(".btn-undo").click();
     await expect(input).toBeEnabled({ timeout: 15_000 });
@@ -445,19 +450,19 @@ test(
       );
       expect(reloadIdx).toBeGreaterThan(undoIdx);
 
-      const forkableIdx = frames.findIndex(
+      const operationsIdx = frames.findIndex(
         (msg, idx) =>
           idx > reloadIdx &&
-          msg?.type === "forkable_uuids" &&
-          Array.isArray(msg?.uuids) &&
-          msg.uuids.length > 0,
+          msg?.type === "history_operations" &&
+          msg?.history_operations?.fork?.user === "jsonl",
       );
-      expect(forkableIdx).toBeGreaterThan(reloadIdx);
+      expect(operationsIdx).toBeGreaterThan(reloadIdx);
 
       const historyEndIdx = frames.findIndex(
         (msg, idx) => idx > reloadIdx && msg?.type === "task_history_end",
       );
       expect(historyEndIdx).toBeGreaterThan(reloadIdx);
+      expect(operationsIdx).toBeLessThan(historyEndIdx);
     }).toPass({ timeout: 15_000 });
 
     const seqToAnchor = new Map<number, string>();

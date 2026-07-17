@@ -252,8 +252,7 @@ export interface TaskState {
   parentTid?: number;
   /** Relation type to parent (e.g. "fork"). */
   relationType?: string;
-  /** Canonical visible-turn anchors currently forkable for this task. */
-  forkableUuids: Set<string>;
+  historyOperations: import("./protocol").HistoryOperations | null;
   /** Current task type (e.g. "conversation", "plan", "implement"). */
   taskType?: string;
   /** Current user-facing entry point (e.g. "agentic", "direct", "isolated"). */
@@ -355,7 +354,7 @@ export function makeTaskState(
     parentTid,
     relationType,
     everLoaded: historyLoaded,
-    forkableUuids: new Set(),
+    historyOperations: null,
     taskType,
     entryPoint,
     agentType,
