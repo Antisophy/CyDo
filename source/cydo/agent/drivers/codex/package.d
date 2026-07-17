@@ -1777,11 +1777,12 @@ string buildConfigOverride(int tid, string creatableTaskTypes,
 		env["CYDO_HANDOFFS"] = handoffs;
 		env["CYDO_INCLUDE_TOOLS"] = includeTools is null ? "" : includeTools.join(",");
 
+		auto toolTimeout = environment.get("CYDO_TEST_CODEX_MCP_TOOL_TIMEOUT_SEC", "");
 		auto serverConfig = McpServerConfig(
 			cydoBin,
 			["mcp-server"],
 			env,
-			100000000,
+			toolTimeout.length > 0 ? to!uint(toolTimeout) : 100000000,
 		);
 
 		config["mcp_servers.cydo"] = JSONFragment(toJson(serverConfig));
