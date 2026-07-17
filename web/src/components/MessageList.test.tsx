@@ -32,6 +32,8 @@ describe("MessageList parse-error rendering", () => {
       />,
     );
     expect(html).toContain("undo-btn");
+    expect(html).toContain('aria-label="Undo to this point"');
+    expect(html).toContain('<svg xmlns="http://www.w3.org/2000/svg"');
     const noIdentity = renderToString(
       <MessageList
         taskTid={1}
@@ -81,6 +83,137 @@ describe("MessageList parse-error rendering", () => {
     );
     expect(html).toContain("fork-btn");
     expect(html).toContain("undo-btn");
+    expect(html).toContain('title="Fork session after this point"');
+    expect(html).toContain(
+      'aria-label="Undo this response and later history, retaining its prompt"',
+    );
+  });
+
+  it("uses the file-revert undo icon only for a checkpoint boundary", () => {
+    const message: DisplayMessage = {
+      id: "u",
+      type: "user",
+      content: [],
+      seq: 1,
+    };
+    const render = (checkpoint_uuid?: string) =>
+      renderToString(
+        <MessageList
+          taskTid={1}
+          messages={[message]}
+          replacementEvents={
+            new Map([
+              [
+                1,
+                {
+                  type: "item/started",
+                  item_type: "user_message",
+                  item_id: "",
+                  history_boundary: {
+                    anchor: "anchor",
+                    kind: "user",
+                    checkpoint_uuid,
+                  },
+                },
+              ],
+            ])
+          }
+          historyOperations={{ fork: {}, undo: { user: "jsonl" } }}
+          blocks={new Map()}
+          isProcessing={false}
+          bandStatus=""
+          onUndo={() => {}}
+        />,
+      );
+
+    expect(render()).toContain('aria-label="Undo to this point"');
+    expect(render()).not.toContain('d="M11 3h3v3"');
+    expect(render("checkpoint")).toContain(
+      'aria-label="Undo to this point (file checkpoint available)"',
+    );
+    expect(render("checkpoint")).toContain('d="M11 3h3v3"');
+  });
+
+  it("keeps fork and undo policy entries independent", () => {
+    const message: DisplayMessage = {
+      id: "u",
+      type: "user",
+      content: [],
+      seq: 1,
+    };
+    const replacementEvents = new Map<number, AgnosticEvent>([
+      [
+        1,
+        {
+          type: "item/started",
+          item_type: "user_message",
+          item_id: "",
+          history_boundary: { anchor: "a", kind: "user" },
+        },
+      ],
+    ]);
+    const render = (historyOperations: {
+      fork: { user?: "jsonl" };
+      undo: { user?: "jsonl" };
+    }) =>
+      renderToString(
+        <MessageList
+          taskTid={1}
+          messages={[message]}
+          replacementEvents={replacementEvents}
+          historyOperations={historyOperations}
+          blocks={new Map()}
+          isProcessing={false}
+          bandStatus=""
+          onFork={() => {}}
+          onUndo={() => {}}
+        />,
+      );
+    expect(render({ fork: { user: "jsonl" }, undo: {} })).toContain("fork-btn");
+    expect(render({ fork: { user: "jsonl" }, undo: {} })).not.toContain(
+      "undo-btn",
+    );
+    expect(render({ fork: {}, undo: { user: "jsonl" } })).toContain("undo-btn");
+    expect(render({ fork: {}, undo: { user: "jsonl" } })).not.toContain(
+      "fork-btn",
+    );
+  });
+
+  it("does not render actions for a nested boundary-looking message", () => {
+    const nested: DisplayMessage = {
+      id: "nested",
+      type: "user",
+      content: [],
+      seq: 1,
+      parentToolUseId: "tool",
+    };
+    const html = renderToString(
+      <MessageList
+        taskTid={1}
+        messages={[nested]}
+        replacementEvents={
+          new Map([
+            [
+              1,
+              {
+                type: "item/started",
+                item_type: "user_message",
+                item_id: "",
+                history_boundary: { anchor: "a", kind: "user" },
+              },
+            ],
+          ])
+        }
+        historyOperations={{ fork: { user: "jsonl" }, undo: { user: "jsonl" } }}
+        blocks={new Map()}
+        isProcessing={false}
+        bandStatus=""
+        onFork={() => {}}
+        onUndo={() => {}}
+      />,
+    );
+    expect(html).not.toContain("undo-btn");
+    expect(html).not.toContain("fork-btn");
   });
 
   it("shows parse_error system messages in normal mode", () => {

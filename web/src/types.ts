@@ -273,6 +273,7 @@ export interface TaskState {
     messagesRemoved: number;
     canRevertFiles: boolean;
     retainsPrompt: boolean;
+    supportsFileRevert?: boolean;
   } | null;
   /** Undo result output to display as a transient banner (null when not showing). */
   undoResult?: string | null;

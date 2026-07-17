@@ -20,6 +20,7 @@ import editIcon from "../icons/edit.svg?raw";
 import viewSourceIcon from "../icons/view-source.svg?raw";
 import forkIcon from "../icons/fork.svg?raw";
 import undoIcon from "../icons/undo.svg?raw";
+import undoFileRevertIcon from "../icons/undo-file-revert.svg?raw";
 import sunIcon from "../icons/sun.svg?raw";
 import checkIcon from "../icons/check.svg?raw";
 import errorIcon from "../icons/error.svg?raw";
@@ -516,7 +517,7 @@ const MessageView = memo(
     onEdit,
     onEditRaw,
     actionUuid,
-    forkable,
+    actionBoundary,
     spawnedTidsByItemId,
     getTaskHref,
   }: {
@@ -531,7 +532,7 @@ const MessageView = memo(
     onEdit?: (uuid: string, content: string) => void;
     onEditRaw?: (seq: number, content: string) => void;
     actionUuid?: string;
-    forkable?: boolean;
+    actionBoundary?: { kind: "user" | "agent_turn"; checkpointUuid?: string };
     spawnedTidsByItemId?: Map<string, Map<number, number>>;
     getTaskHref?: (id: string) => string;
   }) {
@@ -757,7 +758,7 @@ const MessageView = memo(
         ) : (
           inner
         )}
-        {uuid && forkable && (onFork || onUndo) && (
+        {uuid && (onFork || onUndo) && (
           <div class="message-actions message-actions-bottom">
             {onFork && (
               <button
@@ -768,6 +769,7 @@ const MessageView = memo(
                   onFork(uuid);
                 }}
                 title="Fork session after this point"
+                aria-label="Fork session after this point"
               >
                 <span
                   class="action-icon"
@@ -781,11 +783,32 @@ const MessageView = memo(
                 onClick={() => {
                   onUndo(uuid);
                 }}
-                title="Undo: rewind to this point"
+                aria-label={
+                  actionBoundary?.kind === "agent_turn"
+                    ? actionBoundary.checkpointUuid
+                      ? "Undo this response and later history, retaining its prompt (file checkpoint available)"
+                      : "Undo this response and later history, retaining its prompt"
+                    : actionBoundary?.checkpointUuid
+                      ? "Undo to this point (file checkpoint available)"
+                      : "Undo to this point"
+                }
+                title={
+                  actionBoundary?.kind === "agent_turn"
+                    ? actionBoundary.checkpointUuid
+                      ? "Undo this response and later history, retaining its prompt (file checkpoint available)"
+                      : "Undo this response and later history, retaining its prompt"
+                    : actionBoundary?.checkpointUuid
+                      ? "Undo to this point (file checkpoint available)"
+                      : "Undo to this point"
+                }
               >
                 <span
                   class="action-icon"
-                  dangerouslySetInnerHTML={{ __html: undoIcon }}
+                  dangerouslySetInnerHTML={{
+                    __html: actionBoundary?.checkpointUuid
+                      ? undoFileRevertIcon
+                      : undoIcon,
+                  }}
                 />
               </button>
             )}
@@ -804,7 +827,9 @@ const MessageView = memo(
     prev.onFork === next.onFork &&
     prev.onUndo === next.onUndo &&
     prev.onEdit === next.onEdit &&
-    prev.forkable === next.forkable &&
+    prev.actionBoundary?.kind === next.actionBoundary?.kind &&
+    prev.actionBoundary?.checkpointUuid ===
+      next.actionBoundary?.checkpointUuid &&
     prev.actionUuid === next.actionUuid &&
     prev.spawnedTidsByItemId === next.spawnedTidsByItemId &&
     prev.getTaskHref === next.getTaskHref,
@@ -1046,11 +1071,12 @@ export function MessageList({
                       history_boundary: {
                         anchor: string;
                         kind: "user" | "agent_turn";
+                        checkpoint_uuid?: string;
                       };
                     }
                   ).history_boundary
                 : undefined;
-            const actionUuid = msg.uuid ?? boundary?.anchor;
+            const actionUuid = boundary?.anchor;
             const isForkable =
               !!boundary && !!historyOperations?.fork[boundary.kind];
             const isUndoable =
@@ -1069,7 +1095,14 @@ export function MessageList({
                 onEdit={msg.type === "user" ? handleEditMessage : undefined}
                 onEditRaw={handleEditRawEvent}
                 actionUuid={actionUuid}
-                forkable={isForkable || isUndoable}
+                actionBoundary={
+                  boundary
+                    ? {
+                        kind: boundary.kind,
+                        checkpointUuid: boundary.checkpoint_uuid,
+                      }
+                    : undefined
+                }
                 spawnedTidsByItemId={spawnedTidsByItemId}
                 getTaskHref={getTaskHref}
               />

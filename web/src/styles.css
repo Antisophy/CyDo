@@ -841,6 +841,8 @@ body,
 
 .message-wrapper:hover > .message-actions,
 .message-wrapper:hover > .message-actions-bottom,
+.message-wrapper:focus-within > .message-actions,
+.message-wrapper:focus-within > .message-actions-bottom,
 .message-wrapper.show-source > .message-actions {
   opacity: 1;
 }

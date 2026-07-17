@@ -584,8 +584,9 @@ function SessionViewInner({
       {task.undoPending && task.undoPending.messagesRemoved >= 0 && (
         <UndoConfirmDialog
           messagesRemoved={task.undoPending.messagesRemoved}
-          supportsFileRevert={task.undoPending.canRevertFiles}
+          canRevertFiles={task.undoPending.canRevertFiles}
           retainsPrompt={task.undoPending.retainsPrompt}
+          supportsFileRevert={task.undoPending.supportsFileRevert ?? true}
           onConfirm={handleUndoConfirm}
           onDismiss={handleUndoDismiss}
         />
@@ -732,21 +733,23 @@ function QuoteSelectionButton({
   );
 }
 
-function UndoConfirmDialog({
+export function UndoConfirmDialog({
   messagesRemoved,
-  supportsFileRevert,
+  canRevertFiles,
   retainsPrompt,
+  supportsFileRevert,
   onConfirm,
   onDismiss,
 }: {
   messagesRemoved: number;
-  supportsFileRevert: boolean;
+  canRevertFiles: boolean;
   retainsPrompt: boolean;
+  supportsFileRevert: boolean;
   onConfirm: (revertConversation: boolean, revertFiles: boolean) => void;
   onDismiss: () => void;
 }) {
   const [revertConversation, setRevertConversation] = useState(true);
-  const [revertFiles, setRevertFiles] = useState(supportsFileRevert);
+  const [revertFiles, setRevertFiles] = useState(canRevertFiles);
   const neitherSelected = !revertConversation && !revertFiles;
 
   return (
@@ -784,13 +787,18 @@ function UndoConfirmDialog({
             <input
               type="checkbox"
               checked={revertFiles}
-              disabled={!supportsFileRevert}
+              disabled={!canRevertFiles}
               onChange={() => {
                 setRevertFiles(!revertFiles);
               }}
             />{" "}
             Revert file changes
-            {!supportsFileRevert && " (not supported for this agent type)"}
+            {!canRevertFiles &&
+              (supportsFileRevert
+                ? retainsPrompt
+                  ? " (this response has no file checkpoint)"
+                  : " (this point has no file checkpoint and cannot restore files)"
+                : " (not supported for this agent type)")}
           </label>
         </div>
         <div class="undo-dialog-actions">

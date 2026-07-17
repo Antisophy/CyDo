@@ -23,7 +23,26 @@ test(
       `create file ${testFile} with content ${firstContent}`,
     );
     await expect(assistantText(page, "Done.")).toBeVisible({ timeout: 30_000 });
-  expect(readFileSync(testFile, "utf8").trimEnd()).toBe(firstContent);
+    expect(readFileSync(testFile, "utf8").trimEnd()).toBe(firstContent);
+
+    const checkpointAssistant = page
+      .locator(".message-wrapper", {
+        has: page.locator(".assistant-message").last(),
+      })
+      .last();
+    await checkpointAssistant.hover();
+    await expect(checkpointAssistant.locator(".undo-btn")).toHaveAttribute(
+      "title",
+      "Undo this response and later history, retaining its prompt",
+    );
+    await checkpointAssistant.locator(".undo-btn").click();
+    await expect(page.locator(".undo-dialog")).toContainText(
+      "this response has no file checkpoint",
+    );
+    await expect(
+      page.locator('.undo-dialog input[type="checkbox"]').nth(1),
+    ).toBeDisabled();
+    await page.locator(".undo-dialog .btn").first().click();
 
     await sendMessage(
       page,
@@ -32,7 +51,7 @@ test(
     await expect(assistantText(page, "Done.")).toHaveCount(2, {
       timeout: 30_000,
     });
-  expect(readFileSync(testFile, "utf8").trimEnd()).toBe(secondContent);
+    expect(readFileSync(testFile, "utf8").trimEnd()).toBe(secondContent);
 
     await killSession(page, agentType);
     const selectedUser = page
@@ -40,8 +59,20 @@ test(
         has: page.locator(".user-message", { hasText: secondContent }),
       })
       .last();
-    await selectedUser.hover();
-    await selectedUser.locator(".undo-btn").click();
+    const undoButton = selectedUser.locator(".undo-btn");
+    await expect(undoButton).toHaveAttribute(
+      "title",
+      "Undo to this point (file checkpoint available)",
+    );
+    for (let i = 0; i < 30; i++) {
+      if (await undoButton.evaluate((element) => element === document.activeElement)) {
+        break;
+      }
+      await page.keyboard.press("Tab");
+    }
+    await expect(undoButton).toBeFocused();
+    await expect(undoButton).toBeVisible();
+    await undoButton.press("Enter");
     await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
     await expect(
       page.locator('.undo-dialog input[type="checkbox"]').nth(1),
@@ -53,7 +84,7 @@ test(
 
     // The selected second checkpoint restores the first write, proving the
     // backend passed the resolved checkpoint rather than an adjacent one.
-  expect(readFileSync(testFile, "utf8").trimEnd()).toBe(firstContent);
+    expect(readFileSync(testFile, "utf8").trimEnd()).toBe(firstContent);
 
     await sendMessage(
       page,
@@ -62,7 +93,7 @@ test(
     await expect(assistantText(page, "Done.")).toHaveCount(2, {
       timeout: 30_000,
     });
-  expect(readFileSync(testFile, "utf8").trimEnd()).toBe(thirdContent);
+    expect(readFileSync(testFile, "utf8").trimEnd()).toBe(thirdContent);
 
     await killSession(page, agentType);
     const conversationOnly = page
@@ -78,6 +109,7 @@ test(
     await expect(page.locator(".undo-result-banner")).toBeVisible({
       timeout: 15_000,
     });
-  expect(readFileSync(testFile, "utf8").trimEnd()).toBe(thirdContent);
+    expect(readFileSync(testFile, "utf8").trimEnd()).toBe(thirdContent);
+
   },
 );

@@ -83,6 +83,13 @@ function hasHistoryBoundary(
   );
 }
 
+export function revertFilesForUndo(
+  canRevertFiles: boolean,
+  revertFiles: boolean,
+) {
+  return canRevertFiles && revertFiles;
+}
+
 function buildContentBlocks(
   text: string,
   images?: ImageAttachment[],
@@ -1287,6 +1294,7 @@ export function useTaskManager(
               messagesRemoved: messages_removed,
               canRevertFiles: t.undoPending?.canRevertFiles ?? false,
               retainsPrompt: t.undoPending?.retainsPrompt ?? false,
+              supportsFileRevert: t.undoPending?.supportsFileRevert ?? true,
             },
           };
           liveStates.set(t.uuid, updated);
@@ -1921,9 +1929,7 @@ export function useTaskManager(
             };
           }
         | undefined;
-      const canRevertFiles =
-        t.sessionInfo?.supports_file_revert !== false &&
-        !!boundary?.history_boundary?.checkpoint_uuid;
+      const canRevertFiles = !!boundary?.history_boundary?.checkpoint_uuid;
       const updated = {
         ...t,
         undoPending: {
@@ -1931,6 +1937,7 @@ export function useTaskManager(
           messagesRemoved: -1,
           canRevertFiles,
           retainsPrompt: boundary?.history_boundary?.kind === "agent_turn",
+          supportsFileRevert: t.sessionInfo?.supports_file_revert !== false,
         },
       };
       liveStates.set(t.uuid, updated);
@@ -1952,7 +1959,7 @@ export function useTaskManager(
         t.undoPending.afterUuid,
         false,
         revertConversation,
-        revertFiles,
+        revertFilesForUndo(t.undoPending.canRevertFiles, revertFiles),
       );
       // Clear undoPending
       const updated = { ...t, undoPending: null };
