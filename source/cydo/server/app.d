@@ -676,6 +676,9 @@ class App
 			invalidateJsonlLineage: (int tid) {
 				jsonlTracker.invalidateLineage(tid);
 			},
+			startJsonlWatch: (int tid) {
+				jsonlTracker.startJsonlWatch(tid);
+			},
 			stopJsonlWatch: (int tid) {
 				jsonlTracker.stopJsonlWatch(tid);
 			},

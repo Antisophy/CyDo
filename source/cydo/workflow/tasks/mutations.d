@@ -62,6 +62,7 @@ struct TaskMutationServiceHost
 	string delegate(int tid) getUndoJsonl;
 	void delegate(int tid) clearUndoJsonl;
 	void delegate(int tid) invalidateJsonlLineage;
+	void delegate(int tid) startJsonlWatch;
 	void delegate(int tid) stopJsonlWatch;
 
 	void delegate(int tid) generateSuggestions;
@@ -332,6 +333,7 @@ public:
 				}
 
 				auto numTurns = cast(uint)(result.count + 1);
+				host_.invalidateJsonlLineage(tid);
 
 				ca.rollbackThread(td.agentSessionId, numTurns, td.launch, td.workspace)
 					.then((ThreadRollbackOutcome r) {
@@ -372,6 +374,7 @@ public:
 
 						ws.send(Data(toJson(UndoResultMessage("undo_result", tid, "")).representation));
 						host_.emitTaskReload(tid, "");
+						host_.startJsonlWatch(tid);
 						host_.broadcastTaskUpdate(tid);
 					}).ignoreResult();
 				return;

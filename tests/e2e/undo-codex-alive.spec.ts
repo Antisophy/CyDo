@@ -37,6 +37,16 @@ async function undoUserMessage(
 test("codex alive-path undo: session stays alive after undo", { tag: "@codex-only" }, async ({
   page,
 }) => {
+  const frames: any[] = [];
+  page.on("websocket", (ws) => {
+    ws.on("framereceived", (event) => {
+      try {
+        frames.push(JSON.parse(event.payload.toString()));
+      } catch {
+        // ignore non-JSON frames
+      }
+    });
+  });
 
   await enterSession(page);
 
@@ -74,6 +84,7 @@ test("codex alive-path undo: session stays alive after undo", { tag: "@codex-onl
   await expect(page.locator(".undo-dialog-count:visible")).toContainText(
     "3 messages will be removed.",
   );
+  const rollbackFrameStart = frames.length;
   await page.locator(".btn-undo:visible").click();
 
   // After undo: exactly turns 1-2 remain.
@@ -118,11 +129,61 @@ test("codex alive-path undo: session stays alive after undo", { tag: "@codex-onl
     timeout: 15_000,
   });
 
+  const rollbackFrames = () => frames.slice(rollbackFrameStart);
+  await expect
+    .poll(
+      () => {
+        const reloads = rollbackFrames().filter(
+          (frame) => frame?.type === "task_reload",
+        );
+        const reloadIdx = rollbackFrames().findIndex(
+          (frame) => frame?.type === "task_reload",
+        );
+        const historyEndIdx = rollbackFrames().findIndex(
+          (frame, idx) =>
+            idx > reloadIdx && frame?.type === "task_history_end",
+        );
+        return reloads.length === 1 && historyEndIdx > reloadIdx;
+      },
+      { timeout: 15_000 },
+    )
+    .toBe(true);
+  expect(
+    rollbackFrames().findIndex((frame) => frame?.type === "task_history_end"),
+  ).toBeGreaterThan(
+    rollbackFrames().findIndex((frame) => frame?.type === "task_reload"),
+  );
+
   // Send a follow-up message to confirm the session is fully functional.
   await sendMessage(page, 'Please reply with "alive-six"');
+  await expect
+    .poll(
+      () =>
+        rollbackFrames().some(
+          (frame) =>
+            typeof frame?.agentAck === "string" && frame.agentAck.length > 0,
+        ),
+      { timeout: 15_000 },
+    )
+    .toBe(true);
   await expect(assistantText(page, "alive-six")).toBeVisible({
     timeout: 90_000,
   });
+  await expect(
+    page.locator(
+      ".message.user-message:visible:not(.pending):not(.meta-message)",
+      { hasText: "alive-six" },
+    ),
+  ).toBeVisible();
+  expect(
+    rollbackFrames().filter((frame) => frame?.type === "task_reload"),
+  ).toHaveLength(1);
+  expect(
+    rollbackFrames().some(
+      (frame) =>
+        frame?.type === "task_reload" && frame?.reason === "history_lineage",
+    ),
+  ).toBe(false);
 });
 
 test("codex alive-path undo counts only active turns after prior rollback", { tag: "@codex-only" }, async ({
