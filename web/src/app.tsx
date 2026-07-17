@@ -456,6 +456,7 @@ function AppContent() {
               return (
                 <div
                   key={task.uuid}
+                  data-tid={task.tid ?? undefined}
                   style={{ display: isActive ? "contents" : "none" }}
                 >
                   <SessionView

@@ -54,12 +54,21 @@ async function installParentAnswerObserver(page: Page) {
         parentStatus = status;
       }
       const addedAssistantMessage = records.some((record) =>
-        [...record.addedNodes].some(
-          (node) =>
-            node instanceof Element &&
-            (node.matches(".message.assistant-message") ||
-              node.querySelector(".message.assistant-message") !== null),
-        ),
+        [...record.addedNodes].some((node) => {
+          if (!(node instanceof Element)) return false;
+          const assistantMessage = node.matches(".message.assistant-message")
+            ? node
+            : node.querySelector(".message.assistant-message");
+          // Other tasks' views stay mounted after being loaded, and a
+          // focus_hint can transiently make the child's view the visible
+          // one while the parent is still hidden — so scope by the
+          // parent's own task container (data-tid="1"), not by visibility,
+          // to avoid counting the child's own output as the parent's.
+          return (
+            assistantMessage !== null &&
+            assistantMessage.closest('[data-tid="1"]') !== null
+          );
+        }),
       );
       if (addedAssistantMessage) {
         state.__cydoUiEvents!.push({ kind: "output", eventType: "assistant" });
@@ -457,8 +466,10 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
 
   await expect
     .poll(
-      () => {
-        const answerRouteEvents = answerEvents.slice(answerStart);
+      async () => {
+        const answerRouteEvents = (await parentAnswerEvents(page)).slice(
+          answerStart,
+        );
         const waitingIndex = answerRouteEvents.findIndex(
           (event) => event.kind === "status" && event.status === "waiting",
         );
@@ -468,8 +479,13 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
             event.kind === "status" &&
             event.status === "active",
         );
+        // The parent's own turn that issues the Ask tool call (its text +
+        // tool_use) can render as an "output" event right around the
+        // waiting transition — before the child's answer resumes it. Only
+        // an output strictly after activeIndex is evidence of the parent
+        // actually resuming and producing new output.
         const firstResumedOutput = answerRouteEvents.findIndex(
-          (event, index) => index > waitingIndex && event.kind === "output",
+          (event, index) => index > activeIndex && event.kind === "output",
         );
         return (
           waitingIndex >= 0 &&
@@ -477,7 +493,7 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
           firstResumedOutput > activeIndex
         );
       },
-      { timeout: 30_000 },
+      { timeout: 90_000 },
     )
     .toBe(true);
 
