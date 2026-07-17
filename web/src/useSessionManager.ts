@@ -1285,6 +1285,8 @@ export function useTaskManager(
             undoPending: {
               afterUuid: t.undoPending?.afterUuid ?? "",
               messagesRemoved: messages_removed,
+              canRevertFiles: t.undoPending?.canRevertFiles ?? false,
+              retainsPrompt: t.undoPending?.retainsPrompt ?? false,
             },
           };
           liveStates.set(t.uuid, updated);
@@ -1907,9 +1909,29 @@ export function useTaskManager(
     // Optimistically set afterUuid so confirmation bar can reference it
     const t = findByTid(tid);
     if (t) {
+      const boundary = [...t.replacementEvents.values()].find(
+        (event) =>
+          (event as { history_boundary?: { anchor: string } }).history_boundary
+            ?.anchor === afterUuid,
+      ) as
+        | {
+            history_boundary?: {
+              checkpoint_uuid?: string;
+              kind: "user" | "agent_turn";
+            };
+          }
+        | undefined;
+      const canRevertFiles =
+        t.sessionInfo?.supports_file_revert !== false &&
+        !!boundary?.history_boundary?.checkpoint_uuid;
       const updated = {
         ...t,
-        undoPending: { afterUuid, messagesRemoved: -1 },
+        undoPending: {
+          afterUuid,
+          messagesRemoved: -1,
+          canRevertFiles,
+          retainsPrompt: boundary?.history_boundary?.kind === "agent_turn",
+        },
       };
       liveStates.set(t.uuid, updated);
       setTasks((prev) => {
@@ -1918,7 +1940,7 @@ export function useTaskManager(
         return next;
       });
     }
-    connRef.current?.undoTask(tid, afterUuid, true);
+    connRef.current?.undoTask(tid, afterUuid, true, false, false);
   }, []);
 
   const undoConfirm = useCallback(

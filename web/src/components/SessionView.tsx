@@ -584,7 +584,8 @@ function SessionViewInner({
       {task.undoPending && task.undoPending.messagesRemoved >= 0 && (
         <UndoConfirmDialog
           messagesRemoved={task.undoPending.messagesRemoved}
-          supportsFileRevert={task.sessionInfo?.supports_file_revert !== false}
+          supportsFileRevert={task.undoPending.canRevertFiles}
+          retainsPrompt={task.undoPending.retainsPrompt}
           onConfirm={handleUndoConfirm}
           onDismiss={handleUndoDismiss}
         />
@@ -734,11 +735,13 @@ function QuoteSelectionButton({
 function UndoConfirmDialog({
   messagesRemoved,
   supportsFileRevert,
+  retainsPrompt,
   onConfirm,
   onDismiss,
 }: {
   messagesRemoved: number;
   supportsFileRevert: boolean;
+  retainsPrompt: boolean;
   onConfirm: (revertConversation: boolean, revertFiles: boolean) => void;
   onDismiss: () => void;
 }) {
@@ -755,6 +758,11 @@ function UndoConfirmDialog({
         }}
       >
         <div class="undo-dialog-header">Undo to this point?</div>
+        {retainsPrompt && (
+          <div class="undo-dialog-prompt-retention">
+            The preceding prompt will be retained.
+          </div>
+        )}
         {messagesRemoved > 0 && (
           <div class="undo-dialog-count">
             {messagesRemoved} message{messagesRemoved !== 1 ? "s" : ""} will be

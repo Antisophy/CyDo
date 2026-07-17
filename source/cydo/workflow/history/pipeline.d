@@ -290,7 +290,9 @@ class HistoryEventPipeline
 				continue;
 			assertReplayNativeIdentity(ta.driver,
 				probe.uuid.length > 0 ? probe.uuid : probe.item_id, boundaries[0].anchor);
-			boundaries[0].checkpointUuid = td.checkpointUuidForAnchor(boundaries[0].anchor);
+			if (ta.driver == AgentDriver.claude
+				&& boundaries[0].kind == PersistedHistoryBoundaryKind.user)
+				boundaries[0].checkpointUuid = td.checkpointUuidForAnchor(boundaries[0].anchor);
 			backfillHistoryBoundary(tid, i, HistoryBoundary(boundaries[0].anchor,
 				boundaries[0].kind == PersistedHistoryBoundaryKind.user
 					? HistoryBoundaryKind.user : HistoryBoundaryKind.agent_turn,

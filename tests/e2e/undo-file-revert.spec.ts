@@ -6,58 +6,78 @@ import {
   killSession,
   assistantText,
 } from "./fixtures";
-import { existsSync } from "fs";
+import { readFileSync } from "fs";
 
-test("undo with file revert removes file created by agent", { tag: "@claude-only" }, async ({
-  page,
-  backend,
-  agentType,
-}) => {
+test(
+  "undo file revert uses the selected checkpoint",
+  { tag: "@claude-only" },
+  async ({ page, backend, agentType }) => {
+    const testFile = `${backend.wsDir}/undo-revert-test.txt`;
+    const firstContent = "first checkpoint state";
+    const secondContent = "selected checkpoint state";
+    const thirdContent = "conversation only state";
 
-  const testFile = `${backend.wsDir}/undo-revert-test.txt`;
-  const testContent = "hello from undo-revert test";
+    await enterSession(page);
+    await sendMessage(
+      page,
+      `create file ${testFile} with content ${firstContent}`,
+    );
+    await expect(assistantText(page, "Done.")).toBeVisible({ timeout: 30_000 });
+  expect(readFileSync(testFile, "utf8").trimEnd()).toBe(firstContent);
 
-  await enterSession(page);
+    await sendMessage(
+      page,
+      `create file ${testFile} with content ${secondContent}`,
+    );
+    await expect(assistantText(page, "Done.")).toHaveCount(2, {
+      timeout: 30_000,
+    });
+  expect(readFileSync(testFile, "utf8").trimEnd()).toBe(secondContent);
 
-  // 1. Ask Claude to create a file — the "create file" pattern triggers a Write tool call
-  await sendMessage(
-    page,
-    `create file ${testFile} with content ${testContent}`,
-  );
+    await killSession(page, agentType);
+    const selectedUser = page
+      .locator(".message-wrapper", {
+        has: page.locator(".user-message", { hasText: secondContent }),
+      })
+      .last();
+    await selectedUser.hover();
+    await selectedUser.locator(".undo-btn").click();
+    await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+    await expect(
+      page.locator('.undo-dialog input[type="checkbox"]').nth(1),
+    ).toBeChecked();
+    await page.locator(".btn-undo").click();
+    await expect(page.locator(".undo-result-banner")).toBeVisible({
+      timeout: 15_000,
+    });
 
-  // Wait for the Write tool call and its result to complete (the mock follows
-  // up with a "Done." text response after the tool result)
-  await expect(assistantText(page, "Done.")).toBeVisible({ timeout: 30_000 });
+    // The selected second checkpoint restores the first write, proving the
+    // backend passed the resolved checkpoint rather than an adjacent one.
+  expect(readFileSync(testFile, "utf8").trimEnd()).toBe(firstContent);
 
-  // 2. Verify the file was created on disk
-  expect(existsSync(testFile), `File should exist at ${testFile}`).toBe(true);
+    await sendMessage(
+      page,
+      `create file ${testFile} with content ${thirdContent}`,
+    );
+    await expect(assistantText(page, "Done.")).toHaveCount(2, {
+      timeout: 30_000,
+    });
+  expect(readFileSync(testFile, "utf8").trimEnd()).toBe(thirdContent);
 
-  // 3. Kill the session so we can undo
-  await killSession(page, agentType);
-
-  // 4. Find the user message that asked to create the file and click undo
-  const userMsg = page
-    .locator(".message-wrapper", {
-      has: page.locator(".user-message", { hasText: "create file" }),
-    })
-    .last();
-  await userMsg.hover();
-  await expect(userMsg.locator(".undo-btn")).toBeVisible({ timeout: 5_000 });
-  await userMsg.locator(".undo-btn").click();
-
-  // 5. Confirm undo in the dialog (with file revert enabled — the default)
-  await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
-  await page.locator(".btn-undo").click();
-
-  // 6. Wait for the undo to complete — the result banner confirms rewindFiles finished
-  await expect(page.locator(".undo-result-banner")).toBeVisible({
-    timeout: 15_000,
-  });
-
-  // 7. Verify the file was reverted (should no longer exist since it didn't
-  //    exist before the undone message)
-  expect(
-    existsSync(testFile),
-    `File should have been removed by undo file revert: ${testFile}`,
-  ).toBe(false);
-});
+    await killSession(page, agentType);
+    const conversationOnly = page
+      .locator(".message-wrapper", {
+        has: page.locator(".user-message", { hasText: thirdContent }),
+      })
+      .last();
+    await conversationOnly.hover();
+    await conversationOnly.locator(".undo-btn").click();
+    await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+    await page.locator('.undo-dialog input[type="checkbox"]').nth(1).uncheck();
+    await page.locator(".btn-undo").click();
+    await expect(page.locator(".undo-result-banner")).toBeVisible({
+      timeout: 15_000,
+    });
+  expect(readFileSync(testFile, "utf8").trimEnd()).toBe(thirdContent);
+  },
+);

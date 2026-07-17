@@ -17,6 +17,11 @@ import cydo.domain.tasks.model : TaskData, Watermark,
 
 struct JsonlTracker
 {
+	private static bool boundaryHasCheckpoint(AgentDriver driver,
+		PersistedHistoryBoundaryKind kind)
+	{
+		return driver == AgentDriver.claude && kind == PersistedHistoryBoundaryKind.user;
+	}
 	struct LiveBoundaryCandidate { size_t seq; PersistedHistoryBoundaryKind kind; string identity; ulong generation; }
 	struct PersistedBoundaryCandidate { PersistedHistoryBoundary boundary; size_t sourceLine; bool requiresIdentity; ulong generation; }
 	struct BoundaryReconcileState {
@@ -356,7 +361,8 @@ struct JsonlTracker
 			if (tid !in boundaryState)
 				boundaryState[tid] = BoundaryReconcileState.init;
 			auto task = getTask(tid);
-			boundary.checkpointUuid = task.checkpointUuidForAnchor(boundary.anchor);
+			if (boundaryHasCheckpoint(getAgent(tid).driver, boundary.kind))
+				boundary.checkpointUuid = task.checkpointUuidForAnchor(boundary.anchor);
 			boundaryState[tid].persistedByKind[boundary.kind] ~= PersistedBoundaryCandidate(boundary,
 				cast(size_t) boundary.sourceLine, true, historyGeneration(tid));
 			drainLiveBoundaries(tid, boundary.kind);
@@ -430,6 +436,16 @@ struct JsonlTracker
 				? HistoryBoundaryKind.user : HistoryBoundaryKind.agent_turn,
 			boundary.checkpointUuid), publish, generation);
 	}
+}
+
+unittest
+{
+	assert(JsonlTracker.boundaryHasCheckpoint(AgentDriver.claude,
+		PersistedHistoryBoundaryKind.user));
+	assert(!JsonlTracker.boundaryHasCheckpoint(AgentDriver.claude,
+		PersistedHistoryBoundaryKind.agent_turn));
+	assert(!JsonlTracker.boundaryHasCheckpoint(AgentDriver.codex,
+		PersistedHistoryBoundaryKind.user));
 }
 
 unittest

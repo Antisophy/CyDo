@@ -269,6 +269,17 @@ CodexActiveUserTurnsAfterResult countActiveUserTurnsAfterForkId(string content, 
 	return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.ok, count);
 }
 
+/// Count active persisted message records from `anchor` onward for JSONL undo.
+/// Rollback-dead records are excluded by the active-boundary extraction.
+int countActiveFallbackRecordsFromBoundary(string content, string anchor)
+{
+	auto boundaries = extractPersistedHistoryBoundariesImpl(content);
+	foreach (i, ref boundary; boundaries)
+		if (boundary.anchor == anchor)
+			return cast(int)(boundaries.length - i);
+	return -1;
+}
+
 /// Check if a JSONL line is a ThreadRolledBack event_msg.
 bool isRollbackMarker(string line)
 {
@@ -421,6 +432,21 @@ unittest
 
 		auto assistant = countActiveUserTurnsAfterForkId(jsonl, "line:5");
 		assert(assistant.status == CodexActiveUserTurnsAfterStatus.targetNotUser);
+	}
+
+	// Fallback JSONL preview counts any active boundary, including assistants.
+	{
+		string jsonl =
+			`{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`;
+		assert(countActiveFallbackRecordsFromBoundary(jsonl, "line:3") == 1);
+		assert(countActiveFallbackRecordsFromBoundary(jsonl, "line:2") == 2);
+		assert(countActiveFallbackRecordsFromBoundary(jsonl, "line:5") == -1);
+		assert(countActiveFallbackRecordsFromBoundary(jsonl, "line:999999") == -1);
 	}
 
 	// Count user-turn groups, not raw user lines, after rollback.

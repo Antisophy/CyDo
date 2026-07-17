@@ -103,47 +103,113 @@ test("undo moves user message text to input box", async ({
   );
 });
 
-test("undo on first Claude message restores draft input", { tag: "@claude-only" }, async ({
-  page,
-  agentType,
-}) => {
+test(
+  "undo on first Claude message restores draft input",
+  { tag: "@claude-only" },
+  async ({ page, agentType }) => {
+    await enterSession(page);
 
-  await enterSession(page);
+    const prompt = 'Please reply with "first-undo-draft"';
+    await sendMessage(page, prompt);
+    await expect(assistantText(page, "first-undo-draft")).toBeVisible({
+      timeout: 30_000,
+    });
 
-  const prompt = 'Please reply with "first-undo-draft"';
-  await sendMessage(page, prompt);
-  await expect(assistantText(page, "first-undo-draft")).toBeVisible({
-    timeout: 30_000,
-  });
+    await killSession(page, agentType);
 
-  await killSession(page, agentType);
+    const firstUserMsg = page
+      .locator(".message-wrapper", {
+        has: page.locator(".user-message", { hasText: "first-undo-draft" }),
+      })
+      .last();
+    await expect(firstUserMsg).toBeVisible({ timeout: 15_000 });
+    await firstUserMsg.hover();
 
-  const firstUserMsg = page
-    .locator(".message-wrapper", {
-      has: page.locator(".user-message", { hasText: "first-undo-draft" }),
-    })
-    .last();
-  await expect(firstUserMsg).toBeVisible({ timeout: 15_000 });
-  await firstUserMsg.hover();
+    await expect(firstUserMsg.locator(".undo-btn")).toBeVisible({
+      timeout: 5_000,
+    });
+    await firstUserMsg.locator(".undo-btn").click();
 
-  await expect(firstUserMsg.locator(".undo-btn")).toBeVisible({
-    timeout: 5_000,
-  });
-  await firstUserMsg.locator(".undo-btn").click();
+    await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+    await page.locator(".btn-undo").click();
 
-  await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
-  await page.locator(".btn-undo").click();
+    await expect(
+      page.locator(".message.user-message:not(.pending)", {
+        hasText: "first-undo-draft",
+      }),
+    ).toHaveCount(0, { timeout: 15_000 });
+    await expect(assistantText(page, "first-undo-draft")).toHaveCount(0, {
+      timeout: 15_000,
+    });
 
-  await expect(
-    page.locator(".message.user-message:not(.pending)", {
-      hasText: "first-undo-draft",
-    }),
-  ).toHaveCount(0, { timeout: 15_000 });
-  await expect(assistantText(page, "first-undo-draft")).toHaveCount(0, {
-    timeout: 15_000,
-  });
+    const input = page.locator(".input-textarea:visible").first();
+    await expect(input).toBeVisible({ timeout: 15_000 });
+    await expect(input).toHaveValue(prompt, { timeout: 15_000 });
+  },
+);
 
-  const input = page.locator(".input-textarea:visible").first();
-  await expect(input).toBeVisible({ timeout: 15_000 });
-  await expect(input).toHaveValue(prompt, { timeout: 15_000 });
-});
+test(
+  "offline assistant undo retains its prompt",
+  { tag: "@claude-only" },
+  async ({ page, agentType }) => {
+    const prompt = "ASSISTANT_UNDO_PROMPT";
+    const selected = "ASSISTANT_UNDO_SELECTED";
+    const later = "ASSISTANT_UNDO_LATER";
+
+    await enterSession(page);
+    await sendMessage(page, `Reply exactly with ${selected}. ${prompt}`);
+    await expect(assistantText(page, selected)).toBeVisible({
+      timeout: 30_000,
+    });
+    await sendMessage(page, `Reply exactly with ${later}`);
+    await expect(assistantText(page, later)).toBeVisible({ timeout: 30_000 });
+
+    let assistant = page
+      .locator(".message-wrapper", {
+        has: page.locator(".assistant-message", { hasText: selected }),
+      })
+      .last();
+    await assistant.hover();
+    await expect(assistant.locator(".undo-btn")).toBeVisible({
+      timeout: 5_000,
+    });
+    await assistant.locator(".undo-btn").click();
+    await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+    // Assistant boundaries never carry a file checkpoint, even during live
+    // JSONL reconciliation.
+    await expect(
+      page.locator('.undo-dialog input[type="checkbox"]').nth(1),
+    ).toBeDisabled();
+    await page.locator(".undo-dialog .btn", { hasText: "Cancel" }).click();
+
+    await killSession(page, agentType);
+    await page.reload();
+    await expect(assistantText(page, selected)).toBeVisible({
+      timeout: 15_000,
+    });
+    assistant = page
+      .locator(".message-wrapper", {
+        has: page.locator(".assistant-message", { hasText: selected }),
+      })
+      .last();
+    await assistant.hover();
+    await assistant.locator(".undo-btn").click();
+    await expect(
+      page.locator('.undo-dialog input[type="checkbox"]').nth(1),
+    ).toBeDisabled();
+    await expect(page.locator(".undo-dialog-prompt-retention")).toHaveText(
+      "The preceding prompt will be retained.",
+    );
+    await page.locator(".btn-undo").click();
+
+    await expect(assistantText(page, selected)).toHaveCount(0, {
+      timeout: 15_000,
+    });
+    await expect(assistantText(page, later)).toHaveCount(0, {
+      timeout: 15_000,
+    });
+    await expect(
+      page.locator(".message.user-message:not(.pending)", { hasText: prompt }),
+    ).toBeVisible({ timeout: 15_000 });
+  },
+);

@@ -86,7 +86,12 @@ function makeRichState(): TaskState {
     preReloadDrafts: ["draft A"],
     inputDraft: "draft B",
     error: "stderr line",
-    undoPending: { afterUuid: "u-1", messagesRemoved: 1 },
+    undoPending: {
+      afterUuid: "u-1",
+      messagesRemoved: 1,
+      canRevertFiles: false,
+      retainsPrompt: false,
+    },
     undoResult: "undo-ok",
     suggestions: ["next step"],
     serverDraft: "server draft",
