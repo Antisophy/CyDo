@@ -3,6 +3,7 @@ import { execFileSync, spawn } from "child_process";
 import type { ChildProcess } from "child_process";
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   readFileSync,
   rmSync,
@@ -322,6 +323,142 @@ exec "$CYDO_REAL_CODEX_BIN" "$@"
       expect(BigInt(second.start.timestampNs)).toBeLessThan(
         BigInt(first.handoff.timestampNs),
       );
+    } finally {
+      await stopBackend(backend);
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "Codex app-server startup timeout does not crash the backend",
+  { tag: "@codex-only" },
+  async ({}, testInfo) => {
+    test.skip(testInfo.project.name !== "codex", "codex-only regression");
+
+    const workDir = "/tmp/cydo-codex-app-server-startup-timeout";
+    const workerHome = `${workDir}/home`;
+    const logPath = `${workDir}/app-server-startups.jsonl`;
+    const wrapperPath = `${workDir}/codex-wrapper.sh`;
+    const codexHome = `${workDir}/codex-home`;
+    const project = `${workDir}/project`;
+    const realCodexBin = execFileSync("sh", ["-lc", "command -v codex"], {
+      encoding: "utf8",
+    }).trim();
+
+    rmSync(workDir, { recursive: true, force: true });
+    mkdirSync(`${workDir}/data`, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    execFileSync("git", ["init", project]);
+    symlinkSync("/tmp/cydo-test-workspace/defs", `${workDir}/defs`);
+    mkdirSync(`${workerHome}/.config/cydo`, { recursive: true });
+    cpSync("/tmp/codex-test-home", codexHome, { recursive: true });
+
+    writeFileSync(
+      wrapperPath,
+      `#!/bin/sh
+if [ "$1" = app-server ] && [ "$2" = --listen ] && [ "$3" = stdio:// ]; then
+  printf '{"pid":%s,"event":"start","timestampNs":%s,"codexHome":"%s"}\\n' "$$" "$(date +%s%N)" "$CODEX_HOME" >> "$CYDO_APP_SERVER_STARTUP_LOG"
+  sleep 31
+  printf '{"pid":%s,"event":"handoff","timestampNs":%s,"codexHome":"%s"}\\n' "$$" "$(date +%s%N)" "$CODEX_HOME" >> "$CYDO_APP_SERVER_STARTUP_LOG"
+fi
+exec "$CYDO_REAL_CODEX_BIN" "$@"
+`,
+      { mode: 0o755 },
+    );
+
+    writeFileSync(
+      `${workerHome}/.config/cydo/config.yaml`,
+      [
+        "default_agent: delayed-codex",
+        "agents:",
+        "  delayed-codex:",
+        "    driver: codex",
+        "    sandbox:",
+        "      env:",
+        `        CYDO_CODEX_BIN: ${wrapperPath}`,
+        `        CODEX_HOME: ${codexHome}`,
+        `        CYDO_REAL_CODEX_BIN: ${realCodexBin}`,
+        `        CYDO_APP_SERVER_STARTUP_LOG: ${logPath}`,
+        "workspaces:",
+        "  delayed:",
+        `    root: ${project}`,
+        "",
+      ].join("\n"),
+    );
+
+    const backend = spawn(process.env.CYDO_BIN!, [], {
+      detached: true,
+      cwd: workDir,
+      env: {
+        ...process.env,
+        HOME: workerHome,
+        CODEX_HOME: codexHome,
+        CYDO_CODEX_BIN: wrapperPath,
+        CYDO_REAL_CODEX_BIN: realCodexBin,
+        CYDO_APP_SERVER_STARTUP_LOG: logPath,
+        XDG_DATA_HOME: `${workDir}/data`,
+      },
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+
+    try {
+      await waitForBackend(backend);
+      const ws = new WebSocket("ws://localhost:3940/ws");
+      await waitForOpen(ws);
+      const correlationId = "startup-timeout";
+      const created = waitForMessage(
+        ws,
+        (data) =>
+          data.type === "task_created" &&
+          data.correlation_id === correlationId &&
+          typeof data.tid === "number",
+        30_000,
+      );
+      ws.send(
+        JSON.stringify({
+          type: "create_task",
+          workspace: "delayed",
+          project_path: project,
+          entry_point: "agentic",
+          agent_name: "delayed-codex",
+          correlation_id: correlationId,
+        }),
+      );
+      const tid = (await created).tid;
+      const historyEnd = waitForMessage(
+        ws,
+        (data) => data.type === "task_history_end" && data.tid === tid,
+        30_000,
+      );
+      ws.send(JSON.stringify({ type: "request_history", tid }));
+      await historyEnd;
+      ws.send(
+        JSON.stringify({
+          type: "message",
+          tid,
+          content: [{ type: "text", text: 'Please reply with "done"' }],
+        }),
+      );
+
+      await expect
+        .poll(
+          () =>
+            existsSync(logPath) &&
+            readStartupRecords(logPath).some((record) => record.event === "start"),
+        )
+        .toBe(true);
+      await expect
+        .poll(
+          () =>
+            existsSync(logPath) &&
+            readStartupRecords(logPath).some((record) => record.event === "handoff"),
+          { timeout: 45_000 },
+        )
+        .toBe(true);
+      expect(backend.exitCode).toBeNull();
+      expect((await fetch("http://localhost:3940")).status).toBeLessThan(500);
+      ws.close();
     } finally {
       await stopBackend(backend);
       rmSync(workDir, { recursive: true, force: true });

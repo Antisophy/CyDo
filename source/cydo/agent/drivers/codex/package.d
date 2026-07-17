@@ -386,7 +386,7 @@ class CodexAgent : Agent
 		if (lease.released)
 			return;
 		lease.released = true;
-		if (lease.timeout !is null)
+		if (lease.timeout !is null && lease.timeout.isWaiting)
 			lease.timeout.cancel();
 		auto gate = lease.codexHome in appServerStartupGates;
 		if (gate is null)
