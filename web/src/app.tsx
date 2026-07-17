@@ -34,6 +34,7 @@ function AppContent() {
     resume,
     promote,
     fork,
+    undo,
     undoPreview,
     undoConfirm,
     undoDismiss,
@@ -74,10 +75,12 @@ function AppContent() {
   useEffect(() => {
     if (!window.__cydoE2e) return;
     window.__cydoE2e.fork = fork;
+    window.__cydoE2e.undo = undo;
     return () => {
       delete window.__cydoE2e?.fork;
+      delete window.__cydoE2e?.undo;
     };
-  }, [fork]);
+  }, [fork, undo]);
   const mergedNotices = useMemo(
     () => ({ ...notices, ...localNotices }),
     [notices, localNotices],

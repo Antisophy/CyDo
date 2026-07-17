@@ -6,6 +6,62 @@ import {
   assistantText,
   killSession,
 } from "./fixtures";
+import { readFileSync } from "fs";
+import type { Page } from "@playwright/test";
+
+async function visibleHistory(page: Page) {
+  return page.locator(".message-wrapper").evaluateAll((wrappers) =>
+    wrappers
+      .filter((wrapper) => wrapper.querySelector(".message:not(.meta-message)"))
+      .map((wrapper) => wrapper.textContent),
+  );
+}
+
+async function activeTid(page: Page): Promise<number> {
+  const tid = await page
+    .locator(".sidebar-item.active[data-tid]")
+    .getAttribute("data-tid")
+    .catch(() => null);
+  if (tid !== null) return Number(tid);
+  return Number(
+    await page.locator(".sidebar-item[data-tid]").last().getAttribute("data-tid"),
+  );
+}
+
+async function undoAnchorForUserMessage(page: Page, userText: string) {
+  const userMessage = page
+    .locator(".message-wrapper:visible", {
+      has: page.locator(
+        ".message.user-message:visible:not(.pending):not(.meta-message)",
+        { hasText: userText },
+      ),
+    })
+    .last();
+  await userMessage.hover();
+  const anchor = await userMessage
+    .locator(".fork-btn")
+    .getAttribute("data-fork-anchor");
+  expect(anchor).toMatch(/^line:\d+$/);
+  return anchor!;
+}
+
+async function expectUndoRequestRejected(
+  page: Page,
+  tid: number,
+  anchor: string,
+  dryRun: boolean,
+  revertFiles: boolean,
+) {
+  const errorDialog = page.waitForEvent("dialog");
+  await page.evaluate(({ tid, anchor, dryRun, revertFiles }) => {
+    if (!window.__cydoE2e?.undo)
+      throw new Error("CyDo e2e undo bridge unavailable");
+    window.__cydoE2e.undo(tid, anchor, dryRun, true, revertFiles);
+  }, { tid, anchor, dryRun, revertFiles });
+  const error = await errorDialog;
+  expect(error.message()).toBe("UUID not found in task history");
+  await error.dismiss();
+}
 
 async function openUndoDialogForUserMessage(
   page: import("@playwright/test").Page,
@@ -347,6 +403,167 @@ test(
 
     await sendMessage(page, 'Please reply with "CODEX_FALLBACK_FOLLOW_UP"');
     await expect(assistantText(page, "CODEX_FALLBACK_FOLLOW_UP")).toBeVisible({
+      timeout: 90_000,
+    });
+  },
+);
+
+test(
+  "codex rejects a plausible forged undo line anchor without side effects",
+  { tag: "@codex-only" },
+  async ({ page, backend }) => {
+    await page.addInitScript(() => {
+      (window as Window & { __cydoE2e?: object }).__cydoE2e = {};
+    });
+    const marker = "UNDO_FORGED_CANONICAL";
+    const probe = "UNDO_FORGED_ALIVE";
+    const testFile = `${backend.wsDir}/tmp/codex-fileviewer-create.txt`;
+    const fileContent = "hello from create fixture";
+    const frames: any[] = [];
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", (event) => {
+        try {
+          frames.push(JSON.parse(event.payload.toString()));
+        } catch {
+          // Ignore non-JSON frames.
+        }
+      });
+    });
+
+    await enterSession(page);
+    await sendMessage(page, "codex filechange create fixture");
+    await expect(assistantText(page, "Done.")).toBeVisible({ timeout: 90_000 });
+    expect(readFileSync(testFile, "utf8").trimEnd()).toBe(fileContent);
+    await sendMessage(page, `Reply exactly with ${marker}`);
+    await expect(assistantText(page, marker)).toBeVisible({ timeout: 90_000 });
+    const tid = await activeTid(page);
+    const history = await visibleHistory(page);
+    const frameStart = frames.length;
+
+    await expectUndoRequestRejected(page, tid, "line:999999", true, false);
+    await expectUndoRequestRejected(page, tid, "line:999999", false, true);
+
+    await expect.poll(() => frames.slice(frameStart).filter(
+      (frame) => frame?.type === "error",
+    ).length).toBe(2);
+    expect(
+      frames
+        .slice(frameStart)
+        .filter((frame) => frame?.type === "error")
+        .map((frame) => ({ tid: frame.tid, message: frame.message })),
+    ).toEqual([
+      { tid, message: "UUID not found in task history" },
+      { tid, message: "UUID not found in task history" },
+    ]);
+    expect(
+      frames.slice(frameStart).some(
+        (frame) =>
+          frame?.type === "undo_preview" ||
+          frame?.type === "undo_result" ||
+          frame?.type === "task_reload",
+      ),
+    ).toBe(false);
+    expect(await visibleHistory(page)).toEqual(history);
+    expect(readFileSync(testFile, "utf8").trimEnd()).toBe(fileContent);
+    await page.reload();
+    await expect(assistantText(page, marker)).toBeVisible({ timeout: 15_000 });
+    expect(await visibleHistory(page)).toEqual(history);
+    expect(readFileSync(testFile, "utf8").trimEnd()).toBe(fileContent);
+    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled({
+      timeout: 15_000,
+    });
+    await sendMessage(page, `Reply exactly with ${probe}`);
+    await expect(assistantText(page, probe)).toBeVisible({ timeout: 90_000 });
+  },
+);
+
+test(
+  "codex rejects a rollback-dead undo anchor after canonical reload without side effects",
+  { tag: "@codex-only" },
+  async ({ page }) => {
+    await page.addInitScript(() => {
+      (window as Window & { __cydoE2e?: object }).__cydoE2e = {};
+    });
+    const retained = "UNDO_STALE_RETAINED";
+    const rolledBack = "UNDO_STALE_ROLLED_BACK";
+    const frames: any[] = [];
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", (event) => {
+        try {
+          frames.push(JSON.parse(event.payload.toString()));
+        } catch {
+          // Ignore non-JSON frames.
+        }
+      });
+    });
+
+    await enterSession(page);
+    await sendMessage(page, `Reply exactly with ${retained}`);
+    await expect(assistantText(page, retained)).toBeVisible({ timeout: 90_000 });
+    await sendMessage(page, `Reply exactly with ${rolledBack}`);
+    await expect(assistantText(page, rolledBack)).toBeVisible({ timeout: 90_000 });
+    const staleAnchor = await undoAnchorForUserMessage(page, rolledBack);
+    const tid = await activeTid(page);
+
+    const rollbackFrameStart = frames.length;
+    await undoUserMessage(page, `Reply exactly with ${rolledBack}`);
+    await expect(assistantText(page, rolledBack)).toHaveCount(0, {
+      timeout: 15_000,
+    });
+    await expect
+      .poll(
+        () =>
+          frames
+            .slice(rollbackFrameStart)
+            .some((frame) => frame?.type === "undo_result"),
+        { timeout: 15_000 },
+      )
+      .toBe(true);
+    await expect
+      .poll(
+        () =>
+          frames
+            .slice(rollbackFrameStart)
+            .some((frame) => frame?.type === "task_reload"),
+        { timeout: 15_000 },
+      )
+      .toBe(true);
+    // Reload from the canonical active boundary set before replaying the old
+    // physical JSONL line anchor through the normal request bridge.
+    await page.reload();
+    await expect(assistantText(page, retained)).toBeVisible({ timeout: 15_000 });
+    await expect(assistantText(page, rolledBack)).toHaveCount(0);
+    const history = await visibleHistory(page);
+    const frameStart = frames.length;
+
+    await expectUndoRequestRejected(page, tid, staleAnchor, false, true);
+    await expect.poll(() => frames.slice(frameStart).filter(
+      (frame) => frame?.type === "error",
+    ).length).toBe(1);
+    expect(
+      frames
+        .slice(frameStart)
+        .filter((frame) => frame?.type === "error")
+        .map((frame) => ({ tid: frame.tid, message: frame.message })),
+    ).toEqual([{ tid, message: "UUID not found in task history" }]);
+    expect(
+      frames.slice(frameStart).some(
+        (frame) =>
+          frame?.type === "undo_preview" ||
+          frame?.type === "undo_result" ||
+          frame?.type === "task_reload",
+      ),
+    ).toBe(false);
+    expect(await visibleHistory(page)).toEqual(history);
+    await page.reload();
+    await expect(assistantText(page, retained)).toBeVisible({ timeout: 15_000 });
+    await expect(assistantText(page, rolledBack)).toHaveCount(0);
+    expect(await visibleHistory(page)).toEqual(history);
+    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled({
+      timeout: 15_000,
+    });
+    await sendMessage(page, "Reply exactly with UNDO_STALE_ALIVE");
+    await expect(assistantText(page, "UNDO_STALE_ALIVE")).toBeVisible({
       timeout: 90_000,
     });
   },

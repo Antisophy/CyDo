@@ -162,6 +162,13 @@ export interface TaskManager {
   resume: (uuid: string) => void;
   promote: (tid: number) => void;
   fork: (tid: number, afterUuid: string) => void;
+  undo: (
+    tid: number,
+    afterUuid: string,
+    dryRun: boolean,
+    revertConversation: boolean,
+    revertFiles: boolean,
+  ) => void;
   undoPreview: (tid: number, afterUuid: string) => void;
   undoConfirm: (
     tid: number,
@@ -1913,6 +1920,25 @@ export function useTaskManager(
     connRef.current?.forkTask(tid, afterUuid);
   }, []);
 
+  const undo = useCallback(
+    (
+      tid: number,
+      afterUuid: string,
+      dryRun: boolean,
+      revertConversation: boolean,
+      revertFiles: boolean,
+    ) => {
+      connRef.current?.undoTask(
+        tid,
+        afterUuid,
+        dryRun,
+        revertConversation,
+        revertFiles,
+      );
+    },
+    [],
+  );
+
   const undoPreview = useCallback((tid: number, afterUuid: string) => {
     // Optimistically set afterUuid so confirmation bar can reference it
     const t = findByTid(tid);
@@ -2248,6 +2274,7 @@ export function useTaskManager(
     resume,
     promote,
     fork,
+    undo,
     undoPreview,
     undoConfirm,
     undoDismiss,

@@ -225,6 +225,7 @@ export function useExportedTaskManager(): TaskManager {
     resume: noop,
     promote: noop,
     fork: noop,
+    undo: noop,
     undoPreview: noop,
     undoConfirm: noop,
     undoDismiss: noop,
