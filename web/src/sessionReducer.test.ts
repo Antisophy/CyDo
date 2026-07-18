@@ -84,6 +84,51 @@ describe("session/status reducer", () => {
   });
 });
 
+describe("task diagnostic reducer", () => {
+  it("maps a typed diagnostic to its explicit display payload without entering the user-message lifecycle", () => {
+    const state = {
+      ...makeState(),
+      messages: [
+        {
+          id: "pending-user",
+          type: "user" as const,
+          content: [{ type: "text" as const, text: "optimistic input" }],
+          ackState: 4 as const,
+          nonce: "nonce-1",
+          pending: true,
+        },
+      ],
+      msgIdCounter: 1,
+    };
+    const diagnostic = {
+      type: "cydo/task_diagnostic" as const,
+      severity: "error" as const,
+      subject: "Failed to resume session",
+      body: "**The session is unavailable.**",
+    };
+
+    const next = reduceMessage(state, diagnostic, 17, 123456);
+
+    expect(next.messages).toHaveLength(2);
+    expect(next.messages[1]).toMatchObject({
+      id: "task-diagnostic-2",
+      type: "diagnostic",
+      diagnostic: {
+        severity: "error",
+        subject: diagnostic.subject,
+      },
+      rawSource: diagnostic,
+      seq: 17,
+      ts: 123456,
+    });
+    expect(next.messages[1]).not.toHaveProperty("cydoMeta");
+    expect(next.messages[1]).not.toHaveProperty("nonce");
+    expect(next.messages[1]).not.toHaveProperty("ackState");
+    expect(next.messages[1]).not.toHaveProperty("pending");
+    expect(next.messages[0]).toEqual(state.messages[0]);
+  });
+});
+
 describe("session init and metadata reducers", () => {
   it("bootstraps session state from init, then applies metadata as a model update", () => {
     const init = {

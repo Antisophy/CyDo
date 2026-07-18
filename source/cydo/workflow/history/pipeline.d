@@ -915,8 +915,12 @@ unittest
 
 unittest
 {
-	import ae.utils.json : JSONFragment, jsonParse;
+	import ae.net.asockets : ConnectionState, DisconnectType, IConnection;
+	import ae.sys.dataset : joinData;
+	import ae.utils.array : as;
+	import ae.utils.json : JSONFragment, jsonParse, toJson;
 	import cydo.domain.tasks.model : Watermark;
+	import cydo.protocol : TaskDiagnosticEvent, TaskDiagnosticSeverity;
 
 	// A synthesized diagnostic is an in-memory history event, rather than a
 	// transient broadcast. Keep its typed payload intact so request_history can
@@ -924,12 +928,42 @@ unittest
 	enum tid = 73;
 	enum subject = "Failed to load session history";
 	enum body = "The Codex session is unavailable.";
-	enum diagnostic = `{"type":"cydo/task_diagnostic","subject":"` ~ subject
-		~ `","body":"` ~ body ~ `","severity":"error"}`;
-
 	auto td = TaskData(tid, "local", "/tmp");
 	td.history.reset(Watermark.none());
 	Data[] sent;
+	class StubWebSocketAdapter : WebSocketAdapter
+	{
+		string[] sent;
+
+		this()
+		{
+			super(new class IConnection
+			{
+				ConnectionState state_ = ConnectionState.connected;
+				void delegate(string, DisconnectType) disconnectHandler;
+
+				@property ConnectionState state() { return state_; }
+				void send(scope Data[] data, int priority) {}
+				void disconnect(string reason, DisconnectType type)
+				{
+					state_ = ConnectionState.disconnected;
+					disconnectHandler(reason, type);
+				}
+				@property void handleConnect(void delegate() value) {}
+				@property void handleReadData(void delegate(Data) value) {}
+				@property void handleDisconnect(void delegate(string, DisconnectType) value)
+				{
+					disconnectHandler = value;
+				}
+				@property void handleBufferFlushed(void delegate() value) {}
+			});
+		}
+
+		override void send(scope Data[] data, int priority)
+		{
+			sent ~= cast(string) data.joinData().toGC().as!string;
+		}
+	}
 	HistoryEventPipelineHost host;
 	host.getTask = (int t) => t == tid ? &td : null;
 	host.tryAgentForTask = (int t) => null;
@@ -939,7 +973,11 @@ unittest
 	host.makeTaskDiagnosticEventJson = (string actualSubject, string actualBody) {
 		assert(actualSubject == subject);
 		assert(actualBody == body);
-		return diagnostic;
+		TaskDiagnosticEvent diagnostic;
+		diagnostic.severity = TaskDiagnosticSeverity.error;
+		diagnostic.subject = actualSubject;
+		diagnostic.body = actualBody;
+		return toJson(diagnostic);
 	};
 	host.sendToSubscribed = (int t, Data data) { sent ~= data; };
 	host.subscribe = (WebSocketAdapter ws, int t) {};
@@ -964,8 +1002,7 @@ unittest
 	auto persisted = cast(string) td.history[0].toGC();
 	assert(extractTsFromEnvelope(persisted) > 0,
 		"synthesized diagnostic must receive an append timestamp");
-	assert(extractEventFromEnvelope(persisted) == diagnostic,
-		"history must retain the exact typed diagnostic payload");
+	auto persistedEvent = extractEventFromEnvelope(persisted);
 
 	@JSONPartial static struct DiagnosticProbe
 	{
@@ -993,4 +1030,29 @@ unittest
 	assert(sent.length == 1, "only the ordinary task event is broadcast here");
 	assert(cast(string) sent[0].toGC() == toJson(TaskEventSeqEnvelope(tid, 1,
 		4242, JSONFragment(`{"type":"process/stderr","text":"after diagnostic"}`))));
+
+	// Request history through the same generic replay path used by the browser.
+	// The replay must retain the typed event rather than construct an item shape.
+	auto ws = new StubWebSocketAdapter();
+	scope(exit) ws.disconnect("test complete", DisconnectType.requested);
+	pipeline.handleRequestHistory(ws, tid);
+	assert(ws.sent.length == 4, "replay must send start, both events, and end");
+	@JSONPartial static struct ReplayProbe
+	{
+		int tid;
+		int seq;
+		long ts;
+		JSONFragment event;
+	}
+	auto replayEnvelope = jsonParse!ReplayProbe(ws.sent[1]);
+	auto replayedDiagnostic = jsonParse!DiagnosticProbe(replayEnvelope.event.json);
+	assert(replayEnvelope.tid == tid && replayEnvelope.seq == 0,
+		"diagnostic must replay before later task output");
+	assert(replayEnvelope.ts == envelope.ts,
+		"replay must preserve the diagnostic timestamp");
+	assert(replayEnvelope.event.json == persistedEvent,
+		"generic replay must preserve the exact inner event");
+	assert(replayedDiagnostic.type == "cydo/task_diagnostic");
+	assert(replayedDiagnostic.subject == subject && replayedDiagnostic.body == body);
+	assert(replayedDiagnostic.severity == "error");
 }

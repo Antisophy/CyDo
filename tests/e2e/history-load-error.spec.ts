@@ -168,14 +168,21 @@ test(
       .locator(".sidebar-item .sidebar-label", { hasText: "orphan-agent-task" })
       .click();
 
-    // The stream must contain exactly one severity-error system message.
-    const errorMsg = page.locator(".system-user-message.severity-error");
+    // The stream must contain exactly one error diagnostic block.
+    const errorMsg = page.locator(".diagnostic-message.diagnostic-error");
     await expect(errorMsg).toHaveCount(1, { timeout: 10_000 });
 
     // The body must mention the orphan agent name and say it is not configured.
     await expect(errorMsg).toContainText(/agent.*nonexistent.*is not configured/i);
+    await expect(errorMsg.locator('[title="Edit message"]')).toHaveCount(0);
+    await expect(errorMsg.locator('[title="Undo from here"]')).toHaveCount(0);
+    await expect(
+      page.locator(".system-message", { hasText: /Unknown message type/i }),
+    ).toHaveCount(0);
+    await expect(page.locator(".input-textarea:visible").first()).toHaveValue("");
 
-    // Reload the page and verify the error survives the history replay.
+    // Reload deterministically re-synthesizes and replays the diagnostic; it
+    // is not persisted in agent JSONL or a CyDo event journal.
     await page.reload();
     await expect(
       page.locator(".sidebar-item .sidebar-label", {
@@ -185,10 +192,16 @@ test(
     await page
       .locator(".sidebar-item .sidebar-label", { hasText: "orphan-agent-task" })
       .click();
-    const errorMsgAfterReload = page.locator(".system-user-message.severity-error");
+    const errorMsgAfterReload = page.locator(".diagnostic-message.diagnostic-error");
     await expect(errorMsgAfterReload).toHaveCount(1, { timeout: 10_000 });
     await expect(errorMsgAfterReload).toContainText(
       /agent.*nonexistent.*is not configured/i,
     );
+    await expect(errorMsgAfterReload.locator('[title="Edit message"]')).toHaveCount(0);
+    await expect(errorMsgAfterReload.locator('[title="Undo from here"]')).toHaveCount(0);
+    await expect(
+      page.locator(".system-message", { hasText: /Unknown message type/i }),
+    ).toHaveCount(0);
+    await expect(page.locator(".input-textarea:visible").first()).toHaveValue("");
   },
 );

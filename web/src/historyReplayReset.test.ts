@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { reduceMessage } from "./sessionReducer";
-import { resetTaskForHistoryReplay } from "./historyReplayReset";
+import {
+  reconcileInputDraft,
+  resetTaskForHistoryReplay,
+  snapshotUserDrafts,
+} from "./historyReplayReset";
 import { makeTaskState, type TaskState } from "./types";
 
 function asEvent(event: object): Parameters<typeof reduceMessage>[1] {
@@ -95,6 +99,64 @@ function makeRichState(): TaskState {
 }
 
 describe("history replay reset", () => {
+  it("preserves optimistic user drafts while discarding and replaying diagnostics", () => {
+    const before = reduceMessage(
+      {
+        ...makeTaskState(1, true, true),
+        messages: [
+          {
+            id: "user-1",
+            type: "user" as const,
+            content: [{ type: "text" as const, text: "unreplayed input" }],
+          },
+          {
+            id: "pending-1",
+            type: "user" as const,
+            content: [{ type: "text" as const, text: "optimistic input" }],
+            ackState: 4 as const,
+            nonce: "nonce-1",
+            pending: true,
+          },
+        ],
+      },
+      asEvent({
+        type: "cydo/task_diagnostic",
+        severity: "error",
+        subject: "Failed to load session history",
+        body: "The session is unavailable.",
+      }),
+    );
+    const preReloadDrafts = snapshotUserDrafts(before);
+    const reset = resetTaskForHistoryReplay({ ...before, preReloadDrafts }, 1);
+    const replayed = reduceMessage(
+      reset,
+      asEvent({
+        type: "cydo/task_diagnostic",
+        severity: "error",
+        subject: "Failed to load session history",
+        body: "The session is unavailable.",
+      }),
+    );
+
+    expect(preReloadDrafts).toEqual(["unreplayed input", "optimistic input"]);
+    expect(reset.messages).toEqual([before.messages[1]]);
+    expect(
+      replayed.messages.filter((message) => message.type === "diagnostic"),
+    ).toHaveLength(1);
+    expect(
+      replayed.messages.find((message) => message.type === "diagnostic"),
+    ).not.toHaveProperty("nonce");
+    expect(
+      replayed.messages.find((message) => message.type === "diagnostic"),
+    ).toMatchObject({
+      diagnostic: {
+        severity: "error",
+        subject: "Failed to load session history",
+      },
+    });
+    expect(reconcileInputDraft(replayed)).toBe("unreplayed input");
+  });
+
   it("preserves task metadata but clears replay-derived timeline state", () => {
     const before = makeRichState();
     const reset = resetTaskForHistoryReplay(before, 12);
