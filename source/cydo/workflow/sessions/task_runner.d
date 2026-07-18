@@ -54,7 +54,7 @@ struct TaskSessionRunnerHost
 	Agent delegate(int tid) tryAgentForTask;
 	void delegate(int tid) clearLastActive;
 	void delegate(int tid, TranslatedEvent ev) broadcastTask;
-	string delegate(int tid, string subject, string body) appendSynthesizedHistoryError;
+	string delegate(int tid, string subject, string body) appendTaskDiagnostic;
 	void delegate(int tid, string translated) broadcastAppendedTaskEvent;
 	void delegate(int tid, string nonce) sendAgentAck;
 	void delegate(int tid) publishTaskSnapshot;
@@ -506,7 +506,7 @@ class TaskSessionRunner
 			if (missingExecutableLaunchFailure)
 			{
 				host_.resetHistoryWatermarkOnly(tid);
-				auto translated = host_.appendSynthesizedHistoryError(
+				auto translated = host_.appendTaskDiagnostic(
 					tid, "Failed to resume session",
 					buildLaunchFailureBody(tid, current.error));
 				host_.broadcastAppendedTaskEvent(tid, translated);
@@ -678,7 +678,7 @@ class TaskSessionRunner
 					[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
 						TaskStatus.waiting, TaskStatus.completed], TaskStatus.failed,
 					TaskNotificationChange.preserve);
-				auto translated = host_.appendSynthesizedHistoryError(
+				auto translated = host_.appendTaskDiagnostic(
 					tid, "Failed to resume session", buildLaunchFailureBody(tid, e));
 				host_.broadcastAppendedTaskEvent(tid, translated);
 				if (!host_.deliverFailedPendingSubTaskResult(tid))

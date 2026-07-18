@@ -82,7 +82,7 @@ struct WorkflowToolsHost
 		string nonce) sendTaskMessage;
 	void delegate(int tid, string reason) emitTaskReload;
 	void delegate(int tid, string subject,
-		string body) appendSynthesizedHistoryError;
+		string body) appendTaskDiagnostic;
 
 	bool delegate(int tid) taskAlive;
 	bool delegate(int aTid, int bTid) tasksShareWorkspace;
@@ -202,7 +202,7 @@ unittest
 		ensureProcessQueueAlive: (int tid) => tid == 2 ? reject!void(new Exception("simulated child session startup failure")) : resolve(),
 		sendTaskMessage: (int tid, const(ContentBlock)[] content, const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) { assert(tid == 3); },
 		emitTaskReload: (int tid, string reason) {},
-		appendSynthesizedHistoryError: (int tid, string subject, string body) {},
+		appendTaskDiagnostic: (int tid, string subject, string body) {},
 		taskAlive: (int tid) => false, tasksShareWorkspace: (int aTid, int bTid) => true,
 		taskWorkspaceLabel: (int tid) => "local", addIdleCallback: (int tid, void delegate() cb) {},
 		reactivateTask: (int tid, void delegate() onReady) {},
@@ -1498,7 +1498,7 @@ private:
 					[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
 						TaskStatus.waiting, TaskStatus.completed], TaskStatus.failed,
 					TaskNotificationChange.preserve);
-				host_.appendSynthesizedHistoryError(tid,
+				host_.appendTaskDiagnostic(tid,
 					"Continuation failed", td.error);
 				return;
 			}
@@ -1727,7 +1727,7 @@ unittest
 				"startup failure should prevent sending the subtask prompt");
 		},
 		emitTaskReload: (int tid, string reason) {},
-		appendSynthesizedHistoryError: (int tid, string subject, string body) {},
+		appendTaskDiagnostic: (int tid, string subject, string body) {},
 		taskAlive: (int tid) => false,
 		tasksShareWorkspace: (int aTid, int bTid) => true,
 		taskWorkspaceLabel: (int tid) => "local",

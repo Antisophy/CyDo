@@ -41,7 +41,7 @@ struct HistoryEventPipelineHost
 	string delegate(int tid) effectiveCwd;
 	string delegate(string translated, string agentName) injectAgentNameIntoSessionInit;
 	string delegate(string translated, int tid) normalizeKnownSystemMessageMeta;
-	string delegate(string subject, string body) synthesizeHistoryErrorEventJson;
+	string delegate(string subject, string body) makeTaskDiagnosticEventJson;
 	void delegate(int tid, Data data) sendToSubscribed;
 	void delegate(WebSocketAdapter ws, int tid) subscribe;
 	void delegate(WebSocketAdapter ws, int tid) sendForkableUuids;
@@ -230,7 +230,7 @@ class HistoryEventPipeline
 				tid, td.history.length, sw.peek.total!"msecs");
 
 		if (orphan)
-			appendSynthesizedHistoryError(tid, "Failed to load session history",
+			appendTaskDiagnostic(tid, "Failed to load session history",
 				buildOrphanAgentBody(td.agentType));
 
 		td.clearPendingDequeuedSteering();
@@ -334,7 +334,7 @@ class HistoryEventPipeline
 		td.pendingSteeringTexts ~= extractContentText(uiContent);
 	}
 
-	string appendSynthesizedHistoryError(int tid, string subject, string body)
+	string appendTaskDiagnostic(int tid, string subject, string body)
 	{
 		import std.datetime : Clock;
 
@@ -342,7 +342,7 @@ class HistoryEventPipeline
 		if (td is null)
 			return null;
 
-		auto translated = host_.synthesizeHistoryErrorEventJson(subject, body);
+		auto translated = host_.makeTaskDiagnosticEventJson(subject, body);
 		auto envelope = toJson(TaskEventEnvelope(tid, Clock.currStdTime,
 			JSONFragment(translated)));
 		td.history.appendLive(Data(envelope.representation), null);
@@ -797,7 +797,7 @@ unittest
 	host.effectiveCwd = (int t) => projectPath;
 	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
 	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
-	host.synthesizeHistoryErrorEventJson = (string subject, string body) => "";
+	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";
 	host.sendToSubscribed = (int t, Data d) {};
 	host.subscribe = (WebSocketAdapter ws, int t) {};
 	host.sendForkableUuids = (WebSocketAdapter ws, int t) {};
@@ -884,7 +884,7 @@ unittest
 	host.effectiveCwd = (int t) => projectPath;
 	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
 	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
-	host.synthesizeHistoryErrorEventJson = (string subject, string body) => "";
+	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";
 	host.sendToSubscribed = (int t, Data d) {};
 	host.subscribe = (WebSocketAdapter ws, int t) {};
 	host.sendForkableUuids = (WebSocketAdapter ws, int t) {};
@@ -911,4 +911,86 @@ unittest
 			"queued steering event must keep the enqueue physical line");
 	}
 	assert(sawQueuedSteering, "queued steering replay event missing from loaded history");
+}
+
+unittest
+{
+	import ae.utils.json : JSONFragment, jsonParse;
+	import cydo.domain.tasks.model : Watermark;
+
+	// A synthesized diagnostic is an in-memory history event, rather than a
+	// transient broadcast. Keep its typed payload intact so request_history can
+	// replay the same event kind the client received live.
+	enum tid = 73;
+	enum subject = "Failed to load session history";
+	enum body = "The Codex session is unavailable.";
+	enum diagnostic = `{"type":"cydo/task_diagnostic","subject":"` ~ subject
+		~ `","body":"` ~ body ~ `","severity":"error"}`;
+
+	auto td = TaskData(tid, "local", "/tmp");
+	td.history.reset(Watermark.none());
+	Data[] sent;
+	HistoryEventPipelineHost host;
+	host.getTask = (int t) => t == tid ? &td : null;
+	host.tryAgentForTask = (int t) => null;
+	host.effectiveCwd = (int t) => "";
+	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
+	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
+	host.makeTaskDiagnosticEventJson = (string actualSubject, string actualBody) {
+		assert(actualSubject == subject);
+		assert(actualBody == body);
+		return diagnostic;
+	};
+	host.sendToSubscribed = (int t, Data data) { sent ~= data; };
+	host.subscribe = (WebSocketAdapter ws, int t) {};
+	host.sendForkableUuids = (WebSocketAdapter ws, int t) {};
+	host.broadcastForkableUuids = (int t) {};
+	host.sendReplaySupplementalState = (WebSocketAdapter ws, int t) {};
+	host.onHistorySubscribed = (int t) {};
+	host.ensureAgentSessionIdFromEvent = (int t, string line) {};
+	host.updateClaudeUsageFromEvent = (int t, string translated) => false;
+	host.planBroadcast = (int t, TranslatedEvent ev) => HistoryBroadcastPlan.init;
+
+	auto pipeline = new HistoryEventPipeline(host);
+	pipeline.appendTaskDiagnostic(tid, subject, body);
+	pipeline.appendAndBroadcastTaskEvent(tid,
+		TranslatedEvent(`{"type":"process/stderr","text":"after diagnostic"}`,
+			null, AbsTime(4242)));
+
+	assert(td.history.length == 2, "diagnostic must precede later task output");
+	assert(td.history.rawAt(0) is null, "synthesized diagnostic must have no raw agent line");
+	assert(td.history.sourceLineAt(0) == 0, "synthesized diagnostic must not claim a JSONL line");
+
+	auto persisted = cast(string) td.history[0].toGC();
+	assert(extractTsFromEnvelope(persisted) > 0,
+		"synthesized diagnostic must receive an append timestamp");
+	assert(extractEventFromEnvelope(persisted) == diagnostic,
+		"history must retain the exact typed diagnostic payload");
+
+	@JSONPartial static struct DiagnosticProbe
+	{
+		string type;
+		string subject;
+		string body;
+		string severity;
+	}
+	@JSONPartial static struct EnvelopeProbe
+	{
+		int tid;
+		long ts;
+		JSONFragment event;
+	}
+	auto envelope = jsonParse!EnvelopeProbe(persisted);
+	auto replayed = jsonParse!DiagnosticProbe(envelope.event.json);
+	assert(envelope.tid == tid && envelope.ts > 0);
+	assert(replayed.type == "cydo/task_diagnostic");
+	assert(replayed.subject == subject && replayed.body == body);
+	assert(replayed.severity == "error");
+
+	auto later = cast(string) td.history[1].toGC();
+	assert(extractTsFromEnvelope(later) == 4242,
+		"later task event must retain its producer timestamp");
+	assert(sent.length == 1, "only the ordinary task event is broadcast here");
+	assert(cast(string) sent[0].toGC() == toJson(TaskEventSeqEnvelope(tid, 1,
+		4242, JSONFragment(`{"type":"process/stderr","text":"after diagnostic"}`))));
 }

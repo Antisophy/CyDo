@@ -48,7 +48,7 @@ import cydo.workflow.history.pipeline : HistoryBroadcastPlan, HistoryEventPipeli
 import cydo.workflow.history.abbrev : extractMessageText;
 import cydo.runtime.logging : installRobustLogger;
 import cydo.workflow.system_message_normalizer : SystemMessageNormalizer,
-	SystemMessageNormalizerHost, buildCydoMeta;
+	SystemMessageNormalizerHost;
 import cydo.workflow.tasks.derived_text : DerivedTextJobs, DerivedTextJobsHost;
 import cydo.workflow.tasks.mutations : TaskMutationService, TaskMutationServiceHost;
 import cydo.workflow.tools.backend : WorkflowToolsBackend, WorkflowToolsHost;
@@ -61,7 +61,8 @@ import cydo.domain.usage.tracker : AgentUsageTracker;
 
 import cydo.agent.contract : Agent;
 import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
-	ItemStartedEvent, SessionRateLimitEvent, TaskEventEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
+	ItemStartedEvent, SessionRateLimitEvent, TaskDiagnosticEvent, TaskDiagnosticSeverity,
+	TaskEventEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
 	UnconfirmedUserEventEnvelope, extractContentText;
 import cydo.agent.drivers.registry : isRegisteredAgent;
 import cydo.agent.session : AgentSession;
@@ -384,8 +385,8 @@ class App
 			},
 			sendTaskMessage: &sendTaskMessage,
 			emitTaskReload: &emitTaskReload,
-			appendSynthesizedHistoryError: (int tid, string subject, string body) {
-				historyPipeline.appendSynthesizedHistoryError(tid, subject, body);
+			appendTaskDiagnostic: (int tid, string subject, string body) {
+				historyPipeline.appendTaskDiagnostic(tid, subject, body);
 			},
 			taskAlive: &taskAlive,
 			tasksShareWorkspace: (int aTid, int bTid) {
@@ -490,7 +491,7 @@ class App
 			normalizeKnownSystemMessageMeta: (string translated, int tid) {
 				return systemMessageNormalizer.normalizeKnownSystemMessageMeta(translated, tid);
 			},
-			synthesizeHistoryErrorEventJson: &synthesizeHistoryErrorEventJson,
+			makeTaskDiagnosticEventJson: &makeTaskDiagnosticEventJson,
 			sendToSubscribed: (int tid, Data data) {
 				clientHub.sendToSubscribed(tid, data);
 			},
@@ -564,8 +565,8 @@ class App
 			broadcastTask: (int tid, TranslatedEvent ev) {
 				historyPipeline.broadcastTask(tid, ev);
 			},
-			appendSynthesizedHistoryError: (int tid, string subject, string body) {
-				return historyPipeline.appendSynthesizedHistoryError(tid, subject, body);
+			appendTaskDiagnostic: (int tid, string subject, string body) {
+				return historyPipeline.appendTaskDiagnostic(tid, subject, body);
 			},
 			broadcastAppendedTaskEvent: &broadcastAppendedTaskEvent,
 			sendAgentAck: &sendAgentAck,
@@ -2671,28 +2672,13 @@ class App
 		clientHub.broadcast(toJson(TaskReloadMessage("task_reload", tid, reason)));
 	}
 
-	/// Wrap text in [SYSTEM: ...] tags so the agent knows the message is
-	/// injected by CyDo, not typed by the user.
-	private string wrapSystemMessage(string subject, string body = null)
+	private string makeTaskDiagnosticEventJson(string subject, string body)
 	{
-		import cydo.foundation.system.framing : wrapSystemMessageFn = wrapSystemMessage;
-		return wrapSystemMessageFn(config.system_keyword, subject, body);
-	}
-
-	/// Build an `item/started` envelope JSON for a synthesized error system-message.
-	private string synthesizeHistoryErrorEventJson(string subject, string body)
-	{
-		auto wrappedText = wrapSystemMessage(subject, body);
-		ItemStartedEvent ev;
-		ev.item_id   = "cydo-history-error";
-		ev.item_type = "user_message";
-		ev.text      = wrappedText;
-		ev.content   = [ContentBlock("text", wrappedText)];
-		ev.is_meta   = true;
-		auto json = toJson(ev);
-		auto meta = buildCydoMeta(subject, ["details": body], "details",
-			true /*bodyMarkdown*/, "error" /*severity*/);
-		return json[0 .. $ - 1] ~ `,"meta":` ~ meta ~ `}`;
+		TaskDiagnosticEvent event;
+		event.severity = TaskDiagnosticSeverity.error;
+		event.subject = subject;
+		event.body = body;
+		return toJson(event);
 	}
 
 	private bool updateClaudeUsageFromEvent(int tid, string translated)
