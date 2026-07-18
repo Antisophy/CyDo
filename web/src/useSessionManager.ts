@@ -23,10 +23,13 @@ import type {
 import type { CydoMeta, TaskState } from "./types";
 import { makeTaskState } from "./types";
 import { reduceMessage } from "./sessionReducer";
-import { canonicalUserTextFromDisplayMessage } from "./userText";
 import { drafts as inputDrafts } from "./components/InputBox";
 import { outbox } from "./outbox";
-import { resetTaskForHistoryReplay } from "./historyReplayReset";
+import {
+  reconcileInputDraft,
+  resetTaskForHistoryReplay,
+  snapshotUserDrafts,
+} from "./historyReplayReset";
 
 export interface ImageAttachment {
   id: string;
@@ -1059,11 +1062,7 @@ export function useTaskManager(
             if (isEdit) {
               nextDrafts = undefined;
             } else {
-              const snap = t.messages
-                .filter((m) => m.type === "user")
-                .map((m) => canonicalUserTextFromDisplayMessage(m))
-                .filter((s) => s.length > 0);
-              nextDrafts = snap.length > 0 ? snap : undefined;
+              nextDrafts = snapshotUserDrafts(t);
             }
           } else {
             // Intermediate reload within an open cycle — preserve the snapshot
@@ -1156,24 +1155,7 @@ export function useTaskManager(
           // Cycle is closing — compute inputDraft by multiset-subtracting the
           // pre-reload snapshot against the canonical user texts in the final
           // replayed messages (both sides use canonicalUserTextFromDisplayMessage).
-          let inputDraft: string | undefined;
-          if (t0.preReloadDrafts && t0.preReloadDrafts.length > 0) {
-            const finalCounts = new Map<string, number>();
-            for (const m of t0.messages) {
-              if (m.type !== "user") continue;
-              const s = canonicalUserTextFromDisplayMessage(m);
-              if (s.length === 0) continue;
-              finalCounts.set(s, (finalCounts.get(s) ?? 0) + 1);
-            }
-            const remaining: string[] = [];
-            for (const text of t0.preReloadDrafts) {
-              const c = finalCounts.get(text) ?? 0;
-              if (c > 0) finalCounts.set(text, c - 1);
-              else remaining.push(text);
-            }
-            inputDraft =
-              remaining.length > 0 ? remaining.join("\n\n") : undefined;
-          }
+          const inputDraft = reconcileInputDraft(t0);
 
           const t = {
             ...t0,

@@ -1,4 +1,34 @@
 import { makeTaskState, type TaskState } from "./types";
+import { canonicalUserTextFromDisplayMessage } from "./userText";
+
+export function snapshotUserDrafts(task: TaskState): string[] | undefined {
+  const drafts = task.messages
+    .filter((message) => message.type === "user")
+    .map((message) => canonicalUserTextFromDisplayMessage(message))
+    .filter((text) => text.length > 0);
+  return drafts.length > 0 ? drafts : undefined;
+}
+
+export function reconcileInputDraft(task: TaskState): string | undefined {
+  if (!task.preReloadDrafts || task.preReloadDrafts.length === 0) {
+    return undefined;
+  }
+
+  const finalCounts = new Map<string, number>();
+  for (const message of task.messages) {
+    if (message.type !== "user") continue;
+    const text = canonicalUserTextFromDisplayMessage(message);
+    if (text.length === 0) continue;
+    finalCounts.set(text, (finalCounts.get(text) ?? 0) + 1);
+  }
+  const remaining: string[] = [];
+  for (const text of task.preReloadDrafts) {
+    const count = finalCounts.get(text) ?? 0;
+    if (count > 0) finalCounts.set(text, count - 1);
+    else remaining.push(text);
+  }
+  return remaining.length > 0 ? remaining.join("\n\n") : undefined;
+}
 
 /**
  * task_history_start marks the beginning of a full replay bundle for one task.
