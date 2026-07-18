@@ -26,6 +26,7 @@ export type {
   ControlResponseEvent,
   ProcessStderrEvent,
   ProcessExitEvent,
+  TaskDiagnosticEvent,
   ItemStartedEvent,
   ItemDeltaEvent,
   ItemCompletedEvent,
@@ -52,6 +53,7 @@ import type {
   ControlResponseEvent,
   ProcessStderrEvent,
   ProcessExitEvent,
+  TaskDiagnosticEvent,
   ItemStartedEvent,
   ItemDeltaEvent,
   ItemCompletedEvent,
@@ -168,6 +170,7 @@ export type AgnosticEvent =
   | TurnStopEvent
   | ControlResponseEvent
   | ProcessExitEvent
+  | TaskDiagnosticEvent
   | ProcessStderrEvent
   | AgentWarningEvent
   | AgentErrorEvent

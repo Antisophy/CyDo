@@ -7,6 +7,7 @@ import type {
   AssistantContentBlock,
   AskUserQuestionItem,
   ModelUsageInfo,
+  TaskDiagnosticEvent,
 } from "./protocol";
 
 /** Metadata for system-generated user messages (prompt templates, nudges). */
@@ -22,6 +23,7 @@ export interface DisplayMessage {
   id: string;
   type:
     | "user"
+    | "diagnostic"
     | "assistant"
     | "tool_result"
     | "system"
@@ -104,6 +106,10 @@ export interface DisplayMessage {
   /** Metadata for system-generated user messages. Present only for messages
    *  sent by CyDo on behalf of the user (prompt templates, nudges). */
   cydoMeta?: CydoMeta;
+  diagnostic?: {
+    severity: TaskDiagnosticEvent["severity"];
+    subject: string;
+  };
 }
 
 export type ToolResultContent =

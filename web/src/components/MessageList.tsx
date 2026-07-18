@@ -326,6 +326,38 @@ function SystemUserMessage({ message }: { message: DisplayMessage }) {
   );
 }
 
+function TaskDiagnosticView({ message }: { message: DisplayMessage }) {
+  const diagnostic = message.diagnostic!;
+  const body = message.content
+    .filter(
+      (block): block is { type: "text"; text: string } => block.type === "text",
+    )
+    .map((block) => block.text)
+    .join("\n");
+  if (diagnostic.severity === "info") {
+    return (
+      <div class="message system-message diagnostic-message diagnostic-info">
+        <div class="system-message-label">{diagnostic.subject}</div>
+        <Markdown text={body} />
+      </div>
+    );
+  }
+  const blockClass =
+    diagnostic.severity === "error" ? "error-block" : "warning-block";
+  const labelClass =
+    diagnostic.severity === "error"
+      ? "error-block-label"
+      : "warning-block-label";
+  return (
+    <div class={`diagnostic-message diagnostic-${diagnostic.severity}`}>
+      <div class={blockClass}>
+        <div class={labelClass}>{diagnostic.subject}</div>
+        <Markdown text={body} />
+      </div>
+    </div>
+  );
+}
+
 function InitDetailList({ label, items }: { label: string; items: unknown[] }) {
   return (
     <details class="init-details">
@@ -538,6 +570,9 @@ const MessageView = memo(
         ) : (
           <UserMessage message={msg} />
         );
+        break;
+      case "diagnostic":
+        inner = <TaskDiagnosticView message={msg} />;
         break;
       case "assistant":
         inner = (

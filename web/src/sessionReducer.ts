@@ -1389,6 +1389,32 @@ export function reduceExit(s: SessionState): SessionState {
   return cancelPendingFileEdits({ ...s, sessionStatus: null });
 }
 
+function reduceTaskDiagnostic(
+  s: SessionState,
+  msg: Extract<AgnosticEvent, { type: "cydo/task_diagnostic" }>,
+  seq?: number,
+  ts?: number,
+): SessionState {
+  return {
+    ...s,
+    messages: [
+      ...s.messages,
+      {
+        id: `task-diagnostic-${++s.msgIdCounter}`,
+        type: "diagnostic",
+        content: [{ type: "text", text: msg.body }],
+        diagnostic: {
+          severity: msg.severity,
+          subject: msg.subject,
+        },
+        rawSource: msg,
+        seq,
+        ts,
+      },
+    ],
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Top-level dispatcher: routes to individual reducers
 // ---------------------------------------------------------------------------
@@ -1400,6 +1426,8 @@ export function reduceMessage(
   ts?: number,
 ): SessionState {
   switch (msg.type) {
+    case "cydo/task_diagnostic":
+      return reduceTaskDiagnostic(s, msg, seq, ts);
     case "session/init":
       return reduceSystemInit(s, msg, seq);
 
