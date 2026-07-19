@@ -2,6 +2,7 @@ module cydo.workflow.tasks.mutations;
 
 import core.lifetime : move;
 
+import std.file : exists, readText;
 import std.logger : warningf;
 import std.string : representation;
 
@@ -27,7 +28,7 @@ import cydo.workflow.history.jsonl_edit : replaceUserMessageContent;
 import cydo.workflow.history.operations : HistoryOperation, HistoryOperationMechanism,
 	allowsFileRevert, allowsOperation, selectHistoryOperations;
 import cydo.workflow.history.jsonl_store : countLinesAfterForkId,
-	editJsonlMessage, forkTask, lastForkIdInJsonl, spliceJsonlByLine,
+	editJsonlMessage, forkTask, spliceJsonlByLine,
 	truncateJsonl, writeJsonlPrefix;
 import cydo.workflow.sessions.task_runner : TaskSessionLaunch;
 
@@ -764,9 +765,10 @@ private:
 		{
 			import std.datetime : Clock;
 
-			auto lastForkId = lastForkIdInJsonl(
-				ta.historyPath(td.agentSessionId, host_.effectiveCwd(td)),
-				&ta.extractForkableIds);
+			auto historyPath = ta.historyPath(td.agentSessionId, host_.effectiveCwd(td));
+			auto boundaries = historyPath.length > 0 && exists(historyPath)
+				? ta.extractPersistedHistoryBoundaries(readText(historyPath)) : null;
+			auto lastForkId = boundaries.length > 0 ? boundaries[$ - 1].anchor : null;
 			if (lastForkId.length > 0)
 			{
 				auto backup = forkTask(*host_.persistence(), tid, td.agentSessionId,

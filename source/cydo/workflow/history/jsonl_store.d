@@ -367,20 +367,6 @@ int countLinesAfterForkId(string jsonlPath, string afterForkId,
 	return pastTarget ? count : -1;
 }
 
-/// Return the last forkable ID in a JSONL file.
-/// extractFn extracts forkable IDs from JSONL content (agent-specific).
-/// Returns null if no forkable messages found.
-string lastForkIdInJsonl(string jsonlPath, string[] delegate(string content, int lineOffset = 0) extractFn)
-{
-	import std.file : exists, readText;
-
-	if (jsonlPath.length == 0 || !exists(jsonlPath))
-		return null;
-
-	auto ids = extractFn(readText(jsonlPath));
-	return ids.length > 0 ? ids[$ - 1] : null;
-}
-
 /// Find the UUID of the first type:"user" message appearing after the line
 /// matching forkId.  Returns null if not found.
 string findNextUserUuid(string jsonlPath, string forkId,

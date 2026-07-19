@@ -139,13 +139,6 @@ interface Agent
 	/// Each agent knows its own session ID field names.
 	string rewriteSessionId(string line, string oldId, string newId);
 
-	/// Extract forkable identifiers from JSONL content.
-	/// Returns opaque ID strings that the frontend sends back as afterUuid.
-	/// Each ID corresponds to a user or assistant message boundary.
-	/// lineOffset is added to line numbers for agents that use line-based IDs
-	/// (used when extracting from a partial read of the file).
-	string[] extractForkableIds(string content, int lineOffset = 0);
-
 	/// Extract persisted history boundaries with explicit kinds.
 	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0);
 

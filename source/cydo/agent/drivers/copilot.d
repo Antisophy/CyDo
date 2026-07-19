@@ -616,35 +616,6 @@ class CopilotAgent : Agent
 		return line;
 	}
 
-	string[] extractForkableIds(string content, int lineOffset = 0)
-	{
-		import std.algorithm : startsWith;
-		import std.string : lineSplitter;
-
-		@JSONPartial static struct TypeIdProbe { string type; string id;
-			@JSONPartial static struct Data { string content; }
-			Data data; }
-
-		string[] ids;
-		foreach (line; content.lineSplitter)
-		{
-			if (line.length == 0)
-				continue;
-			try
-			{
-				auto probe = jsonParse!TypeIdProbe(line);
-				if (probe.type != "user.message" && probe.type != "assistant.message")
-					continue;
-				if (probe.type == "user.message" && probe.data.content.startsWith("[SYSTEM:"))
-					continue;
-				if (probe.id.length > 0)
-					ids ~= probe.id;
-			}
-			catch (Exception) {}
-		}
-		return ids;
-	}
-
 	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0)
 	{
 		import std.algorithm : startsWith;
@@ -1946,7 +1917,6 @@ unittest
 		~ "\n"
 		~ `{"type":"user.message","id":"native-user-id","data":{"content":"ordinary"}}`
 		~ "\n";
-	assert(agent.extractForkableIds(content) == ["native-user-id"]);
 	auto boundaries = agent.extractPersistedHistoryBoundaries(content);
 	assert(boundaries.length == 1);
 	assert(boundaries[0].anchor == "native-user-id");

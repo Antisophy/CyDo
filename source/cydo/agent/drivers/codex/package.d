@@ -706,49 +706,6 @@ class CodexAgent : Agent
 			.replace(`"session_id":"` ~ oldId ~ `"`, `"session_id":"` ~ newId ~ `"`);
 	}
 
-	string[] extractForkableIds(string content, int lineOffset = 0)
-	{
-		import std.conv : to;
-		import std.string : lineSplitter;
-
-		string[] ids;
-		int lineNum = lineOffset;
-		// Codex prepends system context as a role=user response_item before the
-		// first task_started event.  Skip role=user lines until task_started is
-		// seen so the system context is not treated as a forkable user message.
-		// lineOffset > 0 means we're reading past the startup section already.
-		bool seenTaskStarted = lineOffset > 0;
-		foreach (line; content.lineSplitter)
-		{
-			lineNum++;
-			if (line.length == 0)
-				continue;
-			auto probe = parseRolloutLineProbe(line);
-			if (!seenTaskStarted && probe.isTaskStarted)
-			{
-				seenTaskStarted = true;
-				continue;
-			}
-			// Handle ThreadRolledBack markers: remove last N user-turn groups
-			if (probe.isThreadRolledBack)
-			{
-				if (probe.rollbackNumTurns > 0)
-					ids = applyRollbackToIds(ids, probe.rollbackNumTurns);
-				continue;
-			}
-			// Forkable: message response_item with role user or assistant
-			if (!probe.isForkableMessage)
-				continue;
-			// Skip pre-session role=user lines (system context injected before task_started).
-			if (probe.isUserMessage && !seenTaskStarted)
-				continue;
-			if (probe.isUserMessage && isCodexContextOnlyUserMessageLine(line))
-				continue;
-			ids ~= "line:" ~ to!string(lineNum);
-		}
-		return ids;
-	}
-
 	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0)
 	{
 		return extractPersistedHistoryBoundariesImpl(content, lineOffset);

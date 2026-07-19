@@ -401,52 +401,6 @@ class ClaudeCodeAgent : Agent
 			.replace(`"session_id":"` ~ oldId ~ `"`, `"session_id":"` ~ newId ~ `"`);
 	}
 
-	string[] extractForkableIds(string content, int lineOffset = 0)
-	{
-		import std.algorithm : canFind;
-		import std.format : format;
-		import std.string : indexOf, lineSplitter;
-
-		string[] ids;
-		int lineNum = lineOffset;
-		foreach (line; content.lineSplitter)
-		{
-			lineNum++;
-			if (line.length == 0)
-				continue;
-			// Queue-op enqueue lines become undo anchors for steering messages.
-			// Truncating at the enqueue naturally removes the enqueue itself plus
-			// all subsequent lines (tool_result, responses, dequeue, echo).
-			// Parse the operation field properly to avoid whitespace sensitivity.
-			if (line.canFind(`"queue-operation"`))
-			{
-				import ae.utils.json : jsonParse, JSONPartial;
-				@JSONPartial static struct QueueOpProbe { string operation; }
-				try
-				{
-					auto qop = jsonParse!QueueOpProbe(line);
-					if (qop.operation == "enqueue")
-						ids ~= format!"enqueue-%d"(lineNum);
-				}
-				catch (Exception e) { tracef("history scan: queue op parse error: %s", e.msg); }
-				continue;
-			}
-			if (!line.canFind(`"type":"user"`) && !line.canFind(`"type":"assistant"`))
-				continue;
-			// Extract "uuid":"<value>" by prefix scanning
-			enum prefix = `"uuid":"`;
-			auto idx = line.indexOf(prefix);
-			if (idx >= 0)
-			{
-				auto start = idx + prefix.length;
-				auto end = line.indexOf('"', start);
-				if (end >= 0 && end > idx + cast(ptrdiff_t) prefix.length)
-					ids ~= line[start .. end];
-			}
-		}
-		return ids;
-	}
-
 	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0)
 	{
 		import std.algorithm : canFind;

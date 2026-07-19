@@ -104,20 +104,6 @@ uint parseRollbackNumTurns(string line)
 	return probe.isThreadRolledBack ? probe.rollbackNumTurns : 0;
 }
 
-/// Apply a rollback to a list of fork IDs: remove the last N user-turn groups.
-/// A user-turn group is a user message and all following assistant messages
-/// until the next user message.
-string[] applyRollbackToIds(string[] ids, uint numTurns)
-{
-	if (numTurns == 0 || ids.length == 0)
-		return ids;
-
-	auto toRemove = numTurns * 2;
-	if (toRemove >= ids.length)
-		return [];
-	return ids[0 .. $ - toRemove];
-}
-
 /// Apply a rollback to persisted history boundaries: remove the last N user-turn groups.
 PersistedHistoryBoundary[] applyRollbackToIdsWithInfo(PersistedHistoryBoundary[] ids, uint numTurns)
 {
