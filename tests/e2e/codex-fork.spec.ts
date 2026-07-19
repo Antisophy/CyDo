@@ -317,11 +317,13 @@ test(
     const parentHistory = await visibleHistory(page);
     const tidsBeforeFork = await snapshotTids(page);
 
-    const forkError = page.waitForEvent("dialog");
     await forkThroughBridge(page, parentTid, "line:999999");
-    const error = await forkError;
-    expect(error.message()).toBe("Fork failed: message UUID not found in task history");
-    await error.dismiss();
+    const forkError = page.locator(".command-error-dialog");
+    await expect(forkError).toContainText(
+      "Fork failed: message UUID not found in task history",
+    );
+    await forkError.getByRole("button", { name: "Dismiss" }).click();
+    await expect(forkError).not.toBeVisible();
     expect(await snapshotTids(page)).toEqual(tidsBeforeFork);
     expect(taskCreatedEvents.filter((event) => event.parent_tid === parentTid && event.relation_type === "fork")).toHaveLength(0);
     expect(await visibleHistory(page)).toEqual(parentHistory);
@@ -389,11 +391,13 @@ test(
     const tidsBeforeFork = await snapshotTids(page);
     const parentHistory = await visibleHistory(page);
 
-    const forkError = page.waitForEvent("dialog");
     await forkThroughBridge(page, staleTid, staleAnchor!);
-    const error = await forkError;
-    expect(error.message()).toBe("Fork failed: message UUID not found in task history");
-    await error.dismiss();
+    const forkError = page.locator(".command-error-dialog");
+    await expect(forkError).toContainText(
+      "Fork failed: message UUID not found in task history",
+    );
+    await forkError.getByRole("button", { name: "Dismiss" }).click();
+    await expect(forkError).not.toBeVisible();
     expect(await snapshotTids(page)).toEqual(tidsBeforeFork);
     expect(
       taskCreatedEvents.filter(

@@ -347,13 +347,11 @@ test("invalid raw JSON edit is rejected and leaves the JSONL file unchanged", as
 
   await openRawEditor(page, "Done.");
   await page.locator(".raw-edit-textarea").fill("null");
-  const dialogPromise = page.waitForEvent("dialog").then(async (dialog) => {
-    const message = dialog.message();
-    await dialog.dismiss();
-    return message;
-  });
   await page.locator(".edit-actions .btn-primary").click();
-  expect(await dialogPromise).toMatch(/Invalid JSON|JSON objects/);
+  const dialog = page.locator(".command-error-dialog");
+  await expect(dialog).toContainText(/Invalid JSON|JSON objects/);
+  await dialog.getByRole("button", { name: "Dismiss" }).click();
+  await expect(dialog).not.toBeVisible();
 
   expect(readHistoryFile(historyPath)).toBe(originalFile);
 });

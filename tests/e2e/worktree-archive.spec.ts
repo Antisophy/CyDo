@@ -193,11 +193,11 @@ test("cannot archive parent with alive descendant", { tag: "@no-codex" }, async 
   // 5. Attempt to archive via keyboard shortcut while the subtree is alive.
   //    Ctrl+Shift+A calls setArchived regardless of the task's own alive state,
   //    so this exercises the subtree check in handleSetArchivedMsg.
-  const dialogPromise = page.waitForEvent("dialog");
   await page.keyboard.press("Control+Shift+A");
-  const dialog = await dialogPromise;
-  expect(dialog.message()).toMatch(/Cannot archive/i);
-  await dialog.dismiss();
+  const dialog = page.locator(".command-error-dialog");
+  await expect(dialog).toContainText(/Cannot archive/i);
+  await dialog.getByRole("button", { name: "Dismiss" }).click();
+  await expect(dialog).not.toBeVisible();
 
   // 6. Verify the parent was NOT archived (most recent task_updated for convTid
   //    should not have archived=true).

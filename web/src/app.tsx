@@ -63,6 +63,8 @@ function AppContent() {
     notices,
     localNotices,
     agentUsage,
+    serverError,
+    dismissServerError,
     devMode,
     navigateHome,
     navigateToProject,
@@ -228,6 +230,12 @@ function AppContent() {
               </div>
             )}
             {searchPopup}
+            {serverError && (
+              <CommandErrorDialog
+                message={serverError.message}
+                onDismiss={dismissServerError}
+              />
+            )}
             <Toast
               toasts={toasts}
               onDismiss={dismissToast}
@@ -538,6 +546,12 @@ function AppContent() {
               </div>
             ))}
           {searchPopup}
+          {serverError && (
+            <CommandErrorDialog
+              message={serverError.message}
+              onDismiss={dismissServerError}
+            />
+          )}
           <Toast
             toasts={toasts}
             onDismiss={dismissToast}
@@ -546,6 +560,33 @@ function AppContent() {
         </div>
       </ThemeContext.Provider>
     </DevModeContext.Provider>
+  );
+}
+
+function CommandErrorDialog({
+  message,
+  onDismiss,
+}: {
+  message: string;
+  onDismiss: () => void;
+}) {
+  return (
+    <div class="undo-overlay" onClick={onDismiss}>
+      <div
+        class="undo-dialog command-error-dialog"
+        onClick={(e) => {
+          e.stopPropagation();
+        }}
+      >
+        <div class="undo-dialog-header">Command failed</div>
+        <div class="command-error-message">{message}</div>
+        <div class="undo-dialog-actions">
+          <button class="btn" onClick={onDismiss}>
+            Dismiss
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

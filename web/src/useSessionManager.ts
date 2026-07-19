@@ -215,6 +215,8 @@ export interface TaskManager {
   notices: Record<string, Notice>;
   localNotices: Record<string, Notice>;
   agentUsage: Record<string, AgentUsageMessage>;
+  serverError: { message: string; tid?: number } | null;
+  dismissServerError: () => void;
   devMode: boolean;
   exportLoadError?: string | null;
   navigateHome: () => void;
@@ -224,6 +226,26 @@ export interface TaskManager {
   getByTid: (tid: number) => TaskState | undefined;
   refreshWorkspaces: () => void;
   scanState: "idle" | "requested" | "scanning";
+}
+
+export function receiveServerError(
+  tasks: Map<string, TaskState>,
+  message: string,
+  tid?: number,
+): {
+  serverError: { message: string; tid?: number };
+  tasks: Map<string, TaskState>;
+} {
+  const serverError = { message, tid };
+  if (tid === undefined) return { serverError, tasks };
+
+  for (const [uuid, task] of tasks) {
+    if (task.tid !== tid || !task.undoPending) continue;
+    const nextTasks = new Map(tasks);
+    nextTasks.set(uuid, { ...task, undoPending: null });
+    return { serverError, tasks: nextTasks };
+  }
+  return { serverError, tasks };
 }
 
 /// Extract text content from a user message event (for unconfirmed display).
@@ -312,6 +334,10 @@ export function useTaskManager(
   const [agentUsage, setAgentUsage] = useState<
     Record<string, AgentUsageMessage>
   >({});
+  const [serverError, setServerError] = useState<{
+    message: string;
+    tid?: number;
+  } | null>(null);
   const [devMode, setDevMode] = useState(false);
   const addToastRef = useRef(addToast);
   addToastRef.current = addToast;
@@ -1430,20 +1456,13 @@ export function useTaskManager(
           const errMsg = msg.message;
           const errTid = msg.tid;
           console.error("Server error:", errMsg, "tid:", errTid);
-          // Clear undoPending if this error is for a task with an active undo dialog
-          if (errTid !== undefined) {
-            const t = findByTid(errTid);
-            if (t?.undoPending) {
-              const updated = { ...t, undoPending: null };
-              liveStates.set(t.uuid, updated);
-              setTasks((prev) => {
-                const next = new Map(prev);
-                next.set(t.uuid, updated);
-                return next;
-              });
-            }
+          const transition = receiveServerError(liveStates, errMsg, errTid);
+          if (transition.tasks !== liveStates) {
+            const task = findByTid(errTid!);
+            liveStates.set(task!.uuid, transition.tasks.get(task!.uuid)!);
+            setTasks((prev) => receiveServerError(prev, errMsg, errTid).tasks);
           }
-          alert(errMsg);
+          setServerError(transition.serverError);
           break;
         }
       }
@@ -2303,6 +2322,10 @@ export function useTaskManager(
     notices,
     localNotices,
     agentUsage,
+    serverError,
+    dismissServerError: () => {
+      setServerError(null);
+    },
     devMode,
     exportLoadError: null,
     navigateHome,

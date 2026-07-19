@@ -114,11 +114,6 @@ test(
 
     await sendMessage(page, 'Please reply with "alert-two"');
     await expect(assistantText(page, "alert-two")).toBeVisible({ timeout });
-    const dialogs: string[] = [];
-    page.on("dialog", (dialog) => {
-      dialogs.push(dialog.message());
-      dialog.dismiss().catch(() => {});
-    });
 
     await openUndoDialogForTurn(page, "alert-two");
     const revertFilesCheckbox = page
@@ -137,11 +132,11 @@ test(
       await assertTurnPresence(page, ["alert-two"], false);
     }).toPass({ timeout: 15_000 });
 
-    expect(
-      dialogs.filter((message) =>
-        message.includes("UUID not found for truncation"),
-      ),
-    ).toEqual([]);
+    await expect(
+      page.locator(".command-error-dialog", {
+        hasText: "UUID not found for truncation",
+      }),
+    ).toHaveCount(0);
 
     await expect(input).toHaveValue('Please reply with "alert-two"', {
       timeout: 15_000,
@@ -262,10 +257,6 @@ test(
 
     const input = page.locator(".input-textarea:visible").first();
     await expect(input).toBeEnabled({ timeout: 15_000 });
-
-    page.on("dialog", (d) => {
-      d.dismiss().catch(() => {});
-    });
 
     await openUndoDialogForTurn(page, "reply-one");
     await page.locator(".btn-undo").click();

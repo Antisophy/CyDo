@@ -47,11 +47,11 @@ async function expectUndoRequestRejected(
   dryRun: boolean,
   revertFiles: boolean,
 ) {
-  const errorDialog = page.waitForEvent("dialog");
   await undoThroughBridge(page, tid, anchor, dryRun, revertFiles);
-  const error = await errorDialog;
-  expect(error.message()).toBe("UUID not found in task history");
-  await error.dismiss();
+  const errorDialog = page.locator(".command-error-dialog");
+  await expect(errorDialog).toContainText("UUID not found in task history");
+  await errorDialog.getByRole("button", { name: "Dismiss" }).click();
+  await expect(errorDialog).not.toBeVisible();
 }
 
 async function openUndoDialogForUserMessage(
