@@ -5,6 +5,36 @@ import ae.utils.json : JSONFragment;
 import cydo.mcp : Description, McpName, McpResult;
 import cydo.mcp.payloads : TaskResult;
 
+/// Static Task description shared by MCP-backed agents and Copilot's SDK tools.
+enum string taskToolDescription =
+	"Create sub-tasks that run autonomously and return their output.\n\n"
+	~ "Use this when work can stand alone in its own session. Detailed task-type guidance "
+	~ "lives in the session instructions.\n\n"
+	~ "Each created child appears in the CyDo task tree; the returned `tid` opens that "
+	~ "child session.\n\n"
+	~ "If the backend restarts, CyDo resumes in-flight child tasks and later delivers "
+	~ "recovered results to the parent as a system message rather than through the "
+	~ "interrupted Task call.\n\n"
+	~ "Accepted multi-task batches launch every child before waiting, so the children run "
+	~ "concurrently. Subject to the early-question flow below, a live batch returns after "
+	~ "every child settles with one result item per requested task in request order, "
+	~ "regardless of completion order.\n\n"
+	~ "Results include each child task's output file path and `tid`, and completed children "
+	~ "can be queried again with mcp__cydo__Ask(message, tid). If a sub-task asks a question, "
+	~ "the mcp__cydo__Task or mcp__cydo__Ask call returns early with a `qid`; answer it with "
+	~ "mcp__cydo__Answer(qid, answer).";
+
+/// Static Handoff description shared by MCP-backed agents and Copilot's SDK tools.
+enum string handoffToolDescription =
+	"Hand off this task to a successor in a fresh session.\n\n"
+	~ "Use this when the next phase should start in a fresh session. Detailed handoff "
+	~ "guidance lives in the session instructions.\n\n"
+	~ "After this session exits, a valid Handoff marks this task completed, then creates a "
+	~ "child successor in a fresh session from the supplied prompt; the successor does not "
+	~ "inherit this conversation.\n\n"
+	~ "**This is a terminal action.** After calling mcp__cydo__Handoff, your session will end. "
+	~ "Do not call any other tools after Handoff.";
+
 /// Specification for a single sub-task.
 struct TaskSpec
 {
@@ -12,7 +42,7 @@ struct TaskSpec
 	string description;
 	@Description("The task type to create")
 	string task_type;
-	@Description("The task for the agent to perform")
+	@Description("The child task prompt; see the session's Create Sub-Tasks guidance for context requirements")
 	string prompt;
 }
 
@@ -58,19 +88,10 @@ interface CydoTools
 	);
 	+/
 
-	@Description(
-		"Create sub-tasks that run autonomously and return their output.\n\n"
-		~ "Use this when work can stand alone in its own session. Detailed task-type guidance "
-		~ "lives in the session instructions.\n\n"
-		~ "Results include each child task's output file path and `tid`, and completed children "
-		~ "can be queried again with mcp__cydo__Ask(message, tid). If a sub-task asks a question, "
-		~ "the mcp__cydo__Task or mcp__cydo__Ask call returns early with a `qid`; answer it with "
-		~ "mcp__cydo__Answer(qid, answer).\n\n"
-		~ "Available task types:\n\n{{creatable_task_types}}"
-	)
+	@Description(taskToolDescription ~ "\n\nAvailable task types:\n\n{{creatable_task_types}}")
 	@McpName("Task")
 	McpResult createTasks(
-		@Description("Array of tasks to execute (in parallel if more than one)")
+		@Description("Task specifications to create")
 		TaskSpec[] tasks
 	);
 
@@ -91,14 +112,7 @@ interface CydoTools
 		string continuation
 	);
 
-	@Description(
-		"Hand off this task to a successor with a fresh session.\n\n"
-		~ "Use this when the next phase should start in a fresh session with only the prompt "
-		~ "you provide. Detailed handoff guidance lives in the session instructions.\n\n"
-		~ "**This is a terminal action.** After calling mcp__cydo__Handoff, your session will end. "
-		~ "Do not call any other tools after Handoff.\n\n"
-		~ "Available handoffs:\n\n{{handoffs}}"
-	)
+	@Description(handoffToolDescription ~ "\n\nAvailable handoffs:\n\n{{handoffs}}")
 	@McpName("Handoff")
 	McpResult handoff(
 		@Description("The handoff name to follow (e.g., 'small_fix', 'needs_plan', 'done')")

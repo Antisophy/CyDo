@@ -8,7 +8,7 @@ import cydo.domain.task_types.definition : TaskTypeDef, UserEntryPointDef,
 	formatCompactHandoffToolSummary, formatCompactSwitchModeToolSummary,
 	isInteractive;
 import cydo.mcp.binding : SchemaObj, ToolDef, ToolsList, buildToolsListJson;
-import cydo.mcp.tools : CydoTools;
+import cydo.mcp.tools : CydoTools, handoffToolDescription, taskToolDescription;
 
 /// Approximates Claude Code 2.1.185's roughly 2048-character truncation
 /// trigger: Claude Code retained 2047 characters and appended the
@@ -148,6 +148,8 @@ unittest
 
 unittest
 {
+	import std.algorithm : canFind;
+
 	TaskTypeDef review;
 	review.name = "review";
 	review.agent_description = "Review the implementation.";
@@ -195,6 +197,71 @@ unittest
 		mcpToolDescriptionMaxChars).length == 0);
 	assert(toolsList.tools[$ - 2].name == "Ask");
 	assert(toolsList.tools[$ - 1].name == "Answer");
+
+	ToolDef taskTool;
+	ToolDef handoffTool;
+	bool foundTask;
+	bool foundHandoff;
+	foreach (ref tool; toolsList.tools)
+	{
+		if (tool.name == "Task")
+		{
+			taskTool = tool;
+			foundTask = true;
+		}
+		else if (tool.name == "Handoff")
+		{
+			handoffTool = tool;
+			foundHandoff = true;
+		}
+	}
+	assert(foundTask);
+	assert(foundHandoff);
+
+	auto creatableSuffix = "\n\nAvailable task types:\n\n"
+		~ formatCompactCreatableTaskTypeToolSummary(types, "review");
+	auto handoffSuffix = "\n\nAvailable handoffs:\n\n"
+		~ formatCompactHandoffToolSummary(types, "review");
+	assert(taskTool.description == taskToolDescription ~ creatableSuffix,
+		taskTool.description);
+	assert(handoffTool.description == handoffToolDescription ~ handoffSuffix,
+		handoffTool.description);
+
+	assert(taskTool.description.canFind(
+		"Each created child appears in the CyDo task tree; the returned `tid` opens that "
+		~ "child session."), taskTool.description);
+	assert(taskTool.description.canFind(
+		"If the backend restarts, CyDo resumes in-flight child tasks and later delivers "
+		~ "recovered results to the parent as a system message rather than through the "
+		~ "interrupted Task call."), taskTool.description);
+	assert(taskTool.description.canFind(
+		"Accepted multi-task batches launch every child before waiting, so the children run "
+		~ "concurrently."), taskTool.description);
+	assert(taskTool.description.canFind(
+		"a live batch returns after every child settles with one result item per requested "
+		~ "task in request order, regardless of completion order."), taskTool.description);
+	assert(!taskTool.description.canFind(
+		"Every child starts a fresh session and does not inherit this conversation"),
+		taskTool.description);
+	assert(!taskTool.description.canFind("Make each Task prompt self-contained"),
+		taskTool.description);
+
+	assert(handoffTool.description.canFind(
+		"After this session exits, a valid Handoff marks this task completed, then creates a "
+		~ "child successor in a fresh session from the supplied prompt; the successor does not "
+		~ "inherit this conversation."), handoffTool.description);
+
+	auto tasksSchema = "tasks" in taskTool.inputSchema.properties;
+	assert(tasksSchema !is null);
+	assert(tasksSchema.type == "array");
+	assert(tasksSchema.description == "Task specifications to create");
+	auto taskSpecSchema = jsonParse!SchemaObj(tasksSchema.items.json);
+	assert(taskSpecSchema.type == "object");
+	auto promptSchema = "prompt" in taskSpecSchema.properties;
+	assert(promptSchema !is null);
+	assert(promptSchema.type == "string");
+	assert(promptSchema.description ==
+		"The child task prompt; see the session's Create Sub-Tasks guidance for context requirements");
 }
 
 unittest

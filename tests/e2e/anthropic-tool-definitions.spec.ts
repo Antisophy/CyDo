@@ -8,9 +8,17 @@ import {
   responseTimeout,
 } from "./fixtures";
 
+type AnthropicCaptureSchema = {
+  type?: string;
+  description?: string;
+  items?: AnthropicCaptureSchema;
+  properties?: Record<string, AnthropicCaptureSchema>;
+};
+
 type AnthropicCaptureTool = {
   name: string | null;
   description: string | null;
+  input_schema: AnthropicCaptureSchema | null;
 };
 
 type AnthropicCaptureRecord = {
@@ -77,7 +85,7 @@ test("Claude forwards compact CyDo MCP descriptions to the Anthropic boundary", 
   expect(cydoRecord, `No CyDo MCP tools captured in ${capturePath}`).toBeDefined();
 
   const cydoTools = cydoRecord!.tools.filter(
-    (tool): tool is { name: string; description: string | null } =>
+    (tool): tool is AnthropicCaptureTool & { name: string } =>
       typeof tool.name === "string" && tool.name.startsWith("mcp__cydo__"),
   );
   expect(cydoTools.length).toBeGreaterThan(0);
@@ -93,4 +101,19 @@ test("Claude forwards compact CyDo MCP descriptions to the Anthropic boundary", 
   const taskTool = cydoTools.find((tool) => tool.name === "mcp__cydo__Task");
   expect(taskTool, "Expected mcp__cydo__Task in captured CyDo tool list").toBeDefined();
   expect(taskTool!.description).toMatch(/follow-up|ask|qid|answer/i);
+  expect(taskTool!.description).toContain(
+    "Each created child appears in the CyDo task tree; the returned `tid` opens that child session.",
+  );
+  expect(taskTool!.description).toContain(
+    "If the backend restarts, CyDo resumes in-flight child tasks and later delivers recovered results to the parent as a system message rather than through the interrupted Task call.",
+  );
+  expect(taskTool!.description).toContain(
+    "Accepted multi-task batches launch every child before waiting, so the children run concurrently.",
+  );
+  expect(taskTool!.description).toContain(
+    "a live batch returns after every child settles with one result item per requested task in request order, regardless of completion order.",
+  );
+  expect(taskTool!.input_schema?.properties?.tasks?.items?.properties?.prompt?.description).toBe(
+    "The child task prompt; see the session's Create Sub-Tasks guidance for context requirements",
+  );
 });

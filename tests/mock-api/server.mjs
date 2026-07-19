@@ -940,6 +940,7 @@ function handleMessages(req, res) {
                   typeof tool?.description === "string"
                     ? tool.description
                     : null,
+                input_schema: tool?.input_schema ?? null,
               }))
             : [],
         }) + "\n",

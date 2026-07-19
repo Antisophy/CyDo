@@ -28,9 +28,7 @@ sub-tasks. Your job is to decide _what_ needs doing and dispatch.
 These run as autonomous agents and return results to you:
 `quick_research`, `deep_research`, `spike`, `bug`, `execute`.
 
-Consult the Task tool's description before choosing a type — it carries the
-full guidance on when each fits. If your harness does not load tool
-descriptions up front, fetch it first.
+Use the Create Sub-Tasks guidance below to choose a type.
 
 ## When an execute task returns
 

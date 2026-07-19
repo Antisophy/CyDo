@@ -1355,6 +1355,16 @@ string formatCompactCreatableTaskTypeToolSummary(TaskTypeDef[] allTypes,
 	return formatCompactIdToolSummary(ids);
 }
 
+private enum string createSubTasksPolicy =
+	"Every child starts a fresh session and does not inherit this conversation or "
+	~ "any other task's conversation. Make each Task prompt self-contained with all "
+	~ "necessary context, including requirements, relevant findings and artifact paths, "
+	~ "constraints, and completion criteria.\n\n"
+	~ "Do not redo or reassign work already covered by a live child; give intentionally "
+	~ "overlapping children distinct purposes. Use child results without repeating their "
+	~ "work by default; review or independently verify them when the workflow, uncertainty, "
+	~ "or risk warrants it.\n\n";
+
 /// Build the full task/mode/handoff guidance injected into session instructions.
 string formatGeneratedTaskGuidance(TaskTypeDef[] allTypes, string typeName)
 {
@@ -1365,7 +1375,7 @@ string formatGeneratedTaskGuidance(TaskTypeDef[] allTypes, string typeName)
 	string result;
 	if (def.creatable_tasks.length > 0)
 	{
-		result ~= "## Create Sub-Tasks\n\n";
+		result ~= "## Create Sub-Tasks\n\n" ~ createSubTasksPolicy;
 		foreach (ref edge; def.creatable_tasks)
 		{
 			auto targetDef = allTypes.byName(edge.resolvedType);
@@ -1467,6 +1477,17 @@ unittest
 
 unittest
 {
+	enum createSubTasksHeading = "## Create Sub-Tasks\n\n";
+	auto expectedCreateSubTasksPolicy =
+		"Every child starts a fresh session and does not inherit this conversation or "
+		~ "any other task's conversation. Make each Task prompt self-contained with all "
+		~ "necessary context, including requirements, relevant findings and artifact paths, "
+		~ "constraints, and completion criteria.\n\n"
+		~ "Do not redo or reassign work already covered by a live child; give intentionally "
+		~ "overlapping children distinct purposes. Use child results without repeating their "
+		~ "work by default; review or independently verify them when the workflow, uncertainty, "
+		~ "or risk warrants it.\n\n";
+
 	TaskTypeDef parent;
 	parent.name = "parent";
 	parent.creatable_tasks = [
@@ -1495,7 +1516,51 @@ unittest
 	verify.agent_description = "Run the verification steps.";
 	verify.tool_guidance = "Report failures precisely.";
 
-	auto guidance = formatGeneratedTaskGuidance([parent, implement, review, verify], "parent");
+	TaskTypeDef sparseParent;
+	sparseParent.name = "sparse-parent";
+	sparseParent.creatable_tasks = [
+		CreatableTaskDef("bare", "sparse-child", WorktreeMode.inherit, "", "", ""),
+	];
+
+	TaskTypeDef sparseChild;
+	sparseChild.name = "sparse-child";
+
+	TaskTypeDef continuationOnly;
+	continuationOnly.name = "continuation-only";
+	continuationOnly.continuations = [
+		"continue": ContinuationDef("continuation-target", false, true,
+			WorktreeMode.inherit, "", ""),
+	];
+
+	TaskTypeDef continuationTarget;
+	continuationTarget.name = "continuation-target";
+
+	TaskTypeDef noOutgoing;
+	noOutgoing.name = "no-outgoing";
+
+	auto types = [parent, implement, review, verify, sparseParent, sparseChild,
+		continuationOnly, continuationTarget, noOutgoing];
+	foreach (ref def; types)
+	{
+		if (def.creatable_tasks.length == 0)
+			continue;
+
+		auto generated = formatGeneratedTaskGuidance(types, def.name);
+		auto expectedSectionStart = createSubTasksHeading
+			~ expectedCreateSubTasksPolicy ~ "### Task";
+		assert(generated.length >= expectedSectionStart.length, generated);
+		assert(generated[0 .. expectedSectionStart.length] == expectedSectionStart,
+			generated);
+
+		auto renderedPolicy = generated[createSubTasksHeading.length ..
+			createSubTasksHeading.length + expectedCreateSubTasksPolicy.length];
+		assert(renderedPolicy == expectedCreateSubTasksPolicy, generated);
+		assert(!renderedPolicy.canFind("If the backend restarts"), renderedPolicy);
+		assert(!renderedPolicy.canFind("Accepted multi-task batches"), renderedPolicy);
+		assert(!renderedPolicy.canFind("After this session exits"), renderedPolicy);
+	}
+
+	auto guidance = formatGeneratedTaskGuidance(types, "parent");
 	assert(guidance.canFind("## Create Sub-Tasks"), guidance);
 	assert(guidance.canFind("### Task `execute`"), guidance);
 	assert(guidance.canFind("Target task type: `implement`"), guidance);
@@ -1509,6 +1574,18 @@ unittest
 	assert(guidance.canFind("### Handoff `handoff`"), guidance);
 	assert(guidance.canFind("Run the verification steps."), guidance);
 	assert(guidance.canFind("Report failures precisely."), guidance);
+
+	auto sparseGuidance = formatGeneratedTaskGuidance(types, "sparse-parent");
+	assert(sparseGuidance.canFind("### Task `bare`"), sparseGuidance);
+	assert(sparseGuidance.canFind("Target task type: `sparse-child`"), sparseGuidance);
+
+	auto continuationGuidance = formatGeneratedTaskGuidance(types, "continuation-only");
+	assert(continuationGuidance.canFind("## Switch Modes"), continuationGuidance);
+	assert(continuationGuidance.canFind("### Mode `continue`"), continuationGuidance);
+	assert(!continuationGuidance.canFind("## Create Sub-Tasks"), continuationGuidance);
+	assert(!continuationGuidance.canFind("## Handoffs"), continuationGuidance);
+
+	assert(formatGeneratedTaskGuidance(types, "no-outgoing") == "");
 }
 
 unittest

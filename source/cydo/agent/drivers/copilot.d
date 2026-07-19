@@ -25,6 +25,7 @@ import cydo.runtime.launch.types : ProcessLaunch;
 import cydo.runtime.launch.sandbox : cydoBinaryDir, cydoBinaryPath, effectiveEnvValue,
 	executableMountPaths, resolveExecutablePath;
 import cydo.mcp : McpResult;
+import cydo.mcp.tools : handoffToolDescription, taskToolDescription;
 import cydo.foundation.text.title : truncateTitle;
 
 // Callback type for dispatching custom tool calls.
@@ -2019,7 +2020,7 @@ string buildToolDefinitions(SessionConfig config)
 	// Names use cydo- prefix to match what the LLM sends in tool_calls.
 	ToolDefinition[] tools;
 	tools ~= ToolDefinition("cydo-Task",
-		"Create sub-tasks that run autonomously",
+		taskToolDescription,
 		JSONFragment(`{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object"}}},"required":["tasks"]}`),
 		true);
 	tools ~= ToolDefinition("cydo-Bash",
@@ -2031,7 +2032,7 @@ string buildToolDefinitions(SessionConfig config)
 		JSONFragment(`{"type":"object","properties":{"continuation":{"type":"string"}},"required":["continuation"]}`),
 		true);
 	tools ~= ToolDefinition("cydo-Handoff",
-		"Hand off this task to a successor",
+		handoffToolDescription,
 		JSONFragment(`{"type":"object","properties":{"continuation":{"type":"string"},"prompt":{"type":"string"}},"required":["continuation","prompt"]}`),
 		true);
 	tools ~= ToolDefinition("cydo-AskUserQuestion",
@@ -2047,6 +2048,42 @@ string buildToolDefinitions(SessionConfig config)
 		JSONFragment(`{"type":"object","properties":{"qid":{"type":"integer"},"message":{"type":"string"}},"required":["qid","message"]}`),
 		true);
 	return toJson(tools);
+}
+
+unittest
+{
+	SessionConfig config;
+	config.mcpSocketPath = "/tmp/cydo-mcp.sock";
+	auto tools = jsonParse!(ToolDefinition[])(buildToolDefinitions(config));
+
+	string[] expectedNames = [
+		"cydo-Task",
+		"cydo-Bash",
+		"cydo-SwitchMode",
+		"cydo-Handoff",
+		"cydo-AskUserQuestion",
+		"cydo-Ask",
+		"cydo-Answer",
+	];
+	string[] expectedSchemas = [
+		`{"type":"object","properties":{"tasks":{"type":"array","items":{"type":"object"}}},"required":["tasks"]}`,
+		`{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}`,
+		`{"type":"object","properties":{"continuation":{"type":"string"}},"required":["continuation"]}`,
+		`{"type":"object","properties":{"continuation":{"type":"string"},"prompt":{"type":"string"}},"required":["continuation","prompt"]}`,
+		`{"type":"object","properties":{"questions":{"type":"array","items":{"type":"object"}}},"required":["questions"]}`,
+		`{"type":"object","properties":{"message":{"type":"string"},"tid":{"type":"integer"}},"required":["message"]}`,
+		`{"type":"object","properties":{"qid":{"type":"integer"},"message":{"type":"string"}},"required":["qid","message"]}`,
+	];
+
+	assert(tools.length == expectedNames.length);
+	foreach (i, ref tool; tools)
+	{
+		assert(tool.name == expectedNames[i]);
+		assert(tool.skipPermission);
+		assert(tool.parameters.json == expectedSchemas[i]);
+	}
+	assert(tools[0].description == taskToolDescription);
+	assert(tools[3].description == handoffToolDescription);
 }
 
 /// Build JSON params string for session.create.
