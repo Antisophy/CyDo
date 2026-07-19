@@ -67,6 +67,41 @@ export function responseTimeout(agentType: AgentType): number {
   return agentType === "codex" ? 90_000 : 60_000;
 }
 
+export async function visibleHistory(page: Page) {
+  return page.locator(".message-wrapper").evaluateAll((wrappers) =>
+    wrappers
+      .filter((wrapper) => wrapper.querySelector(".message:not(.meta-message)"))
+      .map((wrapper) => wrapper.textContent),
+  );
+}
+
+export async function installCydoE2eBridge(page: Page) {
+  await page.addInitScript(() => {
+    (window as Window & { __cydoE2e?: object }).__cydoE2e = {};
+  });
+}
+
+export async function forkThroughBridge(page: Page, tid: number, anchor: string) {
+  await page.evaluate(({ tid, anchor }) => {
+    if (!window.__cydoE2e?.fork) throw new Error("CyDo e2e fork bridge unavailable");
+    window.__cydoE2e.fork(tid, anchor);
+  }, { tid, anchor });
+}
+
+export async function undoThroughBridge(
+  page: Page,
+  tid: number,
+  anchor: string,
+  dryRun: boolean,
+  revertFiles: boolean,
+) {
+  await page.evaluate(({ tid, anchor, dryRun, revertFiles }) => {
+    if (!window.__cydoE2e?.undo)
+      throw new Error("CyDo e2e undo bridge unavailable");
+    window.__cydoE2e.undo(tid, anchor, dryRun, true, revertFiles);
+  }, { tid, anchor, dryRun, revertFiles });
+}
+
 type TestFixtures = {
   agentType: AgentType;
   backend: { port: number; baseURL: string; pid: number; wsDir: string };

@@ -54,8 +54,8 @@ test("forked worktree spike task appears in sidebar", { tag: "@no-codex" }, asyn
   //    the process starts), so we must wait for alive: true followed by
   //    alive: false to confirm the process has actually run and exited.
   //    The JSONL file is only fully written after the process exits, so we must
-  //    wait for completion before navigating — otherwise forkable UUIDs may not
-  //    be available yet.
+  //    wait for completion before navigating — otherwise canonical history
+  //    boundaries may not be available yet.
   await expect(async () => {
     const spikeEvents = taskUpdatedEvents.filter((e) => e.tid === spikeTid);
     let seenAlive = false;
@@ -82,7 +82,8 @@ test("forked worktree spike task appears in sidebar", { tag: "@no-codex" }, asyn
   //    The process/exit event is sent before task_updated, so React may process
   //    it after our sidebar click, auto-navigating away to the parent task.
   //    We retry the click until the spike is confirmed active and its content
-  //    is visible (which also guarantees forkable UUIDs have been received).
+  //    is visible (which also guarantees history_boundary replacements and
+  //    history_operations have been applied).
   await expect(async () => {
     await page.locator(`.sidebar-item[data-tid="${spikeTid}"]`).click();
     // Confirm spike is the active task (not navigated away by process/exit).

@@ -5,6 +5,9 @@ import {
   sendMessage,
   killSession,
   responseTimeout,
+  visibleHistory,
+  installCydoE2eBridge,
+  forkThroughBridge,
 } from "./fixtures";
 import type { Page } from "@playwright/test";
 
@@ -63,14 +66,6 @@ function messageWrapper(page: Page, selector: string, text: string) {
       has: page.locator(selector, { hasText: text }),
     })
     .last();
-}
-
-async function visibleHistory(page: Page) {
-  return await page.locator(".message-wrapper").evaluateAll((wrappers) =>
-    wrappers
-      .filter((wrapper) => wrapper.querySelector(".message:not(.meta-message)"))
-      .map((wrapper) => wrapper.textContent),
-  );
 }
 
 async function forkFromMessage(page: Page, selector: string, text: string) {
@@ -300,9 +295,7 @@ test(
   "codex rejects a forged line anchor without changing parent history",
   { tag: "@codex-only" },
   async ({ page, agentType }) => {
-    await page.addInitScript(() => {
-      (window as Window & { __cydoE2e?: object }).__cydoE2e = {};
-    });
+    await installCydoE2eBridge(page);
     const marker = "FORK_FORGED_PARENT";
     const taskCreatedEvents: Array<{ parent_tid?: number; relation_type?: string }> = [];
     page.on("websocket", (ws) => {
@@ -325,10 +318,7 @@ test(
     const tidsBeforeFork = await snapshotTids(page);
 
     const forkError = page.waitForEvent("dialog");
-    await page.evaluate((tid) => {
-      if (!window.__cydoE2e?.fork) throw new Error("CyDo e2e fork bridge unavailable");
-      window.__cydoE2e.fork(tid, "line:999999");
-    }, parentTid);
+    await forkThroughBridge(page, parentTid, "line:999999");
     const error = await forkError;
     expect(error.message()).toBe("Fork failed: message UUID not found in task history");
     await error.dismiss();
@@ -347,9 +337,7 @@ test(
   "codex rejects a stale line anchor after dead-session rollback without creating a child",
   { tag: "@codex-only" },
   async ({ page, agentType }) => {
-    await page.addInitScript(() => {
-      (window as Window & { __cydoE2e?: object }).__cydoE2e = {};
-    });
+    await installCydoE2eBridge(page);
     const retained = "FORK_STALE_RETAINED";
     const rolledBack = "FORK_STALE_ROLLED_BACK";
     const taskCreatedEvents: Array<{
@@ -402,10 +390,7 @@ test(
     const parentHistory = await visibleHistory(page);
 
     const forkError = page.waitForEvent("dialog");
-    await page.evaluate(({ tid, anchor }) => {
-      if (!window.__cydoE2e?.fork) throw new Error("CyDo e2e fork bridge unavailable");
-      window.__cydoE2e.fork(tid, anchor);
-    }, { tid: staleTid, anchor: staleAnchor! });
+    await forkThroughBridge(page, staleTid, staleAnchor!);
     const error = await forkError;
     expect(error.message()).toBe("Fork failed: message UUID not found in task history");
     await error.dismiss();

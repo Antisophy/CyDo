@@ -5,17 +5,12 @@ import {
   sendMessage,
   assistantText,
   killSession,
+  visibleHistory,
+  installCydoE2eBridge,
+  undoThroughBridge,
 } from "./fixtures";
 import { readFileSync } from "fs";
 import type { Page } from "@playwright/test";
-
-async function visibleHistory(page: Page) {
-  return page.locator(".message-wrapper").evaluateAll((wrappers) =>
-    wrappers
-      .filter((wrapper) => wrapper.querySelector(".message:not(.meta-message)"))
-      .map((wrapper) => wrapper.textContent),
-  );
-}
 
 async function activeTid(page: Page): Promise<number> {
   const tid = await page
@@ -53,11 +48,7 @@ async function expectUndoRequestRejected(
   revertFiles: boolean,
 ) {
   const errorDialog = page.waitForEvent("dialog");
-  await page.evaluate(({ tid, anchor, dryRun, revertFiles }) => {
-    if (!window.__cydoE2e?.undo)
-      throw new Error("CyDo e2e undo bridge unavailable");
-    window.__cydoE2e.undo(tid, anchor, dryRun, true, revertFiles);
-  }, { tid, anchor, dryRun, revertFiles });
+  await undoThroughBridge(page, tid, anchor, dryRun, revertFiles);
   const error = await errorDialog;
   expect(error.message()).toBe("UUID not found in task history");
   await error.dismiss();
@@ -412,9 +403,7 @@ test(
   "codex rejects a plausible forged undo line anchor without side effects",
   { tag: "@codex-only" },
   async ({ page, backend }) => {
-    await page.addInitScript(() => {
-      (window as Window & { __cydoE2e?: object }).__cydoE2e = {};
-    });
+    await installCydoE2eBridge(page);
     const marker = "UNDO_FORGED_CANONICAL";
     const probe = "UNDO_FORGED_ALIVE";
     const testFile = `${backend.wsDir}/tmp/codex-fileviewer-create.txt`;
@@ -481,9 +470,7 @@ test(
   "codex rejects a rollback-dead undo anchor after canonical reload without side effects",
   { tag: "@codex-only" },
   async ({ page }) => {
-    await page.addInitScript(() => {
-      (window as Window & { __cydoE2e?: object }).__cydoE2e = {};
-    });
+    await installCydoE2eBridge(page);
     const retained = "UNDO_STALE_RETAINED";
     const rolledBack = "UNDO_STALE_ROLLED_BACK";
     const frames: any[] = [];

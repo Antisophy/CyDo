@@ -25,9 +25,9 @@ test("undo removes preceding queue-operation lines from steering message", { tag
   // 4. Kill the session so we can undo.
   await killSession(page, agentType);
 
-  // 4b. Wait for the history to reload from JSONL and the steering message to
-  //     be visible as confirmed (non-pending).  task_reload clears forkableUuids;
-  //     we need request_history to complete before hovering for the undo button.
+  // 4b. Wait for canonical history_boundary replacements and history_operations
+  //     to make the steering message visible as confirmed before hovering for
+  //     the undo button.
   await expect(
     page.locator(".message.user-message:not(.pending)", { hasText: "steered-reply" }),
   ).toBeVisible({ timeout: 15_000 });
