@@ -134,11 +134,11 @@ describe("Connection client error reporting", () => {
     const ordinary = vi.fn();
     const replacement = vi.fn();
     conn.onTaskMessage = ordinary;
-    conn.onTaskEventReplaced = replacement;
+    conn.onHistoryBoundaryReplaced = replacement;
     conn.connect();
     MockWebSocket.instances[0]!.emitMessage(
       JSON.stringify({
-        type: "task_event_replaced",
+        type: "task_history_boundary_replaced",
         tid: 7,
         seq: 4,
         ts: 9,

@@ -90,7 +90,7 @@ test("completed messages are not recreated when new messages arrive", { tag: "@c
   await expect(async () => {
     const kinds = new Set(
       frames
-        .filter((frame) => frame?.type === "task_event_replaced")
+        .filter((frame) => frame?.type === "task_history_boundary_replaced")
         .map((frame) => frame?.event?.history_boundary?.kind),
     );
     expect(kinds).toEqual(new Set(["user", "agent_turn"]));

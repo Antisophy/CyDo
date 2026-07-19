@@ -16,7 +16,7 @@ import ae.utils.time.types : AbsTime;
 
 import cydo.agent.contract : Agent, PersistedHistoryBoundaryKind;
 import cydo.protocol : ContentBlock, ItemStartedEvent, TaskEventEnvelope,
-	TaskEventReplacedEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
+	TaskHistoryBoundaryReplacedEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
 	UnconfirmedUserEventEnvelope, HistoryBoundary, HistoryBoundaryKind,
 	extractContentText;
 import cydo.runtime.config : AgentDriver;
@@ -565,8 +565,8 @@ class HistoryEventPipeline
 			return;
 		td.history[seq].enter((scope const(ubyte)[] bytes) {
 			auto envelope = bytes.as!(char[]);
-			host_.sendToSubscribed(tid, Data(toJson(TaskEventReplacedEnvelope(
-				"task_event_replaced", tid, cast(int) seq, extractTsFromEnvelope(envelope),
+			host_.sendToSubscribed(tid, Data(toJson(TaskHistoryBoundaryReplacedEnvelope(
+				"task_history_boundary_replaced", tid, cast(int) seq, extractTsFromEnvelope(envelope),
 			JSONFragment(extractEventFromEnvelope(envelope).idup))).representation));
 		});
 		host_.broadcastHistoryOperations(tid);
@@ -951,7 +951,7 @@ unittest
 	pipeline.backfillHistoryBoundary(1, 0, boundary);
 	assert(published.length == 1);
 	assert(publicationOrder == ["replacement", "operations"]);
-	assert(published[0].canFind(`"type":"task_event_replaced","tid":1,"seq":0,"ts":123`));
+	assert(published[0].canFind(`"type":"task_history_boundary_replaced","tid":1,"seq":0,"ts":123`));
 	auto stored = cast(string) td.history[0].toGC();
 	assert(stored.canFind(`"meta":{"codex":true}`));
 	assert(stored.canFind(`"history_boundary":{"anchor":"anchor","kind":"user"}`));

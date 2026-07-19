@@ -35,7 +35,7 @@ export class Connection {
   onTaskMessage:
     | ((tid: number, event: AgnosticEvent, seq?: number, ts?: number) => void)
     | null = null;
-  onTaskEventReplaced:
+  onHistoryBoundaryReplaced:
     | ((tid: number, event: AgnosticEvent, seq: number, ts?: number) => void)
     | null = null;
   onUnconfirmedUserMessage:
@@ -86,14 +86,14 @@ export class Connection {
         const text =
           typeof data === "string" ? data : new TextDecoder().decode(data);
         const raw = JSON.parse(text) as Record<string, unknown>;
-        if (raw.type === "task_event_replaced") {
+        if (raw.type === "task_history_boundary_replaced") {
           if (
             typeof raw.tid !== "number" ||
             typeof raw.seq !== "number" ||
             !raw.event
           )
             throw new Error("Invalid task replacement envelope");
-          this.onTaskEventReplaced?.(
+          this.onHistoryBoundaryReplaced?.(
             raw.tid,
             raw.event as AgnosticEvent,
             raw.seq,

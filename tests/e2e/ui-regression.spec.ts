@@ -157,7 +157,7 @@ test("fork stays focused on forked session", async ({ page, agentType }) => {
   await expect(async () => {
     const targetUsers = frames.filter(
       (frame) =>
-        frame?.type !== "task_event_replaced" &&
+        frame?.type !== "task_history_boundary_replaced" &&
         frame?.event?.type === "item/started" &&
         frame?.event?.item_type === "user_message" &&
         !frame?.event?.is_meta &&
@@ -170,7 +170,7 @@ test("fork stays focused on forked session", async ({ page, agentType }) => {
     const target = targetUsers[0];
     const targetReplacements = frames.filter(
       (frame) =>
-        frame?.type === "task_event_replaced" &&
+        frame?.type === "task_history_boundary_replaced" &&
         frame?.seq === target.seq &&
         frame?.event?.history_boundary?.kind === "user",
     );

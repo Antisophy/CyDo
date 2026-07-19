@@ -1466,7 +1466,7 @@ export function useTaskManager(
           ts?: number;
         }
       | {
-          kind: "replacement";
+          kind: "historyBoundary";
           tid: number;
           msg: HistoryBoundaryEvent;
           seq: number;
@@ -1480,7 +1480,7 @@ export function useTaskManager(
       | { kind: "agentAck"; tid: number; nonce: string }
       | { kind: "control"; msg: ControlMessage };
     let buffer: BufferedMsg[] = [];
-    const pendingReplacements = new Map<
+    const pendingHistoryBoundaries = new Map<
       number,
       { msg: HistoryBoundaryEvent; seq: number }[]
     >();
@@ -1515,7 +1515,7 @@ export function useTaskManager(
         else if (item.kind === "unconfirmed")
           handleUnconfirmedUserMessage(item.tid, item.msg, item.correlationId);
         else if (item.kind === "agentAck") handleAgentAck(item.tid, item.nonce);
-        else if (item.kind === "replacement") {
+        else if (item.kind === "historyBoundary") {
           const uuid = tidToUuid.get(item.tid);
           if (uuid === undefined)
             throw new Error(`Replacement for unknown task ${item.tid}`);
@@ -1528,9 +1528,9 @@ export function useTaskManager(
               (Array.isArray(message.seq) && message.seq.includes(item.seq)),
           );
           if (!hasTarget) {
-            const pending = pendingReplacements.get(item.tid) ?? [];
+            const pending = pendingHistoryBoundaries.get(item.tid) ?? [];
             pending.push({ msg: item.msg, seq: item.seq });
-            pendingReplacements.set(item.tid, pending);
+            pendingHistoryBoundaries.set(item.tid, pending);
             continue;
           }
           const updated = replaceHistoryBoundary(task, item.msg, item.seq);
@@ -1538,7 +1538,7 @@ export function useTaskManager(
           setTasks((prev) => new Map(prev).set(uuid, updated));
         } else {
           handleTaskMessage(item.tid, item.msg, item.seq, item.ts);
-          const pending = pendingReplacements.get(item.tid);
+          const pending = pendingHistoryBoundaries.get(item.tid);
           if (pending && item.seq !== undefined) {
             const matching = pending.filter(
               (replacement) => replacement.seq === item.seq,
@@ -1563,8 +1563,8 @@ export function useTaskManager(
                 (replacement) => replacement.seq !== item.seq,
               );
               if (remaining.length > 0)
-                pendingReplacements.set(item.tid, remaining);
-              else pendingReplacements.delete(item.tid);
+                pendingHistoryBoundaries.set(item.tid, remaining);
+              else pendingHistoryBoundaries.delete(item.tid);
             }
           }
         }
@@ -1635,10 +1635,10 @@ export function useTaskManager(
       buffer.push({ kind: "task", tid, msg, seq, ts });
       scheduleFlush();
     };
-    conn.onTaskEventReplaced = (tid, msg, seq) => {
+    conn.onHistoryBoundaryReplaced = (tid, msg, seq) => {
       if (!hasHistoryBoundary(msg))
         throw new Error("Replacement event has no history boundary");
-      buffer.push({ kind: "replacement", tid, msg, seq });
+      buffer.push({ kind: "historyBoundary", tid, msg, seq });
       scheduleFlush();
     };
     conn.onUnconfirmedUserMessage = (tid, msg, correlationId) => {

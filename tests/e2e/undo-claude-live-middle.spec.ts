@@ -179,7 +179,7 @@ test("all agents publish canonical boundary replacements without duplicate trans
   await expect(async () => {
     const replacements = frames.filter(
       (frame) =>
-        frame?.type === "task_event_replaced" &&
+        frame?.type === "task_history_boundary_replaced" &&
         typeof frame?.seq === "number" &&
         typeof frame?.event?.history_boundary?.anchor === "string",
     );
@@ -192,7 +192,7 @@ test("all agents publish canonical boundary replacements without duplicate trans
     ).toEqual(new Set(["user", "agent_turn"]));
     const targetUsers = frames.filter(
       (frame) =>
-        frame?.type !== "task_event_replaced" &&
+        frame?.type !== "task_history_boundary_replaced" &&
         frame?.event?.type === "item/started" &&
         frame?.event?.item_type === "user_message" &&
         !frame?.event?.is_meta &&
@@ -214,7 +214,7 @@ test("all agents publish canonical boundary replacements without duplicate trans
       expect(
         frames.some(
           (frame) =>
-            frame?.type !== "task_event_replaced" &&
+            frame?.type !== "task_history_boundary_replaced" &&
             frame?.seq === replacement.seq &&
             !frame?.event?.history_boundary,
         ),
@@ -222,7 +222,7 @@ test("all agents publish canonical boundary replacements without duplicate trans
     }
   }).toPass({ timeout: 15_000 });
   const replacements = frames.filter(
-    (frame) => frame?.type === "task_event_replaced",
+    (frame) => frame?.type === "task_history_boundary_replaced",
   );
   const replayFrames: any[] = [];
   page.on("websocket", (ws) => {
@@ -468,7 +468,7 @@ test(
     const seqToAnchor = new Map<number, string>();
     const conflicts: string[] = [];
     for (const frame of frames) {
-      if (frame?.type !== "task_event_replaced") continue;
+      if (frame?.type !== "task_history_boundary_replaced") continue;
       const boundary = frame.event?.history_boundary;
       if (typeof frame.seq !== "number" || typeof boundary?.anchor !== "string")
         continue;
@@ -488,7 +488,7 @@ test(
       expect(
         frames.some(
           (frame) =>
-            frame?.type !== "task_event_replaced" && frame?.seq === seq,
+            frame?.type !== "task_history_boundary_replaced" && frame?.seq === seq,
         ),
       ).toBe(true);
     }

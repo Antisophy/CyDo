@@ -427,10 +427,10 @@ struct TaskEventSeqEnvelope
 	JSONFragment event;
 }
 
-/// Explicit replacement of a canonical sequenced event after persistence correlation.
-struct TaskEventReplacedEnvelope
+/// History-boundary enrichment of a canonical sequenced event after persistence correlation.
+struct TaskHistoryBoundaryReplacedEnvelope
 {
-	string type = "task_event_replaced";
+	string type = "task_history_boundary_replaced";
 	int tid;
 	int seq;
 	long ts;
@@ -549,10 +549,10 @@ unittest
 {
 	import ae.utils.json : toJson;
 	auto boundary = HistoryBoundary("anchor", HistoryBoundaryKind.user, "checkpoint");
-	auto replacement = toJson(TaskEventReplacedEnvelope("task_event_replaced", 7, 4, 9,
+	auto replacement = toJson(TaskHistoryBoundaryReplacedEnvelope("task_history_boundary_replaced", 7, 4, 9,
 		JSONFragment(`{"type":"item/started","item_type":"user_message","history_boundary":` ~ toJson(boundary) ~ `}`)));
 	auto ordinary = toJson(TaskEventSeqEnvelope(7, 4, 9,
 		JSONFragment(`{"type":"item/started","item_type":"user_message"}`)));
-	assert(replacement == `{"type":"task_event_replaced","tid":7,"seq":4,"ts":9,"event":{"type":"item/started","item_type":"user_message","history_boundary":{"anchor":"anchor","kind":"user","checkpoint_uuid":"checkpoint"}}}`);
+	assert(replacement == `{"type":"task_history_boundary_replaced","tid":7,"seq":4,"ts":9,"event":{"type":"item/started","item_type":"user_message","history_boundary":{"anchor":"anchor","kind":"user","checkpoint_uuid":"checkpoint"}}}`);
 	assert(ordinary == `{"tid":7,"seq":4,"ts":9,"event":{"type":"item/started","item_type":"user_message"}}`);
 }
