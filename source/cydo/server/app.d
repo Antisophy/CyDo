@@ -2032,26 +2032,25 @@ class App
 	{
 		import std.algorithm : canFind;
 
-		if (translated.length == 0 || !translated.canFind(`"type":"agent/error"`))
+		if (translated.length == 0 || !translated.canFind(`"type":"cydo/task_diagnostic"`))
 			return false;
 
-		@JSONPartial static struct AgentErrorProbe
+		@JSONPartial static struct TaskDiagnosticProbe
 		{
 			string type;
-			@JSONOptional string message;
+			@JSONOptional string body;
 		}
 		try
 		{
-			auto probe = jsonParse!AgentErrorProbe(translated);
-			if (probe.type == "agent/error" && probe.message.length > 0
-				&& probe.message.canFind("no active turn to steer"))
-				return true;
+			auto probe = jsonParse!TaskDiagnosticProbe(translated);
+			return probe.type == "cydo/task_diagnostic" && probe.body.length > 0
+				&& probe.body.canFind("no active turn to steer");
 		}
 		catch (Exception)
 		{
 			// Fall back to substring matching if payload shape changes.
+			return translated.canFind("no active turn to steer");
 		}
-		return translated.canFind("no active turn to steer");
 	}
 
 	/// Send post-compaction reminder as an in-flight steering message when possible.
@@ -3140,6 +3139,18 @@ class App
 		return "";
 	}
 
+}
+
+unittest
+{
+	assert(App.isCompactionReminderSteerFailureEvent(
+		`{"type":"cydo/task_diagnostic","severity":"error","subject":"Agent error","body":"no active turn to steer"}`));
+	assert(!App.isCompactionReminderSteerFailureEvent(
+		`{"type":"cydo/task_diagnostic","severity":"error","subject":"Agent error","body":"ordinary diagnostic"}`));
+	assert(!App.isCompactionReminderSteerFailureEvent(
+		`{"type":"cydo/task_diagnostic","severity":"error","subject":"no active turn to steer","body":"ordinary diagnostic"}`));
+	assert(App.isCompactionReminderSteerFailureEvent(
+		`{"type":"cydo/task_diagnostic","body":"no active turn to steer"`));
 }
 
 /// Install robust logger implementation once.

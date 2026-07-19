@@ -5,7 +5,8 @@ import ae.utils.json : JSONOptional, JSONPartial, jsonParse, toJson;
 import ae.utils.promise : Promise, resolve;
 
 import cydo.agent.drivers.codex.rpc;
-import cydo.protocol : SessionCompactedEvent, TranslatedEvent;
+import cydo.protocol : SessionCompactedEvent, TaskDiagnosticEvent,
+	TaskDiagnosticSeverity, TranslatedEvent;
 
 package struct CodexSessionRouteTarget
 {
@@ -133,20 +134,21 @@ private string extractErrorMessage(ErrorParams params)
 
 private TranslatedEvent makeAgentErrorTranslatedEvent(ErrorParams params)
 {
-	import cydo.protocol : AgentErrorEvent;
-
-	AgentErrorEvent ev;
-	ev.message = extractErrorMessage(params);
-	ev.willRetry = params.willRetry;
+	TaskDiagnosticEvent ev;
+	ev.severity = params.willRetry ? TaskDiagnosticSeverity.warning : TaskDiagnosticSeverity.error;
+	ev.subject = params.willRetry ? "Agent error (retrying)" : "Agent error";
+	ev.body = extractErrorMessage(params);
+	if (ev.body.length == 0)
+		ev.body = "Unknown error";
 	return TranslatedEvent(toJson(ev), buildRawNotification("error", toJson(params)));
 }
 
 private TranslatedEvent makeAgentWarningTranslatedEvent(WarningParams params)
 {
-	import cydo.protocol : AgentWarningEvent;
-
-	AgentWarningEvent ev;
-	ev.message = params.message;
+	TaskDiagnosticEvent ev;
+	ev.severity = TaskDiagnosticSeverity.warning;
+	ev.subject = "Agent warning";
+	ev.body = params.message;
 	return TranslatedEvent(toJson(ev), buildRawNotification("warning", toJson(params)));
 }
 
@@ -156,7 +158,9 @@ unittest
 	struct EmittedWarningEvent
 	{
 		string type;
-		string message;
+		string severity;
+		string subject;
+		string body;
 	}
 
 	WarningParams params;
@@ -168,11 +172,90 @@ unittest
 	auto translated = makeAgentWarningTranslatedEvent(params);
 	auto ev = jsonParse!EmittedWarningEvent(translated.translated);
 
-	assert(ev.type == "agent/warning");
-	assert(ev.message
+	assert(ev.type == "cydo/task_diagnostic");
+	assert(ev.severity == "warning");
+	assert(ev.subject == "Agent warning");
+	assert(ev.body
 		== "Heads up: Long threads and multiple compactions can cause the model to be less accurate.");
 	assert(translated.raw
 		== `{"jsonrpc":"2.0","method":"warning","params":{"threadId":"thread-warning","turnId":"turn-warning","message":"Heads up: Long threads and multiple compactions can cause the model to be less accurate."}}`);
+}
+
+unittest
+{
+	@JSONPartial struct EmittedErrorEvent
+	{
+		string type;
+		string severity;
+		string subject;
+		string body;
+	}
+
+	auto retrying = jsonParse!ErrorParams(
+		`{"threadId":"thread-retrying","willRetry":true,"error":{"message":"try again"}}`);
+	auto retryingEvent = makeAgentErrorTranslatedEvent(retrying);
+	auto ev = jsonParse!EmittedErrorEvent(retryingEvent.translated);
+	assert(ev.type == "cydo/task_diagnostic");
+	assert(ev.severity == "warning");
+	assert(ev.subject == "Agent error (retrying)");
+	assert(ev.body == "try again");
+	assert(retryingEvent.raw
+		== `{"jsonrpc":"2.0","method":"error","params":{"threadId":"thread-retrying","willRetry":true,"error":{"message":"try again"}}}`);
+
+	auto terminal = jsonParse!ErrorParams(
+		`{"threadId":"thread-terminal","willRetry":false,"error":{"message":"do not retry"}}`);
+	auto terminalEvent = makeAgentErrorTranslatedEvent(terminal);
+	ev = jsonParse!EmittedErrorEvent(terminalEvent.translated);
+	assert(ev.severity == "error");
+	assert(ev.subject == "Agent error");
+	assert(ev.body == "do not retry");
+	assert(terminalEvent.raw
+		== `{"jsonrpc":"2.0","method":"error","params":{"threadId":"thread-terminal","error":{"message":"do not retry"}}}`);
+
+	auto unspecified = jsonParse!ErrorParams(
+		`{"threadId":"thread-unspecified","error":{"message":"still terminal"}}`);
+	ev = jsonParse!EmittedErrorEvent(makeAgentErrorTranslatedEvent(unspecified).translated);
+	assert(ev.severity == "error");
+	assert(ev.subject == "Agent error");
+	assert(ev.body == "still terminal");
+
+	auto missingMessage = jsonParse!ErrorParams(
+		`{"threadId":"thread-missing","willRetry":false,"error":{}}`);
+	ev = jsonParse!EmittedErrorEvent(makeAgentErrorTranslatedEvent(missingMessage).translated);
+	assert(ev.severity == "error");
+	assert(ev.subject == "Agent error");
+	assert(ev.body == "Unknown error");
+
+	TranslatedEvent[] threadEvents;
+	TranslatedEvent[] allEvents;
+	CodexSessionRouteTarget threadTarget;
+	threadTarget.emitTranslatedEvent = (TranslatedEvent event) {
+		threadEvents ~= event;
+	};
+	CodexSessionRouteTarget allTarget;
+	allTarget.emitTranslatedEvent = (TranslatedEvent event) {
+		allEvents ~= event;
+	};
+	CodexServerOwner owner;
+	owner.sessionForThread = (string threadId) {
+		assert(threadId == "thread-terminal");
+		return threadTarget;
+	};
+	owner.allSessions = () => [threadTarget, allTarget];
+	auto router = new CodexServerRouter(owner);
+	router.error(terminal);
+	assert(threadEvents.length == 1);
+	assert(allEvents.length == 0);
+	assert(threadEvents[0].raw == terminalEvent.raw);
+
+	auto broadcast = jsonParse!ErrorParams(
+		`{"error":{"message":"broadcast error"}}`);
+	router.error(broadcast);
+	assert(threadEvents.length == 2);
+	assert(allEvents.length == 1);
+	assert(threadEvents[1].raw
+		== `{"jsonrpc":"2.0","method":"error","params":{"error":{"message":"broadcast error"}}}`);
+	assert(allEvents[0].raw == threadEvents[1].raw);
 }
 
 package class CodexServerRouter : ICodexServer

@@ -34,8 +34,6 @@ export type {
   ItemResultEvent,
   TurnStopEvent,
   TurnDeltaEvent,
-  AgentWarningEvent,
-  AgentErrorEvent,
   AgentUnrecognizedEvent,
   CydoTaskSpawnedEvent,
 } from "./generated/protocol";
@@ -61,8 +59,6 @@ import type {
   ItemResultEvent,
   TurnStopEvent,
   TurnDeltaEvent,
-  AgentWarningEvent,
-  AgentErrorEvent,
   AgentUnrecognizedEvent,
   CydoTaskSpawnedEvent,
 } from "./generated/protocol";
@@ -173,8 +169,6 @@ export type AgnosticEvent =
   | ProcessExitEvent
   | TaskDiagnosticEvent
   | ProcessStderrEvent
-  | AgentWarningEvent
-  | AgentErrorEvent
   | AgentUnrecognizedEvent
   | CydoTaskSpawnedEvent;
 

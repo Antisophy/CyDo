@@ -90,7 +90,7 @@ describe("session/status reducer", () => {
 });
 
 describe("task diagnostic reducer", () => {
-  it("maps a typed diagnostic to its explicit display payload without entering the user-message lifecycle", () => {
+  it("keeps an out-of-turn terminal diagnostic as a top-level message", () => {
     const state = {
       ...makeState(),
       messages: [
@@ -131,6 +131,52 @@ describe("task diagnostic reducer", () => {
     expect(next.messages[1]).not.toHaveProperty("ackState");
     expect(next.messages[1]).not.toHaveProperty("pending");
     expect(next.messages[0]).toEqual(state.messages[0]);
+    expect(next.messages.some((message) => message.type === "assistant")).toBe(
+      false,
+    );
+  });
+
+  it("inserts retry diagnostics into the active assistant turn in block order", () => {
+    const started = reduceMessage(
+      makeState(),
+      asEvent({
+        type: "item/started",
+        item_id: "text-1",
+        item_type: "text",
+        text: "Before the retry.",
+      }),
+    );
+    const diagnostic = {
+      type: "cydo/task_diagnostic" as const,
+      severity: "warning" as const,
+      subject: "Agent error (retrying)",
+      body: "API error: overloaded (attempt 1/3)",
+    };
+
+    const next = reduceMessage(started, diagnostic, 18, 123457);
+    const assistant = next.messages[0]!;
+    const block = next.blocks.get("diagnostic-2");
+
+    expect(assistant).toMatchObject({
+      type: "assistant",
+      streaming: true,
+      blockIds: ["streaming-1:text-1", "diagnostic-2"],
+      nextCreationOrder: 2,
+      rawSource: [
+        expect.objectContaining({ type: "item/started" }),
+        diagnostic,
+      ],
+      seq: 18,
+    });
+    expect(block).toMatchObject({
+      itemId: "diagnostic-2",
+      type: "diagnostic",
+      text: diagnostic.body,
+      severity: diagnostic.severity,
+      subject: diagnostic.subject,
+      completed: false,
+      creationOrder: 1,
+    });
   });
 });
 
@@ -591,70 +637,69 @@ describe("thinking block rendering state", () => {
   });
 });
 
-describe("agent warning reducer", () => {
-  it("creates a standalone assistant warning block when nothing is streaming", () => {
-    const next = reduceMessage(
-      makeState(),
-      asEvent({
-        type: "agent/warning",
-        message:
-          "Heads up: Long threads and multiple compactions can cause the model to be less accurate.",
-      }),
-    );
-
-    expect(next.messages).toHaveLength(1);
-    expect(next.messages[0]?.type).toBe("assistant");
-    expect(next.messages[0]?.streaming).toBe(false);
-    expect(next.messages[0]?.blockIds).toEqual(["warning-1"]);
-
-    const block = next.blocks.get("warning-1");
-    expect(block).toMatchObject({
-      itemId: "warning-1",
-      type: "warning",
-      text: "Heads up: Long threads and multiple compactions can cause the model to be less accurate.",
-      completed: true,
-      creationOrder: 0,
-    });
-  });
-
-  it("appends a warning block to the streaming assistant message in temporal order", () => {
-    const streaming = reduceMessage(
-      makeState(),
-      asEvent({
+describe("task diagnostic streaming sequence", () => {
+  it("continues the same assistant message after a diagnostic and completes every block", () => {
+    const events = [
+      {
         type: "item/started",
         item_id: "text-1",
         item_type: "text",
-        text: "Working on it",
-      }),
-    );
+        text: "First",
+      },
+      {
+        type: "item/delta",
+        item_id: "text-1",
+        delta_type: "text_delta",
+        content: " output",
+      },
+      {
+        type: "cydo/task_diagnostic",
+        severity: "warning",
+        subject: "Agent error (retrying)",
+        body: "API error: overloaded (attempt 1/3)",
+      },
+      {
+        type: "item/started",
+        item_id: "text-2",
+        item_type: "text",
+        text: "Second",
+      },
+      {
+        type: "item/delta",
+        item_id: "text-2",
+        delta_type: "text_delta",
+        content: " output",
+      },
+      { type: "turn/stop" },
+    ];
 
-    const next = reduceMessage(
-      streaming,
-      asEvent({
-        type: "agent/warning",
-        message:
-          "Heads up: Long threads and multiple compactions can cause the model to be less accurate.",
-      }),
+    const next = events.reduce<TaskState>(
+      (state, event) => reduceMessage(state, asEvent(event)),
+      makeState(),
     );
+    const assistant = next.messages[0]!;
 
     expect(next.messages).toHaveLength(1);
-    expect(next.messages[0]?.type).toBe("assistant");
-    expect(next.messages[0]?.streaming).toBe(true);
-    expect(next.messages[0]?.blockIds).toEqual([
-      "streaming-1:text-1",
-      "warning-2",
-    ]);
-
-    const textBlock = next.blocks.get("streaming-1:text-1");
-    expect(textBlock?.type).toBe("text");
-
-    const warningBlock = next.blocks.get("warning-2");
-    expect(warningBlock).toMatchObject({
-      itemId: "warning-2",
-      type: "warning",
-      text: "Heads up: Long threads and multiple compactions can cause the model to be less accurate.",
-      completed: false,
+    expect(assistant).toMatchObject({
+      type: "assistant",
+      streaming: false,
+      blockIds: ["streaming-1:text-1", "diagnostic-2", "streaming-1:text-2"],
+      nextCreationOrder: 3,
+    });
+    expect(next.blocks.get("streaming-1:text-1")).toMatchObject({
+      text: "First output",
+      completed: true,
+      creationOrder: 0,
+    });
+    expect(next.blocks.get("diagnostic-2")).toMatchObject({
+      type: "diagnostic",
+      completed: true,
       creationOrder: 1,
+    });
+    expect(next.blocks.get("streaming-1:text-2")).toMatchObject({
+      text: "Second output",
+      completed: true,
+      creationOrder: 2,
     });
   });
 });

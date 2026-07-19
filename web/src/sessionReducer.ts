@@ -820,61 +820,6 @@ function getOrCreateStreamingMessage(
   return { messages, msgIdx: messages.length - 1 };
 }
 
-function reduceAgentNotice(
-  s: SessionState,
-  kind: "error" | "warning",
-  text: string,
-): SessionState {
-  let streamingMsgIdx = -1;
-  for (let i = s.messages.length - 1; i >= 0; i--) {
-    if (s.messages[i]!.type === "assistant" && s.messages[i]!.streaming) {
-      streamingMsgIdx = i;
-      break;
-    }
-  }
-
-  if (streamingMsgIdx >= 0) {
-    const messages = s.messages.slice();
-    const updated = { ...messages[streamingMsgIdx]! };
-    messages[streamingMsgIdx] = updated;
-    const creationOrder = updated.nextCreationOrder ?? 0;
-    updated.nextCreationOrder = creationOrder + 1;
-
-    const itemId = `${kind}-${++s.msgIdCounter}`;
-    const block: Block = {
-      itemId,
-      type: kind,
-      text,
-      completed: false,
-      creationOrder,
-    };
-    updated.blockIds = [...(updated.blockIds || []), itemId];
-    const blocks = new Map(s.blocks);
-    blocks.set(itemId, block);
-    return { ...s, messages, blocks };
-  }
-
-  const itemId = `${kind}-${++s.msgIdCounter}`;
-  const block: Block = {
-    itemId,
-    type: kind,
-    text,
-    completed: true,
-    creationOrder: 0,
-  };
-  const blocks = new Map(s.blocks);
-  blocks.set(itemId, block);
-  const noticeMsg: DisplayMessage = {
-    id: `${kind}-msg-${s.msgIdCounter}`,
-    type: "assistant" as const,
-    content: [],
-    blockIds: [itemId],
-    streaming: false,
-    nextCreationOrder: 1,
-  };
-  return { ...s, messages: [...s.messages, noticeMsg], blocks };
-}
-
 // ---------------------------------------------------------------------------
 // Item-based protocol handlers (item/started, item/delta, item/completed,
 // item/result, turn/stop) — new event types that carry IDs instead of indices.
@@ -1148,9 +1093,17 @@ export function reduceItemStarted(
 
   const creationOrder = msg.nextCreationOrder ?? 0;
   msg.nextCreationOrder = creationOrder + 1;
+  const blockType =
+    event.item_type === "text" ||
+    event.item_type === "thinking" ||
+    event.item_type === "tool_use" ||
+    event.item_type === "unrecognized" ||
+    event.item_type === "user_message"
+      ? event.item_type
+      : "other";
   const block: Block = {
     itemId: event.item_id,
-    type: event.item_type,
+    type: blockType,
     text: event.text ?? "",
     name: event.name,
     toolServer: event.tool_server,
@@ -1486,6 +1439,29 @@ function reduceTaskDiagnostic(
   seq?: number,
   ts?: number,
 ): SessionState {
+  for (let i = s.messages.length - 1; i >= 0; i--) {
+    if (s.messages[i]!.type !== "assistant" || !s.messages[i]!.streaming)
+      continue;
+    const messages = s.messages.slice();
+    const updated = { ...messages[i]! };
+    messages[i] = updated;
+    appendRawSource(updated, msg, seq);
+    const creationOrder = updated.nextCreationOrder ?? 0;
+    updated.nextCreationOrder = creationOrder + 1;
+    const itemId = `diagnostic-${++s.msgIdCounter}`;
+    const blocks = new Map(s.blocks);
+    blocks.set(itemId, {
+      itemId,
+      type: "diagnostic",
+      text: msg.body,
+      severity: msg.severity,
+      subject: msg.subject,
+      completed: false,
+      creationOrder,
+    });
+    updated.blockIds = [...(updated.blockIds || []), itemId];
+    return { ...s, messages, blocks };
+  }
   return {
     ...s,
     messages: [
@@ -1616,15 +1592,6 @@ export function reduceMessage(
 
     case "process/stderr":
       return reduceStderr(s, msg, seq);
-
-    case "agent/warning":
-      return reduceAgentNotice(s, "warning", msg.message);
-
-    case "agent/error": {
-      const errorText = msg.message || "Unknown error";
-      const retryNote = msg.willRetry ? " (retrying)" : "";
-      return reduceAgentNotice(s, "error", `${errorText}${retryNote}`);
-    }
 
     case "agent/unrecognized": {
       // If mid-turn, embed in the streaming message to preserve temporal order.

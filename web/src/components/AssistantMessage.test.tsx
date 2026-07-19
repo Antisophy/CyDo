@@ -17,30 +17,30 @@ function renderAssistantMessage(message: DisplayMessage, block: Block): string {
   );
 }
 
-describe("AssistantMessage warning blocks", () => {
-  it("renders agent warnings with warning styling and label", () => {
+describe("AssistantMessage diagnostic blocks", () => {
+  it("renders the diagnostic subject and Markdown body with warning styling", () => {
     const html = renderAssistantMessage(
       {
-        id: "warning-msg-1",
+        id: "diagnostic-msg-1",
         type: "assistant",
         content: [],
-        blockIds: ["warning-1"],
+        blockIds: ["diagnostic-1"],
         streaming: false,
         nextCreationOrder: 1,
       },
       {
-        itemId: "warning-1",
-        type: "warning",
-        text: "Heads up: Long threads and multiple compactions can cause the model to be less accurate.",
+        itemId: "diagnostic-1",
+        type: "diagnostic",
+        severity: "warning",
+        subject: "Agent error (retrying)",
+        text: "Try **again** shortly.",
         completed: true,
         creationOrder: 0,
       },
     );
 
     expect(html).toContain("warning-block");
-    expect(html).toContain("Agent warning");
-    expect(html).toContain(
-      "Heads up: Long threads and multiple compactions can cause the model to be less accurate.",
-    );
+    expect(html).toContain("Agent error (retrying)");
+    expect(html).toContain("Try <strong>again</strong> shortly.");
   });
 });

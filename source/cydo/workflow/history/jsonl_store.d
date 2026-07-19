@@ -483,7 +483,7 @@ unittest
 	write(jsonlPath, line ~ "\n");
 
 	auto loaded = loadTaskHistory(1, jsonlPath, (string rawLine, int lineNum) {
-		return [TranslatedEvent(`{"type":"agent/warning","message":"synthetic from file line"}`, null)];
+		return [TranslatedEvent(`{"type":"cydo/task_diagnostic","severity":"warning","subject":"Agent warning","body":"synthetic from file line"}`, null)];
 	});
 
 	assert(loaded.history.length == 1, "expected one translated event");

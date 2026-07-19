@@ -332,21 +332,6 @@ struct CommandInput
 	string description;
 }
 
-/// agent/warning — transient warning from the agent.
-struct AgentWarningEvent
-{
-	string type = "agent/warning";
-	string message;
-}
-
-/// agent/error — transient error from the agent (e.g. API disconnect with retry).
-struct AgentErrorEvent
-{
-	string type = "agent/error";
-	string message;
-	@JSONOptional bool willRetry;
-}
-
 /// agent/unrecognized — data from the agent process that we couldn't translate.
 struct AgentUnrecognizedEvent
 {

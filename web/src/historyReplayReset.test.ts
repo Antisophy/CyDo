@@ -105,6 +105,79 @@ function makeRichState(): TaskState {
 }
 
 describe("history replay reset", () => {
+  it("reconstructs in-turn diagnostic placement exactly during replay", () => {
+    const events = [
+      {
+        type: "item/started",
+        item_id: "text-1",
+        item_type: "text",
+        text: "First",
+      },
+      {
+        type: "item/delta",
+        item_id: "text-1",
+        delta_type: "text_delta",
+        content: " output",
+      },
+      {
+        type: "cydo/task_diagnostic",
+        severity: "warning",
+        subject: "Agent error (retrying)",
+        body: "API error: overloaded (attempt 1/3)",
+      },
+      {
+        type: "item/started",
+        item_id: "text-2",
+        item_type: "text",
+        text: "Second",
+      },
+      {
+        type: "item/delta",
+        item_id: "text-2",
+        delta_type: "text_delta",
+        content: " output",
+      },
+      { type: "turn/stop" },
+    ];
+    const initial = makeTaskState(1, true, true);
+    const live = events.reduce<TaskState>(
+      (state, event) => reduceMessage(state, asEvent(event)),
+      initial,
+    );
+    const replayed = events.reduce<TaskState>(
+      (state, event) => reduceMessage(state, asEvent(event)),
+      resetTaskForHistoryReplay(live, events.length),
+    );
+
+    const shape = (state: typeof live) => ({
+      messages: state.messages.map((message) => ({
+        type: message.type,
+        streaming: message.streaming,
+        nextCreationOrder: message.nextCreationOrder,
+        blocks: (message.blockIds ?? []).map((id) => {
+          const block = state.blocks.get(id)!;
+          return {
+            type: block.type,
+            text: block.text,
+            ...(block.type === "diagnostic"
+              ? { severity: block.severity, subject: block.subject }
+              : {}),
+            completed: block.completed,
+            creationOrder: block.creationOrder,
+          };
+        }),
+      })),
+    });
+
+    expect(shape(replayed)).toEqual(shape(live));
+    expect(replayed.messages[0]).toMatchObject({
+      type: "assistant",
+      streaming: false,
+      nextCreationOrder: 3,
+    });
+    expect(replayed.messages[0]?.blockIds).toHaveLength(3);
+  });
+
   it("preserves optimistic user drafts while discarding and replaying diagnostics", () => {
     const before = reduceMessage(
       {

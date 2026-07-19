@@ -336,6 +336,63 @@ describe("MessageList metadata rendering", () => {
 });
 
 describe("MessageList task diagnostics", () => {
+  it("renders equivalent top-level and in-turn diagnostics with the shared view", () => {
+    const payload = {
+      severity: "warning" as const,
+      subject: "Agent error (retrying)",
+      body: "Try **again** shortly.",
+    };
+    const html = renderToString(
+      <MessageList
+        taskTid={1}
+        messages={[
+          {
+            id: "top-level-diagnostic",
+            type: "diagnostic",
+            content: [{ type: "text", text: payload.body }],
+            diagnostic: {
+              severity: payload.severity,
+              subject: payload.subject,
+            },
+          },
+          {
+            id: "assistant-diagnostic",
+            type: "assistant",
+            content: [],
+            blockIds: ["in-turn-diagnostic"],
+            streaming: false,
+            nextCreationOrder: 1,
+          },
+        ]}
+        blocks={
+          new Map([
+            [
+              "in-turn-diagnostic",
+              {
+                itemId: "in-turn-diagnostic",
+                type: "diagnostic" as const,
+                severity: payload.severity,
+                subject: payload.subject,
+                text: payload.body,
+                completed: true,
+                creationOrder: 0,
+              },
+            ],
+          ])
+        }
+        replacementEvents={new Map()}
+        isProcessing={false}
+        bandStatus=""
+      />,
+    );
+
+    expect(html.match(/warning-block/g)).toHaveLength(4);
+    expect(html.match(/Agent error \(retrying\)/g)).toHaveLength(2);
+    expect(html.match(/Try <strong>again<\/strong> shortly\./g)).toHaveLength(
+      2,
+    );
+  });
+
   it("renders error diagnostics as markdown blocks without user controls", () => {
     const diagnostic: DisplayMessage = {
       id: "diagnostic-1",

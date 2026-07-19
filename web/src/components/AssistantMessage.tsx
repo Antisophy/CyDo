@@ -3,6 +3,7 @@ import { memo } from "preact/compat";
 import { useState } from "preact/hooks";
 import type { DisplayMessage, Block } from "../types";
 import { Markdown } from "./Markdown";
+import { TaskDiagnosticView } from "./TaskDiagnosticView";
 import { ToolCall } from "./ToolCall";
 import { UserMessage } from "./UserMessage";
 import { hasAnsi, renderAnsi } from "../ansi";
@@ -348,24 +349,14 @@ export const AssistantMessage = memo(
             return null;
           }
 
-          if (block.type === "error") {
+          if (block.type === "diagnostic") {
             return (
               <div key={itemId} class={`content-block ${block.type}`}>
-                <div class="error-block">
-                  <div class="error-block-label">Agent error</div>
-                  <pre>{block.text}</pre>
-                </div>
-              </div>
-            );
-          }
-
-          if (block.type === "warning") {
-            return (
-              <div key={itemId} class={`content-block ${block.type}`}>
-                <div class="warning-block">
-                  <div class="warning-block-label">Agent warning</div>
-                  <pre>{block.text}</pre>
-                </div>
+                <TaskDiagnosticView
+                  severity={block.severity}
+                  subject={block.subject}
+                  body={block.text}
+                />
               </div>
             );
           }

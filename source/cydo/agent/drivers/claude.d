@@ -1113,8 +1113,10 @@ class ClaudeCodeSession : AgentSession
 			string errorText;
 			foreach (ref b; raw.message.content)
 				if (b.text.length > 0) errorText ~= b.text;
-			AgentErrorEvent ev;
-			ev.message = errorText;
+			TaskDiagnosticEvent ev;
+			ev.severity = TaskDiagnosticSeverity.error;
+			ev.subject = "Agent error";
+			ev.body = errorText;
 			emitEvent(TranslatedEvent(toJson(ev), rawLine));
 			return;
 		}
@@ -1362,6 +1364,43 @@ class ClaudeCodeSession : AgentSession
 			}
 		}
 	}
+}
+
+unittest
+{
+	@JSONPartial static struct DiagnosticProbe
+	{
+		string type;
+		string severity;
+		string subject;
+		string body;
+	}
+
+	auto liveRaw =
+		`{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"thinking","thinking":"live reasoning"},{"type":"text","text":"live error"}]}}`;
+	TranslatedEvent[] liveEvents;
+	auto session = new ClaudeCodeSession("true");
+	scope(exit) session.stop();
+	session.onOutput = (TranslatedEvent event) { liveEvents ~= event; };
+	session.translateAssistantLive(liveRaw);
+	assert(liveEvents.length == 1);
+	auto live = jsonParse!DiagnosticProbe(liveEvents[0].translated);
+	assert(live.type == "cydo/task_diagnostic");
+	assert(live.severity == "error");
+	assert(live.subject == "Agent error");
+	assert(live.body == "live error");
+	assert(liveEvents[0].raw == liveRaw);
+
+	auto historyRaw =
+		`{"type":"assistant","isApiErrorMessage":true,"message":{"id":"history-error","content":[{"type":"thinking","thinking":"history reasoning"},{"type":"text","text":"history error"}]}}`;
+	auto historyEvents = translateAssistantHistory(historyRaw);
+	assert(historyEvents.length == 1);
+	auto history = jsonParse!DiagnosticProbe(historyEvents[0].translated);
+	assert(history.type == "cydo/task_diagnostic");
+	assert(history.severity == "error");
+	assert(history.subject == "Agent error");
+	assert(history.body == "history reasoninghistory error");
+	assert(historyEvents[0].raw == historyRaw);
 }
 
 private:
@@ -1635,8 +1674,10 @@ private TranslatedEvent[] translateAssistantHistory(string rawLine)
 			auto text = b.type == "thinking" && b.thinking.length > 0 ? b.thinking : b.text;
 			if (text.length > 0) errorText ~= text;
 		}
-		AgentErrorEvent ev;
-		ev.message = errorText;
+		TaskDiagnosticEvent ev;
+		ev.severity = TaskDiagnosticSeverity.error;
+		ev.subject = "Agent error";
+		ev.body = errorText;
 		return [TranslatedEvent(toJson(ev), rawLine)];
 	}
 
@@ -2253,7 +2294,7 @@ unittest
 	}
 }
 
-/// Translate "system/api_retry" event to agent/error with willRetry=true.
+/// Translate "system/api_retry" event to a retrying task diagnostic.
 private string translateApiRetry(string rawLine)
 {
 	@JSONPartial static struct RawApiRetry
@@ -2265,16 +2306,17 @@ private string translateApiRetry(string rawLine)
 	}
 	try
 	{
-		import cydo.protocol : AgentErrorEvent;
+		import cydo.protocol : TaskDiagnosticEvent, TaskDiagnosticSeverity;
 		auto raw = jsonParse!RawApiRetry(rawLine);
-		AgentErrorEvent ev;
+		TaskDiagnosticEvent ev;
+		ev.severity = TaskDiagnosticSeverity.warning;
+		ev.subject = "Agent error (retrying)";
 		if (raw.error_status.isNull)
-			ev.message = format("API error: %s (attempt %d/%d)",
+			ev.body = format("API error: %s (attempt %d/%d)",
 				raw.error, raw.attempt, raw.max_retries);
 		else
-			ev.message = format("API error: %d %s (attempt %d/%d)",
+			ev.body = format("API error: %d %s (attempt %d/%d)",
 				raw.error_status.get, raw.error, raw.attempt, raw.max_retries);
-		ev.willRetry = true;
 		return toJson(ev);
 	}
 	catch (Exception e)
@@ -2283,36 +2325,45 @@ private string translateApiRetry(string rawLine)
 
 unittest
 {
+	import std.algorithm : canFind;
+
 	@JSONPartial static struct ErrorProbe
 	{
 		string type;
-		bool willRetry;
-		string message;
+		string severity;
+		string subject;
+		string body;
 	}
 
 	auto translated = translateClaudeEventInner(
 		`{"type":"system","subtype":"api_retry","attempt":8,"max_retries":10,"retry_delay_ms":39354.3,"error_status":529,"error":"rate_limit","session_id":"abc","uuid":"def"}`,
 		"claude");
 	auto ev = jsonParse!ErrorProbe(translated);
-	assert(ev.type == "agent/error");
-	assert(ev.willRetry == true);
-	assert(ev.message == "API error: 529 rate_limit (attempt 8/10)");
+	assert(ev.type == "cydo/task_diagnostic");
+	assert(ev.severity == "warning");
+	assert(ev.subject == "Agent error (retrying)");
+	assert(ev.body == "API error: 529 rate_limit (attempt 8/10)");
+	assert(!translated.canFind(`"willRetry"`));
 
 	translated = translateClaudeEventInner(
 		`{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":538.56,"error_status":null,"error":"unknown","session_id":"abc","uuid":"def"}`,
 		"claude");
 	ev = jsonParse!ErrorProbe(translated);
-	assert(ev.type == "agent/error");
-	assert(ev.willRetry == true);
-	assert(ev.message == "API error: unknown (attempt 1/10)");
+	assert(ev.type == "cydo/task_diagnostic");
+	assert(ev.severity == "warning");
+	assert(ev.subject == "Agent error (retrying)");
+	assert(ev.body == "API error: unknown (attempt 1/10)");
+	assert(!translated.canFind(`"willRetry"`));
 
 	translated = translateClaudeEventInner(
 		`{"type":"system","subtype":"api_retry","attempt":2,"max_retries":3,"retry_delay_ms":1000,"error":"timeout","session_id":"abc","uuid":"def"}`,
 		"claude");
 	ev = jsonParse!ErrorProbe(translated);
-	assert(ev.type == "agent/error");
-	assert(ev.willRetry == true);
-	assert(ev.message == "API error: timeout (attempt 2/3)");
+	assert(ev.type == "cydo/task_diagnostic");
+	assert(ev.severity == "warning");
+	assert(ev.subject == "Agent error (retrying)");
+	assert(ev.body == "API error: timeout (attempt 2/3)");
+	assert(!translated.canFind(`"willRetry"`));
 }
 
 /// Translate "system/compact_boundary" event to session/compacted.

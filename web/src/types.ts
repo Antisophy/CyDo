@@ -164,9 +164,8 @@ export interface TrackedFile {
 
 /** Unified block type replacing StreamingBlock and AssistantContentBlock for rendering.
  *  Present in TaskState.blocks, keyed by itemId. */
-export interface Block {
+interface BlockBase {
   itemId: string;
-  type: string; // "text" | "tool_use" | "thinking" | "warning" | "error" | "unrecognized"
   text: string; // accumulated text content
   name?: string; // tool name (tool_use)
   toolServer?: string; // MCP server name (e.g. "cydo"); absent for built-ins
@@ -180,6 +179,22 @@ export interface Block {
   result?: ToolResult; // tool result (tool_use only, set by item/result)
   extras?: Record<string, unknown>;
 }
+
+type NonDiagnosticBlockType =
+  | "text"
+  | "thinking"
+  | "tool_use"
+  | "unrecognized"
+  | "user_message"
+  | "other";
+
+export type Block =
+  | (BlockBase & { type: NonDiagnosticBlockType })
+  | (BlockBase & {
+      type: "diagnostic";
+      severity: TaskDiagnosticEvent["severity"];
+      subject: string;
+    });
 
 export interface SessionInfo {
   model: string;
