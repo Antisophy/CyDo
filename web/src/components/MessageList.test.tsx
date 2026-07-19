@@ -352,6 +352,7 @@ describe("MessageList task diagnostics", () => {
         taskTid={1}
         messages={[diagnostic]}
         blocks={new Map()}
+        replacementEvents={new Map()}
         isProcessing={false}
         bandStatus=""
         onEditMessage={() => {}}
@@ -385,6 +386,7 @@ describe("MessageList task diagnostics", () => {
         taskTid={1}
         messages={[diagnostic]}
         blocks={new Map()}
+        replacementEvents={new Map()}
         isProcessing={false}
         bandStatus=""
       />,
@@ -411,6 +413,7 @@ describe("MessageList task diagnostics", () => {
         taskTid={1}
         messages={[nudge]}
         blocks={new Map()}
+        replacementEvents={new Map()}
         isProcessing={false}
         bandStatus=""
         onEditMessage={() => {}}

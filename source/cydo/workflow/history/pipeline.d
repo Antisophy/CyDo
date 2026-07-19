@@ -1246,8 +1246,8 @@ unittest
 	};
 	host.sendToSubscribed = (int t, Data data) { sent ~= data; };
 	host.subscribe = (WebSocketAdapter ws, int t) {};
-	host.sendForkableUuids = (WebSocketAdapter ws, int t) {};
-	host.broadcastForkableUuids = (int t) {};
+	host.sendHistoryOperations = (WebSocketAdapter ws, int t) {};
+	host.broadcastHistoryOperations = (int t) {};
 	host.sendReplaySupplementalState = (WebSocketAdapter ws, int t) {};
 	host.onHistorySubscribed = (int t) {};
 	host.ensureAgentSessionIdFromEvent = (int t, string line) {};
