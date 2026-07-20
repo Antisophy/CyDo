@@ -33,6 +33,7 @@ import { outbox } from "./outbox";
 import {
   beginTaskHistoryReplay,
   reconcileInputDraft,
+  resetTaskForReload,
   snapshotUserDrafts,
 } from "./historyReplayReset";
 
@@ -201,6 +202,7 @@ export interface TaskManager {
     relationType?: string;
     status?: string;
     archived?: boolean;
+    taskType?: string;
     hasPendingQuestion?: boolean;
     hasMessages?: boolean;
   }>;
@@ -1135,26 +1137,7 @@ export function useTaskManager(
             nextDrafts = t.preReloadDrafts;
           }
 
-          const reset: TaskState = {
-            ...makeTaskState(
-              tid,
-              false,
-              t.resumable,
-              t.title,
-              false,
-              t.workspace,
-              t.projectPath,
-              t.parentTid,
-              t.relationType,
-              t.status,
-            ),
-            uuid: t.uuid,
-            resumable: t.resumable,
-            everLoaded: t.everLoaded,
-            preReloadDrafts: nextDrafts,
-            pendingHistoryReplies: t.pendingHistoryReplies,
-            undoResult: t.undoResult,
-          };
+          const reset = resetTaskForReload(t, nextDrafts);
 
           // Re-request history if this is the active task — the useEffect
           // won't re-fire because activeTaskId hasn't changed.

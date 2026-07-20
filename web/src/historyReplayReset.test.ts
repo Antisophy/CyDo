@@ -3,6 +3,7 @@ import { reduceMessage } from "./sessionReducer";
 import {
   beginTaskHistoryReplay,
   reconcileInputDraft,
+  resetTaskForReload,
   resetTaskForHistoryReplay,
   snapshotUserDrafts,
 } from "./historyReplayReset";
@@ -306,6 +307,50 @@ describe("history replay reset", () => {
     expect(reset.historyTotal).toBe(12);
     expect(reset.historyReceived).toBe(0);
     expect(reset.historyLoaded).toBe(false);
+  });
+
+  it("preserves stable server metadata when task reload clears task state", () => {
+    const before = makeRichState();
+    const preReloadDrafts = ["draft captured before reload"];
+    const reset = resetTaskForReload(before, preReloadDrafts);
+
+    expect(reset).toMatchObject({
+      uuid: before.uuid,
+      tid: before.tid,
+      title: before.title,
+      workspace: before.workspace,
+      projectPath: before.projectPath,
+      parentTid: before.parentTid,
+      relationType: before.relationType,
+      status: before.status,
+      resumable: before.resumable,
+      taskType: before.taskType,
+      entryPoint: before.entryPoint,
+      agentType: before.agentType,
+      archived: before.archived,
+      archiving: before.archiving,
+      createdAt: before.createdAt,
+      lastActive: before.lastActive,
+      everLoaded: before.everLoaded,
+      preReloadDrafts,
+      pendingHistoryReplies: before.pendingHistoryReplies,
+      undoResult: before.undoResult,
+      alive: false,
+      isProcessing: false,
+      stdinClosed: false,
+      needsAttention: false,
+      hasPendingQuestion: false,
+      canStop: false,
+      historyLoaded: false,
+      sessionInfo: null,
+      sessionStatus: null,
+      totalCost: 0,
+    });
+    expect(reset.messages).toEqual([]);
+    expect(reset.replacementEvents.size).toBe(0);
+    expect(reset.blocks.size).toBe(0);
+    expect(reset.itemIdMap.size).toBe(0);
+    expect(reset.trackedFiles.size).toBe(0);
   });
 
   it("rebuilds init and metadata session state during history replay", () => {

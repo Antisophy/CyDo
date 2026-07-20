@@ -1,4 +1,4 @@
-import { makeTaskState, type TaskState } from "./types";
+import type { TaskState } from "./types";
 import { canonicalUserTextFromDisplayMessage } from "./userText";
 
 export function snapshotUserDrafts(task: TaskState): string[] | undefined {
@@ -30,6 +30,48 @@ export function reconcileInputDraft(task: TaskState): string | undefined {
   return remaining.length > 0 ? remaining.join("\n\n") : undefined;
 }
 
+type TaskResetLifecycle = Pick<
+  TaskState,
+  | "alive"
+  | "isProcessing"
+  | "stdinClosed"
+  | "canStop"
+  | "needsAttention"
+  | "hasPendingQuestion"
+>;
+
+function resetTaskTimeline(
+  task: TaskState,
+  lifecycle: TaskResetLifecycle,
+): TaskState {
+  return {
+    ...task,
+    messages: [],
+    replacementEvents: new Map(),
+    sessionInfo: null,
+    sessionStatus: null,
+    totalCost: 0,
+    msgIdCounter: 0,
+    historyLoaded: false,
+    historyTotal: undefined,
+    historyReceived: undefined,
+    inputDraft: undefined,
+    historyOperations: null,
+    error: undefined,
+    undoPending: undefined,
+    suggestions: undefined,
+    serverDraft: undefined,
+    pendingAskUser: undefined,
+    pendingPermission: undefined,
+    trackedFiles: new Map(),
+    blocks: new Map(),
+    itemIdMap: new Map(),
+    pendingCydoTaskItemIds: [],
+    spawnedTidsByItemId: new Map(),
+    ...lifecycle,
+  };
+}
+
 /**
  * task_history_start marks the beginning of a full replay bundle for one task.
  * The replay must rebuild timeline state from scratch so repeated bundles do
@@ -44,35 +86,17 @@ export function resetTaskForHistoryReplay(
       message.type === "user" && message.ackState === 4 && message.nonce,
   );
 
-  const reset = makeTaskState(
-    task.tid,
-    task.alive,
-    task.resumable,
-    task.title,
-    false,
-    task.workspace,
-    task.projectPath,
-    task.parentTid,
-    task.relationType,
-    task.status,
-    task.isProcessing,
-    task.stdinClosed,
-    task.needsAttention,
-    task.hasPendingQuestion,
-    task.taskType,
-    task.archived || false,
-    task.createdAt,
-    task.lastActive,
-    task.agentType,
-    task.entryPoint,
-    task.archiving || false,
-    task.canStop,
-  );
+  const reset = resetTaskTimeline(task, {
+    alive: task.alive,
+    isProcessing: task.isProcessing,
+    stdinClosed: task.stdinClosed,
+    canStop: task.canStop,
+    needsAttention: task.needsAttention,
+    hasPendingQuestion: task.hasPendingQuestion,
+  });
 
   return {
     ...reset,
-    uuid: task.uuid,
-    everLoaded: task.everLoaded,
     messages: pendingUserMessages,
     msgIdCounter: Math.max(reset.msgIdCounter, task.msgIdCounter),
     historyTotal: total,
@@ -87,6 +111,23 @@ export function resetTaskForHistoryReplay(
     serverDraft: task.serverDraft,
     pendingAskUser: task.pendingAskUser,
     pendingPermission: task.pendingPermission,
+  };
+}
+
+export function resetTaskForReload(
+  task: TaskState,
+  preReloadDrafts: string[] | undefined,
+): TaskState {
+  return {
+    ...resetTaskTimeline(task, {
+      alive: false,
+      isProcessing: false,
+      stdinClosed: false,
+      canStop: false,
+      needsAttention: false,
+      hasPendingQuestion: false,
+    }),
+    preReloadDrafts,
   };
 }
 
