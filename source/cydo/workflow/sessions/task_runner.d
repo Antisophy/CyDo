@@ -3,10 +3,8 @@ module cydo.workflow.sessions.task_runner;
 import core.time : seconds;
 
 import std.file : mkdirRecurse;
-import std.exception : assertThrown;
-import std.path : absolutePath, buildPath, dirName;
-import std.process : execute;
-import std.string : strip;
+import std.exception : enforce;
+import std.path : buildPath, dirName;
 import std.logger : infof, tracef, warningf;
 
 import ae.utils.json : JSONPartial, jsonParse, toJson;
@@ -27,6 +25,11 @@ import cydo.domain.task_types.catalog : TaskTypeCatalog;
 import cydo.domain.task_types.definition : TaskTypeDef,
 	formatCompactCreatableTaskTypeToolSummary, formatCompactHandoffToolSummary,
 	isInteractive, formatCompactSwitchModeToolSummary, loadTaskTypeSystemPrompt, byName;
+
+version (unittest) import std.exception : assertThrown;
+version (unittest) import std.process : execute;
+version (unittest) import std.string : strip;
+version (unittest) import cydo.agent.drivers.claude : ClaudeCodeAgent;
 
 package(cydo):
 
@@ -284,6 +287,27 @@ class TaskSessionRunner
 		auto sandbox = launchSandbox.resolveSandbox(host_.globalSandbox(), agentTypeSandbox, wsSandbox,
 			agentSandbox, workDir, wsRoot, readOnly);
 
+		if (td.hasWorktree && workDir.length > 0)
+			sandbox.paths[workDir] = PathMode.ro;
+
+		if (workDir.length > 0 && (td.isGitCheckout || td.hasWorktree))
+		{
+			auto workDirMode = workDir in sandbox.paths;
+			enforce(workDirMode !is null, "Sandbox must expose the task checkout: " ~ workDir);
+			final switch (*workDirMode)
+			{
+			case PathMode.ro:
+			case PathMode.rw:
+			case PathMode.always_rw:
+				launchSandbox.grantGitMetadata(sandbox.paths, workDir, *workDirMode);
+				break;
+			case PathMode.tmpfs:
+			case PathMode.empty_dir:
+			case PathMode.empty_file:
+				break;
+			}
+		}
+
 		sandbox.paths[tdDir] = PathMode.rw;
 
 		// Other tasks' outputs are part of the workflow contract (sub-task
@@ -295,50 +319,22 @@ class TaskSessionRunner
 		if (tasksRoot !in sandbox.paths)
 			sandbox.paths[tasksRoot] = PathMode.ro;
 
-		if (td.worktreeTid > 0 && workDir.length > 0)
+		if (td.hasWorktree && workDir.length > 0)
 		{
-			sandbox.paths[workDir] = PathMode.ro;
-
 			// Read-only tasks need the worktree mounted too: the task
 			// directory tree is not necessarily reachable through the
 			// workspace-root mount (it may live on another volume).
 			auto wtPath = host_.worktreePath(td);
-			sandbox.paths[wtPath] = readOnly ? PathMode.ro : PathMode.rw;
-
-			if (!readOnly)
-			{
-				auto gitDirResult = execute(["git", "-C", wtPath, "rev-parse", "--git-dir"]);
-				if (gitDirResult.status == 0)
-				{
-					auto gitDir = gitDirResult.output.strip.absolutePath(wtPath);
-					sandbox.paths[gitDir] = PathMode.rw;
-				}
-				auto gitCommonResult = execute(["git", "-C", wtPath, "rev-parse", "--git-common-dir"]);
-				if (gitCommonResult.status == 0)
-				{
-					auto gitCommonDir = gitCommonResult.output.strip.absolutePath(wtPath);
-					sandbox.paths[gitCommonDir] = PathMode.rw;
-				}
-			}
+			enforce(wtPath.length > 0, "Worktree path must not be empty for worktree task");
+			auto wtMode = readOnly ? PathMode.ro : PathMode.rw;
+			sandbox.paths[wtPath] = wtMode;
+			launchSandbox.grantGitMetadata(sandbox.paths, wtPath, wtMode);
 		}
 
 		auto reachesWorktree = host_.taskTypeCatalog.reachesWorktreeFor(td.projectPath);
-		if (workDir.length > 0 && td.taskType in reachesWorktree
-			&& reachesWorktree[td.taskType])
-		{
-			auto gitDirResult = execute(["git", "-C", workDir, "rev-parse", "--git-dir"]);
-			if (gitDirResult.status == 0)
-			{
-				auto gitDir = gitDirResult.output.strip.absolutePath(workDir);
-				sandbox.paths[gitDir] = PathMode.always_rw;
-			}
-			auto gitCommonResult = execute(["git", "-C", workDir, "rev-parse", "--git-common-dir"]);
-			if (gitCommonResult.status == 0)
-			{
-				auto gitCommonDir = gitCommonResult.output.strip.absolutePath(workDir);
-				sandbox.paths[gitCommonDir] = PathMode.always_rw;
-			}
-		}
+		if (workDir.length > 0 && (td.isGitCheckout || td.hasWorktree)
+			&& td.taskType in reachesWorktree && reachesWorktree[td.taskType])
+			launchSandbox.grantGitMetadata(sandbox.paths, workDir, PathMode.always_rw);
 
 		auto mcpSocketPath = host_.mcpSocketPath();
 		if (mcpSocketPath.length > 0)
@@ -960,4 +956,393 @@ private:
 		return buildLaunchFailureBody(tid,
 			e.classinfo.name ~ ": " ~ e.msg);
 	}
+}
+
+version (unittest) private final class LinkedWorktreeSandboxTestAgent : ClaudeCodeAgent
+{
+	override string executableName(string[string] env)
+	{
+		return "/bin/true";
+	}
+}
+
+version (unittest) private void assertLinkedWorktreeGitMetadataMode(
+	string fixtureName, string taskTypeName, PathMode expectedMode,
+	bool projectIsMasked = false)
+{
+	withGitMetadataLaunchFixture(fixtureName,
+		(GitMetadataLaunchFixture fixture) {
+			auto catalog = gitMetadataTaskCatalog(fixture,
+				"task_types:\n"
+				~ "  writable:\n"
+				~ "    model_class: large\n"
+				~ "  readonly:\n"
+				~ "    model_class: large\n"
+				~ "    read_only: true\n");
+			auto taskTypes = catalog.getTaskTypesForProject(fixture.linkedCheckout);
+			auto reachesWorktree = catalog.reachesWorktreeFor(fixture.linkedCheckout);
+			assert(reachesWorktree !is null);
+			assert(!reachesWorktree["writable"]);
+			assert(!reachesWorktree["readonly"]);
+
+			TaskData[int] tasks;
+			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+			tasks[1].taskType = taskTypeName;
+			tasks[1].agentType = "claude";
+			assert(!tasks[1].hasWorktree);
+
+			auto workspaceSandbox = unrestrictedLaunchTestSandbox();
+			if (projectIsMasked)
+				workspaceSandbox.paths[fixture.linkedCheckout] = expectedMode;
+
+			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
+				workspaceSandbox, "", fixture.linkedCheckout);
+			auto typeDef = taskTypes.byName(taskTypeName);
+			assert(typeDef !is null);
+			auto launch = runner.prepareTaskSessionLaunch(1,
+				new LinkedWorktreeSandboxTestAgent(), typeDef);
+			auto projectMode = fixture.linkedCheckout in launch.processLaunch.sandbox.paths;
+			auto gitDirMode = fixture.linkedGitDir in launch.processLaunch.sandbox.paths;
+			auto gitCommonDirMode = fixture.commonGitDir in launch.processLaunch.sandbox.paths;
+			assert(projectMode !is null, "linked worktree checkout is not mounted");
+			assert(*projectMode == expectedMode);
+			if (projectIsMasked)
+			{
+				assert(gitDirMode is null, "masked checkout granted its git dir");
+				assert(gitCommonDirMode is null, "masked checkout granted its common git dir");
+			}
+			else
+			{
+				assert(gitDirMode !is null, "linked worktree git dir is not mounted");
+				assert(gitCommonDirMode !is null, "linked worktree common git dir is not mounted");
+				assert(*gitDirMode == *projectMode);
+				assert(*gitCommonDirMode == *projectMode);
+			}
+		});
+}
+
+unittest
+{
+	assertLinkedWorktreeGitMetadataMode(
+		"cydo-task-runner-linked-worktree-writable", "writable", PathMode.rw);
+}
+
+unittest
+{
+	assertLinkedWorktreeGitMetadataMode(
+		"cydo-task-runner-linked-worktree-readonly", "readonly", PathMode.ro);
+}
+
+unittest
+{
+	assertLinkedWorktreeGitMetadataMode(
+		"cydo-task-runner-linked-worktree-tmpfs", "writable", PathMode.tmpfs, true);
+}
+
+unittest
+{
+	assertLinkedWorktreeGitMetadataMode(
+		"cydo-task-runner-linked-worktree-empty-dir", "writable", PathMode.empty_dir, true);
+}
+
+unittest
+{
+	assertLinkedWorktreeGitMetadataMode(
+		"cydo-task-runner-linked-worktree-empty-file", "writable", PathMode.empty_file, true);
+}
+
+version (unittest) private struct GitMetadataLaunchFixture
+{
+	string root;
+	string workspaceRoot;
+	string primaryRepo;
+	string linkedCheckout;
+	string linkedGitDir;
+	string commonGitDir;
+}
+
+version (unittest) private void withGitMetadataLaunchFixture(string fixtureName,
+	void delegate(GitMetadataLaunchFixture fixture) test)
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, write;
+	import std.process : environment;
+
+	auto root = buildPath("/tmp", fixtureName);
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto oldHome = environment.get("HOME", "");
+	auto hadHome = "HOME" in environment;
+	scope (exit)
+	{
+		if (hadHome)
+			environment["HOME"] = oldHome;
+		else
+			environment.remove("HOME");
+	}
+	environment["HOME"] = buildPath(root, "home");
+
+	auto workspaceRoot = buildPath(root, "workspace");
+	auto primaryRepo = buildPath(workspaceRoot, "primary");
+	auto linkedCheckout = buildPath(workspaceRoot, "linked");
+	mkdirRecurse(primaryRepo);
+	assert(execute(["git", "-C", primaryRepo, "init", "-q"]).status == 0);
+	assert(execute(["git", "-C", primaryRepo, "config", "user.email", "test@example.com"])
+		.status == 0);
+	assert(execute(["git", "-C", primaryRepo, "config", "user.name", "CyDo Test"])
+		.status == 0);
+	write(buildPath(primaryRepo, "README.md"), "linked worktree fixture\n");
+	assert(execute(["git", "-C", primaryRepo, "add", "README.md"]).status == 0);
+	assert(execute(["git", "-C", primaryRepo, "commit", "-qm", "initial fixture"])
+		.status == 0);
+	assert(execute(["git", "-C", primaryRepo, "worktree", "add", "--detach", linkedCheckout])
+		.status == 0);
+
+	string gitPath(string checkoutPath, string flag)
+	{
+		auto result = execute(["git", "-C", checkoutPath, "rev-parse",
+			"--path-format=absolute", flag]);
+		assert(result.status == 0, result.output);
+		return result.output.strip;
+	}
+
+	GitMetadataLaunchFixture fixture;
+	fixture.root = root;
+	fixture.workspaceRoot = workspaceRoot;
+	fixture.primaryRepo = primaryRepo;
+	fixture.linkedCheckout = linkedCheckout;
+	fixture.linkedGitDir = gitPath(linkedCheckout, "--git-dir");
+	fixture.commonGitDir = gitPath(linkedCheckout, "--git-common-dir");
+	assert(fixture.linkedGitDir != fixture.commonGitDir);
+	assert(fixture.commonGitDir == buildPath(primaryRepo, ".git"));
+	test(fixture);
+}
+
+version (unittest) private TaskTypeCatalog gitMetadataTaskCatalog(
+	GitMetadataLaunchFixture fixture, string yaml)
+{
+	import std.file : mkdirRecurse, write;
+
+	auto defsDir = buildPath(fixture.root, "defs");
+	mkdirRecurse(buildPath(defsDir, "prompts"));
+	write(buildPath(defsDir, "prompts", "blank.md"), "Blank prompt\n");
+	write(buildPath(defsDir, "task-types.yaml"), yaml);
+	return new TaskTypeCatalog(defsDir, buildPath(defsDir, "task-types.yaml"),
+		(string name) => name == "claude");
+}
+
+version (unittest) private SandboxConfig unrestrictedLaunchTestSandbox()
+{
+	import configy.attributes : SetInfo;
+
+	return SandboxConfig(
+		isolate_filesystem: SetInfo!bool(false),
+		isolate_processes: SetInfo!bool(false),
+		isolate_environment: SetInfo!bool(false),
+	);
+}
+
+version (unittest) private TaskSessionRunner gitMetadataTestRunner(
+	TaskData[int]* tasks, TaskTypeCatalog catalog, GitMetadataLaunchFixture fixture,
+	SandboxConfig workspaceSandbox, string worktreePath, string taskCwd)
+{
+	return new TaskSessionRunner(TaskSessionRunnerHost(
+		getTask: (int tid) {
+			auto task = tid in *tasks;
+			return task is null ? null : &(*tasks)[tid];
+		},
+		taskDir: (const TaskData* td) => buildPath(fixture.root, "tasks", "task"),
+		outputPath: (const TaskData* td) => buildPath(fixture.root, "tasks", "task", "output.md"),
+		effectiveCwd: (const TaskData* td) => taskCwd,
+		worktreePath: (const TaskData* td) => worktreePath,
+		globalSandbox: () => unrestrictedLaunchTestSandbox(),
+		findWorkspaceSandbox: (string workspaceName) => workspaceSandbox,
+		findWorkspaceRoot: (string workspaceName) => fixture.workspaceRoot,
+		findWorkspacePermissionPolicy: (string workspaceName) => "",
+		findAgentSandbox: (string agentName) => unrestrictedLaunchTestSandbox(),
+		reportMcpToolDescriptionLimit: (string projectPath, string taskType,
+			ToolDescriptionViolation[] violations) {},
+		resolveSharedTmpPath: (int tid) => "",
+		mcpSocketPath: () => "",
+		taskTypeCatalog: catalog,
+	));
+}
+
+unittest
+{
+	withGitMetadataLaunchFixture("cydo-task-runner-managed-linked-worktree",
+		(GitMetadataLaunchFixture fixture) {
+			auto managedCheckout = buildPath(fixture.workspaceRoot, "managed");
+			assert(execute(["git", "-C", fixture.primaryRepo, "worktree", "add", "--detach",
+				managedCheckout]).status == 0);
+			auto managedGitDir = execute(["git", "-C", managedCheckout, "rev-parse",
+				"--path-format=absolute", "--git-dir"]);
+			assert(managedGitDir.status == 0, managedGitDir.output);
+
+			auto catalog = gitMetadataTaskCatalog(fixture,
+				"task_types:\n"
+				~ "  managed:\n"
+				~ "    model_class: large\n");
+			auto taskTypes = catalog.getTaskTypesForProject(fixture.linkedCheckout);
+			auto typeDef = taskTypes.byName("managed");
+			assert(typeDef !is null);
+			auto reachesWorktree = catalog.reachesWorktreeFor(fixture.linkedCheckout);
+			assert(reachesWorktree !is null && !reachesWorktree["managed"]);
+
+			TaskData[int] tasks;
+			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+			tasks[1].taskType = "managed";
+			tasks[1].agentType = "claude";
+			tasks[1].worktreeTid = 1;
+
+			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
+				unrestrictedLaunchTestSandbox(), managedCheckout, managedCheckout);
+			auto launch = runner.prepareTaskSessionLaunch(1,
+				new LinkedWorktreeSandboxTestAgent(), typeDef);
+			auto workDirMode = fixture.linkedCheckout in launch.processLaunch.sandbox.paths;
+			auto baseGitMode = fixture.linkedGitDir in launch.processLaunch.sandbox.paths;
+			auto worktreeMode = managedCheckout in launch.processLaunch.sandbox.paths;
+			auto managedGitMode = managedGitDir.output.strip in launch.processLaunch.sandbox.paths;
+			auto commonGitMode = fixture.commonGitDir in launch.processLaunch.sandbox.paths;
+			assert(workDirMode !is null);
+			assert(baseGitMode !is null);
+			assert(worktreeMode !is null);
+			assert(managedGitMode !is null);
+			assert(commonGitMode !is null);
+			assert(*workDirMode == PathMode.ro);
+			assert(*baseGitMode == PathMode.ro);
+			assert(*worktreeMode == PathMode.rw);
+			assert(*managedGitMode == PathMode.rw);
+			assert(*commonGitMode == PathMode.rw);
+		});
+}
+
+unittest
+{
+	withGitMetadataLaunchFixture("cydo-task-runner-reaches-worktree-git-metadata",
+		(GitMetadataLaunchFixture fixture) {
+			auto catalog = gitMetadataTaskCatalog(fixture,
+				"task_types:\n"
+				~ "  parent:\n"
+				~ "    model_class: large\n"
+				~ "    read_only: true\n"
+				~ "    creatable_tasks:\n"
+				~ "      child:\n"
+				~ "        task_type: child\n"
+				~ "        worktree: require\n"
+				~ "        prompt_template: prompts/blank.md\n"
+				~ "  child:\n"
+				~ "    model_class: large\n");
+			auto taskTypes = catalog.getTaskTypesForProject(fixture.linkedCheckout);
+			auto typeDef = taskTypes.byName("parent");
+			assert(typeDef !is null);
+			auto reachesWorktree = catalog.reachesWorktreeFor(fixture.linkedCheckout);
+			assert(reachesWorktree !is null && reachesWorktree["parent"]);
+
+			TaskData[int] tasks;
+			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+			tasks[1].taskType = "parent";
+			tasks[1].agentType = "claude";
+
+			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
+				unrestrictedLaunchTestSandbox(), "", fixture.linkedCheckout);
+			auto launch = runner.prepareTaskSessionLaunch(1,
+				new LinkedWorktreeSandboxTestAgent(), typeDef);
+			auto workDirMode = fixture.linkedCheckout in launch.processLaunch.sandbox.paths;
+			auto gitDirMode = fixture.linkedGitDir in launch.processLaunch.sandbox.paths;
+			auto commonGitMode = fixture.commonGitDir in launch.processLaunch.sandbox.paths;
+			assert(workDirMode !is null);
+			assert(gitDirMode !is null);
+			assert(commonGitMode !is null);
+			assert(*workDirMode == PathMode.ro);
+			assert(*gitDirMode == PathMode.always_rw);
+			assert(*commonGitMode == PathMode.always_rw);
+		});
+}
+
+unittest
+{
+	withGitMetadataLaunchFixture("cydo-task-runner-non-git-managed-worktree",
+		(GitMetadataLaunchFixture fixture) {
+			import std.algorithm : canFind;
+			import std.file : mkdirRecurse;
+
+			auto worktreePath = buildPath(fixture.root, "plain-worktree");
+			mkdirRecurse(worktreePath);
+
+			auto catalog = gitMetadataTaskCatalog(fixture,
+				"task_types:\n"
+				~ "  managed:\n"
+				~ "    model_class: large\n");
+			auto taskTypes = catalog.getTaskTypesForProject(fixture.linkedCheckout);
+			auto typeDef = taskTypes.byName("managed");
+			assert(typeDef !is null);
+
+			TaskData[int] tasks;
+			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+			tasks[1].taskType = "managed";
+			tasks[1].agentType = "claude";
+			tasks[1].worktreeTid = 1;
+
+			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
+				unrestrictedLaunchTestSandbox(), worktreePath, worktreePath);
+			bool threw;
+			try
+				runner.prepareTaskSessionLaunch(1, new LinkedWorktreeSandboxTestAgent(), typeDef);
+			catch (Exception e)
+			{
+				threw = true;
+				assert(e.msg.canFind(worktreePath));
+				assert(e.msg.canFind("--git-dir"));
+			}
+			assert(threw);
+		});
+}
+
+unittest
+{
+	withGitMetadataLaunchFixture("cydo-task-runner-non-git-reaches-worktree",
+		(GitMetadataLaunchFixture fixture) {
+			import std.file : mkdirRecurse;
+
+			auto projectPath = buildPath(fixture.workspaceRoot, "plain-project");
+			mkdirRecurse(projectPath);
+
+			auto catalog = gitMetadataTaskCatalog(fixture,
+				"task_types:\n"
+				~ "  parent:\n"
+				~ "    model_class: large\n"
+				~ "    creatable_tasks:\n"
+				~ "      child:\n"
+				~ "        task_type: child\n"
+				~ "        worktree: require\n"
+				~ "        prompt_template: prompts/blank.md\n"
+				~ "  child:\n"
+				~ "    model_class: large\n");
+			auto taskTypes = catalog.getTaskTypesForProject(projectPath);
+			auto typeDef = taskTypes.byName("parent");
+			assert(typeDef !is null);
+			auto reachesWorktree = catalog.reachesWorktreeFor(projectPath);
+			assert(reachesWorktree !is null && reachesWorktree["parent"]);
+
+			TaskData[int] tasks;
+			tasks[1] = TaskData(1, "local", projectPath);
+			tasks[1].taskType = "parent";
+			tasks[1].agentType = "claude";
+			assert(!tasks[1].isGitCheckout);
+
+			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
+				unrestrictedLaunchTestSandbox(), "", projectPath);
+			// A non-Git project may launch a worktree-reaching parent; only an
+			// actually requested worktree child can fail. No metadata is granted.
+			auto launch = runner.prepareTaskSessionLaunch(1,
+				new LinkedWorktreeSandboxTestAgent(), typeDef);
+			auto projectMode = projectPath in launch.processLaunch.sandbox.paths;
+			assert(projectMode !is null);
+			assert(*projectMode == PathMode.rw);
+			assert(fixture.commonGitDir !in launch.processLaunch.sandbox.paths);
+		});
 }

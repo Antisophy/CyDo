@@ -6,8 +6,8 @@ import std.file : exists, isSymlink, readLink;
 import std.format : format;
 import std.logger : warningf;
 import std.path : expandTilde, pathSplitter;
-import std.process : environment;
-import std.string : lastIndexOf;
+import std.process : environment, execute;
+import std.string : lastIndexOf, strip;
 
 import ae.sys.file : realPath;
 
@@ -104,6 +104,34 @@ ResolvedSandbox resolveSandboxForDiscovery(SandboxConfig global, SandboxConfig w
 	resolveIsolationFlags(result, global, workspace);
 
 	return result;
+}
+
+/// Grant a checkout's Git metadata directories with the checkout's access mode.
+void grantGitMetadata(ref PathMode[string] paths, string checkoutPath, PathMode mode)
+{
+	final switch (mode)
+	{
+	case PathMode.ro:
+	case PathMode.rw:
+	case PathMode.always_rw:
+		break;
+	case PathMode.tmpfs:
+	case PathMode.empty_dir:
+	case PathMode.empty_file:
+		enforce(false, "Git metadata requires an exposed checkout: " ~ checkoutPath);
+		break;
+	}
+
+	foreach (flag; ["--git-dir", "--git-common-dir"])
+	{
+		auto result = execute(["git", "-C", checkoutPath, "rev-parse",
+			"--path-format=absolute", flag]);
+		auto metadataPath = result.output.strip;
+		enforce(result.status == 0 && metadataPath.length > 0,
+			"Failed to resolve Git metadata " ~ flag ~ " for " ~ checkoutPath
+			~ ": " ~ result.output);
+		paths[metadataPath] = mode;
+	}
 }
 
 private:

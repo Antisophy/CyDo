@@ -1,6 +1,12 @@
 module cydo.domain.tasks.model;
 
-private string[string] repoPathCache;
+private struct ProjectRepoResolution
+{
+	string repoPath;
+	bool isGitCheckout;
+}
+
+private ProjectRepoResolution[string] projectRepoResolutionCache;
 
 import ae.sys.data : Data;
 import ae.sys.dataset : DataVec;
@@ -47,21 +53,29 @@ TaskStatus parseTaskStatus(string value)
 	assert(0);
 }
 
+private ProjectRepoResolution resolveProjectRepo(string projectPath)
+{
+	if (projectPath.length == 0)
+		return ProjectRepoResolution("", false);
+	if (auto cached = projectPath in projectRepoResolutionCache)
+		return *cached;
+
+	import std.process : execute;
+	import std.string : strip;
+	auto repoResult = execute(["git", "-C", projectPath, "rev-parse", "--show-toplevel"]);
+	auto repoRoot = repoResult.output.strip();
+	auto resolution = repoResult.status == 0 && repoRoot.length > 0
+		? ProjectRepoResolution(repoRoot, true)
+		: ProjectRepoResolution(projectPath, false);
+	projectRepoResolutionCache[projectPath] = resolution;
+	return resolution;
+}
+
 /// Git repository root for the selected project.
 /// Falls back to projectPath if git resolution fails.
 string resolveProjectRepoPath(string projectPath)
 {
-	if (projectPath.length == 0)
-		return "";
-	return repoPathCache.require(projectPath, {
-		import std.process : execute;
-		import std.string : strip;
-		auto repoResult = execute(["git", "-C", projectPath, "rev-parse", "--show-toplevel"]);
-		if (repoResult.status != 0)
-			return projectPath;
-		auto repoRoot = repoResult.output.strip();
-		return repoRoot.length > 0 ? repoRoot : projectPath;
-	}());
+	return resolveProjectRepo(projectPath).repoPath;
 }
 
 string resolveTaskDir(int tid, string workspace, string workspaceRoot, string projectPath,
@@ -528,6 +542,11 @@ struct TaskData
 		return resolveProjectRepoPath(projectPath);
 	}
 
+	@property bool isGitCheckout() const
+	{
+		return resolveProjectRepo(projectPath).isGitCheckout;
+	}
+
 	/// Returns true if this task owns its worktree (worktreeTid == own tid).
 	bool ownsWorktree() const
 	{
@@ -783,6 +802,97 @@ struct TaskData
 	int pendingAskQid;                     // qid allocated for this question
 	void delegate()[] onIdleCallbacks;     // callbacks to run when the task next yields idle
 	string error;  // last stderr text on non-zero exit; cleared on restart
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, write;
+	import std.path : buildPath;
+	import std.process : execute;
+
+	auto root = buildPath("/tmp", "cydo-task-data-is-git-checkout");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto plainDir = buildPath(root, "plain");
+	auto repoRoot = buildPath(root, "repository");
+	auto nestedDir = buildPath(repoRoot, "nested");
+	auto linkedCheckout = buildPath(root, "linked");
+	mkdirRecurse(plainDir);
+	mkdirRecurse(repoRoot);
+
+	auto plainTask = TaskData(1, "local", plainDir);
+	assert(!plainTask.isGitCheckout);
+	assert(plainTask.repoPath == plainDir);
+
+	assert(execute(["git", "-C", repoRoot, "init", "-q"]).status == 0);
+	assert(execute(["git", "-C", repoRoot, "config", "user.email", "test@example.com"])
+		.status == 0);
+	assert(execute(["git", "-C", repoRoot, "config", "user.name", "CyDo Test"])
+		.status == 0);
+	write(buildPath(repoRoot, "README.md"), "checkout fixture\n");
+	assert(execute(["git", "-C", repoRoot, "add", "README.md"]).status == 0);
+	assert(execute(["git", "-C", repoRoot, "commit", "-qm", "initial fixture"])
+		.status == 0);
+	mkdirRecurse(nestedDir);
+	assert(execute(["git", "-C", repoRoot, "worktree", "add", "--detach", linkedCheckout])
+		.status == 0);
+
+	auto rootTask = TaskData(2, "local", repoRoot);
+	assert(rootTask.isGitCheckout);
+	assert(rootTask.repoPath == repoRoot);
+
+	auto nestedTask = TaskData(3, "local", nestedDir);
+	assert(nestedTask.isGitCheckout);
+	assert(nestedTask.repoPath == repoRoot);
+
+	auto linkedTask = TaskData(4, "local", linkedCheckout);
+	assert(linkedTask.isGitCheckout);
+	assert(linkedTask.repoPath == linkedCheckout);
+}
+
+unittest
+{
+	import std.exception : assertThrown;
+	import std.file : exists, mkdirRecurse, rmdirRecurse;
+	import std.path : buildPath;
+	import std.process : environment, execute, ProcessException;
+
+	auto root = buildPath("/tmp", "cydo-project-repo-resolution-cache-after-probe-error");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto repoRoot = buildPath(root, "repository");
+	mkdirRecurse(repoRoot);
+	assert(execute(["git", "-C", repoRoot, "init", "-q"]).status == 0);
+
+	projectRepoResolutionCache.remove(repoRoot);
+	scope (exit)
+		projectRepoResolutionCache.remove(repoRoot);
+
+	auto oldPath = environment.get("PATH", "");
+	auto hadPath = "PATH" in environment;
+	scope (exit)
+	{
+		if (hadPath)
+			environment["PATH"] = oldPath;
+		else
+			environment.remove("PATH");
+	}
+	// Make the first real Git probe fail, then allow the retry to resolve it.
+	environment["PATH"] = buildPath(root, "without-git");
+	assertThrown!ProcessException(resolveProjectRepo(repoRoot));
+
+	environment["PATH"] = oldPath;
+	auto resolution = resolveProjectRepo(repoRoot);
+	assert(resolution.repoPath == repoRoot);
+	assert(resolution.isGitCheckout);
 }
 
 struct TaskHistoryStartMessage

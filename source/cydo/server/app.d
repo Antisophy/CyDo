@@ -3375,14 +3375,60 @@ unittest
 		taskTypeCatalog: app.taskTypeCatalog,
 	));
 
+	// projectPath is deliberately a plain directory. Launch preparation must
+	// preserve non-Git projects rather than treating repoPath's fallback as a
+	// checkout whose metadata needs mounting.
+	assert(!app.tasks[41].isGitCheckout);
+	auto codexLaunch = runner.prepareTaskSessionLaunch(41, new TestCodexPromptAgent(),
+		currentTypeDef());
+	auto codexProjectMode = projectPath in codexLaunch.processLaunch.sandbox.paths;
+	assert(codexProjectMode !is null);
+	final switch (*codexProjectMode)
+	{
+	case PathMode.ro:
+	case PathMode.rw:
+	case PathMode.always_rw:
+		break;
+	case PathMode.tmpfs:
+	case PathMode.empty_dir:
+	case PathMode.empty_file:
+		assert(0, "non-Git project is masked");
+	}
+
 	app.tasks[41].agentType = "claude";
 	auto claudeLaunch = runner.prepareTaskSessionLaunch(41, new TestClaudePromptAgent(),
 		currentTypeDef());
+	auto claudeProjectMode = projectPath in claudeLaunch.processLaunch.sandbox.paths;
+	assert(claudeProjectMode !is null);
+	final switch (*claudeProjectMode)
+	{
+	case PathMode.ro:
+	case PathMode.rw:
+	case PathMode.always_rw:
+		break;
+	case PathMode.tmpfs:
+	case PathMode.empty_dir:
+	case PathMode.empty_file:
+		assert(0, "non-Git project is masked");
+	}
 	assert(claudeLaunch.sessionConfig.appendSystemPrompt == codexPrompt);
 
 	app.tasks[41].agentType = "copilot";
 	auto copilotLaunch = runner.prepareTaskSessionLaunch(41, new TestCopilotPromptAgent(),
 		currentTypeDef());
+	auto copilotProjectMode = projectPath in copilotLaunch.processLaunch.sandbox.paths;
+	assert(copilotProjectMode !is null);
+	final switch (*copilotProjectMode)
+	{
+	case PathMode.ro:
+	case PathMode.rw:
+	case PathMode.always_rw:
+		break;
+	case PathMode.tmpfs:
+	case PathMode.empty_dir:
+	case PathMode.empty_file:
+		assert(0, "non-Git project is masked");
+	}
 	assert(copilotLaunch.sessionConfig.appendSystemPrompt == codexPrompt);
 }
 
