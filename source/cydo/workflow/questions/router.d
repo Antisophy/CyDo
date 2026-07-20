@@ -347,6 +347,15 @@ public:
 				(*questionPromise).fulfill(McpResult.structured(answerJson));
 				clearQuestionRoute(qid);
 
+				// The answerer re-blocks on the batch below; restore the waiting
+				// status that assistant-work activation replaced while it was
+				// processing the question. Both batch-loop exits reactivate it:
+				// a further question via assistant-work output, a final batch
+				// result via onToolCallDelivered.
+				if (callerTd.status != TaskStatus.waiting)
+					host_.transitionTask(route.answererTid, TaskStatus.active,
+						TaskStatus.waiting, TaskNotificationChange.preserve);
+
 				return host_.awaitBatchLoop(route.answererTid, route.batchId);
 			}
 			case QuestionAfterAnswer.completeAnswererOnIdle:

@@ -1320,6 +1320,67 @@ test("Ask/Answer: Ask to active sub-task delivers follow-up message", async ({
   ).toBeVisible({ timeout: 60_000 });
 });
 
+test("Ask/Answer: parent returns to waiting after answering mid-batch", async ({
+  page,
+  agentType,
+}) => {
+  test.setTimeout(TALK_TIMEOUT);
+
+  const observedTaskResults = observeTaskResultItems(page);
+
+  await enterSession(page);
+
+  // "call active-child-test" creates:
+  //   - child tid=2: stalls (LLM connection kept open, stays in-flight)
+  //   - child tid=3: calls Ask("am I doing this right?") asking parent
+  await sendMessage(page, "call active-child-test");
+
+  // Wait for both children, then navigate to the parent (auto-focus went to
+  // the stalling tid=2, which never completes).
+  await page.locator('.sidebar-item[data-tid="3"]').waitFor({
+    state: "visible",
+    timeout: 30_000,
+  });
+  await page.locator('.sidebar-item[data-tid="1"]').click();
+  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
+    timeout: 10_000,
+  });
+
+  // Wait for child 3's question in the parent's Task tool result, then for
+  // the parent's turn to complete ("Done.").
+  await expect(
+    page
+      .locator('[style*="display: contents"] .message-list')
+      .getByText("am I doing this right?")
+      .last(),
+  ).toBeVisible({ timeout: 90_000 });
+  await expect(
+    page
+      .locator('[style*="display: contents"] .message-list')
+      .getByText("Done.", { exact: true })
+      .last(),
+  ).toBeVisible({ timeout: 30_000 });
+
+  const questionResult = await waitForTaskResultItem(
+    observedTaskResults,
+    (item) =>
+      item["status"] === "question" &&
+      item["tid"] === 3 &&
+      item["message"] === "am I doing this right?",
+  );
+  const capturedQid = questionResult["qid"] as number;
+
+  // Parent answers child 3. The answer completes child 3, but the stalling
+  // child 2 keeps the batch live, so the parent's Answer call re-blocks on
+  // the batch loop. The parent must return to "waiting" — before the fix it
+  // stayed stuck in "active" (assistant-work activation was never undone
+  // when Answer re-entered the batch).
+  await sendMessage(page, `call answer ${capturedQid} keep going`);
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"] .task-type-icon.waiting'),
+  ).toBeVisible({ timeout: 60_000 });
+});
+
 test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued", async ({
   page,
   agentType,
