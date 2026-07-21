@@ -9,7 +9,7 @@ import { spawn, execSync } from "child_process";
 import type { ChildProcess } from "child_process";
 import type { Locator, Page } from "@playwright/test";
 import { mkdirSync, rmSync, symlinkSync, cpSync, writeFileSync } from "fs";
-import { assistantText, killBackend } from "./fixtures";
+import { assistantText, killBackend, sendMessage } from "./fixtures";
 
 // ---------------------------------------------------------------------------
 // Custom fixture
@@ -350,6 +350,96 @@ test("MCP tools work after backend restart", async ({
       .getByText("sub-task-done", { exact: true }),
   ).toBeVisible({ timeout: 60_000 });
 });
+
+test(
+  "Ask follow-up does not remain blocked after child question is interrupted by restart",
+  { tag: "@codex-only" },
+  async ({ page, restartableBackend }) => {
+    test.setTimeout(150_000);
+
+    const parentTaskUpdates: {
+      status: string;
+      isProcessing: boolean;
+    }[] = [];
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", (frame) => {
+        try {
+          const data = JSON.parse(frame.payload.toString()) as {
+            type?: string;
+            task?: {
+              tid?: number;
+              status?: string;
+              isProcessing?: boolean;
+            };
+          };
+          if (
+            data.type === "task_updated" &&
+            data.task?.tid === 1 &&
+            typeof data.task.status === "string" &&
+            typeof data.task.isProcessing === "boolean"
+          ) {
+            parentTaskUpdates.push({
+              status: data.task.status,
+              isProcessing: data.task.isProcessing,
+            });
+          }
+        } catch {
+          // Ignore non-JSON frames and unrelated events.
+        }
+      });
+    });
+
+    await page.goto("/");
+    await page.locator('button[title="New task"]').first().click();
+    await sendMessage(
+      page,
+      "call task research call ask restart-interrupted-question",
+    );
+
+    await expect(page.locator('.sidebar-item[data-tid="2"]')).toBeVisible({
+      timeout: 30_000,
+    });
+    await page.locator('.sidebar-item[data-tid="1"]').click();
+
+    // The child is blocked in Ask with a live qid when the backend stops.
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("restart-interrupted-question", { exact: true })
+        .last(),
+    ).toBeVisible({ timeout: 90_000 });
+    const parentUrl = page.url();
+    await restartableBackend.restart();
+    await page.goto(parentUrl);
+    await expect(page.locator('.sidebar-item[data-tid="1"]')).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(page.locator('.sidebar-item[data-tid="2"]')).toBeVisible({
+      timeout: 30_000,
+    });
+    await page.locator('.sidebar-item[data-tid="1"]').click();
+
+    // A new parent-to-child Ask is accepted and blocks the parent. The child
+    // should receive it, call Answer, and return this fixture response.
+    const updateStart = parentTaskUpdates.length;
+    await sendMessage(page, "call ask 2 restart-follow-up");
+    await expect
+      .poll(
+        () =>
+          parentTaskUpdates.slice(updateStart).some(
+            (update) => update.status === "waiting" && update.isProcessing,
+          ),
+        { timeout: 30_000 },
+      )
+      .toBe(true);
+
+    const parentMessages = page.locator('[data-tid="1"] .message-list');
+    const followUpAnswer = parentMessages
+      .getByText("follow-up-answered", { exact: true })
+      .last();
+    await expect(followUpAnswer).toBeVisible({ timeout: 20_000 });
+  },
+);
 
 test("active task receives nudge and continues after restart", { tag: "@claude-only" }, async ({
   page,

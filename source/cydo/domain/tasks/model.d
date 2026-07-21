@@ -37,6 +37,13 @@ enum TaskStatus : string
 	importable = "importable",
 }
 
+enum WaitingTaskDependencyState
+{
+	noChildren,
+	allChildrenTerminal,
+	hasNonTerminalChildren,
+}
+
 TaskStatus parseTaskStatus(string value)
 {
 	switch (value)

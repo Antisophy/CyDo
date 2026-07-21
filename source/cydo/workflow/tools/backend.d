@@ -88,7 +88,7 @@ struct WorkflowToolsHost
 	bool delegate(int aTid, int bTid) tasksShareWorkspace;
 	string delegate(int tid) taskWorkspaceLabel;
 	void delegate(int tid, void delegate() cb) addIdleCallback;
-	void delegate(int tid, void delegate() onReady) reactivateTask;
+	Promise!void delegate(int tid) reactivateTask;
 	bool delegate(int tid, out string sessionState) canSendSystemMessage;
 	void delegate(int tid, KnownSystemMessageKind kind, string body)
 		sendKnownSystemMessage;
@@ -205,7 +205,7 @@ unittest
 		appendTaskDiagnostic: (int tid, string subject, string body) {},
 		taskAlive: (int tid) => false, tasksShareWorkspace: (int aTid, int bTid) => true,
 		taskWorkspaceLabel: (int tid) => "local", addIdleCallback: (int tid, void delegate() cb) {},
-		reactivateTask: (int tid, void delegate() onReady) {},
+		reactivateTask: (int tid) => resolve(),
 		canSendSystemMessage: (int tid, out string sessionState) { sessionState = "dead"; return false; },
 		sendKnownSystemMessage: (int tid, KnownSystemMessageKind kind, string body) {},
 		persistAddTaskDep: (int parentTid, int childTid) {}, persistRemoveTaskDep: (int parentTid, int childTid) {},
@@ -305,6 +305,7 @@ public:
 			sendTaskMessage: (int tid, const(ContentBlock)[] content,
 				string cydoMeta, string nonce) {
 				host_.sendTaskMessage(tid, content, null, cydoMeta, nonce);
+				return resolve();
 			},
 			transitionTask: host_.transitionTask,
 			transitionTaskFrom: host_.transitionTaskFrom,
@@ -1238,25 +1239,29 @@ public:
 				taskDeps_[childTid] = parentTid;
 	}
 
-	bool waitingTaskChildrenAllDone(int parentTid)
+	WaitingTaskDependencyState waitingTaskDependencyState(int parentTid)
 	{
+		bool hasChildren;
 		foreach (childTid, depParent; taskDeps_)
 		{
 			if (depParent != parentTid)
 				continue;
+			hasChildren = true;
 			auto child = host_.getTask(childTid);
 			if (child is null)
 				continue;
-			if (child.status != "completed"
-				&& child.status != "failed"
-				&& child.status != "importable")
+			if (child.status != TaskStatus.completed
+				&& child.status != TaskStatus.failed
+				&& child.status != TaskStatus.importable)
 			{
 				tracef("resumeInFlightTasks: tid=%d waiting, child tid=%d still %s",
 					parentTid, childTid, child.status);
-				return false;
+				return WaitingTaskDependencyState.hasNonTerminalChildren;
 			}
 		}
-		return true;
+		return hasChildren
+			? WaitingTaskDependencyState.allChildrenTerminal
+			: WaitingTaskDependencyState.noChildren;
 	}
 
 	void killActiveTerminals()
@@ -1732,7 +1737,7 @@ unittest
 		tasksShareWorkspace: (int aTid, int bTid) => true,
 		taskWorkspaceLabel: (int tid) => "local",
 		addIdleCallback: (int tid, void delegate() cb) {},
-		reactivateTask: (int tid, void delegate() onReady) {},
+		reactivateTask: (int tid) => resolve(),
 		canSendSystemMessage: (int tid, out string sessionState) {
 			sessionState = "dead";
 			return false;

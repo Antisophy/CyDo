@@ -414,7 +414,7 @@ class App
 					format!"WorkflowTools idle callback requested for missing task %d"(tid));
 				td.onIdleCallbacks ~= cb;
 			},
-			reactivateTask: (int tid, void delegate() onReady) {
+			reactivateTask: (int tid) {
 				auto td = tid in tasks;
 				assert(td !is null,
 					format!"WorkflowTools reactivation requested for missing task %d"(tid));
@@ -424,7 +424,7 @@ class App
 					transitionTask(tid, [TaskStatus.pending, TaskStatus.alive,
 						TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
 						TaskStatus.active, TaskNotificationChange.preserve);
-				td.processQueue.setGoal(ProcessState.Alive).then(onReady).ignoreResult();
+				return td.processQueue.setGoal(ProcessState.Alive);
 			},
 			canSendSystemMessage: &canSendSystemMessage,
 			sendKnownSystemMessage: &sendKnownSystemMessage,
@@ -647,7 +647,7 @@ class App
 			sendSystemRestartNudge: &workflowTools.sendSystemRestartNudge,
 			loadPersistedTaskDeps: &workflowTools.loadPersistedTaskDeps,
 			snapshotTaskIds: &snapshotTaskIdsForResume,
-			waitingTaskChildrenAllDone: &workflowTools.waitingTaskChildrenAllDone,
+			waitingTaskDependencyState: &workflowTools.waitingTaskDependencyState,
 			shuttingDown: () => shuttingDown,
 			taskTypeCatalog: taskTypeCatalog,
 		));

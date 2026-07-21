@@ -19,7 +19,8 @@ import cydo.protocol : ItemDeltaEvent, ItemStartedEvent, ProcessExitEvent,
 import cydo.runtime.config : AgentDriver, PathMode, SandboxConfig;
 import cydo.runtime.launch.types : AgentSandboxConfig, ProcessLaunch;
 import launchSandbox = cydo.runtime.launch.sandbox;
-import cydo.domain.tasks.model : ProcessState, TaskData, TaskStatus;
+import cydo.domain.tasks.model : ProcessState, TaskData, TaskStatus,
+	WaitingTaskDependencyState;
 import cydo.domain.tasks.lifecycle : TaskNotificationChange;
 import cydo.domain.task_types.catalog : TaskTypeCatalog;
 import cydo.domain.task_types.definition : TaskTypeDef,
@@ -169,7 +170,7 @@ struct TaskSessionRunnerHost
 	void delegate(int tid) sendSystemRestartNudge;
 	void delegate() loadPersistedTaskDeps;
 	int[] delegate() snapshotTaskIds;
-	bool delegate(int parentTid) waitingTaskChildrenAllDone;
+	WaitingTaskDependencyState delegate(int parentTid) waitingTaskDependencyState;
 	bool delegate() shuttingDown;
 	TaskTypeCatalog taskTypeCatalog;
 }
@@ -804,17 +805,23 @@ class TaskSessionRunner
 
 			if (status == "waiting")
 			{
-				if (host_.waitingTaskChildrenAllDone(tid))
+				final switch (host_.waitingTaskDependencyState(tid))
 				{
-					tracef("resumeInFlightTasks: tid=%d waiting, all children done — resuming with batch delivery",
+				case WaitingTaskDependencyState.noChildren:
+					tracef("resumeInFlightTasks: tid=%d waiting, no children — resuming with restart nudge",
+						tid);
+					resumeActiveTask(tid);
+					break;
+				case WaitingTaskDependencyState.allChildrenTerminal:
+					tracef("resumeInFlightTasks: tid=%d waiting, all children terminal — resuming with batch delivery",
 						tid);
 					resumeAndDeliverResults(tid);
-				}
-				else
-				{
-					tracef("resumeInFlightTasks: tid=%d waiting, children still running — resuming without message",
+					break;
+				case WaitingTaskDependencyState.hasNonTerminalChildren:
+					tracef("resumeInFlightTasks: tid=%d waiting, nonterminal children — resuming without message",
 						tid);
 					resumeWaitingTask(tid);
+					break;
 				}
 			}
 			else if (status == "active")
