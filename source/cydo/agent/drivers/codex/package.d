@@ -1919,24 +1919,25 @@ unittest
 /// Extract display-level command input from a live Codex commandExecution item.
 string extractCommandExecutionInput(JSONFragment commandActions, JSONFragment action, string command)
 {
-	import std.algorithm.searching : canFind;
 	import cydo.protocol : CommandInput;
 
-	auto actionCommand = extractCommandActionsCommand(commandActions);
-	if (actionCommand.length > 0)
+	string actionType;
+	auto actionCommand = extractCommandActionsCommand(commandActions, actionType);
+	if (command.length > 0)
 	{
-		if (command.length == 0 || !command.canFind('\n') || actionCommand.canFind('\n'))
+		if (actionType == "unknown" && actionCommand.length > 0)
 			return toJson(CommandInput(actionCommand, ""));
+		return toJson(CommandInput(command, ""));
 	}
+
+	if (actionCommand.length > 0)
+		return toJson(CommandInput(actionCommand, ""));
 
 	auto fromAction = extractCommandInput(action);
 	if (fromAction.length > 0 && fromAction != `{}`)
 		return fromAction;
 
-	if (command.length > 0)
-		return toJson(CommandInput(command, ""));
-
-	return actionCommand.length > 0 ? toJson(CommandInput(actionCommand, "")) : `{}`;
+	return `{}`;
 }
 
 /// Extract a fallback command from Codex commandActions when no executed command
@@ -1954,12 +1955,20 @@ string extractCommandActionsInput(JSONFragment commandActions)
 /// Extract a single user-level command from Codex commandActions.
 string extractCommandActionsCommand(JSONFragment commandActions)
 {
+	string actionType;
+	return extractCommandActionsCommand(commandActions, actionType);
+}
+
+/// Extract a single user-level command and its action type from Codex commandActions.
+string extractCommandActionsCommand(JSONFragment commandActions, out string actionType)
+{
 	if (commandActions.json is null || commandActions.json.length == 0)
 		return "";
 
 	@JSONPartial
 	static struct CommandAction
 	{
+		@JSONOptional string type;
 		@JSONOptional string command;
 	}
 
@@ -1968,6 +1977,7 @@ string extractCommandActionsCommand(JSONFragment commandActions)
 		auto actions = jsonParse!(CommandAction[])(commandActions.json);
 		if (actions.length != 1 || actions[0].command.length == 0)
 			return "";
+		actionType = actions[0].type;
 		return actions[0].command;
 	}
 	catch (Exception e)
@@ -2046,6 +2056,33 @@ unittest
 		`{"params":{"item":{"id":"ordinary","type":"userMessage","content":[{"type":"text","text":"ordinary"}]}}}`);
 	session.handleItemStarted(ordinary.params, "ordinary");
 	assert(emitted.length == 2 && !emitted[1].isContextBootstrap);
+}
+
+unittest
+{
+	import std.algorithm.searching : canFind;
+
+	@JSONPartial struct StartedNotification { ItemStartedParams params; }
+	@JSONPartial struct EmittedStartedEvent { JSONFragment input; }
+	@JSONPartial struct ParsedCommandInput { string command; }
+
+	enum startedPayload =
+		`{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"019f815e-a188-7ae1-8802-4bb069784c21","turnId":"019f8595-526f-7df3-9824-f7bda4b4c0f9","item":{"type":"commandExecution","id":"exec-24065314-fcdb-4934-8299-1cd7bd4095bc","command":"/run/current-system/sw/bin/zsh -lc \"wc -l /home/vladimir/work/cydo/.cydo/tasks/32026/output.md && sed -n '1,520p' /home/vladimir/work/cydo/.cydo/tasks/32026/output.md\"","cwd":"/home/vladimir/work/cydo/.cydo/tasks/31903/worktree","status":"inProgress","processId":"16474","commandActions":[{"type":"read","command":"sed -n '1,520p' /home/vladimir/work/cydo/.cydo/tasks/32026/output.md","name":"output.md","path":"/home/vladimir/work/cydo/.cydo/tasks/32026/output.md"}],"source":"unifiedExecStartup"}}}`;
+
+	auto session = new CodexSession(cast(AppServerProcess) null, 1, SessionConfig.init);
+	string[] emitted;
+	void sink(TranslatedEvent ev) { emitted ~= ev.translated; }
+	session.onOutput(&sink);
+
+	auto started = jsonParse!StartedNotification(startedPayload);
+	session.handleItemStarted(started.params, startedPayload);
+	auto startedEvent = jsonParse!EmittedStartedEvent(emitted[0]);
+	auto input = jsonParse!ParsedCommandInput(startedEvent.input.json);
+	assert(
+		input.command.canFind("wc -l") && input.command.canFind("sed -n"),
+		"expected compound commandExecution input to preserve both wc and sed; actual="
+			~ input.command,
+	);
 }
 
 unittest

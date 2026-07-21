@@ -369,6 +369,37 @@ function renderShellInput(command: string): string {
   );
 }
 
+describe("codex/commandExecution command fidelity", () => {
+  it("keeps a compound command when its completed action only describes the read", () => {
+    const command =
+      "sh -c \"wc -l /tmp/output.md && sed -n '1,520p' /tmp/output.md\"";
+    const html = renderToString(
+      h(ToolCall, {
+        name: "commandExecution",
+        driver: "codex",
+        toolUseId: "tool-command-1",
+        input: { command },
+        result: makeResult({
+          isError: false,
+          toolResult: {
+            status: "completed",
+            exitCode: 0,
+            commandActions: [
+              {
+                type: "read",
+                command: "sed -n '1,520p' /tmp/output.md",
+              },
+            ],
+          },
+        }),
+      }),
+    );
+
+    expect(html).toContain("wc -l");
+    expect(html).toContain("sed -n");
+  });
+});
+
 function renderCydoTaskInput(
   tasks: Array<Record<string, unknown>>,
   spawnedTids?: Map<number, number>,

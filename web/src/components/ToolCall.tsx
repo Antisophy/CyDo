@@ -171,7 +171,15 @@ function extractShellInputCommand(
   return null;
 }
 
-function extractShellActionCommand(result?: ToolResult): string | null {
+type ShellActionCommand = {
+  command: string;
+  isSole: boolean;
+  isUnknown: boolean;
+};
+
+function extractShellActionCommand(
+  result?: ToolResult,
+): ShellActionCommand | null {
   const toolResult =
     result?.toolResult != null && typeof result.toolResult === "object"
       ? (result.toolResult as Record<string, unknown>)
@@ -181,33 +189,45 @@ function extractShellActionCommand(result?: ToolResult): string | null {
   for (const action of actions) {
     if (!action || typeof action !== "object" || Array.isArray(action))
       continue;
-    const cmd = (action as Record<string, unknown>).command;
-    if (typeof cmd === "string" && cmd.trim().length > 0) return cmd;
+    const commandAction = action as Record<string, unknown>;
+    const cmd = commandAction.command;
+    if (typeof cmd === "string" && cmd.trim().length > 0)
+      return {
+        command: cmd,
+        isSole: actions.length === 1,
+        isUnknown: commandAction.type === "unknown",
+      };
   }
   return null;
 }
 
-function extractSemanticShellCommand(
+function extractShellDisplayCommand(
   input: Record<string, unknown>,
-  result?: ToolResult,
+  actionCommand?: ShellActionCommand | null,
 ): string | null {
   const base = extractShellInputCommand(input);
-  const actionCommand = extractShellActionCommand(result);
   if (!actionCommand) return base;
-  if (!base) return actionCommand;
+  if (!base) return actionCommand.command;
+  // Only Codex's sole unknown action is a lossless full-command fallback.
+  if (actionCommand.isSole && actionCommand.isUnknown)
+    return actionCommand.command;
+  return base;
+}
+
+function extractSemanticShellCommand(
+  input: Record<string, unknown>,
+  actionCommand?: ShellActionCommand | null,
+): string | null {
+  const base = extractShellInputCommand(input);
+  if (!actionCommand) return base;
+  if (!base) return actionCommand.command;
   const actionLooksLikeShellWrapper =
-    /^\s*(?:\S+\/)?(?:ba|z)?sh\s+-[cl]+\s+/i.test(actionCommand);
-  // Codex commandExecution often reports an outer `sh -c "..."` wrapper
-  // in input.command while commandActions[*].command can hold a normalized
-  // semantic command. For multiline wrappers, keep the wrapper payload intact
-  // so structured command-list parsing (e.g. sed/printf sections) can see all
-  // commands, not just the first parsed action.
+    /^\s*(?:\S+\/)?(?:ba|z)?sh\s+-[cl]+\s+/i.test(actionCommand.command);
   if (/^\s*(?:\S+\/)?sh\s+-c\s+/i.test(base)) {
-    // Nested shell wrappers (e.g. sh -c "/run/.../zsh -lc 'python <<PY'")
-    // parse more reliably from commandActions than from heavily escaped input.
-    if (actionLooksLikeShellWrapper) return actionCommand;
+    if (actionLooksLikeShellWrapper) return actionCommand.command;
+    // Preserve multiline wrappers so semantic parsing sees every command.
     if (base.includes("\n")) return base;
-    return actionCommand;
+    return actionCommand.command;
   }
   return base;
 }
@@ -713,18 +733,20 @@ function ShellCommandInput({
   input: Record<string, unknown>;
   result?: ToolResult;
 }) {
-  const command = extractSemanticShellCommand(input, result);
-  const semantic = useShellSemantic(command);
+  const actionCommand = extractShellActionCommand(result);
+  const displayCommand = extractShellDisplayCommand(input, actionCommand);
+  const semanticCommand = extractSemanticShellCommand(input, actionCommand);
+  const semantic = useShellSemantic(semanticCommand);
   const parsedSourceTree = useMemo(
-    () => (command ? parseShellCommandSourceTree(command) : null),
-    [command],
+    () => (displayCommand ? parseShellCommandSourceTree(displayCommand) : null),
+    [displayCommand],
   );
   const isHeredocWrite =
     semantic?.ok === true && semantic.value.kind === "write";
   const isScriptExec =
     semantic?.ok === true && semantic.value.kind === "script-exec";
   // All useHighlight calls must be unconditional (hooks rules).
-  const tokens = useHighlight(command ?? "", "bash");
+  const tokens = useHighlight(displayCommand ?? "", "bash");
   const consumedKeys = new Set([
     "command",
     "cmd",
@@ -742,7 +764,7 @@ function ShellCommandInput({
     const writeVal = (
       semantic as { ok: true; value: ShellHeredocWriteSemantic }
     ).value;
-    if (command && parsedSourceTree?.ok) {
+    if (displayCommand && parsedSourceTree?.ok) {
       return formatGenericInput(
         remaining,
         <div class="semantic-shell-command" data-testid="semantic-shell-write">
@@ -758,7 +780,7 @@ function ShellCommandInput({
     (semantic as { ok: true; value: ShellScriptExecSemantic }).value
       .scriptSource.type === "heredoc"
   ) {
-    if (command && parsedSourceTree?.ok) {
+    if (displayCommand && parsedSourceTree?.ok) {
       return formatGenericInput(
         remaining,
         <div class="semantic-shell-command" data-testid="semantic-shell-script">
@@ -768,7 +790,7 @@ function ShellCommandInput({
     }
   }
 
-  if (command && parsedSourceTree?.ok) {
+  if (displayCommand && parsedSourceTree?.ok) {
     return formatGenericInput(
       remaining,
       renderSourceTreeCommand(parsedSourceTree.value),
@@ -777,9 +799,9 @@ function ShellCommandInput({
 
   return formatGenericInput(
     remaining,
-    command ? (
-      <CodePre class="write-content" copyText={command}>
-        {tokens ? renderTokenLines(tokens) : command}
+    displayCommand ? (
+      <CodePre class="write-content" copyText={displayCommand}>
+        {tokens ? renderTokenLines(tokens) : displayCommand}
       </CodePre>
     ) : undefined,
   );
@@ -3006,10 +3028,13 @@ export const ToolCall = memo(
       result != null &&
       result.toolResult != null &&
       typeof result.toolResult === "object";
-    const shellCommand = isShellTool(name, driver, toolServer)
-      ? extractSemanticShellCommand(input, result)
+    const shellActionCommand = isShellTool(name, driver, toolServer)
+      ? extractShellActionCommand(result)
       : null;
-    const shellSemantic = useShellSemantic(shellCommand);
+    const semanticCommand = isShellTool(name, driver, toolServer)
+      ? extractSemanticShellCommand(input, shellActionCommand)
+      : null;
+    const shellSemantic = useShellSemantic(semanticCommand);
     const useSemanticShellRead =
       shellSemantic?.ok === true &&
       shellSemantic.value.kind === "read" &&
