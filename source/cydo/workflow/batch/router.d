@@ -30,12 +30,11 @@ struct BatchState
 	}
 }
 
-enum BatchConsumeKind { ignored, childDone, question, invalid }
+enum BatchConsumeKind { ignored, childDone, question }
 
 struct BatchConsumeResult
 {
 	BatchConsumeKind kind = BatchConsumeKind.ignored;
-	string error;
 	int childTid;
 	int qid;
 	string questionText;
@@ -69,34 +68,82 @@ BatchState buildBatchState(ulong batchId, int[] childTids, out string error)
 	return batch;
 }
 
+/// Assert the intrinsic representation of one live batch.
+///
+/// Registry-wide ownership is deliberately not checked here: callers that
+/// know the registry use its global invariant, while the pure signal consumer
+/// still needs to reject a locally malformed BatchState before it writes a
+/// result.
+void assertBatchStateShape(in BatchState batch)
+{
+	auto childCount = batch.childTids.length;
+	assert(batch.totalChildren == childCount,
+		format!"batch child count mismatch: batch=%s total=%s childTids=%s"(
+			batch.batchId, batch.totalChildren, childCount));
+	assert(batch.results.length == childCount,
+		format!"batch result-state length mismatch: batch=%s results=%s children=%s"(
+			batch.batchId, batch.results.length, childCount));
+	assert(batch.done.length == childCount,
+		format!"batch completion-state length mismatch: batch=%s done=%s children=%s"(
+			batch.batchId, batch.done.length, childCount));
+	assert(batch.slotByChildTid.length == childCount,
+		format!"batch slot-map length mismatch: batch=%s slots=%s children=%s"(
+			batch.batchId, batch.slotByChildTid.length, childCount));
+
+	size_t completed;
+	foreach (i, childTid; batch.childTids)
+	{
+		assert(childTid > 0,
+			format!"invalid live child tid: batch=%s child=%d slot=%s"(
+				batch.batchId, childTid, i));
+		auto slot = childTid in batch.slotByChildTid;
+		assert(slot !is null,
+			format!"batch child missing slot map: batch=%s child=%d slot=%s"(
+				batch.batchId, childTid, i));
+		assert(*slot == i,
+			format!"batch child slot map mismatch: batch=%s child=%d ordered_slot=%s mapped_slot=%s"(
+				batch.batchId, childTid, i, *slot));
+		if (batch.done[i])
+			completed++;
+	}
+
+	foreach (childTid, slot; batch.slotByChildTid)
+	{
+		assert(slot < childCount,
+			format!"batch slot map out of range: batch=%s child=%d slot=%s child_count=%s"(
+				batch.batchId, childTid, slot, childCount));
+		assert(batch.childTids[slot] == childTid,
+			format!"batch slot map ordered-child mismatch: batch=%s child=%d slot=%s ordered_child=%d"(
+				batch.batchId, childTid, slot, batch.childTids[slot]));
+	}
+
+	assert(batch.completed == completed,
+		format!"batch completed count mismatch: batch=%s completed=%s done_count=%s"(
+			batch.batchId, batch.completed, completed));
+}
+
 BatchConsumeResult consumeBatchSignal(ref BatchState batch, BatchSignal sig,
 	scope bool delegate(int childTid, int qid) hasPendingQuestion)
 {
 	BatchConsumeResult result;
 	if (sig.batchId != batch.batchId)
 		return result;
+	assertBatchStateShape(batch);
 
-	if (sig.slot >= batch.childTids.length)
-	{
-		result.kind = BatchConsumeKind.invalid;
-		result.error = format!"slot %s out of range for child count %s"(sig.slot, batch.childTids.length);
-		return result;
-	}
-
-	if (batch.childTids[sig.slot] != sig.childTid)
-	{
-		result.kind = BatchConsumeKind.invalid;
-		result.error = format!"slot %s expects child tid %d but got %d"(sig.slot, batch.childTids[sig.slot], sig.childTid);
-		return result;
-	}
+	assert(sig.slot < batch.childTids.length,
+		format!"slot %s out of range for child count %s"
+			(sig.slot, batch.childTids.length));
+	assert(batch.childTids[sig.slot] == sig.childTid,
+		format!"slot %s expects child tid %d but got %d"
+			(sig.slot, batch.childTids[sig.slot], sig.childTid));
 
 	size_t mappedSlot;
-	if (!batch.trySlotForChild(sig.childTid, mappedSlot) || mappedSlot != sig.slot)
-	{
-		result.kind = BatchConsumeKind.invalid;
-		result.error = format!"child tid %d maps to slot %s, signal targeted slot %s"(sig.childTid, mappedSlot, sig.slot);
-		return result;
-	}
+	assert(batch.trySlotForChild(sig.childTid, mappedSlot),
+		format!"child tid %d is missing from the reverse slot map"
+			(sig.childTid));
+	assert(mappedSlot == sig.slot,
+		format!"child tid %d maps to slot %s, signal targeted slot %s"
+			(sig.childTid, mappedSlot, sig.slot));
 
 	if (sig.kind == BatchSignal.Kind.childDone)
 	{
@@ -121,8 +168,7 @@ BatchConsumeResult consumeBatchSignal(ref BatchState batch, BatchSignal sig,
 
 string validateBatchCompletion(in BatchState batch)
 {
-	if (batch.totalChildren != batch.childTids.length)
-		return format!"batch child count mismatch: total=%s childTids=%s"(batch.totalChildren, batch.childTids.length);
+	assertBatchStateShape(batch);
 	if (batch.completed != batch.totalChildren)
 		return format!"batch completed mismatch: completed=%s total=%s"(batch.completed, batch.totalChildren);
 	foreach (i, d; batch.done)
@@ -133,21 +179,62 @@ string validateBatchCompletion(in BatchState batch)
 
 unittest
 {
-	string err;
-	auto batch = buildBatchState(10, [101, 202], err);
-	assert(err.length == 0);
+	import core.exception : AssertError;
+	import std.exception : assertThrown;
 
-	auto foreignBatch = consumeBatchSignal(batch,
-		BatchSignal.childDone(99, 0, 101, McpResult("foreign-batch", false)),
-		(int childTid, int qid) => false);
-	assert(foreignBatch.kind == BatchConsumeKind.ignored);
-	assert(batch.completed == 0);
+	void assertResultStateUnchanged(ref BatchState batch)
+	{
+		assert(batch.completed == 0);
+		assert(batch.done == [false, false]);
+		assert(batch.results[0].text.length == 0);
+		assert(batch.results[1].text.length == 0);
+	}
 
-	auto wrongSlot = consumeBatchSignal(batch,
-		BatchSignal.childDone(10, 1, 101, McpResult("wrong-slot", false)),
-		(int childTid, int qid) => false);
-	assert(wrongSlot.kind == BatchConsumeKind.invalid);
-	assert(batch.completed == 0);
+	{
+		string error;
+		auto batch = buildBatchState(10, [101, 202], error);
+		assert(error.length == 0);
+		auto foreignBatch = consumeBatchSignal(batch,
+			BatchSignal.childDone(99, 0, 101,
+				McpResult("foreign-batch", false)),
+			(int childTid, int qid) => false);
+		assert(foreignBatch.kind == BatchConsumeKind.ignored);
+		assertResultStateUnchanged(batch);
+	}
+
+	{
+		string error;
+		auto batch = buildBatchState(10, [7, 8], error);
+		assert(error.length == 0);
+		assertThrown!AssertError(consumeBatchSignal(batch,
+			BatchSignal.childDone(10, 2, 7,
+				McpResult("out-of-range", false)),
+			(int childTid, int qid) => false));
+		assertResultStateUnchanged(batch);
+	}
+
+	{
+		string error;
+		auto batch = buildBatchState(10, [7, 8], error);
+		assert(error.length == 0);
+		assertThrown!AssertError(consumeBatchSignal(batch,
+			BatchSignal.childDone(10, 1, 7,
+				McpResult("wrong-child", false)),
+			(int childTid, int qid) => false));
+		assertResultStateUnchanged(batch);
+	}
+
+	{
+		string error;
+		auto batch = buildBatchState(10, [7, 8], error);
+		assert(error.length == 0);
+		batch.slotByChildTid[7] = 1;
+		assertThrown!AssertError(consumeBatchSignal(batch,
+			BatchSignal.childDone(10, 0, 7,
+				McpResult("wrong-reverse-map", false)),
+			(int childTid, int qid) => false));
+		assertResultStateUnchanged(batch);
+	}
 }
 
 unittest

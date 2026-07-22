@@ -3,7 +3,6 @@ module cydo.workflow.questions.router;
 import std.conv : to;
 import std.datetime.systime : Clock;
 import std.format : format;
-import std.logger : errorf;
 
 import ae.utils.json : toJson;
 import ae.utils.promise : Promise, resolve, race;
@@ -208,28 +207,17 @@ public:
 		{
 			BatchHandle ownerHandle;
 			size_t slot;
-			bool done;
-			string batchError;
-			if (!batchRegistry_.findOwnerOfChild(callerTidInt, ownerHandle, slot,
-				done, batchError))
+			if (!batchRegistry_.findOwnerOfChild(callerTidInt, ownerHandle, slot))
 			{
 				return resolve(host_.makeInternalBatchError(
 					format!"no active batch owning child tid=%d while asking parent tid=%d"
 						(callerTidInt, targetTid)));
 			}
-			if (batchError.length > 0)
-				return resolve(host_.makeInternalBatchError(batchError));
 			if (ownerHandle.parentTid != targetTid)
 			{
 				return resolve(host_.makeInternalBatchError(
 					format!"child tid=%d routed to parent tid=%d but is owned by parent tid=%d batch=%s"
 						(callerTidInt, targetTid, ownerHandle.parentTid, ownerHandle.batchId)));
-			}
-			if (done)
-			{
-				return resolve(host_.makeInternalBatchError(
-					format!"child tid=%d owned by completed slot while asking parent tid=%d batch=%s"
-						(callerTidInt, targetTid, ownerHandle.batchId)));
 			}
 
 			route.delivery = QuestionDelivery.batchQuestion;
@@ -265,30 +253,23 @@ public:
 				|| targetTd.status == "failed"
 				|| targetTd.status == "active";
 			string batchError;
-			bool childDone;
-			if (batchRegistry_.findOwnerOfChild(targetTid, batchHandle, childSlot,
-				childDone, batchError))
+			if (batchRegistry_.findOwnerOfChild(targetTid, batchHandle, childSlot))
 			{
-				if (batchError.length > 0)
-					return resolve(host_.makeInternalBatchError(batchError));
 				if (batchHandle.parentTid != callerTidInt)
 				{
 					return resolve(host_.makeInternalBatchError(
 						format!"child tid=%d owned by parent tid=%d batch=%s, cannot reuse for parent tid=%d"
 							(targetTid, batchHandle.parentTid, batchHandle.batchId, callerTidInt)));
 				}
-				if (!childDone)
+				if (targetTd.status == "completed" || targetTd.status == "failed")
+				{}
+				else if (host_.hasPendingSubTask(targetTid))
+					reuseExistingBatch = true;
+				else
 				{
-					if (targetTd.status == "completed" || targetTd.status == "failed")
-					{}
-					else if (host_.hasPendingSubTask(targetTid))
-						reuseExistingBatch = true;
-					else
-					{
-						return resolve(host_.makeInternalBatchError(
-							format!"unfinished batch slot has no pending sub-task promise: parent tid=%d batch=%s child tid=%d slot=%s status=%s"
-								(batchHandle.parentTid, batchHandle.batchId, targetTid, childSlot, targetTd.status)));
-					}
+					return resolve(host_.makeInternalBatchError(
+						format!"unfinished batch slot has no pending sub-task promise: parent tid=%d batch=%s child tid=%d slot=%s status=%s"
+							(batchHandle.parentTid, batchHandle.batchId, targetTid, childSlot, targetTd.status)));
 				}
 			}
 
@@ -666,11 +647,9 @@ private:
 			auto slot = currentRoute.batchSlot;
 			auto childTid = currentRoute.batchChildTid;
 			promise.then((McpResult r) {
-				string error;
 				if (r.isError)
 					routeErrorPromise.fulfill(r);
-				if (!batchRegistry_.enqueueChildDone(handle, slot, childTid, r, error))
-					errorf("batch router error: %s", error);
+				batchRegistry_.enqueueChildDone(handle, slot, childTid, r);
 				clearQuestionRoute(qid);
 			});
 		}
@@ -698,15 +677,12 @@ private:
 
 		if (currentRoute.delivery == QuestionDelivery.batchQuestion)
 		{
-			string error;
-			if (!batchRegistry_.enqueueQuestion(
+			batchRegistry_.enqueueQuestion(
 				BatchHandle(currentRoute.answererTid, currentRoute.batchId),
 				currentRoute.batchSlot,
 				currentRoute.batchChildTid,
 				message,
-				currentRoute.qid,
-				error))
-				return resolve(host_.makeInternalBatchError(error));
+				currentRoute.qid);
 		}
 		else
 			deliverInjectedQuestion(currentRoute, message);
@@ -952,12 +928,9 @@ unittest
 
 		BatchHandle batchHandle;
 		size_t batchSlot;
-		bool batchChildDone;
 		string batchError;
-		assert(batchRegistry.findOwnerOfChild(2, batchHandle, batchSlot,
-			batchChildDone, batchError), test.name);
-		assert(batchError.length == 0, test.name);
-		assert(batchSlot == 0 && !batchChildDone, test.name);
+		assert(batchRegistry.findOwnerOfChild(2, batchHandle, batchSlot), test.name);
+		assert(batchSlot == 0, test.name);
 
 		Promise!BatchSignal batchEventPromise;
 		BatchSignal batchEvent;

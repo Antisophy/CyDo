@@ -321,9 +321,7 @@ public:
 				taskDeps_[childTid] = parentTid;
 				host_.persistAddTaskDep(parentTid, childTid);
 				subTaskPromise.then((McpResult r) {
-					string error;
-					if (!batchRegistry_.enqueueChildDone(handle, 0, childTid, r, error))
-						errorf("batch router error: %s", error);
+					batchRegistry_.enqueueChildDone(handle, 0, childTid, r);
 				});
 			},
 			cleanupAfterFollowUpAnswerDelivery: (int childTid) {
@@ -806,9 +804,7 @@ public:
 		{
 			(BatchHandle h, size_t slot, int cTid, Promise!McpResult promise) {
 				promise.then((McpResult r) {
-					string error;
-					if (!batchRegistry_.enqueueChildDone(h, slot, cTid, r, error))
-						errorf("batch router error: %s", error);
+					batchRegistry_.enqueueChildDone(h, slot, cTid, r);
 				});
 			}(handle, i, launchedTask.childTid, launchedTask.promise);
 		}
@@ -873,15 +869,7 @@ public:
 		if (td is null)
 			return;
 
-		bool hasLiveBatches;
-		string batchError;
-		if (!batchRegistry_.parentHasLiveBatches(tid, hasLiveBatches,
-			batchError))
-		{
-			errorf("batch router invariant violated: %s", batchError);
-			return;
-		}
-		if (hasLiveBatches)
+		if (batchRegistry_.parentHasLiveBatches(tid))
 			return;
 
 		auto children = childrenOf(tid);
@@ -1340,10 +1328,6 @@ private:
 					return resolve(questionRouter_.buildQuestionResult(
 						consumed.childTid, consumed.qid,
 						consumed.questionText));
-				case BatchConsumeKind.invalid:
-					errorf("ignoring invalid batch signal for parent=%d batch=%s: %s",
-						parentTid, batchId, consumed.error);
-					break;
 			}
 		}
 
@@ -1404,16 +1388,11 @@ private:
 	bool findPendingChildQuestion(int tid, out int childTid,
 		out string question, out int qid)
 	{
-		string batchError;
 		if (!batchRegistry_.findFirstLiveChild(tid, (int cTid) {
 			auto child = host_.getTask(cTid);
 			return child !is null && child.pendingAskPromise !is null;
-		}, childTid, batchError))
-		{
-			if (batchError.length > 0)
-				errorf("batch router invariant violated: %s", batchError);
+		}, childTid))
 			return false;
-		}
 
 		auto child = requireTask(childTid,
 			"Pending child question must belong to a live child task");
@@ -1859,4 +1838,545 @@ unittest
 		"Implement it");
 	assert(validated.launch !is null);
 	assert(!validated.error.isError);
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import ae.utils.promise.await : async;
+	import core.exception : AssertError;
+	import cydo.workflow.batch.registry : ActiveBatchKey;
+	import std.algorithm.searching : canFind;
+	import std.exception : assertThrown;
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager,
+				"nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	final class BatchInvariantFixture
+	{
+		TaskData[int] tasks;
+		TaskTypeDef[] taskTypes;
+		int persistAddDependencyCalls;
+		int persistRemoveDependencyCalls;
+		int[] removedChildren;
+		int waitingToActiveTransitions;
+		Promise!void reactivationGate;
+
+		this()
+		{
+			TaskTypeDef parentType;
+			parentType.name = "parent";
+			parentType.agent = "fake";
+			ContinuationDef handoff;
+			handoff.task_type = "child";
+			parentType.continuations["continue"] = handoff;
+			taskTypes = [parentType];
+
+			tasks[1] = TaskData(1, "local", "/tmp/cydo-batch-invariants");
+			tasks[1].taskType = "parent";
+			tasks[1].agentName = "fake";
+			tasks[1].status = TaskStatus.active;
+			tasks[2] = TaskData(2, "local", "/tmp/cydo-batch-invariants");
+			tasks[2].taskType = "child";
+			tasks[2].agentName = "fake";
+			tasks[2].parentTid = 1;
+			tasks[2].status = TaskStatus.active;
+
+			reactivationGate = new Promise!void;
+		}
+
+		WorkflowToolsBackend makeBackend()
+		{
+			return new WorkflowToolsBackend(WorkflowToolsHost(
+				getTask: (int tid) {
+					auto task = tid in tasks;
+					return task is null ? null : task;
+				},
+				taskTypesForProject: (string projectPath) => taskTypes,
+				tasksShareWorkspace: (int aTid, int bTid) => true,
+				taskWorkspaceLabel: (int tid) => "local",
+				systemKeyword: () => "SYSTEM",
+				readPromptFile: (string relativePath, string projectPath,
+					string[string] vars) => "",
+				buildKnownSystemMessageMeta: (KnownSystemMessageKind kind,
+					string subject, string[string] vars,
+					string bodyVar) => "{}",
+				sendTaskMessage: (int tid, const(ContentBlock)[] content,
+					const(ContentBlock)[] broadcastContent,
+					string cydoMeta, string nonce) {},
+				transitionTask: (int tid, TaskStatus expectedFrom,
+					TaskStatus to,
+					TaskNotificationChange notification) {
+					assert(tasks[tid].status == expectedFrom);
+					if (expectedFrom == TaskStatus.waiting
+						&& to == TaskStatus.active)
+						waitingToActiveTransitions++;
+					tasks[tid].status = to;
+				},
+				transitionTaskFrom: (int tid, TaskStatus[] expectedFrom,
+					TaskStatus to,
+					TaskNotificationChange notification) {
+					bool allowed;
+					foreach (from; expectedFrom)
+						allowed = allowed || tasks[tid].status == from;
+					assert(allowed);
+					tasks[tid].status = to;
+				},
+				persistResultText: (int tid, string resultText) {},
+				taskAlive: (int tid) => (tid in tasks) !is null,
+				broadcastFocusHint: (int fromTid, int toTid) {},
+				addIdleCallback: (int tid, void delegate() cb) {},
+				reactivateTask: (int tid) {
+					assert(tid == 2);
+					return reactivationGate;
+				},
+				persistAddTaskDep: (int parentTid, int childTid) {
+					persistAddDependencyCalls++;
+				},
+				persistRemoveTaskDep: (int parentTid, int childTid) {
+					persistRemoveDependencyCalls++;
+					removedChildren ~= childTid;
+				},
+			));
+		}
+	}
+
+	BatchRegistry* batchRegistryOf(WorkflowToolsBackend backend)
+	{
+		return &__traits(getMember, backend, "batchRegistry_");
+	}
+
+	BatchHandle liveHandle(BatchRegistry* registry, int childTid)
+	{
+		BatchHandle handle;
+		size_t slot;
+		assert(registry.findOwnerOfChild(childTid, handle, slot));
+		assert(slot == 0);
+		return handle;
+	}
+
+	void corruptOrderedChild(BatchRegistry* registry, BatchHandle handle)
+	{
+		auto key = ActiveBatchKey(handle.parentTid, handle.batchId);
+		__traits(getMember, *registry,
+			"activeBatches")[key].childTids[0] = 99;
+	}
+
+	void removeReverseOwner(BatchRegistry* registry, int childTid)
+	{
+		__traits(getMember, *registry,
+			"batchKeyByChildTid").remove(childTid);
+	}
+
+	void assertChildAskPreflightUntouched(BatchInvariantFixture fixture,
+		WorkflowToolsBackend backend, BatchRegistry* registry,
+		BatchHandle handle)
+	{
+		auto router = __traits(getMember, backend, "questionRouter_");
+		assert(__traits(getMember, router, "questionRoutes_").length == 0);
+		assert(__traits(getMember, router, "pendingQuestions_").length == 0);
+		assert(fixture.tasks[1].status == TaskStatus.active);
+		assert(fixture.tasks[1].pendingContinuation is null);
+		assert(fixture.tasks[2].status == TaskStatus.active);
+		assert(fixture.tasks[2].pendingAskPromise is null);
+		assert(fixture.tasks[2].pendingAskQuestion.length == 0);
+		assert(fixture.tasks[2].pendingAskQid == 0);
+		assert(!backend.hasTaskDependency(2));
+		assert(fixture.persistAddDependencyCalls == 0);
+		assert(fixture.persistRemoveDependencyCalls == 0);
+		assert(registry.exists(handle));
+	}
+
+	// A missing unfinished batchKeyByChildTid entry aborts the ordinary Task
+	// callback before enqueue/consume can change its result state.
+	{
+		auto fixture = new BatchInvariantFixture;
+		auto backend = fixture.makeBackend();
+		auto childResult = new Promise!McpResult;
+		auto batchResult = async({
+			return backend.registerBatchAndAwait("1",
+				[LaunchedTask(2, childResult)]).await;
+		});
+		batchResult.ignoreResult();
+
+		auto registry = batchRegistryOf(backend);
+		auto handle = liveHandle(registry, 2);
+		auto key = ActiveBatchKey(handle.parentTid, handle.batchId);
+		removeReverseOwner(registry, 2);
+
+		childResult.fulfill(McpResult("done", false));
+		assertThrown!AssertError(drainPromiseNextTicks());
+		auto batch = key in __traits(getMember, *registry, "activeBatches");
+		assert(batch !is null);
+		assert((*batch).results[0].text.length == 0);
+		assert(!(*batch).done[0]);
+		assert((*batch).completed == 0);
+		assert(__traits(getMember, *registry, "activeBatches").length == 1);
+		auto ids = 1 in __traits(getMember, *registry,
+			"batchIdsByParentTid");
+		assert(ids !is null && ids.length == 1 && (*ids)[0] == handle.batchId);
+		assert((2 in __traits(getMember, *registry,
+			"batchKeyByChildTid")) is null);
+	}
+
+	// A local ordered-child/captured-slot mismatch still aborts the real
+	// follow-up pending-subtask completion callback.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.tasks[2].status = TaskStatus.completed;
+		auto backend = fixture.makeBackend();
+		backend.handleAsk("1", "follow up", 2).ignoreResult();
+		assert(fixture.persistAddDependencyCalls == 1);
+
+		auto registry = batchRegistryOf(backend);
+		auto handle = liveHandle(registry, 2);
+		corruptOrderedChild(registry, handle);
+
+		auto pending = 2 in __traits(getMember, backend,
+			"pendingSubTasks_");
+		assert(pending !is null);
+		(*pending).fulfill(McpResult("follow-up result", false));
+		assertThrown!AssertError(drainPromiseNextTicks());
+	}
+
+	// Child Ask treats a missing unfinished batchKeyByChildTid entry as an
+	// assertion before it creates a route or changes task state.
+	{
+		auto fixture = new BatchInvariantFixture;
+		auto backend = fixture.makeBackend();
+		auto registry = batchRegistryOf(backend);
+		BatchHandle handle;
+		string error;
+		assert(registry.create(1, [2], handle, error), error);
+		removeReverseOwner(registry, 2);
+
+		assertThrown!AssertError(backend.handleAsk("2", "need an answer", -1));
+		assertChildAskPreflightUntouched(fixture, backend, registry, handle);
+	}
+
+	// A dangling batchKeyByChildTid target also asserts before child-to-parent
+	// Ask can return an internal MCP result or start a route.
+	{
+		auto fixture = new BatchInvariantFixture;
+		auto backend = fixture.makeBackend();
+		auto registry = batchRegistryOf(backend);
+		BatchHandle handle;
+		string error;
+		assert(registry.create(1, [2], handle, error), error);
+		__traits(getMember, *registry, "batchKeyByChildTid")[2] =
+			ActiveBatchKey(999, 999);
+
+		assertThrown!AssertError(backend.handleAsk("2", "need an answer", -1));
+		assertChildAskPreflightUntouched(fixture, backend, registry, handle);
+	}
+
+	// A live batch that does not contain the child is not a foreign Ask owner;
+	// it is a globally corrupt batchKeyByChildTid entry.
+	{
+		auto fixture = new BatchInvariantFixture;
+		auto backend = fixture.makeBackend();
+		auto registry = batchRegistryOf(backend);
+		BatchHandle handle;
+		BatchHandle wrong;
+		string error;
+		assert(registry.create(1, [2], handle, error), error);
+		assert(registry.create(1, [3], wrong, error), error);
+		__traits(getMember, *registry, "batchKeyByChildTid")[2] =
+			ActiveBatchKey(wrong.parentTid, wrong.batchId);
+
+		assertThrown!AssertError(backend.handleAsk("2", "need an answer", -1));
+		assertChildAskPreflightUntouched(fixture, backend, registry, handle);
+		assert(registry.exists(wrong));
+	}
+
+	// A reverse owner cannot point at a completed historical slot. It must
+	// assert before child-to-parent Ask starts its route.
+	{
+		auto fixture = new BatchInvariantFixture;
+		auto backend = fixture.makeBackend();
+		auto registry = batchRegistryOf(backend);
+		BatchHandle completed;
+		string error;
+		assert(registry.create(1, [2], completed, error), error);
+		auto consumed = registry.consume(completed,
+			BatchSignal.childDone(completed.batchId, 0, 2,
+				McpResult("completed", false)),
+			(int childTid, int qid) => false, error);
+		assert(consumed.kind == BatchConsumeKind.childDone);
+		assert(error.length == 0);
+		auto completedBatch = ActiveBatchKey(completed.parentTid,
+			completed.batchId) in __traits(getMember, *registry,
+				"activeBatches");
+		assert(completedBatch !is null && (*completedBatch).done[0]);
+		__traits(getMember, *registry, "batchKeyByChildTid")[2] =
+			ActiveBatchKey(completed.parentTid, completed.batchId);
+
+		assertThrown!AssertError(backend.handleAsk("2", "need an answer", -1));
+		assertChildAskPreflightUntouched(fixture, backend, registry, completed);
+	}
+
+	// A missing parent index asserts before post-response cleanup.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.tasks[1].status = TaskStatus.waiting;
+		auto backend = fixture.makeBackend();
+		__traits(getMember, backend, "taskDeps_")[2] = 1;
+		auto registry = batchRegistryOf(backend);
+		BatchHandle handle;
+		string error;
+		assert(registry.create(1, [2], handle, error), error);
+		__traits(getMember, *registry, "batchIdsByParentTid").remove(1);
+
+		assertThrown!AssertError(backend.onToolCallDelivered("1"));
+		assert(fixture.persistRemoveDependencyCalls == 0);
+		assert(backend.hasTaskDependency(2));
+		assert(fixture.tasks[1].status == TaskStatus.waiting);
+		assert(fixture.waitingToActiveTransitions == 0);
+		assert(registry.exists(handle));
+	}
+
+	// A missing batchKeyByChildTid entry asserts in parentHasLiveBatches before
+	// post-response cleanup can remove a dependency or reactivate the parent.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.tasks[1].status = TaskStatus.waiting;
+		auto backend = fixture.makeBackend();
+		__traits(getMember, backend, "taskDeps_")[2] = 1;
+		auto registry = batchRegistryOf(backend);
+		BatchHandle handle;
+		string error;
+		assert(registry.create(1, [2], handle, error), error);
+		removeReverseOwner(registry, 2);
+
+		assertThrown!AssertError(backend.onToolCallDelivered("1"));
+		assert(fixture.persistRemoveDependencyCalls == 0);
+		assert(backend.hasTaskDependency(2));
+		assert(fixture.tasks[1].status == TaskStatus.waiting);
+		assert(fixture.waitingToActiveTransitions == 0);
+		assert(registry.exists(handle));
+	}
+
+	// A partial parent index asserts before post-response cleanup.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.tasks[1].status = TaskStatus.waiting;
+		auto backend = fixture.makeBackend();
+		__traits(getMember, backend, "taskDeps_")[2] = 1;
+		__traits(getMember, backend, "taskDeps_")[3] = 1;
+		auto registry = batchRegistryOf(backend);
+		BatchHandle visible;
+		BatchHandle omitted;
+		string error;
+		assert(registry.create(1, [2], visible, error), error);
+		assert(registry.create(1, [3], omitted, error), error);
+		__traits(getMember, *registry, "batchIdsByParentTid")[1] =
+			[visible.batchId];
+
+		assertThrown!AssertError(backend.onToolCallDelivered("1"));
+		assert(fixture.persistRemoveDependencyCalls == 0);
+		assert(backend.hasTaskDependency(2));
+		assert(backend.hasTaskDependency(3));
+		assert(fixture.tasks[1].status == TaskStatus.waiting);
+		assert(fixture.waitingToActiveTransitions == 0);
+		assert(registry.exists(visible));
+		assert(registry.exists(omitted));
+	}
+
+	// Normal delivery removes every dependency once and reactivates the parent.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.tasks[1].status = TaskStatus.waiting;
+		auto backend = fixture.makeBackend();
+		__traits(getMember, backend, "taskDeps_")[2] = 1;
+		__traits(getMember, backend, "taskDeps_")[3] = 1;
+
+		backend.onToolCallDelivered("1");
+		assert(fixture.persistRemoveDependencyCalls == 2);
+		assert(fixture.removedChildren.canFind(2));
+		assert(fixture.removedChildren.canFind(3));
+		assert(!backend.hasTaskDependency(2));
+		assert(!backend.hasTaskDependency(3));
+		assert(fixture.tasks[1].status == TaskStatus.active);
+		assert(fixture.waitingToActiveTransitions == 1);
+
+		backend.onToolCallDelivered("1");
+		assert(fixture.persistRemoveDependencyCalls == 2);
+		assert(fixture.waitingToActiveTransitions == 1);
+	}
+
+	// A real live batch continues to defer dependency cleanup.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.tasks[1].status = TaskStatus.waiting;
+		auto backend = fixture.makeBackend();
+		__traits(getMember, backend, "taskDeps_")[2] = 1;
+		auto registry = batchRegistryOf(backend);
+		BatchHandle handle;
+		string error;
+		assert(registry.create(1, [2], handle, error), error);
+
+		backend.onToolCallDelivered("1");
+		assert(fixture.persistRemoveDependencyCalls == 0);
+		assert(backend.hasTaskDependency(2));
+		assert(fixture.tasks[1].status == TaskStatus.waiting);
+	}
+
+	// Handoff distinguishes absence, a real pending question, and corruption.
+	{
+		auto fixture = new BatchInvariantFixture;
+		auto backend = fixture.makeBackend();
+		auto registry = batchRegistryOf(backend);
+		assert(!backend.hasPendingChildQuestion(1));
+
+		BatchHandle handle;
+		string error;
+		assert(registry.create(1, [2], handle, error), error);
+		backend.handleAsk("2", "need an answer", -1).ignoreResult();
+		assert(backend.hasPendingChildQuestion(1));
+		auto handoff = backend.handleHandoff(
+			"1", "continue", "handoff prompt");
+		assert(handoff.isError);
+		assert(handoff.text.canFind("Handoff cannot continue"));
+
+		Promise!BatchSignal questionEvent;
+		assert(registry.waitOne(handle, questionEvent, error), error);
+		questionEvent.then((BatchSignal signal) {}).ignoreResult();
+		drainPromiseNextTicks();
+
+		__traits(getMember, *registry, "batchIdsByParentTid").remove(1);
+		assertThrown!AssertError(backend.hasPendingChildQuestion(1));
+		assertThrown!AssertError(backend.handleHandoff(
+			"1", "continue", "handoff prompt"));
+		assert(registry.exists(handle));
+	}
+
+	// A completed old slot cannot smuggle a dangling alleged later owner
+	// through the parent-wide Handoff scan.
+	{
+		auto fixture = new BatchInvariantFixture;
+		auto backend = fixture.makeBackend();
+		auto registry = batchRegistryOf(backend);
+		BatchHandle oldHandle;
+		string error;
+		assert(registry.create(1, [2, 3], oldHandle, error), error);
+		auto consumed = registry.consume(oldHandle,
+			BatchSignal.childDone(oldHandle.batchId, 0, 2,
+				McpResult("first", false)),
+			(int childTid, int qid) => false, error);
+		assert(consumed.kind == BatchConsumeKind.childDone);
+		assert(error.length == 0);
+		auto oldBatch = ActiveBatchKey(oldHandle.parentTid, oldHandle.batchId)
+			in __traits(getMember, *registry, "activeBatches");
+		assert(oldBatch !is null);
+		assert((*oldBatch).done[0] && !(*oldBatch).done[1]);
+		__traits(getMember, *registry, "batchKeyByChildTid")[2] =
+			ActiveBatchKey(999, 999);
+
+		assert(fixture.tasks[1].pendingContinuation is null);
+		assert(fixture.tasks[1].status == TaskStatus.active);
+		assertThrown!AssertError(backend.handleHandoff(
+			"1", "continue", "handoff prompt"));
+		assert(fixture.tasks[1].pendingContinuation is null);
+		assert(fixture.tasks[1].status == TaskStatus.active);
+		assert(registry.exists(oldHandle));
+	}
+
+	// Handoff validates live child ownership before treating a question as absent.
+	{
+		auto fixture = new BatchInvariantFixture;
+		auto backend = fixture.makeBackend();
+		auto registry = batchRegistryOf(backend);
+		BatchHandle handle;
+		string error;
+		assert(registry.create(1, [2], handle, error), error);
+		backend.handleAsk("2", "need an answer", -1).ignoreResult();
+		assert(backend.hasPendingChildQuestion(1));
+		auto router = __traits(getMember, backend, "questionRouter_");
+		assert(__traits(getMember, router, "questionRoutes_").length == 1);
+		assert(__traits(getMember, router, "pendingQuestions_").length == 1);
+		Promise!BatchSignal questionEvent;
+		assert(registry.waitOne(handle, questionEvent, error), error);
+		questionEvent.then((BatchSignal signal) {}).ignoreResult();
+		drainPromiseNextTicks();
+
+		corruptOrderedChild(registry, handle);
+		assert(fixture.tasks[1].pendingContinuation is null);
+		assertThrown!AssertError(backend.handleHandoff(
+			"1", "continue", "handoff prompt"));
+		assert(fixture.tasks[1].pendingContinuation is null);
+		assert(fixture.tasks[2].status == TaskStatus.waiting);
+		assert(fixture.tasks[2].pendingAskPromise !is null);
+		assert(fixture.tasks[2].pendingAskQuestion == "need an answer");
+		assert(fixture.tasks[2].pendingAskQid > 0);
+		assert(__traits(getMember, router, "questionRoutes_").length == 1);
+		assert(__traits(getMember, router, "pendingQuestions_").length == 1);
+		assert(registry.exists(handle));
+	}
+
+	// A partial parent index cannot hide a pending question during Handoff.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.tasks[3] = TaskData(3, "local", "/tmp/cydo-batch-invariants");
+		fixture.tasks[3].taskType = "child";
+		fixture.tasks[3].agentName = "fake";
+		fixture.tasks[3].parentTid = 1;
+		fixture.tasks[3].status = TaskStatus.active;
+		auto backend = fixture.makeBackend();
+		auto registry = batchRegistryOf(backend);
+		BatchHandle visible;
+		BatchHandle omitted;
+		string error;
+		assert(registry.create(1, [2], visible, error), error);
+		assert(registry.create(1, [3], omitted, error), error);
+		backend.handleAsk("3", "need an answer", -1).ignoreResult();
+		assert(backend.hasPendingChildQuestion(1));
+
+		Promise!BatchSignal questionEvent;
+		assert(registry.waitOne(omitted, questionEvent, error), error);
+		questionEvent.then((BatchSignal signal) {}).ignoreResult();
+		drainPromiseNextTicks();
+
+		__traits(getMember, *registry, "batchIdsByParentTid")[1] =
+			[visible.batchId];
+		assert(fixture.tasks[1].pendingContinuation is null);
+		assertThrown!AssertError(backend.hasPendingChildQuestion(1));
+		assertThrown!AssertError(backend.handleHandoff(
+			"1", "continue", "handoff prompt"));
+		assert(fixture.tasks[1].pendingContinuation is null);
+		assert(registry.exists(visible));
+		assert(registry.exists(omitted));
+	}
+
+	// Local slotByChildTid corruption must still escape through the real Promise
+	// scheduler.
+	{
+		auto fixture = new BatchInvariantFixture;
+		auto backend = fixture.makeBackend();
+		auto childResult = new Promise!McpResult;
+		auto batchResult = async({
+			return backend.registerBatchAndAwait("1",
+				[LaunchedTask(2, childResult)]).await;
+		});
+		batchResult.ignoreResult();
+
+		auto registry = batchRegistryOf(backend);
+		auto handle = liveHandle(registry, 2);
+		auto key = ActiveBatchKey(handle.parentTid, handle.batchId);
+		__traits(getMember, *registry,
+			"activeBatches")[key].slotByChildTid.remove(2);
+
+		childResult.fulfill(McpResult("done", false));
+		assertThrown!AssertError(drainPromiseNextTicks());
+	}
 }
