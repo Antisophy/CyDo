@@ -17,6 +17,11 @@ import ae.utils.serialization.store : SerializedObject;
 
 private alias SO = SerializedObject!(immutable char);
 import ae.utils.promise : Promise, resolve;
+import ae.net.asockets : onNextTick, socketManager;
+
+version (unittest) import ae.net.asockets : ConnectionState, DisconnectType,
+	IConnection;
+version (unittest) import ae.utils.jsonrpc : JsonRpcRequest;
 
 import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
 import cydo.agent.process : AgentProcess, FramingMode;
@@ -26,7 +31,7 @@ public import cydo.agent.drivers.codex.rollout;
 public import cydo.agent.drivers.codex.rpc;
 import cydo.protocol : ContentBlock, ProcessStderrEvent, SessionCompactedEvent,
 	TranslatedEvent, extrasToFragment;
-import cydo.agent.session : AgentSession;
+import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.runtime.config : AgentDriver;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
@@ -165,10 +170,16 @@ class CodexAgent : Agent
 					try
 						result = resp.getResult!ThreadStartResult();
 					catch (Exception e)
+					{
 						warningf("thread/start error: %s", e.msg);
+						session.onThreadStartFailed(e);
+						return;
+					}
 					registerSessionPath(result.thread.id, result.thread.path);
 					session.onThreadStarted(result, null, model, workDir,
 						resp.result.toJson());
+				}, (Exception e) {
+					session.onThreadStartFailed(e);
 				});
 			}
 
@@ -199,7 +210,7 @@ class CodexAgent : Agent
 							ev.text = "thread/resume error: " ~ e.msg;
 							session.outputHandler_(TranslatedEvent(toJson(ev), null));
 						}
-						session.closeStdin();
+						session.onThreadStartFailed(e);
 						return;
 					}
 					if (result.thread.id.length == 0)
@@ -211,12 +222,15 @@ class CodexAgent : Agent
 							ev.text = "thread/resume returned empty thread id";
 							session.outputHandler_(TranslatedEvent(toJson(ev), null));
 						}
-						session.closeStdin();
+						session.onThreadStartFailed(new Exception(
+							"thread/resume returned empty thread id"));
 						return;
 					}
 					registerSessionPath(result.thread.id, result.thread.path);
 					session.onThreadStarted(result, resumeSessionId, model, workDir,
 						resp.result.toJson());
+				}, (Exception e) {
+					session.onThreadStartFailed(e);
 				});
 			}
 			else
@@ -1143,19 +1157,46 @@ class CodexSession : AgentSession
 	private string sessionId;
 	private string agentName_;
 
-	// Queued messages waiting for thread to be ready.
-	private ContentBlock[][] pendingMessages;
-	private bool[] pendingContextBootstraps;
+	private enum SubmissionOperation { queued, starting, steering }
 
-	// Nonce of the in-flight user message; tagged onto the user_message echo.
-	private string pendingTurnCorrelationId_;
-	private bool pendingTurnContextBootstrap_;
+	/// One caller-owned submission through readiness, request response, and echo.
+	private static final class PendingMessage
+	{
+		ContentBlock[] content;
+		string text;
+		string correlationId;
+		bool isContextBootstrap;
+		SubmissionOperation operation;
+		Promise!AgentSubmissionReceipt promise;
+		bool settled;
+		bool accepted;
+		TranslatedEvent gatedUserEcho;
+		bool hasGatedUserEcho;
+
+		this(const(ContentBlock)[] content, string text, string correlationId,
+			bool isContextBootstrap)
+		{
+			this.content = content.dup;
+			this.text = text;
+			this.correlationId = correlationId;
+			this.isContextBootstrap = isContextBootstrap;
+			this.operation = SubmissionOperation.queued;
+			this.promise = new Promise!AgentSubmissionReceipt;
+		}
+	}
+
+	// Records pending thread readiness or a request response.
+	private PendingMessage[] pendingMessages_;
+	private PendingMessage[] inFlightMessages_;
+	// Sent records stay in native echo order until either their response and
+	// echo have both arrived or their request is rejected.
+	private PendingMessage[] expectedEchoMessages_;
+	private bool startInFlight_;
 
 	// Callbacks
 	package void delegate(TranslatedEvent) outputHandler_;
 	package void delegate(string line) stderrHandler_;
 	private void delegate(int status) exitHandler_;
-	private void delegate(string nonce) agentAckHandler_;
 
 	this(AppServerProcess server, int tid, SessionConfig config)
 	{
@@ -1208,6 +1249,7 @@ class CodexSession : AgentSession
 				ev.text = "Failed to start Codex thread";
 				outputHandler_(TranslatedEvent(toJson(ev), null));
 			}
+			onThreadStartFailed(new Exception("Failed to start Codex thread"));
 			return;
 		}
 
@@ -1242,14 +1284,231 @@ class CodexSession : AgentSession
 		drainPendingMessages();
 	}
 
+	package void onThreadStartFailed(Exception error)
+	{
+		rejectUnsettledMessages(error);
+		closeStdin();
+	}
+
 	private void drainPendingMessages()
 	{
-		auto queued = pendingMessages;
-		auto queuedContextBootstraps = pendingContextBootstraps;
-		pendingMessages = null;
-		pendingContextBootstraps = null;
-		foreach (i, msg; queued)
-			sendMessage(msg, null, queuedContextBootstraps[i]);
+		if (!alive_)
+			return;
+		while (pendingMessages_.length > 0)
+		{
+			if (threadId.length == 0 || startInFlight_
+				|| (turnInProgress && activeTurnId_.length == 0))
+				return;
+			auto submission = pendingMessages_[0];
+			pendingMessages_ = pendingMessages_[1 .. $];
+			submitMessage(submission);
+			if (submission.operation == SubmissionOperation.starting)
+				return;
+		}
+	}
+
+	private void removeInFlightMessage(PendingMessage submission)
+	{
+		foreach (i, candidate; inFlightMessages_)
+			if (candidate is submission)
+			{
+				inFlightMessages_ = inFlightMessages_[0 .. i]
+					~ inFlightMessages_[i + 1 .. $];
+				return;
+			}
+		assert(false, "Codex submission response has no in-flight record");
+	}
+
+	private void removeExpectedEchoMessage(PendingMessage submission)
+	{
+		foreach (i, candidate; expectedEchoMessages_)
+			if (candidate is submission)
+			{
+				expectedEchoMessages_ = expectedEchoMessages_[0 .. i]
+					~ expectedEchoMessages_[i + 1 .. $];
+				return;
+			}
+		assert(false, "Codex submission response has no expected user echo");
+	}
+
+	private void rejectSubmission(PendingMessage submission, Exception error)
+	{
+		if (submission.settled)
+			return;
+		submission.settled = true;
+		submission.promise.reject(error);
+	}
+
+	private void emitAcceptedUserEcho(PendingMessage submission,
+		TranslatedEvent event)
+	{
+		assert(submission.accepted,
+			"Codex user echo emitted before request acceptance");
+		auto output = outputHandler_;
+		// Queue after fulfillment so App commits acceptance before translating it.
+		onNextTick(socketManager, {
+			if (output)
+				output(event);
+		});
+	}
+
+	private void releaseGatedUserEcho(PendingMessage submission)
+	{
+		if (!submission.hasGatedUserEcho)
+			return;
+		auto event = submission.gatedUserEcho;
+		submission.gatedUserEcho = TranslatedEvent.init;
+		submission.hasGatedUserEcho = false;
+		removeExpectedEchoMessage(submission);
+		emitAcceptedUserEcho(submission, event);
+	}
+
+	private void fulfillSubmission(PendingMessage submission)
+	{
+		assert(!submission.settled,
+			"Codex submission settled more than once");
+		submission.accepted = true;
+		submission.settled = true;
+		submission.promise.fulfill(AgentSubmissionReceipt.appServerAccepted);
+		releaseGatedUserEcho(submission);
+	}
+
+	private void rejectUnsettledMessages(Exception error)
+	{
+		auto queued = pendingMessages_;
+		pendingMessages_ = null;
+		foreach (submission; queued)
+			rejectSubmission(submission, error);
+
+		auto inFlight = inFlightMessages_;
+		inFlightMessages_ = null;
+		foreach (submission; inFlight)
+			rejectSubmission(submission, error);
+
+		expectedEchoMessages_ = null;
+		startInFlight_ = false;
+	}
+
+	private void resetRejectedStart()
+	{
+		startInFlight_ = false;
+		turnInProgress = false;
+		activeTurnId_ = null;
+		activeItemId_ = null;
+		activeItemTypes_ = null;
+		hadItemsSinceLastStop_ = false;
+	}
+
+	private void submitSteer(PendingMessage submission)
+	{
+		submission.operation = SubmissionOperation.steering;
+		inFlightMessages_ ~= submission;
+		expectedEchoMessages_ ~= submission;
+		try
+		{
+			server.sendRequest("turn/steer",
+				toJson(TurnSteerParams(threadId,
+					[TurnStartInput("text", submission.text)], activeTurnId_)))
+				.then((JsonRpcResponse response) {
+					if (submission.settled)
+						return;
+					removeInFlightMessage(submission);
+					if (response.isError)
+					{
+						removeExpectedEchoMessage(submission);
+						rejectSubmission(submission,
+							new Exception(response.error.get.message));
+						return;
+					}
+					fulfillSubmission(submission);
+				}, (Exception e) {
+					if (submission.settled)
+						return;
+					removeInFlightMessage(submission);
+					removeExpectedEchoMessage(submission);
+					rejectSubmission(submission, e);
+				}).ignoreResult();
+		}
+		catch (Exception e)
+		{
+			removeInFlightMessage(submission);
+			removeExpectedEchoMessage(submission);
+			rejectSubmission(submission, e);
+		}
+	}
+
+	private void submitStart(PendingMessage submission)
+	{
+		submission.operation = SubmissionOperation.starting;
+		turnInProgress = true;
+		startInFlight_ = true;
+		activeTurnId_ = null;
+		activeItemId_ = null;
+		activeItemTypes_ = null;
+		hadItemsSinceLastStop_ = false;
+		inFlightMessages_ ~= submission;
+		expectedEchoMessages_ ~= submission;
+		try
+		{
+			server.sendRequest("turn/start",
+				toJson(TurnStartParams(threadId,
+					[TurnStartInput("text", submission.text)],
+					SandboxPolicy("externalSandbox", "enabled"))))
+				.then((JsonRpcResponse response) {
+					if (submission.settled)
+						return;
+					removeInFlightMessage(submission);
+					try
+					{
+						auto result = response.getResult!TurnStartResult();
+						if (result.turn.id.length == 0)
+							throw new Exception("turn/start returned an empty turn id");
+						activeTurnId_ = result.turn.id;
+						startInFlight_ = false;
+						fulfillSubmission(submission);
+						drainPendingMessages();
+					}
+					catch (Exception e)
+					{
+						removeExpectedEchoMessage(submission);
+						resetRejectedStart();
+						rejectSubmission(submission, e);
+						drainPendingMessages();
+					}
+				}, (Exception e) {
+					if (submission.settled)
+						return;
+					removeInFlightMessage(submission);
+					removeExpectedEchoMessage(submission);
+					resetRejectedStart();
+					rejectSubmission(submission, e);
+					drainPendingMessages();
+				}).ignoreResult();
+		}
+		catch (Exception e)
+		{
+			removeInFlightMessage(submission);
+			removeExpectedEchoMessage(submission);
+			resetRejectedStart();
+			rejectSubmission(submission, e);
+			drainPendingMessages();
+		}
+	}
+
+	private void submitMessage(PendingMessage submission)
+	{
+		assert(!submission.settled,
+			"Codex queued submission was already settled");
+		assert(threadId.length > 0,
+			"Codex submission requires a ready thread");
+		if (turnInProgress)
+		{
+			assert(activeTurnId_.length > 0,
+				"Codex submission cannot steer without an active turn id");
+			submitSteer(submission);
+		}
+		else
+			submitStart(submission);
 	}
 
 	package void handleTurnStarted(TurnRef turn)
@@ -1257,12 +1516,14 @@ class CodexSession : AgentSession
 		if (turn.id.length == 0)
 			return;
 		activeTurnId_ = turn.id;
-		drainPendingMessages();
+		if (!startInFlight_)
+			drainPendingMessages();
 	}
 
 	/// Called when the app-server process dies.
 	package void onServerExit(int status)
 	{
+		rejectUnsettledMessages(new Exception("Codex app-server exited before accepting message submission"));
 		if (!alive_)
 			return; // Already stopped; avoid double-invocation of exitHandler_.
 		alive_ = false;
@@ -1274,7 +1535,7 @@ class CodexSession : AgentSession
 
 	// ----- AgentSession interface -----
 
-	void sendMessage(const(ContentBlock)[] content, string correlationId = null,
+	Promise!AgentSubmissionReceipt sendMessage(const(ContentBlock)[] content, string correlationId = null,
 		bool isContextBootstrap = false)
 	{
 		// Extract text (only text blocks supported; throw on others).
@@ -1285,70 +1546,28 @@ class CodexSession : AgentSession
 			else throw new Exception("Unsupported content block type for Codex: " ~ b.type);
 		}
 
+		auto submission = new PendingMessage(content, text, correlationId,
+			isContextBootstrap);
 		if (!alive_)
-			return;
-
-		// Queue message if thread hasn't been created yet.
-		if (threadId.length == 0)
 		{
-			pendingMessages ~= content.dup;
-			pendingContextBootstraps ~= isContextBootstrap;
-			return;
+			submission.promise.reject(new Exception(
+				"Codex session is no longer alive"));
+			return submission.promise;
 		}
 
-		if (turnInProgress)
-		{
-			if (activeTurnId_.length == 0)
-			{
-				pendingMessages ~= content.dup;
-				pendingContextBootstraps ~= isContextBootstrap;
-				return;
-			}
-			pendingTurnCorrelationId_ = correlationId;
-			pendingTurnContextBootstrap_ = isContextBootstrap;
-			auto steerCid = correlationId;
-			server.sendRequest("turn/steer",
-				toJson(TurnSteerParams(
-					threadId,
-					[TurnStartInput("text", text)],
-					activeTurnId_))).then((JsonRpcResponse resp) {
-				if (!resp.isError && steerCid.length > 0 && agentAckHandler_)
-					agentAckHandler_(steerCid);
-			});
-		}
+		if (threadId.length == 0 || startInFlight_
+			|| (turnInProgress && activeTurnId_.length == 0))
+			pendingMessages_ ~= submission;
 		else
-		{
-			turnInProgress = true;
-			activeTurnId_ = null;
-			activeItemId_ = null;
-			activeItemTypes_ = null;
-			hadItemsSinceLastStop_ = false;
-			pendingTurnCorrelationId_ = correlationId;
-			pendingTurnContextBootstrap_ = isContextBootstrap;
-
-			auto startCid = correlationId;
-			server.sendRequest("turn/start",
-				toJson(TurnStartParams(
-					threadId,
-					[TurnStartInput("text", text)],
-					SandboxPolicy("externalSandbox", "enabled"))))
-				.then((JsonRpcResponse resp) {
-				try
-				{
-					auto result = resp.getResult!TurnStartResult();
-					handleTurnStarted(result.turn);
-					if (startCid.length > 0 && agentAckHandler_)
-						agentAckHandler_(startCid);
-				}
-				catch (Exception e)
-				{
-					warningf("turn/start error: %s", e.msg);
-				}
-			});
-		}
+			submitMessage(submission);
+		return submission.promise;
 	}
 
-	void invalidatePendingSubmittedMessages() {}
+	void invalidatePendingSubmittedMessages()
+	{
+		rejectUnsettledMessages(new Exception(
+			"Codex message submission was invalidated"));
+	}
 
 	@property bool supportsImages() const { return false; }
 
@@ -1374,6 +1593,8 @@ class CodexSession : AgentSession
 	{
 		if (!alive_)
 			return;
+		rejectUnsettledMessages(new Exception(
+			"Codex session closed before accepting message submission"));
 		// Codex sessions share a pooled app-server process. Kill is an
 		// emergency stop that terminates that process and lets onServerExit
 		// propagate the real exit to all attached sessions.
@@ -1382,6 +1603,8 @@ class CodexSession : AgentSession
 
 	void closeStdin()
 	{
+		rejectUnsettledMessages(new Exception(
+			"Codex session closed before accepting message submission"));
 		if (!alive_)
 			return;
 		if (threadId.length > 0)
@@ -1402,7 +1625,6 @@ class CodexSession : AgentSession
 		return true;
 	}
 
-	@property void onAgentAck(void delegate(string nonce) dg) { agentAckHandler_ = dg; }
 	@property void onOutput(void delegate(TranslatedEvent) dg) { outputHandler_ = dg; }
 	@property void onStderr(void delegate(string line) dg) { stderrHandler_ = dg; }
 	@property void onExit(void delegate(int status) dg) { exitHandler_ = dg; }
@@ -1444,12 +1666,27 @@ class CodexSession : AgentSession
 				cb.type = "text";
 				cb.text = userText;
 				ev.content = [cb];
-				ev.correlation_id = pendingTurnCorrelationId_;
-				auto isContextBootstrap = pendingTurnContextBootstrap_;
-				pendingTurnCorrelationId_ = null;
-				pendingTurnContextBootstrap_ = false;
-				outputHandler_(TranslatedEvent(toJson(ev), rawNotification,
-					AbsTime.init, 0, isContextBootstrap));
+				assert(expectedEchoMessages_.length > 0,
+					"Codex native user echo has no expected submission");
+				auto submission = expectedEchoMessages_[0];
+				assert(userText == submission.text,
+					"Codex native user echo text does not match expected submission");
+				ev.correlation_id = submission.correlationId;
+				auto translated = TranslatedEvent(toJson(ev), rawNotification,
+					AbsTime.init, 0, submission.isContextBootstrap);
+				if (submission.accepted)
+				{
+					expectedEchoMessages_ = expectedEchoMessages_[1 .. $];
+					emitAcceptedUserEcho(submission, translated);
+				}
+				else
+				{
+					assert(!submission.hasGatedUserEcho,
+						"Codex submission received multiple native user echoes");
+					submission.gatedUserEcho = translated;
+					submission.hasGatedUserEcho = true;
+				}
+				return;
 			}
 			return;
 		}
@@ -1857,6 +2094,7 @@ class CodexSession : AgentSession
 			outputHandler_(TranslatedEvent(toJson(tre), rawNotification));
 		}
 		lastResultText_ = null;
+		drainPendingMessages();
 	}
 
 	package void handleTokenUsageUpdated(TokenUsageUpdatedParams params, string rawNotification)
@@ -1879,6 +2117,85 @@ class CodexSession : AgentSession
 				tsev.usage = UsageInfo(0, 0);
 			outputHandler_(TranslatedEvent(toJson(tsev), rawNotification));
 		}
+	}
+}
+
+version (unittest) private final class TestCodexConnection : IConnection
+{
+	string[] sentMessages;
+	private ReadDataHandler readDataHandler;
+
+	@property ConnectionState state()
+	{
+		return ConnectionState.connected;
+	}
+
+	void send(scope Data[] data, int priority = DEFAULT_PRIORITY)
+	{
+		ubyte[] message;
+		foreach (ref datum; data)
+			datum.enter((contents) { message ~= cast(ubyte[]) contents; });
+		sentMessages ~= cast(string) message;
+	}
+	alias send = IConnection.send;
+
+	JsonRpcRequest takeRequest(string expectedMethod)
+	{
+		assert(sentMessages.length > 0,
+			"Codex test connection has no pending request");
+		auto request = jsonParse!JsonRpcRequest(sentMessages[0]);
+		sentMessages = sentMessages[1 .. $];
+		assert(request.method == expectedMethod,
+			"Unexpected Codex request method: " ~ request.method);
+		assert(request.id, "Codex request has no JSON-RPC id");
+		return request;
+	}
+
+	JsonRpcRequest takeRequest(Params)(string expectedMethod, string expectedText)
+	{
+		auto request = takeRequest(expectedMethod);
+		auto params = jsonParse!Params(toJson(request.params));
+		assert(params.input.length == 1 && params.input[0].text == expectedText,
+			"Unexpected Codex request input");
+		return request;
+	}
+
+	void respond(JsonRpcRequest request, JsonRpcResponse response)
+	{
+		import ae.utils.array : asBytes;
+
+		assert(readDataHandler !is null,
+			"Codex test connection has no response handler");
+		response.id = request.id;
+		readDataHandler(Data(toJson(response).asBytes));
+	}
+
+	void disconnect(string reason = defaultDisconnectReason,
+		DisconnectType type = DisconnectType.requested)
+	{
+		assert(false, reason);
+	}
+	@property void handleConnect(ConnectHandler value) {}
+	@property void handleReadData(ReadDataHandler value) { readDataHandler = value; }
+	@property void handleDisconnect(DisconnectHandler value) {}
+	@property void handleBufferFlushed(BufferFlushedHandler value) {}
+}
+
+version (unittest) private final class TestSubmissionOutcome
+{
+	int acceptedCount;
+	int rejectedCount;
+	string rejectionMessage;
+
+	this(Promise!AgentSubmissionReceipt promise)
+	{
+		promise.then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.appServerAccepted);
+			acceptedCount++;
+		}, (Exception error) {
+			rejectedCount++;
+			rejectionMessage = error.msg;
+		}).ignoreResult();
 	}
 }
 
@@ -2180,21 +2497,110 @@ unittest
 
 unittest
 {
+	import ae.net.asockets : socketManager;
+	import cydo.protocol : ItemStartedEvent;
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager, "nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
 	@JSONPartial struct StartedNotification { ItemStartedParams params; }
 	auto session = new CodexSession(cast(AppServerProcess) null, 1, SessionConfig.init);
 	TranslatedEvent[] emitted;
 	void sink(TranslatedEvent ev) { emitted ~= ev; }
 	session.onOutput(&sink);
-	session.pendingTurnContextBootstrap_ = true;
+	auto bootstrapSubmission = new CodexSession.PendingMessage(
+		[ContentBlock("text", "ignored")], "ignored", null, true);
+	auto ordinarySubmission = new CodexSession.PendingMessage(
+		[ContentBlock("text", "ordinary")], "ordinary", "ordinary-nonce", false);
+	bootstrapSubmission.accepted = true;
+	bootstrapSubmission.settled = true;
+	ordinarySubmission.accepted = true;
+	ordinarySubmission.settled = true;
+	session.expectedEchoMessages_ ~= bootstrapSubmission;
+	session.expectedEchoMessages_ ~= ordinarySubmission;
 	auto bootstrap = jsonParse!StartedNotification(
 		`{"params":{"item":{"id":"bootstrap","type":"userMessage","content":[{"type":"text","text":"ignored"}]}}}`);
 	session.handleItemStarted(bootstrap.params, "bootstrap");
+	drainPromiseNextTicks();
 	assert(emitted.length == 1 && emitted[0].isContextBootstrap);
-	session.pendingTurnContextBootstrap_ = false;
 	auto ordinary = jsonParse!StartedNotification(
 		`{"params":{"item":{"id":"ordinary","type":"userMessage","content":[{"type":"text","text":"ordinary"}]}}}`);
 	session.handleItemStarted(ordinary.params, "ordinary");
-	assert(emitted.length == 2 && !emitted[1].isContextBootstrap);
+	drainPromiseNextTicks();
+	auto ordinaryEvent = jsonParse!ItemStartedEvent(emitted[1].translated);
+	assert(emitted.length == 2 && !emitted[1].isContextBootstrap
+		&& ordinaryEvent.correlation_id == "ordinary-nonce"
+		&& session.expectedEchoMessages_.length == 0);
+}
+
+unittest
+{
+	import core.exception : AssertError;
+	import std.exception : assertThrown;
+
+	@JSONPartial struct StartedNotification { ItemStartedParams params; }
+
+	void ignoreOutput(TranslatedEvent event) {}
+
+	// Native echoes must match the expected submission FIFO. A second echo
+	// arriving before the first is a text/order mismatch, not an event that can
+	// be correlated to whichever matching submission happens to be queued.
+	{
+		auto session = new CodexSession(cast(AppServerProcess) null, 1,
+			SessionConfig.init);
+		session.onOutput(&ignoreOutput);
+		auto first = new CodexSession.PendingMessage(
+			[ContentBlock("text", "first")], "first", "first-nonce", false);
+		auto second = new CodexSession.PendingMessage(
+			[ContentBlock("text", "second")], "second", "second-nonce", false);
+		first.accepted = true;
+		second.accepted = true;
+		session.expectedEchoMessages_ = [first, second];
+		auto outOfOrder = jsonParse!StartedNotification(
+			`{"params":{"item":{"id":"native-second","type":"userMessage","content":[{"type":"text","text":"second"}]}}}`);
+		assertThrown!AssertError(session.handleItemStarted(outOfOrder.params,
+			"out-of-order"));
+		assert(session.expectedEchoMessages_ == [first, second]);
+	}
+
+	// A gated first echo remains attached to its submission until request
+	// acceptance, so a second native echo for that submission is invalid.
+	{
+		auto session = new CodexSession(cast(AppServerProcess) null, 1,
+			SessionConfig.init);
+		session.onOutput(&ignoreOutput);
+		auto submission = new CodexSession.PendingMessage(
+			[ContentBlock("text", "once")], "once", "once-nonce", false);
+		session.expectedEchoMessages_ = [submission];
+		auto echo = jsonParse!StartedNotification(
+			`{"params":{"item":{"id":"native-once","type":"userMessage","content":[{"type":"text","text":"once"}]}}}`);
+		session.handleItemStarted(echo.params, "first-echo");
+		assert(submission.hasGatedUserEcho);
+		assertThrown!AssertError(session.handleItemStarted(echo.params,
+			"duplicate-echo"));
+	}
+
+	// A native user echo without a live originating submission is an invariant
+	// violation rather than an uncorrelated output event.
+	{
+		auto session = new CodexSession(cast(AppServerProcess) null, 1,
+			SessionConfig.init);
+		session.onOutput(&ignoreOutput);
+		auto unexpected = jsonParse!StartedNotification(
+			`{"params":{"item":{"id":"native-unexpected","type":"userMessage","content":[{"type":"text","text":"unexpected"}]}}}`);
+		assertThrown!AssertError(session.handleItemStarted(unexpected.params,
+			"no-expected-echo"));
+	}
 }
 
 unittest
@@ -2474,6 +2880,388 @@ unittest
 			&& hasTransportClosed,
 		"expected failed mcp tool result to surface error text; actual result=" ~ actualResult,
 	);
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import ae.utils.jsonrpc : JsonRpcError, JsonRpcErrorCode;
+	import std.algorithm.searching : canFind;
+	import cydo.agent.drivers.codex.process : makeTestAppServerProcess;
+	import cydo.protocol : ItemStartedEvent;
+
+	@JSONPartial
+	struct StartedNotification
+	{
+		ItemStartedParams params;
+	}
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager, "nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	JsonRpcResponse turnStartResponse(string turnId)
+	{
+		JsonRpcResponse response;
+		response.result = SO.from(TurnStartResult(TurnRef(turnId)));
+		return response;
+	}
+
+	JsonRpcResponse rejectedResponse(string message)
+	{
+		JsonRpcResponse response;
+		response.error = JsonRpcError.fromCode(JsonRpcErrorCode.invalidRequest,
+			message);
+		return response;
+	}
+
+	JsonRpcResponse acceptedResponse()
+	{
+		JsonRpcResponse response;
+		response.result = SO.from(true);
+		return response;
+	}
+
+	void assertAcceptedOnce(TestSubmissionOutcome outcome)
+	{
+		assert(outcome.acceptedCount == 1 && outcome.rejectedCount == 0);
+	}
+
+	void assertRejectedOnce(TestSubmissionOutcome outcome)
+	{
+		assert(outcome.acceptedCount == 0 && outcome.rejectedCount == 1);
+		assert(outcome.rejectionMessage.length > 0);
+	}
+
+	void exerciseThreadSetupFailure(string resumeSessionId,
+		string expectedMethod)
+	{
+		auto connection = new TestCodexConnection;
+		auto server = makeTestAppServerProcess(connection);
+		auto agent = new CodexAgent;
+		ProcessLaunch launch;
+		launch.executablePath = "unused-test-codex";
+		launch.workDir = "/test/workdir";
+		SessionConfig config;
+		config.workspace = expectedMethod;
+		config.model = "test-model";
+		agent.serverPool[agent.serverPoolKey(config.workspace, launch)] = server;
+
+		auto session = cast(CodexSession) agent.createSession(
+			31, resumeSessionId, launch, config);
+		assert(session !is null);
+		auto setupRequest = connection.takeRequest(expectedMethod);
+		if (resumeSessionId.length > 0)
+		{
+			auto params = jsonParse!ThreadResumeParams(toJson(setupRequest.params));
+			assert(params.threadId == resumeSessionId
+				&& params.model == "test-model"
+				&& params.cwd == "/test/workdir");
+		}
+		else
+		{
+			auto params = jsonParse!ThreadStartParams(toJson(setupRequest.params));
+			assert(params.model == "test-model"
+				&& params.cwd == "/test/workdir");
+		}
+
+		auto first = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", "queued setup first")], "setup-first"));
+		auto second = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", "queued setup second")], "setup-second"));
+		assert(connection.sentMessages.length == 0);
+		assert(session.pendingMessages_.length == 2
+			&& session.inFlightMessages_.length == 0);
+
+		connection.respond(setupRequest,
+			rejectedResponse(expectedMethod ~ " failed"));
+		drainPromiseNextTicks();
+		assertRejectedOnce(first);
+		assertRejectedOnce(second);
+		assert(first.rejectionMessage == expectedMethod ~ " failed"
+			&& second.rejectionMessage == expectedMethod ~ " failed");
+		assert(!session.alive_);
+		assert(session.pendingMessages_.length == 0
+			&& session.inFlightMessages_.length == 0);
+
+		session.onThreadStartFailed(new Exception("duplicate setup failure"));
+		drainPromiseNextTicks();
+		assertRejectedOnce(first);
+		assertRejectedOnce(second);
+		assert(connection.sentMessages.length == 0);
+	}
+
+	exerciseThreadSetupFailure(null, "thread/start");
+	exerciseThreadSetupFailure("resume-thread", "thread/resume");
+
+	{
+		auto connection = new TestCodexConnection;
+		auto server = makeTestAppServerProcess(connection);
+		auto session = new CodexSession(server, 1, SessionConfig.init);
+		auto first = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", "first")], "first-nonce", true));
+		assert(session.pendingMessages_.length == 1);
+		assert(connection.sentMessages.length == 0);
+
+		ThreadStartResult ready;
+		ready.thread.id = "thread";
+		session.onThreadStarted(ready, null, "test-model", "/test/workdir",
+			`{"thread":{"id":"thread"}}`);
+		auto firstRequest = connection.takeRequest!TurnStartParams(
+			"turn/start", "first");
+		auto firstParams = jsonParse!TurnStartParams(toJson(firstRequest.params));
+		assert(firstParams.threadId == "thread");
+		connection.respond(firstRequest, turnStartResponse("turn-first"));
+		drainPromiseNextTicks();
+		assertAcceptedOnce(first);
+		assert(session.turnInProgress && !session.startInFlight_
+			&& session.activeTurnId_ == "turn-first");
+
+		auto steerAccepted = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", "accepted steer")], "steer-nonce"));
+		auto steerRejected = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", "stale steer")], "stale-nonce"));
+		auto acceptedSteerRequest = connection.takeRequest!TurnSteerParams(
+			"turn/steer", "accepted steer");
+		auto rejectedSteerRequest = connection.takeRequest!TurnSteerParams(
+			"turn/steer", "stale steer");
+		auto acceptedSteerParams = jsonParse!TurnSteerParams(
+			toJson(acceptedSteerRequest.params));
+		auto rejectedSteerParams = jsonParse!TurnSteerParams(
+			toJson(rejectedSteerRequest.params));
+		assert(acceptedSteerParams.threadId == "thread"
+			&& acceptedSteerParams.expectedTurnId == "turn-first");
+		assert(rejectedSteerParams.threadId == "thread"
+			&& rejectedSteerParams.expectedTurnId == "turn-first");
+		assert(acceptedSteerRequest.id.toJson()
+			!= rejectedSteerRequest.id.toJson());
+
+		connection.respond(rejectedSteerRequest,
+			rejectedResponse("stale expected turn"));
+		drainPromiseNextTicks();
+		assertRejectedOnce(steerRejected);
+		assert(steerRejected.rejectionMessage == "stale expected turn");
+		assert(steerAccepted.acceptedCount == 0
+			&& steerAccepted.rejectedCount == 0);
+		assert(session.turnInProgress
+			&& session.activeTurnId_ == "turn-first");
+		assert(session.expectedEchoMessages_.length == 2);
+
+		connection.respond(acceptedSteerRequest, acceptedResponse());
+		drainPromiseNextTicks();
+		assertAcceptedOnce(steerAccepted);
+		assert(session.turnInProgress
+			&& session.activeTurnId_ == "turn-first");
+		assert(session.expectedEchoMessages_.length == 2);
+
+		TranslatedEvent[] emitted;
+		session.onOutput = (TranslatedEvent event) { emitted ~= event; };
+		enum firstEcho = `{"params":{"threadId":"thread","turnId":"turn-first","item":{"id":"user-first","type":"userMessage","content":[{"type":"text","text":"first"}]}}}`;
+		auto notification = jsonParse!StartedNotification(firstEcho);
+		session.handleItemStarted(notification.params, firstEcho);
+		drainPromiseNextTicks();
+		auto emittedUser = jsonParse!ItemStartedEvent(emitted[0].translated);
+		assert(emittedUser.correlation_id == "first-nonce"
+			&& emitted[0].isContextBootstrap);
+
+		enum steerEcho = `{"params":{"threadId":"thread","turnId":"turn-first","item":{"id":"user-steer","type":"userMessage","content":[{"type":"text","text":"accepted steer"}]}}}`;
+		notification = jsonParse!StartedNotification(steerEcho);
+		session.handleItemStarted(notification.params, steerEcho);
+		drainPromiseNextTicks();
+		emittedUser = jsonParse!ItemStartedEvent(emitted[1].translated);
+		assert(emittedUser.correlation_id == "steer-nonce"
+			&& !emitted[1].isContextBootstrap);
+		assert(session.expectedEchoMessages_.length == 0);
+	}
+
+	// A successful request response and item/started notification can arrive
+	// back-to-back. The App acceptance continuation must run before either echo.
+	{
+		auto connection = new TestCodexConnection;
+		auto server = makeTestAppServerProcess(connection);
+		auto session = new CodexSession(server, 1, SessionConfig.init);
+		session.threadId = "echo-order";
+
+		bool firstAccepted;
+		bool secondAccepted;
+		string[] correlations;
+		session.onOutput = (TranslatedEvent event) {
+			if (!event.translated.canFind(`"item_type":"user_message"`))
+				return;
+			auto user = jsonParse!ItemStartedEvent(event.translated);
+			if (user.correlation_id == "first-nonce")
+				assert(firstAccepted);
+			else
+			{
+				assert(user.correlation_id == "second-nonce");
+				assert(secondAccepted);
+			}
+			correlations ~= user.correlation_id;
+		};
+
+		session.sendMessage([ContentBlock("text", "first prompt")],
+			"first-nonce").then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.appServerAccepted);
+			firstAccepted = true;
+		}).ignoreResult();
+		auto firstRequest = connection.takeRequest!TurnStartParams(
+			"turn/start", "first prompt");
+		connection.respond(firstRequest, turnStartResponse("first-turn"));
+		enum firstEcho = `{"params":{"threadId":"echo-order","turnId":"first-turn","item":{"id":"first-native","type":"userMessage","content":[{"type":"text","text":"first prompt"}]}}}`;
+		auto notification = jsonParse!StartedNotification(firstEcho);
+		session.handleItemStarted(notification.params, firstEcho);
+		assert(!firstAccepted && correlations.length == 0);
+		drainPromiseNextTicks();
+		assert(firstAccepted && correlations == ["first-nonce"]);
+
+		session.handleTurnCompleted(TurnCompletedParams("echo-order"),
+			`{"method":"turn/completed"}`);
+		session.sendMessage([ContentBlock("text", "second prompt")],
+			"second-nonce").then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.appServerAccepted);
+			secondAccepted = true;
+		}).ignoreResult();
+		auto secondRequest = connection.takeRequest!TurnStartParams(
+			"turn/start", "second prompt");
+		connection.respond(secondRequest, turnStartResponse("second-turn"));
+		enum secondEcho = `{"params":{"threadId":"echo-order","turnId":"second-turn","item":{"id":"second-native","type":"userMessage","content":[{"type":"text","text":"second prompt"}]}}}`;
+		notification = jsonParse!StartedNotification(secondEcho);
+		session.handleItemStarted(notification.params, secondEcho);
+		assert(!secondAccepted && correlations == ["first-nonce"]);
+		drainPromiseNextTicks();
+		assert(secondAccepted && correlations == ["first-nonce", "second-nonce"]);
+	}
+
+	{
+		auto connection = new TestCodexConnection;
+		auto server = makeTestAppServerProcess(connection);
+		auto session = new CodexSession(server, 1, SessionConfig.init);
+		session.threadId = "thread";
+
+		auto rejected = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", "rejected start")], "rejected"));
+		auto rejectedRequest = connection.takeRequest!TurnStartParams(
+			"turn/start", "rejected start");
+		connection.respond(rejectedRequest,
+			rejectedResponse("no successor failure"));
+		drainPromiseNextTicks();
+		assertRejectedOnce(rejected);
+		assert(rejected.rejectionMessage == "no successor failure");
+		assert(!session.turnInProgress && !session.startInFlight_
+			&& session.activeTurnId_.length == 0
+			&& session.pendingMessages_.length == 0
+			&& session.inFlightMessages_.length == 0);
+
+		auto later = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", "later valid start")], "later"));
+		auto laterRequest = connection.takeRequest!TurnStartParams(
+			"turn/start", "later valid start");
+		assert(rejectedRequest.id.toJson() != laterRequest.id.toJson());
+		connection.respond(laterRequest, turnStartResponse("turn-later"));
+		drainPromiseNextTicks();
+		assertAcceptedOnce(later);
+		assert(session.turnInProgress && !session.startInFlight_
+			&& session.activeTurnId_ == "turn-later");
+	}
+
+	{
+		auto connection = new TestCodexConnection;
+		auto server = makeTestAppServerProcess(connection);
+		auto session = new CodexSession(server, 1, SessionConfig.init);
+		session.threadId = "thread";
+
+		auto first = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", "rejected start")], "first"));
+		auto firstRequest = connection.takeRequest!TurnStartParams(
+			"turn/start", "rejected start");
+		auto second = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", "accepted successor")], "second"));
+		assert(connection.sentMessages.length == 0);
+		assert(session.pendingMessages_.length == 1);
+
+		connection.respond(firstRequest,
+			rejectedResponse("queued successor failure"));
+		drainPromiseNextTicks();
+		assertRejectedOnce(first);
+		assert(first.rejectionMessage == "queued successor failure");
+		assert(second.acceptedCount == 0 && second.rejectedCount == 0);
+		assert(session.turnInProgress && session.startInFlight_
+			&& session.activeTurnId_.length == 0);
+		auto secondRequest = connection.takeRequest!TurnStartParams(
+			"turn/start", "accepted successor");
+		assert(firstRequest.id.toJson() != secondRequest.id.toJson());
+
+		connection.respond(secondRequest, turnStartResponse("turn-successor"));
+		drainPromiseNextTicks();
+		assertAcceptedOnce(second);
+		assert(session.turnInProgress && !session.startInFlight_
+			&& session.activeTurnId_ == "turn-successor"
+			&& session.pendingMessages_.length == 0
+			&& session.inFlightMessages_.length == 0);
+	}
+
+	void exerciseLifecycleLoss(string label,
+		void delegate(CodexSession) loseLifecycle, bool remainsAlive)
+	{
+		auto connection = new TestCodexConnection;
+		auto server = makeTestAppServerProcess(connection);
+		auto session = new CodexSession(server, 1, SessionConfig.init);
+		session.threadId = "thread-" ~ label;
+
+		auto inFlight = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", label ~ " in flight")], label ~ "-flight"));
+		auto captured = connection.takeRequest!TurnStartParams(
+			"turn/start", label ~ " in flight");
+		auto queued = new TestSubmissionOutcome(session.sendMessage(
+			[ContentBlock("text", label ~ " queued")], label ~ "-queued"));
+		assert(connection.sentMessages.length == 0);
+		assert(session.inFlightMessages_.length == 1
+			&& session.pendingMessages_.length == 1);
+
+		loseLifecycle(session);
+		loseLifecycle(session);
+		drainPromiseNextTicks();
+		assertRejectedOnce(inFlight);
+		assertRejectedOnce(queued);
+		assert(session.alive_ == remainsAlive);
+		assert(!session.startInFlight_
+			&& session.inFlightMessages_.length == 0
+			&& session.pendingMessages_.length == 0);
+
+		connection.respond(captured, turnStartResponse("late-" ~ label));
+		drainPromiseNextTicks();
+		assertRejectedOnce(inFlight);
+		assertRejectedOnce(queued);
+		assert(session.activeTurnId_.length == 0);
+		assert(session.expectedEchoMessages_.length == 0);
+		assert(connection.sentMessages.length == 0);
+	}
+
+	exerciseLifecycleLoss("thread-setup-owner",
+		(CodexSession session) {
+			session.onThreadStartFailed(new Exception("thread setup failed"));
+		}, false);
+	exerciseLifecycleLoss("invalidation",
+		(CodexSession session) {
+			session.invalidatePendingSubmittedMessages();
+		}, true);
+	exerciseLifecycleLoss("close-stdin",
+		(CodexSession session) {
+			session.closeStdin();
+		}, false);
+	exerciseLifecycleLoss("server-exit",
+		(CodexSession session) {
+			session.onServerExit(17);
+		}, false);
 }
 
 unittest

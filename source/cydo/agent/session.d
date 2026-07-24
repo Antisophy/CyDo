@@ -2,15 +2,33 @@ module cydo.agent.session;
 
 import core.time : Duration;
 
+import ae.utils.promise : Promise;
+
 import cydo.protocol : ContentBlock, TranslatedEvent;
+
+/// The earliest submission boundary a concrete agent driver can prove.
+enum AgentSubmissionReceipt
+{
+	/// Claude serialized the input and queued it to a live local stdin connection.
+	localEnqueued,
+	/// Codex or Copilot received a non-error response to the matching submission RPC.
+	appServerAccepted,
+}
 
 /// Abstract agent session interface.
 /// Decouples the transport (WebSocket) from the agent implementation.
 interface AgentSession
 {
 	/// Send a user message to the agent.
+	///
+	/// Fulfills at the driver's earliest definitive submission boundary:
+	/// Claude after input serialization and enqueue to a live local stdin
+	/// connection; Codex after the matching non-error turn/start or turn/steer
+	/// response; Copilot after the matching non-error session.send response.
+	/// This does not promise a flush, model-context entry, user echo, or turn
+	/// completion. Rejects when the session lifecycle is lost before that boundary.
 	/// correlationId is the nonce from the originating UI send (may be null).
-	void sendMessage(const(ContentBlock)[] content, string correlationId = null,
+	Promise!AgentSubmissionReceipt sendMessage(const(ContentBlock)[] content, string correlationId = null,
 		bool isContextBootstrap = false);
 
 	/// Discard submitted messages buffered locally across a history-lineage reset.
@@ -37,11 +55,6 @@ interface AgentSession
 
 	/// Force-kill the agent if it has not exited within `timeout` (SIGTERM, then SIGKILL after 2s).
 	void killAfterTimeout(Duration timeout);
-
-	/// Callback: called when the agent acknowledges a user message before it
-	/// enters the LLM context. Argument is the correlationId (nonce) from the
-	/// originating send. Only fired by agents with a separable ack signal.
-	@property void onAgentAck(void delegate(string nonce) dg);
 
 	/// Callback: called for each translated event from the agent.
 	@property void onOutput(void delegate(TranslatedEvent) dg);

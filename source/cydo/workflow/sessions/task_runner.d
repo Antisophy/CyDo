@@ -168,7 +168,6 @@ struct TaskSessionRunnerHost
 	void delegate(int tid, TranslatedEvent ev) broadcastTask;
 	string delegate(int tid, string subject, string body) appendTaskDiagnostic;
 	void delegate(int tid, string translated) broadcastAppendedTaskEvent;
-	void delegate(int tid, string nonce) sendAgentAck;
 	void delegate(int tid) publishTaskSnapshot;
 	void delegate(int tid) onTaskTurnCompletedAlive;
 	bool delegate(int tid) drainIdleCallbacksForTurnResult;
@@ -180,8 +179,9 @@ struct TaskSessionRunnerHost
 	string delegate(int tid) checkDeclaredOutputs;
 	bool delegate(int tid, bool eagerDepCleanup) finalizeCompletedSubTask;
 	bool delegate(int tid) deliverFailedPendingSubTaskResult;
-	void delegate(int tid) deliverWaitingParentResultsIfReady;
-	void delegate(int parentTid) deliverBatchResults;
+	int delegate(int childTid) parentTaskForChild;
+	Promise!void delegate(int tid) deliverWaitingParentResultsIfReady;
+	Promise!void delegate(int parentTid) deliverBatchResults;
 	void delegate(int tid) failPendingAskUserQuestionOnExit;
 	void delegate(int tid) failPendingPermissionPromptOnExit;
 	void delegate(int tid) failPendingAskRouteOnExit;
@@ -206,7 +206,7 @@ struct TaskSessionRunnerHost
 	void delegate(int tid) finalReconcileJsonlIfPresent;
 	void delegate(int tid) stopJsonlWatch;
 	void delegate(int tid) broadcastHistoryOperations;
-	void delegate(int tid) sendSystemRestartNudge;
+	Promise!void delegate(int tid) sendSystemRestartNudge;
 	void delegate() loadPersistedTaskDeps;
 	int[] delegate() snapshotTaskIds;
 	WaitingTaskDependencyState delegate(int parentTid) waitingTaskDependencyState;
@@ -606,12 +606,6 @@ class TaskSessionRunner
 			host_.publishTaskSnapshot(tid);
 		};
 
-		session.onAgentAck = (string nonce) {
-			if (nonce.length == 0)
-				return;
-			host_.sendAgentAck(tid, nonce);
-		};
-
 		string lastStderr;
 
 		session.onStderr = (string line) {
@@ -693,6 +687,7 @@ class TaskSessionRunner
 				return;
 
 			current.recentNonces = null;
+			current.clearSubmissionCorrelationState();
 
 			auto ta = host_.tryAgentForTask(tid);
 			bool intentionalExit = !missingExecutableLaunchFailure
@@ -734,8 +729,9 @@ class TaskSessionRunner
 					if (ancestor >= 0)
 						host_.broadcastFocusHint(tid, ancestor);
 				}
-				if (!host_.deliverFailedPendingSubTaskResult(tid))
-					host_.deliverWaitingParentResultsIfReady(tid);
+					if (!host_.deliverFailedPendingSubTaskResult(tid))
+						observeWaitingParentDeliveryAttempt(tid,
+							host_.deliverWaitingParentResultsIfReady(tid));
 				return;
 			}
 
@@ -798,7 +794,8 @@ class TaskSessionRunner
 			}
 
 			if (!deliveredPendingSubTask)
-				host_.deliverWaitingParentResultsIfReady(tid);
+				observeWaitingParentDeliveryAttempt(tid,
+					host_.deliverWaitingParentResultsIfReady(tid));
 
 			host_.emitTaskReload(tid);
 
@@ -855,7 +852,8 @@ class TaskSessionRunner
 					tid, "Failed to resume session", buildLaunchFailureBody(tid, e));
 				host_.broadcastAppendedTaskEvent(tid, translated);
 				if (!host_.deliverFailedPendingSubTaskResult(tid))
-					host_.deliverWaitingParentResultsIfReady(tid);
+					observeWaitingParentDeliveryAttempt(tid,
+						host_.deliverWaitingParentResultsIfReady(tid));
 				return reject!ProcessState(e);
 			}
 			return resolve(ProcessState.Alive);
@@ -944,9 +942,9 @@ class TaskSessionRunner
 
 	void resumeAndDeliverResults(int tid)
 	{
-		resumeTask(tid).then(() {
-			host_.deliverBatchResults(tid);
-		}).ignoreResult();
+		observeRecoveryAttempt(tid, resumeTask(tid).then(() {
+			return host_.deliverBatchResults(tid);
+		}));
 	}
 
 	void resumeWaitingTask(int tid)
@@ -956,12 +954,38 @@ class TaskSessionRunner
 
 	void resumeActiveTask(int tid)
 	{
-		resumeTask(tid).then(() {
-			host_.sendSystemRestartNudge(tid);
-		}).ignoreResult();
+		observeRecoveryAttempt(tid, resumeTask(tid).then(() {
+			return host_.sendSystemRestartNudge(tid);
+		}));
 	}
 
 private:
+	void observeWaitingParentDeliveryAttempt(int childTid, Promise!void attempt)
+	{
+		requireTask(childTid,
+			"Completed child task must exist while observing recovered delivery");
+		auto ownerTid = host_.parentTaskForChild(childTid);
+		if (ownerTid <= 0)
+			ownerTid = childTid;
+		observeRecoveryAttempt(ownerTid, attempt);
+	}
+
+	void observeRecoveryAttempt(int tid, Promise!void attempt)
+	{
+		attempt.then({}, (Exception e) {
+			auto current = host_.getTask(tid);
+			assert(current !is null,
+				"Recovered delivery attempt rejected after its task disappeared");
+			if (current.status == TaskStatus.active || current.status == TaskStatus.alive)
+				host_.transitionTaskFrom(tid,
+					[TaskStatus.active, TaskStatus.alive], TaskStatus.waiting,
+					TaskNotificationChange.preserve);
+			assert(current.status == TaskStatus.waiting
+				|| current.status == TaskStatus.failed,
+				"Recovered delivery rejection escaped its process owner state");
+		}).ignoreResult();
+	}
+
 	TaskData* requireTask(int tid, string message)
 	{
 		auto td = host_.getTask(tid);
@@ -1057,6 +1081,89 @@ private:
 		return buildLaunchFailureBody(tid,
 			e.classinfo.name ~ ": " ~ e.msg);
 	}
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+
+	void drainRecoveryNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager,
+				"nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	enum dependencyOwnerTid = 1;
+	enum handoffPredecessorTid = 2;
+	enum handoffSuccessorTid = 3;
+	TaskData[int] tasks;
+	foreach (tid; [dependencyOwnerTid, handoffPredecessorTid, handoffSuccessorTid])
+		tasks[tid] = TaskData(tid, "local", "/tmp/cydo-handoff-recovery-owner");
+	tasks[dependencyOwnerTid].status = TaskStatus.waiting;
+	tasks[dependencyOwnerTid].resultText = "existing failed result";
+	tasks[handoffPredecessorTid].status = TaskStatus.completed;
+	tasks[handoffSuccessorTid].status = TaskStatus.completed;
+	tasks[handoffSuccessorTid].parentTid = handoffPredecessorTid;
+
+	int[int] persistedDependencyOwners;
+	int[int] runtimeDependencyOwners;
+	persistedDependencyOwners[handoffSuccessorTid] = dependencyOwnerTid;
+	runtimeDependencyOwners[handoffSuccessorTid] = dependencyOwnerTid;
+	int ownerLookups;
+	int transitionCalls;
+	int resultWrites;
+	int diagnosticCalls;
+	auto runner = new TaskSessionRunner(TaskSessionRunnerHost(
+		getTask: (int tid) {
+			auto task = tid in tasks;
+			return task is null ? null : &tasks[tid];
+		},
+		parentTaskForChild: (int childTid) {
+			ownerLookups++;
+			assert(childTid == handoffSuccessorTid);
+			auto persistedOwner = childTid in persistedDependencyOwners;
+			auto runtimeOwner = childTid in runtimeDependencyOwners;
+			assert(persistedOwner !is null && runtimeOwner !is null);
+			assert(*persistedOwner == dependencyOwnerTid
+				&& *runtimeOwner == dependencyOwnerTid);
+			return *runtimeOwner;
+		},
+		transitionTaskFrom: (int tid, TaskStatus[] expectedFrom, TaskStatus to,
+			TaskNotificationChange notification) { transitionCalls++; },
+		persistResultText: (int tid, string resultText) { resultWrites++; },
+		appendTaskDiagnostic: (int tid, string subject, string body) {
+			diagnosticCalls++;
+			return "";
+		},
+	));
+
+	Promise!void recoveredDeliveryAttempt()
+	{
+		assert(tasks[dependencyOwnerTid].status == TaskStatus.waiting);
+		tasks[dependencyOwnerTid].status = TaskStatus.failed;
+		return reject!void(new Exception(
+			"simulated recovered delivery activation failure"));
+	}
+
+	runner.observeWaitingParentDeliveryAttempt(handoffSuccessorTid,
+		recoveredDeliveryAttempt());
+	drainRecoveryNextTicks();
+
+	assert(ownerLookups == 1);
+	assert(tasks[dependencyOwnerTid].status == TaskStatus.failed
+		&& tasks[dependencyOwnerTid].resultText == "existing failed result");
+	assert(tasks[handoffPredecessorTid].status == TaskStatus.completed);
+	assert(tasks[handoffSuccessorTid].status == TaskStatus.completed
+		&& tasks[handoffSuccessorTid].parentTid == handoffPredecessorTid);
+	assert(transitionCalls == 0 && resultWrites == 0 && diagnosticCalls == 0);
 }
 
 version (unittest) private final class LinkedWorktreeSandboxTestAgent : ClaudeCodeAgent

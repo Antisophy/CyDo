@@ -67,7 +67,7 @@ import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
 	HistoryBoundary, ItemStartedEvent, SessionRateLimitEvent, TaskDiagnosticEvent, TaskDiagnosticSeverity,
 	TaskEventEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
 	UnconfirmedUserEventEnvelope, UserMessageConsumedEvent, extractContentText;
-import cydo.agent.session : AgentSession;
+import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.agent.drivers.codex : CodexSession;
 import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
 import cydo.domain.storage.persistence : Persistence, openDatabase;
@@ -81,7 +81,8 @@ import cydo.foundation.system.known_messages : KnownSystemMessageKind,
 	sessionStartSubject, systemMessagePrefix, wrapKnownSystemMessage;
 import cydo.foundation.platform.path : bestEffortProjectPathIdentity, canonicalProjectPath;
 import cydo.domain.tasks.model;
-import cydo.domain.tasks.lifecycle : TaskLifecycle, TaskNotificationChange;
+import cydo.domain.tasks.lifecycle : TaskLifecycle, TaskNotificationChange,
+	isLegalTaskStatusTransition;
 import cydo.foundation.text.title : truncateTitle;
 import cydo.workflow.history.jsonl_store : findNextUserUuid;
 import cydo.workflow.workspace.worktree;
@@ -378,11 +379,17 @@ class App
 			},
 			sendTaskMessage: (int tid, const(ContentBlock)[] content,
 				const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) {
-				sendTaskMessage(tid, content, broadcastContent, cydoMeta, nonce);
+				return sendTaskMessage(tid, content, broadcastContent, cydoMeta, nonce);
 			},
 			emitTaskReload: &emitTaskReload,
 			appendTaskDiagnostic: (int tid, string subject, string body) {
 				historyPipeline.appendTaskDiagnostic(tid, subject, body);
+			},
+			appendAndBroadcastRecoveryDeliveryDiagnostic: (int tid, string subject,
+				string body) {
+				auto translated = historyPipeline.appendTaskDiagnostic(tid, subject, body);
+				broadcastAppendedTaskEvent(tid, translated);
+				broadcastTaskUpdate(tid);
 			},
 			taskAlive: &taskAlive,
 			tasksShareWorkspace: (int aTid, int bTid) {
@@ -581,7 +588,6 @@ class App
 				return historyPipeline.appendTaskDiagnostic(tid, subject, body);
 			},
 			broadcastAppendedTaskEvent: &broadcastAppendedTaskEvent,
-			sendAgentAck: &sendAgentAck,
 			publishTaskSnapshot: &broadcastTaskUpdate,
 			onTaskTurnCompletedAlive: &onTaskTurnCompletedAlive,
 			drainIdleCallbacksForTurnResult: &drainIdleCallbacksForTurnResult,
@@ -593,6 +599,7 @@ class App
 			checkDeclaredOutputs: &checkDeclaredOutputs,
 			finalizeCompletedSubTask: &workflowTools.finalizeCompletedSubTask,
 			deliverFailedPendingSubTaskResult: &workflowTools.deliverFailedPendingSubTaskResult,
+			parentTaskForChild: &workflowTools.parentTaskForChild,
 			deliverWaitingParentResultsIfReady: &workflowTools.deliverWaitingParentResultsIfReady,
 			deliverBatchResults: &workflowTools.deliverBatchResults,
 			failPendingAskUserQuestionOnExit: &workflowTools.failPendingAskUserQuestionOnExit,
@@ -695,6 +702,10 @@ class App
 				jsonlTracker.clearUndoJsonl(tid);
 			},
 			invalidateJsonlLineage: (int tid) {
+				auto td = tid in tasks;
+				assert(td !is null,
+					"History lineage invalidated for missing task");
+				td.clearSubmissionCorrelationState();
 				jsonlTracker.invalidateLineage(tid);
 			},
 			startJsonlWatch: (int tid) {
@@ -740,6 +751,7 @@ class App
 		jsonlTracker.onLineageInvalidated = (int tid) {
 			auto td = tid in tasks;
 			assert(td !is null, "history lineage invalidated for missing task");
+			td.clearSubmissionCorrelationState();
 			jsonlTracker.invalidateLineage(tid);
 			auto path = agentForTask(tid).historyPath(td.agentSessionId,
 				taskPathResolver.effectiveCwd(td));
@@ -1333,7 +1345,6 @@ class App
 		if (blocks.length > 0)
 		{
 			auto td = &tasks[tid];
-			materializePendingTask(tid);
 			auto typeDef = taskTypes.byName(td.taskType);
 			auto textContent = extractContentText(blocks);
 			auto messageToSend = blocks;
@@ -1363,18 +1374,44 @@ class App
 					sessionStartMsgSubject,
 					["task_description": textContent], "task_description")
 				: null;
+			void commitAcceptedInitialSubmission(TaskData* accepted)
+			{
+				if (accepted.description.length == 0)
+				{
+					accepted.description = textContent;
+					persistence.setDescription(tid, textContent);
+				}
+				if (accepted.title.length == 0)
+				{
+					accepted.title = truncateTitle(textContent, 80);
+					persistence.setTitle(tid, accepted.title);
+					broadcastTitleUpdate(tid, accepted.title);
+					derivedTextJobs.generateTitle(tid, textContent);
+				}
+			}
+			materializePendingTask(tid);
 			tasks[tid].processQueue.setGoal(ProcessState.Alive).then(() {
-				sendTaskMessage(tid, messageToSend, msgContent, msgMeta, null, true);
-			}).ignoreResult();
-
-			td.description = textContent;
-			persistence.setDescription(tid, textContent);
-
-			td.title = truncateTitle(textContent, 80);
-			persistence.setTitle(tid, td.title);
-			broadcastTitleUpdate(tid, td.title);
-			tasks[tid].processQueue.setGoal(ProcessState.Alive).then(() {
-				derivedTextJobs.generateTitle(tid, textContent);
+				return sendTaskMessage(tid, messageToSend, msgContent, msgMeta,
+					null, true, &commitAcceptedInitialSubmission);
+			}).except((Exception e) {
+				auto failed = tid in tasks;
+				assert(failed !is null,
+					"Initial message submission task disappeared");
+				// TaskSessionRunner already owns a failed launch and its diagnostic.
+				if (failed.status == TaskStatus.failed)
+					return;
+				assert(failed.status == TaskStatus.active,
+					"Initial message submission failed outside an active task");
+				failed.error = e.msg;
+				failed.resultText = e.msg;
+				persistence.setResultText(tid, failed.resultText);
+				transitionTask(tid, TaskStatus.active, TaskStatus.failed,
+					TaskNotificationChange.preserve);
+				auto translated = historyPipeline.appendTaskDiagnostic(tid,
+					"Failed to submit initial message", e.msg);
+				broadcastAppendedTaskEvent(tid, translated);
+				workflowTools.deliverFailedPendingSubTaskResult(tid);
+				broadcastTaskUpdate(tid);
 			}).ignoreResult();
 		}
 	}
@@ -1452,8 +1489,7 @@ class App
 		if (isCompactionReminderSteerFailureEvent(plan.currentEvent.translated))
 			td.compactionReminderInFlight = false;
 
-		if (td.pendingUserNonce.length > 0
-			&& plan.currentEvent.translated.canFind(`"type":"item/started"`)
+		if (plan.currentEvent.translated.canFind(`"type":"item/started"`)
 			&& plan.currentEvent.translated.canFind(`"item_type":"user_message"`))
 		{
 			@JSONPartial static struct UserMsgTagProbe
@@ -1463,22 +1499,48 @@ class App
 				@JSONOptional bool is_replay;
 				@JSONOptional bool is_meta;
 				@JSONOptional bool pending;
+				@JSONOptional string correlation_id;
 			}
+			UserMsgTagProbe probe;
 			try
-			{
-				auto probe = jsonParse!UserMsgTagProbe(plan.currentEvent.translated);
-				if (probe.type == "item/started"
-					&& probe.item_type == "user_message"
-					&& !probe.is_replay && !probe.is_meta && !probe.pending)
-				{
-					auto taggedNonce = td.pendingUserNonce;
-					td.pendingUserNonce = null;
-					plan.currentEvent.translated = plan.currentEvent.translated[0 .. $ - 1]
-						~ `,"correlation_id":` ~ toJson(taggedNonce) ~ `}`;
-				}
-			}
+				probe = jsonParse!UserMsgTagProbe(plan.currentEvent.translated);
 			catch (Exception)
+				return plan;
+			if (probe.type == "item/started"
+				&& probe.item_type == "user_message"
+				&& !probe.is_replay && !probe.is_meta && !probe.pending)
 			{
+				if (probe.correlation_id.length > 0)
+				{
+					bool found;
+					size_t foundIndex;
+					foreach (index, ref acceptedEcho; td.acceptedNativeEchoes)
+					{
+						if (acceptedEcho.receipt != AgentSubmissionReceipt.appServerAccepted
+							|| acceptedEcho.generation != td.history.generation
+							|| acceptedEcho.nonce != probe.correlation_id)
+							continue;
+						assert(!found,
+							"Agent user echo correlation matches multiple accepted submissions");
+						found = true;
+						foundIndex = index;
+					}
+					assert(found,
+						"Agent user echo correlation does not match an accepted submission");
+					td.acceptedNativeEchoes = td.acceptedNativeEchoes[0 .. foundIndex]
+						~ td.acceptedNativeEchoes[foundIndex + 1 .. $];
+				}
+				else if (td.acceptedNativeEchoes.length > 0
+					&& td.acceptedNativeEchoes[0].receipt == AgentSubmissionReceipt.localEnqueued)
+				{
+					auto acceptedEcho = td.acceptedNativeEchoes[0];
+					assert(acceptedEcho.generation == td.history.generation,
+						"Local agent echo belongs to a stale history lineage");
+					td.acceptedNativeEchoes = td.acceptedNativeEchoes[1 .. $];
+					if (acceptedEcho.nonce.length > 0)
+						plan.currentEvent.translated = plan.currentEvent.translated[0 .. $ - 1]
+							~ `,"correlation_id":` ~ toJson(acceptedEcho.nonce) ~ `}`;
+				}
 			}
 		}
 
@@ -1495,13 +1557,9 @@ class App
 			return;
 		assert(td.taskType.length > 0, "Task must have a task_type when receiving a message");
 
-		// Deduplicate: ignore a message whose nonce we've already processed.
-		if (json.correlation_id.length > 0)
-		{
-			if (json.correlation_id in td.recentNonces)
-				return;
-			td.recentNonces[json.correlation_id] = true;
-		}
+		// Deduplicate accepted delivery and unresolved outbox replay independently.
+		if (json.correlation_id.length > 0 && json.correlation_id in td.recentNonces)
+			return;
 
 		ContentBlock[] blocks;
 		if (json.content.json !is null)
@@ -1511,9 +1569,11 @@ class App
 		// Wrap first message in prompt template (e.g. conversation.md)
 		auto messageToSend = blocks;
 		string userMsgMeta;
-		if (td.description.length == 0)
+		auto initializesDescription = td.description.length == 0;
+		auto initializesTitle = td.title.length == 0;
+		auto draftAtSubmission = td.draft;
+		if (initializesDescription)
 		{
-			materializePendingTask(tid);
 			auto typeDef = taskTypeCatalog.getTaskTypesForProject(td.projectPath).byName(td.taskType);
 			if (typeDef !is null)
 			{
@@ -1545,47 +1605,77 @@ class App
 					["task_description": textContent], "task_description");
 			}
 		}
-		derivedTextJobs.clearSuggestions(tid);
+		if (initializesDescription)
+			materializePendingTask(tid);
 		auto msgNonce = json.correlation_id;
-		if (td.status != TaskStatus.active)
-			transitionTask(tid, [TaskStatus.pending, TaskStatus.alive,
-				TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
-				TaskStatus.active, TaskNotificationChange.preserve);
 		auto submissionGeneration = td.history.generation;
-		td.processQueue.setGoal(ProcessState.Alive).then(() {
-			auto td = &tasks[tid];
-			if (td.history.generation != submissionGeneration)
-				return;
-			sendTaskMessage(tid, messageToSend, blocks, userMsgMeta, msgNonce,
-				userMsgMeta.length > 0);
-		}).ignoreResult();
-
-		// Store first message as task description
-		if (td.description.length == 0)
+		if (msgNonce.length > 0)
 		{
-			td.description = textContent;
-			persistence.setDescription(tid, textContent);
+			if (auto leasedGeneration = msgNonce in td.inFlightUiNonceGeneration)
+				if (*leasedGeneration == submissionGeneration)
+					return;
+			td.inFlightUiNonceGeneration[msgNonce] = submissionGeneration;
 		}
-
-		// Set initial title from first user message (truncated)
-		if (td.title.length == 0)
+		void commitAcceptedBrowserSubmission(TaskData* accepted)
 		{
-			td.title = truncateTitle(textContent, 80);
-			persistence.setTitle(tid, td.title);
-			broadcastTitleUpdate(tid, td.title);
-			td.processQueue.setGoal(ProcessState.Alive).then(() {
+			if (initializesDescription && accepted.description.length == 0)
+			{
+				accepted.description = textContent;
+				persistence.setDescription(tid, textContent);
+			}
+			if (accepted.status != TaskStatus.active)
+			{
+				assert(isLegalTaskStatusTransition(accepted.status, TaskStatus.active),
+					"Accepted browser submission has an illegal status transition");
+				accepted.status = TaskStatus.active;
+				persistence.setStatus(tid, cast(string) TaskStatus.active);
+			}
+			if (initializesTitle && accepted.title.length == 0)
+			{
+				accepted.title = truncateTitle(textContent, 80);
+				persistence.setTitle(tid, accepted.title);
+				broadcastTitleUpdate(tid, accepted.title);
 				derivedTextJobs.generateTitle(tid, textContent);
-			}).ignoreResult();
+			}
+			if (draftAtSubmission.length > 0 && accepted.draft == draftAtSubmission)
+			{
+				accepted.draft = "";
+				persistence.setDraft(tid, "");
+				auto draftData = Data(toJson(DraftUpdatedMessage("draft_updated", tid, "")).representation);
+				clientHub.sendToSubscribed(tid, draftData);
+			}
 		}
-
-		// Clear draft when message is sent
-		if (td.draft.length > 0)
-		{
-			td.draft = "";
-			persistence.setDraft(tid, "");
-			auto draftData = Data(toJson(DraftUpdatedMessage("draft_updated", tid, "")).representation);
-			clientHub.sendToSubscribed(tid, draftData);
-		}
+		td.processQueue.setGoal(ProcessState.Alive).then(() {
+			auto queued = tid in tasks;
+			assert(queued !is null,
+				"User message submission task disappeared before dispatch");
+			if (queued.history.generation != submissionGeneration)
+			{
+				if (msgNonce.length > 0)
+					if (auto leasedGeneration = msgNonce in queued.inFlightUiNonceGeneration)
+						if (*leasedGeneration == submissionGeneration)
+							queued.inFlightUiNonceGeneration.remove(msgNonce);
+				return resolve();
+			}
+			return sendTaskMessage(tid, messageToSend, blocks, userMsgMeta, msgNonce,
+				userMsgMeta.length > 0, &commitAcceptedBrowserSubmission);
+		}).except((Exception e) {
+			auto rejected = tid in tasks;
+			assert(rejected !is null,
+				"User message submission task disappeared");
+			if (rejected.history.generation != submissionGeneration)
+				return;
+			if (msgNonce.length > 0)
+				if (auto leasedGeneration = msgNonce in rejected.inFlightUiNonceGeneration)
+					if (*leasedGeneration == submissionGeneration)
+						rejected.inFlightUiNonceGeneration.remove(msgNonce);
+			if (rejected.status == TaskStatus.failed)
+				return;
+			auto translated = historyPipeline.appendTaskDiagnostic(tid,
+				"Failed to submit message", e.msg);
+			broadcastAppendedTaskEvent(tid, translated);
+			broadcastTaskUpdate(tid);
+		}).ignoreResult();
 	}
 
 	private void handleResumeMsg(WsMessage json)
@@ -1606,15 +1696,24 @@ class App
 		transitionTask(tid, [TaskStatus.pending, TaskStatus.active,
 			TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
 			TaskStatus.alive, TaskNotificationChange.clearAttention);
-		td.processQueue.setGoal(ProcessState.Alive).then(() {
-			try
-				derivedTextJobs.generateSuggestions(tid);
-			catch (Exception e)
-				warningf("Error generating suggestions: %s", e.msg);
+			td.processQueue.setGoal(ProcessState.Alive).then(() {
+				try
+					derivedTextJobs.generateSuggestions(tid);
+				catch (Exception e)
+					warningf("Error generating suggestions: %s", e.msg);
 
-			workflowTools.deliverBatchFallbackIfReady(tid);
-
-		}).ignoreResult();
+				return workflowTools.deliverBatchFallbackIfReady(tid);
+			}).except((Exception e) {
+				auto current = tid in tasks;
+				assert(current !is null,
+					"Manual recovery delivery rejected after task deletion");
+				if (current.status == TaskStatus.alive)
+					transitionTask(tid, TaskStatus.alive, TaskStatus.waiting,
+						TaskNotificationChange.preserve);
+				assert(current.status == TaskStatus.waiting
+					|| current.status == TaskStatus.failed,
+					"Manual recovery delivery rejection escaped its process owner state");
+			}).ignoreResult();
 	}
 
 	private void handleInterruptMsg(WsMessage json)
@@ -1754,31 +1853,31 @@ class App
 	/// `broadcastContent` — if non-null, broadcast this to the UI instead of
 	/// `content`.  Use this when the agent receives a rendered prompt template
 	/// but the UI should display the user's original text.
-	private void sendTaskMessage(int tid, const(ContentBlock)[] content,
+	private Promise!void sendTaskMessage(int tid, const(ContentBlock)[] content,
 		const(ContentBlock)[] broadcastContent = null, string cydoMeta = null,
-		string nonce = null, bool isContextBootstrap = false)
+		string nonce = null, bool isContextBootstrap = false,
+		void delegate(TaskData*) acceptedSubmissionMutation = null)
 	{
-		sendPreparedTaskMessage(tid, content, broadcastContent, cydoMeta, true, nonce,
-			isContextBootstrap);
+		return sendPreparedTaskMessage(tid, content, broadcastContent, cydoMeta, true, nonce,
+			isContextBootstrap, acceptedSubmissionMutation);
 	}
 
 	/// Send a prepared message to the agent and emit the matching pending UI echo.
 	///
 	/// System messages are ordinary prepared messages with a stable wrapper format
 	/// and CyDo metadata for collapsed rendering.
-	private void sendPreparedTaskMessage(int tid, const(ContentBlock)[] content,
+	private Promise!void sendPreparedTaskMessage(int tid, const(ContentBlock)[] content,
 		const(ContentBlock)[] broadcastContent = null, string cydoMeta = null,
 		bool captureUndoSnapshot = true, string nonce = null,
-		bool isContextBootstrap = false)
+		bool isContextBootstrap = false,
+		void delegate(TaskData*) acceptedSubmissionMutation = null)
 	{
 		import std.algorithm : min, filter;
 		import std.array : array;
 
-		auto td = &tasks[tid];
+		auto td = tid in tasks;
+		assert(td !is null, "Task must exist when sending a message");
 		assert(td.taskType.length > 0, "Task must have a task_type when sending a message");
-
-		historyPipeline.appendUnconfirmedUserMessage(tid, content, broadcastContent,
-			cydoMeta, nonce);
 
 		// --- send to agent ---
 		// Snapshot the JSONL before the agent processes the new message.
@@ -1792,18 +1891,59 @@ class App
 		const(ContentBlock)[] toSend = session.supportsImages
 			? content
 			: content.filter!(b => b.type != "image").array;
-		session.sendMessage(toSend, nonce, isContextBootstrap);
-		// The queue tail (onTailedJsonlLine) links enqueue records to sends
-		// FIFO; only claude sessions produce queue-operation records.
-		if (agentForTask(tid).driver == AgentDriver.claude)
-			td.sentNonceFifo ~= nonce is null ? "" : nonce;
-		td.isProcessing = true;
-		touchTask(tid);
-		td.needsAttention = false;
-		persistence.setNeedsAttention(tid, false);
-		td.notificationBody = "";
-		derivedTextJobs.discardInFlightSuggestions(tid);
-		broadcastTaskUpdate(tid);
+		auto submissionGeneration = td.history.generation;
+		Promise!AgentSubmissionReceipt submission;
+		try
+			submission = session.sendMessage(toSend, nonce, isContextBootstrap);
+		catch (Exception e)
+			return reject!void(e);
+
+		return submission.then((AgentSubmissionReceipt receipt) {
+			auto accepted = tid in tasks;
+			assert(accepted !is null,
+				"Task disappeared while committing accepted message submission");
+			if (accepted.history.generation != submissionGeneration)
+				throw new Exception("Message submission invalidated by history lineage reset");
+			assert(sessionForTask(tid) is session,
+				"Task session changed while committing accepted message submission");
+
+			final switch (receipt)
+			{
+			case AgentSubmissionReceipt.localEnqueued:
+				accepted.acceptedNativeEchoes ~= AcceptedNativeEcho(receipt,
+					nonce is null ? "" : nonce, submissionGeneration);
+				break;
+			case AgentSubmissionReceipt.appServerAccepted:
+				if (nonce.length > 0)
+					accepted.acceptedNativeEchoes ~= AcceptedNativeEcho(receipt, nonce,
+						submissionGeneration);
+				break;
+			}
+
+			if (acceptedSubmissionMutation !is null)
+				acceptedSubmissionMutation(accepted);
+			historyPipeline.appendUnconfirmedUserMessage(tid, content,
+				broadcastContent, cydoMeta, nonce);
+			if (nonce.length > 0)
+			{
+				accepted.recentNonces[nonce] = true;
+				if (auto leasedGeneration = nonce in accepted.inFlightUiNonceGeneration)
+					if (*leasedGeneration == submissionGeneration)
+						accepted.inFlightUiNonceGeneration.remove(nonce);
+			}
+			if (receipt == AgentSubmissionReceipt.localEnqueued)
+				accepted.sentNonceFifo ~= nonce is null ? "" : nonce;
+			accepted.isProcessing = true;
+			touchTask(tid);
+			accepted.needsAttention = false;
+			persistence.setNeedsAttention(tid, false);
+			accepted.notificationBody = "";
+			derivedTextJobs.clearSuggestions(tid);
+			derivedTextJobs.discardInFlightSuggestions(tid);
+			broadcastTaskUpdate(tid);
+			if (receipt == AgentSubmissionReceipt.appServerAccepted)
+				sendAgentAck(tid, nonce);
+		});
 	}
 
 	private string taskSystemPromptForMessage(int tid, TaskTypeDef* typeDef)
@@ -1978,7 +2118,17 @@ class App
 		auto reminderBlocks = [ContentBlock("text", reminder)];
 		auto reminderMeta = systemMessageNormalizer.buildKnownSystemMessageMeta(
 			KnownSystemMessageKind.postCompactionTaskModeReminder);
-		sendPreparedTaskMessage(tid, reminderBlocks, null, reminderMeta, false);
+		sendPreparedTaskMessage(tid, reminderBlocks, null, reminderMeta, false)
+			.except((Exception e) {
+				auto rejected = tid in tasks;
+				assert(rejected !is null,
+					"Compaction reminder task disappeared during submission");
+				rejected.compactionReminderInFlight = false;
+				auto translated = historyPipeline.appendTaskDiagnostic(tid,
+					"Failed to deliver post-compaction reminder", e.msg);
+				broadcastAppendedTaskEvent(tid, translated);
+				broadcastTaskUpdate(tid);
+			}).ignoreResult();
 		return true;
 	}
 
@@ -2446,7 +2596,7 @@ class App
 		if (tid !in tasks)
 			return;
 		jsonlTracker.invalidateLineage(tid);
-		tasks[tid].clearQueueTailState();
+		tasks[tid].clearSubmissionCorrelationState();
 		auto ta = tryAgentForTask(tid);
 		{
 			Watermark wm;
@@ -2476,7 +2626,26 @@ class App
 					~ "Write your report to your output file if you haven't already.");
 			auto outputsMeta = systemMessageNormalizer.buildKnownSystemMessageMeta(
 				KnownSystemMessageKind.missingRequiredOutputs);
-			sendTaskMessage(tid, [ContentBlock("text", msg)], null, outputsMeta);
+			return sendTaskMessage(tid, [ContentBlock("text", msg)], null,
+				outputsMeta);
+		}).except((Exception e) {
+			auto failed = tid in tasks;
+			assert(failed !is null,
+				"Missing-output retry task disappeared during submission");
+			if (failed.status == TaskStatus.failed)
+				return;
+			assert(failed.status == TaskStatus.active,
+				"Missing-output retry failed outside an active task");
+			failed.error = e.msg;
+			failed.resultText = e.msg;
+			persistence.setResultText(tid, failed.resultText);
+			transitionTask(tid, TaskStatus.active, TaskStatus.failed,
+				TaskNotificationChange.preserve);
+			auto translated = historyPipeline.appendTaskDiagnostic(tid,
+				"Failed to request missing outputs", e.msg);
+			broadcastAppendedTaskEvent(tid, translated);
+			workflowTools.deliverFailedPendingSubTaskResult(tid);
+			broadcastTaskUpdate(tid);
 		}).ignoreResult();
 	}
 
@@ -2498,21 +2667,23 @@ class App
 		return true;
 	}
 
-	private void sendKnownSystemMessage(int tid, KnownSystemMessageKind kind,
+	private Promise!void sendKnownSystemMessage(int tid, KnownSystemMessageKind kind,
 		string body)
 	{
-		// An injected system message resumes the task's agent, so mark the task
-		// active before delivery — mirroring the user-message path. This keeps a
-		// task that is processing an injected message (and may, e.g., create
-		// sub-tasks) from being left in a non-active state.
 		auto td = tid in tasks;
-		if (td !is null && td.status != TaskStatus.active)
-			transitionTask(tid, [TaskStatus.pending, TaskStatus.alive,
-				TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
-				TaskStatus.active, TaskNotificationChange.preserve);
+		assert(td !is null, "Known system message task must exist");
 		auto msg = wrapKnownSystemMessage(config.system_keyword, kind, body);
 		auto meta = systemMessageNormalizer.buildKnownSystemMessageMeta(kind);
-		sendTaskMessage(tid, [ContentBlock("text", msg)], null, meta);
+		return sendTaskMessage(tid, [ContentBlock("text", msg)], null, meta)
+			.then(() {
+				auto accepted = tid in tasks;
+				assert(accepted !is null,
+					"Known system message task disappeared after acceptance");
+				if (accepted.status != TaskStatus.active)
+					transitionTask(tid, [TaskStatus.pending, TaskStatus.alive,
+						TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
+						TaskStatus.active, TaskNotificationChange.preserve);
+			});
 	}
 
 	private int[] snapshotTaskIdsForResume()
@@ -2749,6 +2920,7 @@ class App
 		if (tid !in tasks)
 			return;
 		jsonlTracker.invalidateLineage(tid);
+		tasks[tid].clearSubmissionCorrelationState();
 		clientHub.unsubscribeAll(tid);
 		derivedTextJobs.invalidateSuggestions(tid);
 		clientHub.broadcast(toJson(TaskReloadMessage("task_reload", tid, reason)));
@@ -3188,10 +3360,16 @@ package(cydo) void applyConfiguredLogLevel(string level)
 version (unittest)
 {
 	import configy.attributes : SetInfo;
-	import std.algorithm : canFind;
-	import std.file : exists, mkdirRecurse, rmdirRecurse, write;
+	import core.exception : AssertError;
+	import core.time : Duration;
+	import std.algorithm : canFind, countUntil;
+	import std.exception : assertThrown;
+	import std.file : exists, mkdirRecurse, remove, rmdirRecurse, tempDir, write;
 	import std.path : buildPath;
-	import std.process : environment;
+	import std.process : environment, execute;
+	import ae.net.asockets : ConnectionState, IConnection;
+	import ae.sys.dataset : joinData;
+	import ae.utils.array : as;
 
 	import cydo.agent.drivers.claude : ClaudeCodeAgent;
 	import cydo.agent.drivers.codex : CodexAgent;
@@ -3220,6 +3398,1060 @@ version (unittest) private final class TestCodexPromptAgent : CodexAgent
 	{
 		return "/bin/sh";
 	}
+}
+
+version (unittest) private final class GatedSubmissionSession : AgentSession
+{
+	Promise!AgentSubmissionReceipt[] gates;
+	string[] correlations;
+	ContentBlock[][] contents;
+	size_t sendCalls;
+	private void delegate(TranslatedEvent) outputHandler_;
+
+	Promise!AgentSubmissionReceipt sendMessage(const(ContentBlock)[] content,
+		string correlationId = null, bool isContextBootstrap = false)
+	{
+		sendCalls++;
+		correlations ~= correlationId;
+		contents ~= content.dup;
+		auto gate = new Promise!AgentSubmissionReceipt;
+		gates ~= gate;
+		return gate;
+	}
+
+	void accept(size_t index, AgentSubmissionReceipt receipt)
+	{
+		gates[index].fulfill(receipt);
+	}
+
+	void reject(size_t index, string message)
+	{
+		gates[index].reject(new Exception(message));
+	}
+
+	TranslatedEvent nativeUserEcho(string text, string correlationId = null)
+	{
+		ItemStartedEvent event;
+		event.item_id = "gated-user";
+		event.item_type = "user_message";
+		event.content = [ContentBlock("text", text)];
+		event.correlation_id = correlationId;
+		return TranslatedEvent(toJson(event), null);
+	}
+
+	void emitNativeUserEcho(string text, string correlationId = null)
+	{
+		auto event = nativeUserEcho(text, correlationId);
+		auto output = outputHandler_;
+		onNextTick(socketManager, {
+			if (output)
+				output(event);
+		});
+	}
+
+	void acceptAndEmitUserEcho(size_t index, string text)
+	{
+		accept(index, AgentSubmissionReceipt.appServerAccepted);
+		emitNativeUserEcho(text, correlations[index]);
+	}
+
+	void invalidatePendingSubmittedMessages() {}
+	@property bool supportsImages() const { return false; }
+	void interrupt() {}
+	void sigint() {}
+	void stop() {}
+	void closeStdin() {}
+	void killAfterTimeout(Duration timeout) {}
+	@property bool canStopAfterCloseStdin() const { return true; }
+	@property void onOutput(void delegate(TranslatedEvent) dg) { outputHandler_ = dg; }
+	@property void onStderr(void delegate(string line) dg) {}
+	@property void onExit(void delegate(int status) dg) {}
+	@property bool alive() { return true; }
+}
+
+version (unittest) private final class GatedSubmissionRunner : TaskSessionRunner
+{
+	private AgentSession session_;
+	private bool deferSessionUntilAlive_;
+	private bool[int] launched_;
+	void delegate(int) onLaunch;
+
+	this(AgentSession session, bool deferSessionUntilAlive = false)
+	{
+		super(TaskSessionRunnerHost.init);
+		session_ = session;
+		deferSessionUntilAlive_ = deferSessionUntilAlive;
+	}
+
+	override AgentSession sessionForTask(int tid)
+	{
+		if (deferSessionUntilAlive_ && tid !in launched_)
+			return null;
+		return session_;
+	}
+
+	override Promise!ProcessState delegate(ProcessState) makeProcessQueueSF(int tid)
+	{
+		return (ProcessState state) {
+			assert(state == ProcessState.Alive);
+			if (onLaunch !is null)
+				onLaunch(tid);
+			launched_[tid] = true;
+			return resolve(state);
+		};
+	}
+}
+
+version (unittest) private final class SubmissionCaptureWebSocket : WebSocketAdapter
+{
+	string[] sent;
+	private void delegate(string) onSend_;
+
+	this(void delegate(string) onSend = null)
+	{
+		onSend_ = onSend;
+		super(new class IConnection
+		{
+			ConnectionState state_ = ConnectionState.connected;
+			void delegate(string, DisconnectType) disconnectHandler;
+
+			@property ConnectionState state() { return state_; }
+			void send(scope Data[] data, int priority) {}
+			void disconnect(string reason, DisconnectType type)
+			{
+				state_ = ConnectionState.disconnected;
+				disconnectHandler(reason, type);
+			}
+			@property void handleConnect(void delegate() value) {}
+			@property void handleReadData(void delegate(Data) value) {}
+			@property void handleDisconnect(void delegate(string, DisconnectType) value)
+			{
+				disconnectHandler = value;
+			}
+			@property void handleBufferFlushed(void delegate() value) {}
+		});
+	}
+
+	override void send(scope Data[] data, int priority)
+	{
+		auto payload = cast(string) data.joinData().toGC().as!string;
+		sent ~= payload;
+		if (onSend_)
+			onSend_(payload);
+	}
+}
+
+version (unittest) private final class GatedSubmissionFixture
+{
+	App app;
+	GatedSubmissionSession session;
+	SubmissionCaptureWebSocket socket;
+	string[] submissionMessages;
+	int[] submissionTids;
+	string[] publicationOrder;
+	size_t titlePromptReads;
+	int[] titlePromptTids;
+	int tid;
+
+	this(string dbPath)
+	{
+		app = new App();
+		app.persistence = Persistence(dbPath);
+		tid = app.persistence.createTask();
+		app.tasks[tid] = TaskData(tid, "local", "/tmp/cydo-app-submission");
+		app.tasks[tid].taskType = "test";
+		app.tasks[tid].description = "existing description";
+		app.tasks[tid].title = "existing title";
+		app.tasks[tid].status = TaskStatus.active;
+		app.tasks[tid].history.reset(Watermark.none());
+		app.taskTypeCatalog = new TaskTypeCatalog("", "", (string name) => true);
+		socket = new SubmissionCaptureWebSocket((string payload) {
+			if (payload.canFind(`"type":"task_updated"`))
+				publicationOrder ~= "task_update";
+			else if (payload.canFind(`"agentAck"`))
+				publicationOrder ~= "agent_ack";
+			else if (payload.canFind(`"type":"task_reload"`))
+				publicationOrder ~= "task_reload";
+			else if (payload.canFind(`"type":"title_update"`))
+				publicationOrder ~= "title_update";
+			else if (payload.canFind(`"type":"draft_updated"`))
+				publicationOrder ~= "draft_updated";
+		});
+		app.clientHub.add(socket);
+		app.clientHub.subscribe(socket, tid);
+		app.tasks[tid].processQueue = new StateQueue!ProcessState(
+			(ProcessState state) { return resolve(state); },
+			ProcessState.Alive,
+		);
+		app.jsonlTracker.getTask = (int lookupTid) {
+			auto task = lookupTid in app.tasks;
+			return task is null ? null : task;
+		};
+		app.archiveManager = new ArchiveManager(ArchiveManagerHost(
+			tryGetTask: (int lookupTid, out ArchiveTaskSnapshot snapshot) {
+				auto task = lookupTid in app.tasks;
+				if (task is null)
+					return false;
+				snapshot.tid = lookupTid;
+				snapshot.archiving = task.archiving;
+				return true;
+			},
+		));
+		app.historyPipeline = new HistoryEventPipeline(HistoryEventPipelineHost(
+			getTask: (int lookupTid) {
+				auto task = lookupTid in app.tasks;
+				return task is null ? null : task;
+			},
+			makeTaskDiagnosticEventJson: (string subject, string body) {
+				TaskDiagnosticEvent event;
+				event.severity = TaskDiagnosticSeverity.error;
+				event.subject = subject;
+				event.body = body;
+				return toJson(event);
+			},
+			sendToSubscribed: (int broadcastTid, Data data) {
+				submissionTids ~= broadcastTid;
+				submissionMessages ~= cast(string) data.toGC().as!string;
+				publicationOrder ~= "unconfirmed";
+			},
+		));
+		app.derivedTextJobs = new DerivedTextJobs(DerivedTextJobsHost(
+			getTask: (int lookupTid) {
+				auto task = lookupTid in app.tasks;
+				return task is null ? null : task;
+			},
+			readPromptFile: (int lookupTid, string relativePath,
+				string[string] vars) {
+				assert(relativePath == "prompts/generate-title.md");
+				titlePromptReads++;
+				titlePromptTids ~= lookupTid;
+				return "";
+			},
+		));
+		session = new GatedSubmissionSession;
+		app.taskSessionRunner = new GatedSubmissionRunner(session);
+	}
+}
+
+version (unittest) private WsMessage testBrowserSubmission(int tid, string text,
+	string nonce)
+{
+	WsMessage message;
+	message.type = "message";
+	message.tid = tid;
+	message.content = JSONFragment(toJson([ContentBlock("text", text)]));
+	message.correlation_id = nonce;
+	return message;
+}
+
+version (unittest) private string testUserCorrelation(TranslatedEvent event)
+{
+	return jsonParse!ItemStartedEvent(event.translated).correlation_id;
+}
+
+version (unittest) private void drainSubmissionNextTicks()
+{
+	for (;;)
+	{
+		auto handlers = __traits(getMember, socketManager, "nextTickHandlers");
+		if (handlers.length == 0)
+			return;
+		mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+		foreach (handler; handlers)
+			handler();
+	}
+}
+
+unittest
+{
+	auto dbPath = buildPath(tempDir(), "cydo-app-submission-transaction.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+
+	auto app = new App();
+	app.persistence = Persistence(dbPath);
+	auto tid = app.persistence.createTask();
+	app.tasks[tid] = TaskData(tid, "local", "/tmp/cydo-app-submission");
+	app.tasks[tid].taskType = "test";
+	app.tasks[tid].status = TaskStatus.active;
+	app.tasks[tid].history.reset(Watermark.none());
+	app.jsonlTracker.getTask = (int lookupTid) {
+		auto task = lookupTid in app.tasks;
+		return task is null ? null : task;
+	};
+
+	size_t userEventBroadcasts;
+	app.historyPipeline = new HistoryEventPipeline(HistoryEventPipelineHost(
+		getTask: (int lookupTid) {
+			auto task = lookupTid in app.tasks;
+			return task is null ? null : task;
+		},
+		sendToSubscribed: (int broadcastTid, Data data) {
+			assert(broadcastTid == tid);
+			userEventBroadcasts++;
+		},
+	));
+	app.derivedTextJobs = new DerivedTextJobs(DerivedTextJobsHost(
+		getTask: (int lookupTid) {
+			auto task = lookupTid in app.tasks;
+			return task is null ? null : task;
+		},
+	));
+	auto session = new GatedSubmissionSession;
+	app.taskSessionRunner = new GatedSubmissionRunner(session);
+	TranslatedEvent[] userEchoes;
+	session.onOutput = (TranslatedEvent event) {
+		auto plan = app.planHistoryBroadcast(tid, event);
+		assert(!plan.consumeCurrent);
+		userEchoes ~= plan.currentEvent;
+	};
+
+	void assertSingleCorrelation(TranslatedEvent event, string expectedNonce)
+	{
+		enum marker = `"correlation_id"`;
+		auto first = event.translated.countUntil(marker);
+		assert(first >= 0);
+		assert(event.translated[first + marker.length .. $].countUntil(marker) < 0);
+		auto user = jsonParse!ItemStartedEvent(event.translated);
+		assert(user.correlation_id == expectedNonce);
+	}
+
+	bool fulfilled;
+	app.sendTaskMessage(tid, [ContentBlock("text", "gated submission")], null,
+		null, "submission-nonce").then(() {
+		fulfilled = true;
+	}).ignoreResult();
+
+	assert(session.sendCalls == 1);
+	assert(!fulfilled);
+	assert(!app.tasks[tid].isProcessing);
+	assert(app.tasks[tid].history.length == 0);
+	assert(("submission-nonce" in app.tasks[tid].recentNonces) is null);
+	assert(app.tasks[tid].acceptedNativeEchoes.length == 0);
+	assert(app.tasks[tid].sentNonceFifo.length == 0);
+	assert(app.tasks[tid].pendingSteeringTexts.length == 0);
+	assert(userEventBroadcasts == 0);
+
+	session.acceptAndEmitUserEcho(0, "gated submission");
+	drainSubmissionNextTicks();
+
+	assert(fulfilled);
+	assert(app.tasks[tid].isProcessing);
+	assert(app.tasks[tid].history.length == 1);
+	assert(("submission-nonce" in app.tasks[tid].recentNonces) !is null);
+	assert(userEventBroadcasts == 1);
+	assert(userEchoes.length == 1);
+	assertSingleCorrelation(userEchoes[0], "submission-nonce");
+	assert(app.tasks[tid].acceptedNativeEchoes.length == 0);
+
+	bool secondFulfilled;
+	app.sendTaskMessage(tid, [ContentBlock("text", "following submission")], null,
+		null, "following-nonce").then(() {
+		secondFulfilled = true;
+	}).ignoreResult();
+	assert(session.sendCalls == 2);
+	assert(!secondFulfilled);
+	session.acceptAndEmitUserEcho(1, "following submission");
+	drainSubmissionNextTicks();
+
+	assert(secondFulfilled);
+	assert(app.tasks[tid].history.length == 2);
+	assert(userEventBroadcasts == 2);
+	assert(userEchoes.length == 2);
+	assertSingleCorrelation(userEchoes[1], "following-nonce");
+	assert(app.tasks[tid].acceptedNativeEchoes.length == 0);
+}
+
+unittest
+{
+	auto dbPath = buildPath(tempDir(), "cydo-app-submission-browser-nonce.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+
+	auto fixture = new GatedSubmissionFixture(dbPath);
+	auto message = testBrowserSubmission(fixture.tid, "browser submission",
+		"browser-nonce");
+	fixture.app.handleUserMessage(message);
+	fixture.app.handleUserMessage(message);
+
+	assert(("browser-nonce" in fixture.app.tasks[fixture.tid]
+		.inFlightUiNonceGeneration) !is null);
+	drainSubmissionNextTicks();
+	assert(fixture.session.sendCalls == 1 && fixture.session.gates.length == 1);
+
+	fixture.session.reject(0, "submission rejected");
+	drainSubmissionNextTicks();
+	assert(("browser-nonce" in fixture.app.tasks[fixture.tid]
+		.inFlightUiNonceGeneration) is null);
+	assert(("browser-nonce" in fixture.app.tasks[fixture.tid].recentNonces)
+		is null);
+
+	fixture.app.handleUserMessage(message);
+	drainSubmissionNextTicks();
+	assert(fixture.session.sendCalls == 2 && fixture.session.gates.length == 2);
+	assert(("browser-nonce" in fixture.app.tasks[fixture.tid]
+		.inFlightUiNonceGeneration) !is null);
+}
+
+unittest
+{
+	auto dbPath = buildPath(tempDir(), "cydo-app-browser-acceptance.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+
+	auto fixture = new GatedSubmissionFixture(dbPath);
+	auto td = &fixture.app.tasks[fixture.tid];
+	td.status = TaskStatus.waiting;
+	td.description = "";
+	td.title = "";
+	td.draft = "saved retry draft";
+	fixture.app.persistence.setDraft(fixture.tid, td.draft);
+	td.lastSuggestions = ["pending suggestion"];
+	auto suggestionHandle = new Promise!string;
+	td.suggestGenHandle = suggestionHandle;
+	td.suggestGeneration = 41;
+	string readPersistedDraft()
+	{
+		foreach (row; fixture.app.persistence.loadTasks())
+			if (row.tid == fixture.tid)
+				return row.draft;
+		assert(false, "Expected persisted browser task row");
+	}
+	auto message = testBrowserSubmission(fixture.tid, "first browser message",
+		"first-browser-nonce");
+	fixture.app.handleUserMessage(message);
+	drainSubmissionNextTicks();
+
+	assert(fixture.session.sendCalls == 1);
+	assert(td.status == TaskStatus.waiting);
+	assert(td.description.length == 0 && td.title.length == 0
+		&& td.draft == "saved retry draft");
+	assert(td.history.length == 0 && !td.isProcessing);
+	assert(("first-browser-nonce" in td.recentNonces) is null);
+	assert(td.acceptedNativeEchoes.length == 0 && td.sentNonceFifo.length == 0
+		&& td.pendingSteeringTexts.length == 0);
+	assert(fixture.submissionMessages.length == 0 && fixture.socket.sent.length == 0
+		&& fixture.titlePromptReads == 0);
+	assert(td.lastSuggestions == ["pending suggestion"]
+		&& td.suggestGenHandle is suggestionHandle && td.suggestGeneration == 41);
+	assert(readPersistedDraft() == "saved retry draft");
+
+	fixture.publicationOrder = null;
+	fixture.submissionMessages = null;
+	fixture.submissionTids = null;
+	fixture.socket.sent = null;
+	fixture.session.reject(0, "first submission rejected");
+	drainSubmissionNextTicks();
+	assert(td.status == TaskStatus.waiting);
+	assert(td.description.length == 0 && td.title.length == 0
+		&& td.draft == "saved retry draft");
+	assert(td.history.length == 1 && !td.isProcessing);
+	assert(td.history.lastEventContents().canFind(`"type":"cydo/task_diagnostic"`)
+		&& td.history.lastEventContents().canFind(`"subject":"Failed to submit message"`)
+		&& td.history.lastEventContents().canFind(`"body":"first submission rejected"`));
+	assert(("first-browser-nonce" in td.recentNonces) is null
+		&& ("first-browser-nonce" in td.inFlightUiNonceGeneration) is null);
+	assert(fixture.titlePromptReads == 0);
+	assert(td.lastSuggestions == ["pending suggestion"]
+		&& td.suggestGenHandle is suggestionHandle && td.suggestGeneration == 41);
+	assert(readPersistedDraft() == "saved retry draft");
+	assert(fixture.socket.sent.length == 2);
+	assert(fixture.socket.sent[0].canFind(`"type":"cydo/task_diagnostic"`)
+		&& fixture.socket.sent[0].canFind(`"subject":"Failed to submit message"`)
+		&& fixture.socket.sent[0].canFind(`"body":"first submission rejected"`));
+	assert(fixture.socket.sent[1].canFind(`"type":"task_updated"`));
+	foreach (payload; fixture.socket.sent)
+	{
+		assert(!payload.canFind(`"type":"task_reload"`));
+		assert(!payload.canFind(`"type":"unconfirmedUserEvent"`));
+		assert(!payload.canFind(`"type":"agentAck"`));
+	}
+
+	fixture.publicationOrder = null;
+	fixture.submissionMessages = null;
+	fixture.submissionTids = null;
+	fixture.socket.sent = null;
+	fixture.app.handleUserMessage(message);
+	drainSubmissionNextTicks();
+	assert(fixture.session.sendCalls == 2);
+	assert(toJson(fixture.session.contents[0]) == toJson(fixture.session.contents[1]));
+	assert(td.status == TaskStatus.waiting && td.description.length == 0
+		&& td.title.length == 0 && td.draft == "saved retry draft");
+	assert(readPersistedDraft() == "saved retry draft");
+
+	fixture.session.accept(1, AgentSubmissionReceipt.appServerAccepted);
+	drainSubmissionNextTicks();
+	assert(td.status == TaskStatus.active);
+	assert(td.description == "first browser message");
+	assert(td.title == truncateTitle("first browser message", 80));
+	assert(td.draft.length == 0 && td.history.length == 2 && td.isProcessing);
+	assert(("first-browser-nonce" in td.recentNonces) !is null);
+	assert(td.acceptedNativeEchoes.length == 1
+		&& td.acceptedNativeEchoes[0].nonce == "first-browser-nonce");
+	assert(fixture.titlePromptReads == 1);
+	assert(td.lastSuggestions.length == 0 && td.suggestGenHandle is null
+		&& td.suggestGeneration == 42);
+	assert(readPersistedDraft().length == 0);
+	assert(fixture.publicationOrder == ["title_update", "draft_updated",
+		"unconfirmed", "task_update", "agent_ack"]);
+}
+
+unittest
+{
+	auto root = buildPath(tempDir(), "cydo-app-create-submission-acceptance");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope(exit) if (exists(root)) rmdirRecurse(root);
+	mkdirRecurse(root);
+
+	auto oldHome = environment.get("HOME", "");
+	auto hadHome = "HOME" in environment;
+	scope(exit)
+	{
+		if (hadHome)
+			environment["HOME"] = oldHome;
+		else
+			environment.remove("HOME");
+	}
+	auto home = buildPath(root, "home");
+	mkdirRecurse(home);
+	environment["HOME"] = home;
+
+	auto projectPath = buildPath(root, "project");
+	mkdirRecurse(projectPath);
+	execute(["git", "-C", projectPath, "init", "-q"]);
+	execute(["git", "-C", projectPath, "config", "user.email", "test@test"]);
+	execute(["git", "-C", projectPath, "config", "user.name", "Test"]);
+	write(buildPath(projectPath, "README.md"), "initial\n");
+	execute(["git", "-C", projectPath, "add", "."]);
+	execute(["git", "-C", projectPath, "commit", "-qm", "init"]);
+
+	auto defs = buildPath(root, "defs");
+	mkdirRecurse(buildPath(defs, "prompts"));
+	write(buildPath(defs, "prompts", "start.md"), "{{task_description}}\n");
+	write(buildPath(defs, "task-types.yaml"),
+		"user_entry_points:\n"
+		~ "  isolated:\n"
+		~ "    task_type: direct_test\n"
+		~ "    description: Isolated\n"
+		~ "    prompt_template: prompts/start.md\n"
+		~ "    worktree: require\n"
+		~ "task_types:\n"
+		~ "  direct_test:\n"
+		~ "    model_class: large\n");
+
+	auto dbPath = buildPath(tempDir(), "cydo-app-create-submission-acceptance.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+	auto fixture = new GatedSubmissionFixture(dbPath);
+	fixture.app.config.system_keyword = "SYSTEM";
+	fixture.app.config.workspaces = [WorkspaceConfig(name: "create", root: root)];
+	fixture.app.taskDirTemplate = "{{ workspace_root }}/tasks/{{ tid }}";
+	fixture.app.taskTypeCatalog = new TaskTypeCatalog(defs,
+		buildPath(defs, "task-types.yaml"), (string name) => name == "claude");
+	fixture.app.agentsByName["claude"] = new TestClaudePromptAgent;
+	fixture.app.taskPathResolver = new TaskPathResolver(TaskPathResolverHost(
+		getTask: (int lookupTid) {
+			auto task = lookupTid in fixture.app.tasks;
+			return task is null ? null : task;
+		},
+		workspaces: () => fixture.app.config.workspaces,
+		taskDirTemplate: () => fixture.app.taskDirTemplate,
+	));
+	fixture.app.worktreeAllocator = new WorktreeAllocator(WorktreeAllocatorHost(
+		getTask: (int lookupTid) {
+			auto task = lookupTid in fixture.app.tasks;
+			return task is null ? null : task;
+		},
+		persistWorktreeTid: (int lookupTid, int worktreeTid) {
+			fixture.app.persistence.setWorktreeTid(lookupTid, worktreeTid);
+		},
+		findRootTid: (int lookupTid) {
+			return fixture.app.findRootTid(lookupTid);
+		},
+		taskDir: (const TaskData* task) => fixture.app.taskPathResolver.taskDir(task),
+		worktreePath: (const TaskData* task) => fixture.app.taskPathResolver.worktreePath(task),
+	));
+	fixture.app.taskLifecycle = TaskLifecycle(
+		getTask: (int lookupTid) {
+			auto task = lookupTid in fixture.app.tasks;
+			return task is null ? null : task;
+		},
+		persistStatus: (int lookupTid, string status) {
+			fixture.app.persistence.setStatus(lookupTid, status);
+		},
+		persistNeedsAttention: (int lookupTid, bool needsAttention) {
+			fixture.app.persistence.setNeedsAttention(lookupTid, needsAttention);
+		},
+		publishSnapshot: (int lookupTid) {
+			fixture.app.broadcastTaskUpdate(lookupTid);
+		},
+	);
+	fixture.app.systemMessageNormalizer = new SystemMessageNormalizer(
+		SystemMessageNormalizerHost(
+			systemKeyword: () => fixture.app.config.system_keyword,
+			projectPathForTask: (int lookupTid) {
+				auto task = lookupTid in fixture.app.tasks;
+				return task is null ? null : task.projectPath;
+			},
+			taskTypesForProject: (string lookupProjectPath) =>
+				fixture.app.taskTypeCatalog.getTaskTypesForProject(lookupProjectPath),
+			entryPointsForProject: (string lookupProjectPath) =>
+				fixture.app.taskTypeCatalog.getEntryPointsForProject(lookupProjectPath),
+			loadTemplateText: (string templateName, string lookupProjectPath) => "",
+		));
+	fixture.app.archiveManager = new ArchiveManager(ArchiveManagerHost(
+		tryGetTask: (int lookupTid, out ArchiveTaskSnapshot snapshot) {
+			auto task = lookupTid in fixture.app.tasks;
+			if (task is null)
+				return false;
+			snapshot = ArchiveTaskSnapshot(
+				tid: lookupTid,
+				parentTid: task.parentTid,
+				archived: task.archived,
+				archiving: task.archiving,
+				alive: false,
+				workspace: task.workspace,
+				projectPath: task.projectPath,
+			);
+			return true;
+		},
+		snapshotTasks: () {
+			ArchiveTaskSnapshot[int] snapshots;
+			foreach (lookupTid, ref task; fixture.app.tasks)
+				snapshots[lookupTid] = ArchiveTaskSnapshot(
+					tid: lookupTid,
+					parentTid: task.parentTid,
+					archived: task.archived,
+					archiving: task.archiving,
+					alive: false,
+					workspace: task.workspace,
+					projectPath: task.projectPath,
+				);
+			return snapshots;
+		},
+	));
+	fixture.app.workflowTools = new WorkflowToolsBackend(WorkflowToolsHost.init);
+	auto runner = new GatedSubmissionRunner(fixture.session, true);
+	bool launchSawAssignedWorktree;
+	runner.onLaunch = (int launchTid) {
+		auto launched = &fixture.app.tasks[launchTid];
+		launchSawAssignedWorktree = launched.worktreeTid == launchTid
+			&& exists(fixture.app.taskPathResolver.worktreePath(launched));
+		fixture.app.tasks[launchTid].status = TaskStatus.active;
+		fixture.app.persistence.setStatus(launchTid, cast(string) TaskStatus.active);
+	};
+	fixture.app.taskSessionRunner = runner;
+
+	Persistence.TaskRow rowFor(int lookupTid)
+	{
+		foreach (row; fixture.app.persistence.loadTasks())
+			if (row.tid == lookupTid)
+				return row;
+		assert(false, "Expected persisted task row");
+	}
+
+	int latestTid()
+	{
+		int result;
+		foreach (row; fixture.app.persistence.loadTasks())
+			if (row.tid > result)
+				result = row.tid;
+		return result;
+	}
+
+	WsMessage createMessage(string content)
+	{
+		WsMessage message;
+		message.type = "create_task";
+		message.workspace = "create";
+		message.project_path = projectPath;
+		message.agent_name = "claude";
+		message.entry_point = "isolated";
+		message.content = JSONFragment(toJson([ContentBlock("text", content)]));
+		return message;
+	}
+
+	fixture.publicationOrder = null;
+	fixture.submissionMessages = null;
+	fixture.submissionTids = null;
+	fixture.socket.sent = null;
+	fixture.app.handleCreateTaskMsg(fixture.socket,
+		createMessage("rejected direct first message"));
+	auto rejectedTid = latestTid();
+	fixture.app.clientHub.subscribe(fixture.socket, rejectedTid);
+	auto rejected = &fixture.app.tasks[rejectedTid];
+	auto rejectedCreationPublications = fixture.socket.sent.dup;
+	assert(rejectedCreationPublications.length == 3
+		&& rejectedCreationPublications[0].canFind(`"type":"task_created"`)
+		&& rejectedCreationPublications[1].canFind(`"type":"focus_hint"`)
+		&& rejectedCreationPublications[2].canFind(`"type":"task_updated"`));
+	assert(rejected.worktreeTid == rejectedTid
+		&& exists(fixture.app.taskPathResolver.worktreePath(rejected)));
+	auto beforeRejectedReceipt = rowFor(rejectedTid);
+	assert(rejected.description.length == 0 && rejected.title.length == 0
+		&& beforeRejectedReceipt.description.length == 0
+		&& beforeRejectedReceipt.title.length == 0 && beforeRejectedReceipt.draft.length == 0);
+	fixture.publicationOrder = null;
+	fixture.submissionMessages = null;
+	fixture.submissionTids = null;
+	fixture.socket.sent = null;
+	drainSubmissionNextTicks();
+	assert(launchSawAssignedWorktree && fixture.session.sendCalls == 1);
+	assert(rejected.status == TaskStatus.active && rejected.history.length == 0
+		&& rejected.acceptedNativeEchoes.length == 0 && rejected.sentNonceFifo.length == 0
+		&& rejected.queueTailQueuedUuids.length == 0 && rejected.queueTailQueuedNonces.length == 0
+		&& rejected.queueTailAwaitingUuids.length == 0 && rejected.queueTailAwaitingNonces.length == 0
+		&& rejected.pendingSteeringTexts.length == 0 && rejected.recentNonces.length == 0
+		&& !rejected.isProcessing && rejected.lastSuggestions.length == 0
+		&& fixture.titlePromptReads == 0 && fixture.socket.sent.length == 0
+		&& fixture.submissionMessages.length == 0 && fixture.publicationOrder.length == 0);
+
+	fixture.session.reject(0, "initial direct submission rejected");
+	drainSubmissionNextTicks();
+	auto afterRejectedReceipt = rowFor(rejectedTid);
+	assert(rejected.status == TaskStatus.failed && rejected.history.length == 1
+		&& rejected.description.length == 0 && rejected.title.length == 0
+		&& afterRejectedReceipt.description.length == 0
+		&& afterRejectedReceipt.title.length == 0
+		&& rejected.worktreeTid == rejectedTid
+		&& exists(fixture.app.taskPathResolver.worktreePath(rejected)));
+
+	fixture.publicationOrder = null;
+	fixture.submissionMessages = null;
+	fixture.submissionTids = null;
+	fixture.socket.sent = null;
+	fixture.app.handleCreateTaskMsg(fixture.socket,
+		createMessage("accepted direct first message"));
+	auto acceptedTid = latestTid();
+	fixture.app.clientHub.subscribe(fixture.socket, acceptedTid);
+	auto accepted = &fixture.app.tasks[acceptedTid];
+	auto acceptedCreationPublications = fixture.socket.sent.dup;
+	assert(acceptedCreationPublications.length == 3
+		&& acceptedCreationPublications[0].canFind(`"type":"task_created"`)
+		&& acceptedCreationPublications[1].canFind(`"type":"focus_hint"`)
+		&& acceptedCreationPublications[2].canFind(`"type":"task_updated"`));
+	assert(accepted.worktreeTid == acceptedTid
+		&& exists(fixture.app.taskPathResolver.worktreePath(accepted)));
+	auto beforeAcceptedReceipt = rowFor(acceptedTid);
+	assert(accepted.description.length == 0 && accepted.title.length == 0
+		&& beforeAcceptedReceipt.description.length == 0
+		&& beforeAcceptedReceipt.title.length == 0 && beforeAcceptedReceipt.draft.length == 0);
+	fixture.publicationOrder = null;
+	fixture.submissionMessages = null;
+	fixture.submissionTids = null;
+	fixture.socket.sent = null;
+	drainSubmissionNextTicks();
+	assert(fixture.session.sendCalls == 2 && accepted.status == TaskStatus.active);
+	assert(accepted.history.length == 0 && accepted.acceptedNativeEchoes.length == 0
+		&& accepted.recentNonces.length == 0 && accepted.sentNonceFifo.length == 0
+		&& accepted.queueTailQueuedUuids.length == 0 && accepted.queueTailQueuedNonces.length == 0
+		&& accepted.queueTailAwaitingUuids.length == 0 && accepted.queueTailAwaitingNonces.length == 0
+		&& accepted.pendingSteeringTexts.length == 0 && !accepted.isProcessing
+		&& accepted.lastSuggestions.length == 0 && fixture.titlePromptReads == 0
+		&& fixture.socket.sent.length == 0 && fixture.submissionMessages.length == 0
+		&& fixture.publicationOrder.length == 0);
+	fixture.session.accept(1, AgentSubmissionReceipt.appServerAccepted);
+	drainSubmissionNextTicks();
+	auto afterAcceptedReceipt = rowFor(acceptedTid);
+	assert(accepted.description == "accepted direct first message"
+		&& accepted.title == truncateTitle("accepted direct first message", 80)
+		&& afterAcceptedReceipt.description == accepted.description
+		&& afterAcceptedReceipt.title == accepted.title);
+	assert(accepted.history.length == 1 && accepted.acceptedNativeEchoes.length == 0
+		&& accepted.sentNonceFifo.length == 0 && accepted.pendingSteeringTexts.length == 1);
+	assert(fixture.titlePromptReads == 1 && fixture.titlePromptTids == [acceptedTid]);
+	assert(fixture.submissionTids == [acceptedTid]);
+	assert(fixture.publicationOrder == ["title_update", "unconfirmed", "task_update"]);
+	foreach (payload; fixture.socket.sent)
+		assert(!payload.canFind(`"agentAck"`));
+
+	auto browserTid = fixture.app.createTask("create", projectPath, "claude", "isolated");
+	fixture.app.tasks[browserTid].taskType = "direct_test";
+	fixture.app.persistence.setTaskType(browserTid, "direct_test");
+	fixture.app.tasks[browserTid].draft = "browser worktree retry draft";
+	fixture.app.persistence.setDraft(browserTid, "browser worktree retry draft");
+	fixture.app.clientHub.subscribe(fixture.socket, browserTid);
+	auto browserMessage = testBrowserSubmission(browserTid,
+		"browser worktree retry message", "browser-worktree-nonce");
+	fixture.app.handleUserMessage(browserMessage);
+	drainSubmissionNextTicks();
+	auto browser = &fixture.app.tasks[browserTid];
+	auto browserWorktreePath = fixture.app.taskPathResolver.worktreePath(browser);
+	auto beforeBrowserReceipt = rowFor(browserTid);
+	assert(fixture.session.sendCalls == 3 && browser.status == TaskStatus.active
+		&& browser.worktreeTid == browserTid && exists(browserWorktreePath));
+	assert(browser.description.length == 0 && browser.title.length == 0
+		&& browser.draft == "browser worktree retry draft"
+		&& browser.history.length == 0 && !browser.isProcessing
+		&& beforeBrowserReceipt.description.length == 0
+		&& beforeBrowserReceipt.title.length == 0
+		&& beforeBrowserReceipt.draft == "browser worktree retry draft");
+
+	fixture.session.reject(2, "browser worktree submission rejected");
+	drainSubmissionNextTicks();
+	auto afterBrowserRejection = rowFor(browserTid);
+	assert(browser.status == TaskStatus.active && browser.worktreeTid == browserTid
+		&& fixture.app.taskPathResolver.worktreePath(browser) == browserWorktreePath
+		&& exists(browserWorktreePath));
+	assert(browser.description.length == 0 && browser.title.length == 0
+		&& browser.draft == "browser worktree retry draft"
+		&& afterBrowserRejection.description.length == 0
+		&& afterBrowserRejection.title.length == 0
+		&& afterBrowserRejection.draft == "browser worktree retry draft"
+		&& ("browser-worktree-nonce" in browser.recentNonces) is null
+		&& ("browser-worktree-nonce" in browser.inFlightUiNonceGeneration) is null);
+
+	fixture.app.handleUserMessage(browserMessage);
+	drainSubmissionNextTicks();
+	assert(fixture.session.sendCalls == 4
+		&& fixture.session.correlations[2] == fixture.session.correlations[3]
+		&& toJson(fixture.session.contents[2]) == toJson(fixture.session.contents[3])
+		&& browser.worktreeTid == browserTid
+		&& fixture.app.taskPathResolver.worktreePath(browser) == browserWorktreePath);
+}
+
+unittest
+{
+	auto dbPath = buildPath(tempDir(), "cydo-app-rejected-newer.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+
+	auto fixture = new GatedSubmissionFixture(dbPath);
+	auto td = &fixture.app.tasks[fixture.tid];
+
+	foreach (index, nonce; ["queue-one-nonce", "queue-two-nonce",
+		"queue-three-nonce"])
+	{
+		fixture.app.sendTaskMessage(fixture.tid,
+			[ContentBlock("text", "accepted queue message " ~ nonce)], null, null,
+			nonce).ignoreResult();
+		fixture.session.accept(index, AgentSubmissionReceipt.localEnqueued);
+		drainSubmissionNextTicks();
+	}
+	assert(td.sentNonceFifo == ["queue-one-nonce", "queue-two-nonce",
+		"queue-three-nonce"]);
+	assert(td.acceptedNativeEchoes.length == 3 && td.pendingSteeringTexts == [
+		"accepted queue message queue-one-nonce",
+		"accepted queue message queue-two-nonce",
+		"accepted queue message queue-three-nonce",
+	]);
+
+	fixture.app.onTailedJsonlLine(fixture.tid,
+		`{"type":"queue-operation","operation":"enqueue","content":"queue one"}`, 101);
+	fixture.app.onTailedJsonlLine(fixture.tid,
+		`{"type":"queue-operation","operation":"enqueue","content":"queue two"}`, 102);
+	fixture.app.onTailedJsonlLine(fixture.tid,
+		`{"type":"queue-operation","operation":"dequeue"}`, 103);
+	assert(td.sentNonceFifo.length > 0 && td.queueTailQueuedUuids.length > 0
+		&& td.queueTailQueuedNonces.length > 0
+		&& td.queueTailAwaitingUuids.length > 0
+		&& td.queueTailAwaitingNonces.length > 0);
+
+	auto sentNonceFifo = td.sentNonceFifo.dup;
+	auto queuedUuids = td.queueTailQueuedUuids.dup;
+	auto queuedNonces = td.queueTailQueuedNonces.dup;
+	auto awaitingUuids = td.queueTailAwaitingUuids.dup;
+	auto awaitingNonces = td.queueTailAwaitingNonces.dup;
+	auto pendingSteeringTexts = td.pendingSteeringTexts.dup;
+	auto acceptedEchoes = td.acceptedNativeEchoes.dup;
+	auto historyGeneration = td.history.generation;
+	string[] historyPrefix;
+	foreach (index; 0 .. td.history.length)
+		historyPrefix ~= cast(string) td.history.opIndex(index).toGC().as!string;
+
+	fixture.app.handleUserMessage(testBrowserSubmission(fixture.tid,
+		"rejected newer message", "rejected-newer-nonce"));
+	fixture.app.handleUserMessage(testBrowserSubmission(fixture.tid,
+		"unrelated pending message", "unrelated-nonce"));
+	drainSubmissionNextTicks();
+	assert(fixture.session.sendCalls == 5);
+	assert(("rejected-newer-nonce" in td.inFlightUiNonceGeneration) !is null
+		&& ("unrelated-nonce" in td.inFlightUiNonceGeneration) !is null);
+
+	fixture.session.reject(3, "newer submission rejected");
+	drainSubmissionNextTicks();
+	assert(td.sentNonceFifo == sentNonceFifo);
+	assert(td.queueTailQueuedUuids == queuedUuids
+		&& td.queueTailQueuedNonces == queuedNonces
+		&& td.queueTailAwaitingUuids == awaitingUuids
+		&& td.queueTailAwaitingNonces == awaitingNonces);
+	assert(td.pendingSteeringTexts == pendingSteeringTexts);
+	assert(td.acceptedNativeEchoes == acceptedEchoes);
+	assert(td.history.generation == historyGeneration
+		&& td.history.length == historyPrefix.length + 1);
+	foreach (index; 0 .. historyPrefix.length)
+		assert(cast(string) td.history.opIndex(index).toGC().as!string == historyPrefix[index]);
+	assert(td.history.lastEventContents().canFind(`"subject":"Failed to submit message"`)
+		&& td.history.lastEventContents().canFind(`"body":"newer submission rejected"`));
+	assert(("rejected-newer-nonce" in td.inFlightUiNonceGeneration) is null);
+	assert(("rejected-newer-nonce" in td.recentNonces) is null);
+	assert(("unrelated-nonce" in td.inFlightUiNonceGeneration) !is null);
+
+	fixture.app.handleUserMessage(testBrowserSubmission(fixture.tid,
+		"rejected newer message", "rejected-newer-nonce"));
+	drainSubmissionNextTicks();
+	assert(fixture.session.sendCalls == 6 && fixture.session.gates.length == 6);
+	assert(("rejected-newer-nonce" in td.inFlightUiNonceGeneration) !is null);
+}
+
+unittest
+{
+	auto dbPath = buildPath(tempDir(), "cydo-app-local-receipt-echoes.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+
+	auto fixture = new GatedSubmissionFixture(dbPath);
+	fixture.app.sendTaskMessage(fixture.tid,
+		[ContentBlock("text", "first local prompt")], null, null,
+		"first-local-nonce").ignoreResult();
+	fixture.app.sendTaskMessage(fixture.tid,
+		[ContentBlock("text", "[SYSTEM: internal reminder]")]).ignoreResult();
+	fixture.app.sendTaskMessage(fixture.tid,
+		[ContentBlock("text", "second local prompt")], null, null,
+		"second-local-nonce").ignoreResult();
+	assert(fixture.session.sendCalls == 3);
+
+	foreach (index; 0 .. fixture.session.gates.length)
+	{
+		fixture.session.accept(index, AgentSubmissionReceipt.localEnqueued);
+		drainSubmissionNextTicks();
+	}
+	assert(fixture.app.tasks[fixture.tid].acceptedNativeEchoes.length == 3);
+	assert(fixture.app.tasks[fixture.tid].sentNonceFifo == [
+		"first-local-nonce", "", "second-local-nonce"]);
+	foreach (payload; fixture.socket.sent)
+		assert(!payload.canFind(`"agentAck"`));
+
+	auto first = fixture.app.planHistoryBroadcast(fixture.tid,
+		fixture.session.nativeUserEcho("first local prompt"));
+	assert(testUserCorrelation(first.currentEvent) == "first-local-nonce");
+	auto system = fixture.app.planHistoryBroadcast(fixture.tid,
+		fixture.session.nativeUserEcho("[SYSTEM: internal reminder]"));
+	assert(testUserCorrelation(system.currentEvent).length == 0);
+	auto second = fixture.app.planHistoryBroadcast(fixture.tid,
+		fixture.session.nativeUserEcho("second local prompt"));
+	assert(testUserCorrelation(second.currentEvent) == "second-local-nonce");
+	assert(fixture.app.tasks[fixture.tid].acceptedNativeEchoes.length == 0);
+}
+
+unittest
+{
+	auto dbPath = buildPath(tempDir(), "cydo-app-server-receipt-echoes.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+
+	auto fixture = new GatedSubmissionFixture(dbPath);
+	fixture.app.sendTaskMessage(fixture.tid,
+		[ContentBlock("text", "first app-server prompt")], null, null,
+		"first-app-server-nonce").ignoreResult();
+	fixture.app.sendTaskMessage(fixture.tid,
+		[ContentBlock("text", "second app-server prompt")], null, null,
+		"second-app-server-nonce").ignoreResult();
+	assert(fixture.session.sendCalls == 2);
+
+	fixture.session.accept(0, AgentSubmissionReceipt.appServerAccepted);
+	drainSubmissionNextTicks();
+	fixture.session.accept(1, AgentSubmissionReceipt.appServerAccepted);
+	drainSubmissionNextTicks();
+	assert(fixture.app.tasks[fixture.tid].acceptedNativeEchoes.length == 2);
+	assertThrown!AssertError(fixture.app.planHistoryBroadcast(fixture.tid,
+		fixture.session.nativeUserEcho("unknown app-server prompt", "unknown-nonce")));
+	assert(fixture.app.tasks[fixture.tid].acceptedNativeEchoes.length == 2);
+
+	auto second = fixture.app.planHistoryBroadcast(fixture.tid,
+		fixture.session.nativeUserEcho("second app-server prompt",
+			"second-app-server-nonce"));
+	assert(testUserCorrelation(second.currentEvent) == "second-app-server-nonce");
+	auto first = fixture.app.planHistoryBroadcast(fixture.tid,
+		fixture.session.nativeUserEcho("first app-server prompt",
+			"first-app-server-nonce"));
+	assert(testUserCorrelation(first.currentEvent) == "first-app-server-nonce");
+	assert(fixture.app.tasks[fixture.tid].acceptedNativeEchoes.length == 0);
+	assertThrown!AssertError(fixture.app.planHistoryBroadcast(fixture.tid,
+		fixture.session.nativeUserEcho("second app-server prompt",
+			"second-app-server-nonce")));
+}
+
+unittest
+{
+	auto dbPath = buildPath(tempDir(), "cydo-app-submission-lineage.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+
+	auto fixture = new GatedSubmissionFixture(dbPath);
+	fixture.app.sendTaskMessage(fixture.tid,
+		[ContentBlock("text", "old echoed prompt")], null, null,
+		"old-echo-nonce").ignoreResult();
+	fixture.session.accept(0, AgentSubmissionReceipt.localEnqueued);
+	drainSubmissionNextTicks();
+	assert(fixture.app.tasks[fixture.tid].history.length == 1);
+	assert(fixture.app.tasks[fixture.tid].acceptedNativeEchoes.length == 1);
+
+	bool oldReceiptRejected;
+	fixture.app.sendTaskMessage(fixture.tid,
+		[ContentBlock("text", "old receipt prompt")], null, null,
+		"old-receipt-nonce").then(() {
+		assert(false, "stale submission receipt was committed");
+	}, (Exception error) {
+		oldReceiptRejected = true;
+	}).ignoreResult();
+	fixture.app.handleUserMessage(testBrowserSubmission(fixture.tid,
+		"old rejected prompt", "old-rejection-nonce"));
+	drainSubmissionNextTicks();
+	assert(fixture.session.gates.length == 3);
+	assert(("old-rejection-nonce" in fixture.app.tasks[fixture.tid]
+		.inFlightUiNonceGeneration) !is null);
+
+	auto oldGeneration = fixture.app.tasks[fixture.tid].history.generation;
+	fixture.app.resetHistoryWatermarkOnly(fixture.tid);
+	assert(fixture.app.tasks[fixture.tid].history.generation != oldGeneration);
+	assert(fixture.app.tasks[fixture.tid].history.length == 0);
+	// The old local echo record must not label the first native echo of the
+	// replacement lineage.
+	assert(fixture.app.tasks[fixture.tid].acceptedNativeEchoes.length == 0);
+	assert(fixture.app.tasks[fixture.tid].inFlightUiNonceGeneration.length == 0);
+
+	fixture.app.handleUserMessage(testBrowserSubmission(fixture.tid,
+		"new generation prompt", "old-rejection-nonce"));
+	drainSubmissionNextTicks();
+	assert(fixture.session.gates.length == 4);
+	assert(("old-rejection-nonce" in fixture.app.tasks[fixture.tid]
+		.inFlightUiNonceGeneration) !is null);
+
+	fixture.session.accept(1, AgentSubmissionReceipt.appServerAccepted);
+	fixture.session.reject(2, "old submission rejected");
+	drainSubmissionNextTicks();
+	assert(oldReceiptRejected);
+	assert(fixture.app.tasks[fixture.tid].history.length == 0);
+	assert(("old-receipt-nonce" in fixture.app.tasks[fixture.tid].recentNonces)
+		is null);
+	assert(("old-rejection-nonce" in fixture.app.tasks[fixture.tid].recentNonces)
+		is null);
+	assert(("old-rejection-nonce" in fixture.app.tasks[fixture.tid]
+		.inFlightUiNonceGeneration) !is null);
+
+	fixture.session.accept(3, AgentSubmissionReceipt.localEnqueued);
+	drainSubmissionNextTicks();
+	assert(fixture.app.tasks[fixture.tid].history.length == 1);
+	assert(("old-rejection-nonce" in fixture.app.tasks[fixture.tid].recentNonces)
+		!is null);
+	assert(("old-rejection-nonce" in fixture.app.tasks[fixture.tid]
+		.inFlightUiNonceGeneration) is null);
+	assert(fixture.app.tasks[fixture.tid].acceptedNativeEchoes.length == 1);
+
+	auto newEcho = fixture.app.planHistoryBroadcast(fixture.tid,
+		fixture.session.nativeUserEcho("new generation prompt"));
+	assert(testUserCorrelation(newEcho.currentEvent) == "old-rejection-nonce");
+	assert(fixture.app.tasks[fixture.tid].acceptedNativeEchoes.length == 0);
 }
 
 version (unittest) private bool isKnownPromptParityAgent(string name)

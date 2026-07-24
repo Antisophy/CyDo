@@ -77,12 +77,14 @@ struct WorkflowToolsHost
 	bool delegate(string projectPath, string taskTypeName) taskProducesCommitOutput;
 	void delegate(int childTid, int parentTid, WorktreeMode mode) setupWorktreeForEdge;
 	Promise!void delegate(int tid) ensureProcessQueueAlive;
-	void delegate(int tid, const(ContentBlock)[] content,
+	Promise!void delegate(int tid, const(ContentBlock)[] content,
 		const(ContentBlock)[] broadcastContent, string cydoMeta,
 		string nonce) sendTaskMessage;
 	void delegate(int tid, string reason) emitTaskReload;
 	void delegate(int tid, string subject,
 		string body) appendTaskDiagnostic;
+	void delegate(int tid, string subject,
+		string body) appendAndBroadcastRecoveryDeliveryDiagnostic;
 
 	bool delegate(int tid) taskAlive;
 	bool delegate(int aTid, int bTid) tasksShareWorkspace;
@@ -90,7 +92,7 @@ struct WorkflowToolsHost
 	void delegate(int tid, void delegate() cb) addIdleCallback;
 	Promise!void delegate(int tid) reactivateTask;
 	bool delegate(int tid, out string sessionState) canSendSystemMessage;
-	void delegate(int tid, KnownSystemMessageKind kind, string body)
+	Promise!void delegate(int tid, KnownSystemMessageKind kind, string body)
 		sendKnownSystemMessage;
 
 	void delegate(int parentTid, int childTid) persistAddTaskDep;
@@ -200,14 +202,14 @@ unittest
 		taskProducesCommitOutput: (string projectPath, string taskTypeName) => false,
 		setupWorktreeForEdge: (int childTid, int parentTid, WorktreeMode mode) {},
 		ensureProcessQueueAlive: (int tid) => tid == 2 ? reject!void(new Exception("simulated child session startup failure")) : resolve(),
-		sendTaskMessage: (int tid, const(ContentBlock)[] content, const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) { assert(tid == 3); },
+		sendTaskMessage: (int tid, const(ContentBlock)[] content, const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) { assert(tid == 3); return resolve(); },
 		emitTaskReload: (int tid, string reason) {},
 		appendTaskDiagnostic: (int tid, string subject, string body) {},
 		taskAlive: (int tid) => false, tasksShareWorkspace: (int aTid, int bTid) => true,
 		taskWorkspaceLabel: (int tid) => "local", addIdleCallback: (int tid, void delegate() cb) {},
 		reactivateTask: (int tid) => resolve(),
 		canSendSystemMessage: (int tid, out string sessionState) { sessionState = "dead"; return false; },
-		sendKnownSystemMessage: (int tid, KnownSystemMessageKind kind, string body) {},
+		sendKnownSystemMessage: (int tid, KnownSystemMessageKind kind, string body) { return resolve(); },
 		persistAddTaskDep: (int parentTid, int childTid) {}, persistRemoveTaskDep: (int parentTid, int childTid) {},
 		persistRemoveAllChildDeps: (int childTid) {}, loadTaskDeps: () => cast(int[][int]) null,
 		broadcastTaskUpdate: (int tid) {}, broadcastFocusHint: (int fromTid, int toTid) {},
@@ -276,10 +278,7 @@ public:
 				clearPendingSubTask: (int tid) {
 					pendingSubTasks_.remove(tid);
 				},
-				parentTaskForChild: (int childTid) {
-					auto parentTid = childTid in taskDeps_;
-					return parentTid is null ? 0 : *parentTid;
-				},
+				parentTaskForChild: &parentTaskForChild,
 				childTaskIds: &childrenOf,
 				wasLiveDelivered: (int childTid) {
 					return (childTid in liveDeliveredSubTasks_) !is null;
@@ -293,6 +292,8 @@ public:
 				removeTaskDependency: &removeTaskDependency,
 				taskAlive: host_.taskAlive,
 				onNextTick: host_.onNextTick,
+				appendAndBroadcastRecoveryDeliveryDiagnostic:
+					host_.appendAndBroadcastRecoveryDeliveryDiagnostic,
 			));
 		questionRouter_ = new QuestionRouter(QuestionRouterHost(
 			getTask: host_.getTask,
@@ -304,8 +305,7 @@ public:
 			buildKnownSystemMessageMeta: host_.buildKnownSystemMessageMeta,
 			sendTaskMessage: (int tid, const(ContentBlock)[] content,
 				string cydoMeta, string nonce) {
-				host_.sendTaskMessage(tid, content, null, cydoMeta, nonce);
-				return resolve();
+				return host_.sendTaskMessage(tid, content, null, cydoMeta, nonce);
 			},
 			transitionTask: host_.transitionTask,
 			transitionTaskFrom: host_.transitionTaskFrom,
@@ -495,7 +495,7 @@ public:
 				taskPromptMsgSubject,
 				["task_description": prompt], "task_description");
 			host_.ensureProcessQueueAlive(childTid).then(() {
-				host_.sendTaskMessage(childTid,
+				return host_.sendTaskMessage(childTid,
 					[ContentBlock("text", wrapKnownSystemMessage(
 						host_.systemKeyword(),
 						KnownSystemMessageKind.taskPrompt,
@@ -505,12 +505,15 @@ public:
 			}).except((Exception e) {
 				auto failedChild = requireTask(childTid,
 					"Created child task must exist when launch fails");
-				failedChild.error = e.msg;
-				failedChild.resultText = e.msg;
-				host_.persistResultText(childTid, failedChild.resultText);
-				host_.transitionTaskFrom(childTid,
-					[TaskStatus.pending, TaskStatus.active], TaskStatus.failed,
-					TaskNotificationChange.preserve);
+				if (failedChild.status != TaskStatus.failed)
+				{
+					failedChild.error = e.msg;
+					failedChild.resultText = e.msg;
+					host_.persistResultText(childTid, failedChild.resultText);
+					host_.transitionTaskFrom(childTid,
+						[TaskStatus.pending, TaskStatus.active], TaskStatus.failed,
+						TaskNotificationChange.preserve);
+				}
 				if (hasPendingSubTask(childTid))
 					deliverFailedPendingSubTaskResult(childTid);
 			}).ignoreResult();
@@ -897,7 +900,17 @@ public:
 		if (host_.getTask(tid) is null)
 			return;
 
-		deliverBatchFallbackIfReady(tid);
+		deliverBatchFallbackIfReady(tid).except((Exception e) {
+			auto current = requireTask(tid,
+				"Recovered MCP fallback parent must exist when delivery rejects");
+			if (current.status == TaskStatus.active || current.status == TaskStatus.alive)
+				host_.transitionTaskFrom(tid,
+					[TaskStatus.active, TaskStatus.alive], TaskStatus.waiting,
+					TaskNotificationChange.preserve);
+			assert(current.status == TaskStatus.waiting
+				|| current.status == TaskStatus.failed,
+				"Recovered MCP fallback rejection escaped its process owner state");
+		}).ignoreResult();
 	}
 
 	void handleAskUserResponse(WsMessage json)
@@ -1043,6 +1056,12 @@ public:
 		return (tid in taskDeps_) !is null;
 	}
 
+	int parentTaskForChild(int childTid)
+	{
+		auto parentTid = childTid in taskDeps_;
+		return parentTid is null ? 0 : *parentTid;
+	}
+
 	bool hasPendingChildQuestion(int tid)
 	{
 		int childTid;
@@ -1081,7 +1100,10 @@ public:
 			reminderSubject,
 			["question": question], "question");
 		host_.sendTaskMessage(tid, [ContentBlock("text", reminder)],
-			null, askReminderMeta, null);
+			null, askReminderMeta, null).except((Exception e) {
+			questionRouter_.failQuestionRoute(qid,
+				"Failed to submit sub-task answer reminder: " ~ e.msg);
+		}).ignoreResult();
 	}
 
 	bool finalizeCompletedSubTask(int tid, bool eagerDepCleanup = false)
@@ -1095,24 +1117,24 @@ public:
 		return subtaskResultDelivery_.deliverFailedPendingSubTaskResult(tid);
 	}
 
-	void deliverWaitingParentResultsIfReady(int tid)
+	Promise!void deliverWaitingParentResultsIfReady(int tid)
 	{
-		subtaskResultDelivery_.deliverWaitingParentResultsIfReady(tid);
+		return subtaskResultDelivery_.deliverWaitingParentResultsIfReady(tid);
 	}
 
-	void deliverBatchResults(int parentTid)
+	Promise!void deliverBatchResults(int parentTid)
 	{
-		subtaskResultDelivery_.deliverBatchResults(parentTid);
+		return subtaskResultDelivery_.deliverBatchResults(parentTid);
 	}
 
-	void deliverBatchFallbackIfReady(int parentTid)
+	Promise!void deliverBatchFallbackIfReady(int parentTid)
 	{
-		subtaskResultDelivery_.deliverBatchFallbackIfReady(parentTid);
+		return subtaskResultDelivery_.deliverBatchFallbackIfReady(parentTid);
 	}
 
-	void sendSystemRestartNudge(int tid)
+	Promise!void sendSystemRestartNudge(int tid)
 	{
-		subtaskResultDelivery_.sendSystemRestartNudge(tid);
+		return subtaskResultDelivery_.sendSystemRestartNudge(tid);
 	}
 
 	void failPendingAskUserQuestionOnExit(int tid)
@@ -1456,14 +1478,36 @@ private:
 				KnownSystemMessageKind.modeSwitch,
 				modeSwitchMsgSubject, null, null);
 			host_.ensureProcessQueueAlive(tid).then(() {
-				host_.sendTaskMessage(tid,
+				return host_.sendTaskMessage(tid,
 					[ContentBlock("text", wrapKnownSystemMessage(
 						host_.systemKeyword(),
 						KnownSystemMessageKind.modeSwitch,
 						renderedContinuationPrompt,
 						modeSwitchMsgSubject))],
 					null, contMeta, null);
+			}).then(() {
 				sendPendingChildAnswerReminder(tid);
+			}, (Exception e) {
+				auto failed = requireTask(tid,
+					"Continuation task must exist when message submission fails");
+				if (failed.status != TaskStatus.failed)
+				{
+					assert(failed.status == TaskStatus.active,
+						"Continuation submission failed outside an active task");
+					failed.error = e.msg;
+					failed.resultText = e.msg;
+					host_.persistResultText(tid, failed.resultText);
+					host_.transitionTask(tid, TaskStatus.active, TaskStatus.failed,
+						TaskNotificationChange.preserve);
+					host_.appendTaskDiagnostic(tid, "Continuation failed", e.msg);
+				}
+				if (hasPendingSubTask(tid))
+					deliverFailedPendingSubTaskResult(tid);
+				questionRouter_.failQuestionRoutesForAnswerer(tid,
+					"Continuation message submission failed: " ~ e.msg);
+				if (failed.pendingAskPromise !is null && failed.pendingAskQid > 0)
+					questionRouter_.failQuestionRoute(failed.pendingAskQid,
+						"Continuation message submission failed: " ~ e.msg);
 			}).ignoreResult();
 			if (wasActive)
 				host_.broadcastTaskUpdate(tid);
@@ -1548,13 +1592,29 @@ private:
 				["task_description": successorPrompt],
 				"task_description");
 			host_.ensureProcessQueueAlive(childTid).then(() {
-				host_.sendTaskMessage(childTid,
+				return host_.sendTaskMessage(childTid,
 					[ContentBlock("text", wrapKnownSystemMessage(
 						host_.systemKeyword(),
 						KnownSystemMessageKind.handoff,
 						renderedSuccessorPrompt,
 						handoffMsgSubject))],
 					null, handoffMeta, null);
+			}).except((Exception e) {
+				auto failed = requireTask(childTid,
+					"Handoff successor must exist when message submission fails");
+				if (failed.status != TaskStatus.failed)
+				{
+					assert(failed.status == TaskStatus.active,
+						"Handoff successor submission failed outside an active task");
+					failed.error = e.msg;
+					failed.resultText = e.msg;
+					host_.persistResultText(childTid, failed.resultText);
+					host_.transitionTask(childTid, TaskStatus.active, TaskStatus.failed,
+						TaskNotificationChange.preserve);
+					host_.appendTaskDiagnostic(childTid, "Handoff failed", e.msg);
+				}
+				if (hasPendingSubTask(childTid))
+					deliverFailedPendingSubTaskResult(childTid);
 			}).ignoreResult();
 		}
 	}
@@ -1709,6 +1769,7 @@ unittest
 			const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) {
 			assert(tid == 3,
 				"startup failure should prevent sending the subtask prompt");
+			return resolve();
 		},
 		emitTaskReload: (int tid, string reason) {},
 		appendTaskDiagnostic: (int tid, string subject, string body) {},
@@ -1722,7 +1783,7 @@ unittest
 			return false;
 		},
 		sendKnownSystemMessage: (int tid, KnownSystemMessageKind kind,
-			string body) {},
+			string body) { return resolve(); },
 		persistAddTaskDep: (int parentTid, int childTid) {},
 		persistRemoveTaskDep: (int parentTid, int childTid) {},
 		persistRemoveAllChildDeps: (int childTid) {},
@@ -1842,7 +1903,8 @@ unittest
 
 unittest
 {
-	import ae.net.asockets : socketManager;
+	import ae.net.asockets : onNextTick, socketManager;
+	import ae.utils.promise : reject;
 	import ae.utils.promise.await : async;
 	import core.exception : AssertError;
 	import cydo.workflow.batch.registry : ActiveBatchKey;
@@ -1871,6 +1933,11 @@ unittest
 		int persistRemoveDependencyCalls;
 		int[] removedChildren;
 		int waitingToActiveTransitions;
+		int nextTid = 3;
+		size_t sendCalls;
+		string sendFailure;
+		string[] diagnosticSubjects;
+		string[] diagnosticBodies;
 		Promise!void reactivationGate;
 
 		this()
@@ -1878,10 +1945,20 @@ unittest
 			TaskTypeDef parentType;
 			parentType.name = "parent";
 			parentType.agent = "fake";
+			CreatableTaskDef childEdge;
+			childEdge.name = "child";
+			parentType.creatable_tasks = [childEdge];
 			ContinuationDef handoff;
 			handoff.task_type = "child";
 			parentType.continuations["continue"] = handoff;
-			taskTypes = [parentType];
+			ContinuationDef keepContext;
+			keepContext.task_type = "child";
+			keepContext.keep_context = true;
+			parentType.continuations["keep"] = keepContext;
+			TaskTypeDef childType;
+			childType.name = "child";
+			childType.agent = "fake";
+			taskTypes = [parentType, childType];
 
 			tasks[1] = TaskData(1, "local", "/tmp/cydo-batch-invariants");
 			tasks[1].taskType = "parent";
@@ -1903,7 +1980,26 @@ unittest
 					auto task = tid in tasks;
 					return task is null ? null : task;
 				},
+				createTask: (string workspace, string projectPath, string agentName) {
+					auto tid = nextTid++;
+					tasks[tid] = TaskData(tid, workspace, projectPath);
+					tasks[tid].agentName = agentName;
+					return tid;
+				},
+				persistTaskType: (int tid, string taskType) {},
+				persistDescription: (int tid, string description) {},
+				persistParentTid: (int tid, int parentTid) {},
+				persistRelationType: (int tid, string relationType) {},
+				persistTitle: (int tid, string title) {},
+				persistNeedsAttention: (int tid, bool needsAttention) {},
+				persistLastActive: (int tid, long lastActive) {},
 				taskTypesForProject: (string projectPath) => taskTypes,
+				entryPointsForProject: (string projectPath) => cast(UserEntryPointDef[]) null,
+				promptSearchPath: (string projectPath) => cast(string[]) null,
+				treeReadOnlyForProject: (string projectPath) => cast(bool[string]) null,
+				resolveTaskAgent: (string requestedAgent, string parentAgent) => "fake",
+				isConfiguredAgentName: (string agentName) => agentName == "fake",
+				taskSystemPromptForMessage: (int tid, TaskTypeDef* typeDef) => "",
 				tasksShareWorkspace: (int aTid, int bTid) => true,
 				taskWorkspaceLabel: (int tid) => "local",
 				systemKeyword: () => "SYSTEM",
@@ -1912,9 +2008,32 @@ unittest
 				buildKnownSystemMessageMeta: (KnownSystemMessageKind kind,
 					string subject, string[string] vars,
 					string bodyVar) => "{}",
+				taskDir: (const TaskData* task) => "",
+				outputPath: (const TaskData* task) => "",
+				worktreePath: (const TaskData* task) => "",
+				taskProducesCommitOutput: (string projectPath, string taskType) => false,
+				setupWorktreeForEdge: (int childTid, int parentTid,
+					WorktreeMode mode) {},
+				ensureProcessQueueAlive: (int tid) {
+					if (tasks[tid].status == TaskStatus.pending)
+						tasks[tid].status = TaskStatus.active;
+					return resolve();
+				},
 				sendTaskMessage: (int tid, const(ContentBlock)[] content,
 					const(ContentBlock)[] broadcastContent,
-					string cydoMeta, string nonce) {},
+					string cydoMeta, string nonce) {
+					sendCalls++;
+					if (sendFailure.length > 0)
+						return reject!void(new Exception(sendFailure));
+					return resolve();
+				},
+				emitTaskReload: (int tid, string reason) {},
+				appendTaskDiagnostic: (int tid, string subject, string body) {
+					diagnosticSubjects ~= subject;
+					diagnosticBodies ~= body;
+				},
+				appendAndBroadcastRecoveryDeliveryDiagnostic:
+					(int tid, string subject, string body) {},
 				transitionTask: (int tid, TaskStatus expectedFrom,
 					TaskStatus to,
 					TaskNotificationChange notification) {
@@ -1934,6 +2053,8 @@ unittest
 					tasks[tid].status = to;
 				},
 				persistResultText: (int tid, string resultText) {},
+				persistTaskStartHead: (int tid, string taskStartHead) {},
+				touchTask: (int tid) {},
 				taskAlive: (int tid) => (tid in tasks) !is null,
 				broadcastFocusHint: (int fromTid, int toTid) {},
 				addIdleCallback: (int tid, void delegate() cb) {},
@@ -1948,6 +2069,27 @@ unittest
 					persistRemoveDependencyCalls++;
 					removedChildren ~= childTid;
 				},
+				persistRemoveAllChildDeps: (int childTid) {},
+				loadTaskDeps: () => cast(int[][int]) null,
+				broadcastTaskUpdate: (int tid) {},
+				broadcastTaskCreated: (TaskCreatedMessage message) {},
+				canSendSystemMessage: (int tid, out string sessionState) {
+					sessionState = "live";
+					return true;
+				},
+				sendKnownSystemMessage: (int tid, KnownSystemMessageKind kind,
+					string body) { return resolve(); },
+				sendAskUserQuestionPrompt: (int tid, JSONFragment questions,
+					string toolUseId) {},
+				clearAskUserQuestionPrompt: (int tid) {},
+				sendPermissionPrompt: (int tid, string toolUseId, string toolName,
+					JSONFragment input) {},
+				clearPermissionPrompt: (int tid) {},
+				appendTaskSpawnedEvent: (int parentTid, int childTid,
+					int specIndex) {},
+				workspacePermissionPolicy: (string workspaceName) => "",
+				onNextTick: (void delegate() cb) { onNextTick(socketManager, cb); },
+				generateTitle: (int tid, string prompt) {},
 			));
 		}
 	}
@@ -1996,6 +2138,113 @@ unittest
 		assert(fixture.persistAddDependencyCalls == 0);
 		assert(fixture.persistRemoveDependencyCalls == 0);
 		assert(registry.exists(handle));
+	}
+
+	// Initial child prompt failure is observed through the real send Promise,
+	// then settles the direct Task result exactly once for its parent.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.sendFailure = "initial child prompt rejected";
+		auto backend = fixture.makeBackend();
+		auto validated = backend.handleCreateTask("1", 0, "child title",
+			"child", "child prompt");
+		assert(validated.launch !is null && !validated.error.isError);
+		auto launched = validated.launch();
+		bool settled;
+		McpResult result;
+		launched.promise.then((McpResult value) {
+			settled = true;
+			result = value;
+		}).ignoreResult();
+		drainPromiseNextTicks();
+
+		assert(fixture.sendCalls == 1 && settled && result.isError);
+		assert(fixture.tasks[launched.childTid].status == TaskStatus.failed);
+		assert(fixture.tasks[launched.childTid].resultText
+			== "initial child prompt rejected");
+		assert(!backend.hasPendingSubTask(launched.childTid));
+	}
+
+	// An answer reminder must settle its existing Ask route when its actual
+	// submission Promise rejects; it cannot leave the child waiting forever.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.sendFailure = "answer reminder rejected";
+		auto backend = fixture.makeBackend();
+		auto registry = batchRegistryOf(backend);
+		BatchHandle handle;
+		string error;
+		assert(registry.create(1, [2], handle, error), error);
+		bool settled;
+		McpResult result;
+		backend.handleAsk("2", "need an answer", -1).then((McpResult value) {
+			settled = true;
+			result = value;
+		}).ignoreResult();
+		assert(fixture.tasks[2].pendingAskQid > 0);
+		Promise!BatchSignal questionEvent;
+		assert(registry.waitOne(handle, questionEvent, error), error);
+		questionEvent.then((BatchSignal signal) {}).ignoreResult();
+		drainPromiseNextTicks();
+		backend.sendPendingChildAnswerReminder(1);
+		drainPromiseNextTicks();
+
+		assert(fixture.sendCalls == 1 && settled && result.isError);
+		assert(result.text.canFind("Failed to submit sub-task answer reminder"));
+		assert(fixture.tasks[2].pendingAskPromise is null
+			&& fixture.tasks[2].pendingAskQid == 0);
+		auto router = __traits(getMember, backend, "questionRouter_");
+		assert(__traits(getMember, router, "questionRoutes_").length == 0
+			&& __traits(getMember, router, "pendingQuestions_").length == 0);
+	}
+
+	// A keep-context continuation owns only its own failed task and diagnostic
+	// when the actual mode-switch send is rejected.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.sendFailure = "keep-context submission rejected";
+		auto backend = fixture.makeBackend();
+		fixture.tasks[1].pendingContinuation = new PendingContinuation(
+			PendingContinuation.Kind.switchMode, "keep");
+		backend.spawnContinuation(1);
+		drainPromiseNextTicks();
+
+		assert(fixture.sendCalls == 1);
+		assert(fixture.tasks[1].status == TaskStatus.failed
+			&& fixture.tasks[1].resultText == "keep-context submission rejected");
+		assert(fixture.diagnosticSubjects == ["Continuation failed"]
+			&& fixture.diagnosticBodies == ["keep-context submission rejected"]);
+	}
+
+	// Handoff moves its pending Task topology before submission. A rejected
+	// successor send fails and settles that moved owner without rolling it back.
+	{
+		auto fixture = new BatchInvariantFixture;
+		fixture.sendFailure = "handoff submission rejected";
+		auto backend = fixture.makeBackend();
+		auto pending = new Promise!McpResult;
+		bool settled;
+		McpResult result;
+		pending.then((McpResult value) {
+			settled = true;
+			result = value;
+		}).ignoreResult();
+		__traits(getMember, backend, "pendingSubTasks_")[1] = pending;
+		__traits(getMember, backend, "taskDeps_")[1] = 0;
+		auto accepted = backend.handleHandoff("1", "continue", "handoff prompt");
+		assert(!accepted.isError);
+		backend.spawnContinuation(1);
+		drainPromiseNextTicks();
+
+		assert(fixture.sendCalls == 1 && settled && result.isError);
+		assert(fixture.tasks[1].status == TaskStatus.completed);
+		assert(fixture.tasks[3].status == TaskStatus.failed
+			&& fixture.tasks[3].resultText == "handoff submission rejected");
+		assert(!backend.hasPendingSubTask(1)
+			&& !backend.hasPendingSubTask(3));
+		assert(!backend.hasTaskDependency(1) && backend.hasTaskDependency(3));
+		assert(fixture.diagnosticSubjects == ["Handoff failed"]
+			&& fixture.diagnosticBodies == ["handoff submission rejected"]);
 	}
 
 	// A missing unfinished batchKeyByChildTid entry aborts the ordinary Task

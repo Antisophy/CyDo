@@ -8,6 +8,8 @@ import ae.utils.json : JSONFragment, jsonParse, toJson;
 import ae.utils.jsonrpc : JsonRpcErrorCode, JsonRpcRequest, JsonRpcResponse;
 import ae.utils.promise : Promise, resolve;
 
+version (unittest) import ae.net.asockets : IConnection;
+
 import cydo.agent.drivers.codex.app_server;
 import cydo.agent.drivers.codex.rpc;
 import cydo.agent.process : AgentProcess;
@@ -308,4 +310,13 @@ class AppServerProcess
 	{
 		return sessionsByTid.values;
 	}
+}
+
+version (unittest) package AppServerProcess makeTestAppServerProcess(
+	IConnection connection)
+{
+	auto server = new AppServerProcess(null);
+	server.codec = new JsonRpcCodec(connection);
+	server.state_ = AppServerProcess.State.ready;
+	return server;
 }

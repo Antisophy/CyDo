@@ -9,17 +9,25 @@ import ae.utils.json : JSONFragment, JSONOptional, JSONPartial, jsonParse, toJso
 import ae.utils.time.types : AbsTime;
 import ae.utils.jsonrpc : JsonRpcResponse;
 import ae.utils.promise : Promise, resolve;
+import ae.net.asockets : onNextTick, socketManager;
+
+version (unittest) import ae.net.asockets : ConnectionState, DisconnectType,
+	IConnection;
+version (unittest) import ae.sys.data : Data;
+version (unittest) import ae.utils.jsonrpc : JsonRpcError, JsonRpcErrorCode,
+	JsonRpcRequest;
 
 import cydo.agent.sdk : SdkProcess, SdkSessionHandler,
 	SdkPermissionRequest, SdkPermissionResult,
 	SdkToolCallRequest, SdkToolCallResult, SdkToolResult,
 	SdkEvent, EmptyResult;
+version (unittest) import cydo.agent.sdk : makeTestSdkProcess;
 import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary, PersistedHistoryBoundaryKind, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
 import cydo.protocol : ContentBlock, ItemCompletedEvent, ItemDeltaEvent,
 	ItemResultEvent, ItemStartedEvent, makeUnrecognizedEvent, ProcessExitEvent,
 	ProcessStderrEvent, SessionInitEvent, TranslatedEvent, TurnResultEvent,
 	TurnStopEvent, UsageInfo;
-import cydo.agent.session : AgentSession;
+import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.runtime.config : AgentDriver;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
@@ -135,45 +143,8 @@ class CopilotAgent : Agent
 		auto server = new SdkProcess(args, null, null, "copilot");
 		sharedSdkServer_ = server;
 		sharedWorkDir_ = workDir;
-		auto session = new CopilotSession(server, tid, sessionId, model, workDir, launch.cmdPrefix, toolDispatch_, config.agentName);
-
-		// Register before sending create/resume so events can be routed immediately.
-		server.registerSession(sessionId, session);
-
-		server.onReady(() {
-			if (resumeSessionId.length > 0)
-			{
-				// session.resume replays history; set replayMode to suppress events.
-				session.startReplay();
-				server.sendRequest("session.resume",
-					buildSessionResumeParams(sessionId, model, config))
-				.then((JsonRpcResponse resp) {
-					if (resp.isError)
-					{
-						import std.logger : warningf;
-						warningf("session.resume error: %s", resp.error.get.message);
-						session.replayMode = false;
-						ProcessStderrEvent resumeErrEv;
-						resumeErrEv.text = "session.resume error: " ~ resp.error.get.message;
-						session.emitEvent(toJson(resumeErrEv));
-						server.unregisterSession(sessionId);
-						session.handleExit(1);
-						return;
-					}
-					session.onSessionStarted(model, workDir);
-				});
-			}
-			else
-			{
-				server.sendRequest("session.create",
-					buildSessionCreateParams(sessionId, model, workDir, config))
-				.then((JsonRpcResponse resp) {
-					session.onSessionStarted(model, workDir);
-				});
-			}
-		});
-
-		return session;
+		return attachSession(server, tid, sessionId, resumeSessionId, model,
+			workDir, launch.cmdPrefix, toolDispatch_, config);
 	}
 
 	string parseSessionId(string line)
@@ -891,6 +862,66 @@ unittest
 	assert(ancestorPaths.exact(cydoDir).isNull);
 }
 
+private CopilotSession attachSession(SdkProcess server, int tid,
+	string sessionId, string resumeSessionId, string model, string workDir,
+	string[] cmdPrefix, ToolDispatchFn toolDispatch, SessionConfig config)
+{
+	auto session = new CopilotSession(server, tid, sessionId, model, workDir,
+		cmdPrefix, toolDispatch, config.agentName);
+
+	// Register before sending create/resume so events can be routed immediately.
+	server.registerSession(sessionId, session);
+
+	server.onReady(() {
+		if (resumeSessionId.length > 0)
+		{
+			// session.resume replays history; set replayMode to suppress events.
+			session.startReplay();
+			server.sendRequest("session.resume",
+				buildSessionResumeParams(sessionId, model, config))
+			.then((JsonRpcResponse resp) {
+				if (resp.isError)
+				{
+					import std.logger : warningf;
+					warningf("session.resume error: %s", resp.error.get.message);
+					session.replayMode = false;
+					ProcessStderrEvent resumeErrEv;
+					resumeErrEv.text = "session.resume error: " ~ resp.error.get.message;
+					session.emitEvent(toJson(resumeErrEv));
+					server.unregisterSession(sessionId);
+					session.handleStartupFailure(new Exception(
+						"session.resume error: " ~ resp.error.get.message));
+					return;
+				}
+				session.onSessionStarted(model, workDir);
+			}, (Exception e) {
+				server.unregisterSession(sessionId);
+				session.handleStartupFailure(e);
+			});
+		}
+		else
+		{
+			server.sendRequest("session.create",
+				buildSessionCreateParams(sessionId, model, workDir, config))
+			.then((JsonRpcResponse resp) {
+				if (resp.isError)
+				{
+					server.unregisterSession(sessionId);
+					session.handleStartupFailure(new Exception(
+						"session.create error: " ~ resp.error.get.message));
+					return;
+				}
+				session.onSessionStarted(model, workDir);
+			}, (Exception e) {
+				server.unregisterSession(sessionId);
+				session.handleStartupFailure(e);
+			});
+		}
+	});
+
+	return session;
+}
+
 // ---------------------------------------------------------------------------
 // CopilotSession — one Copilot session, implementing AgentSession + SdkSessionHandler.
 // ---------------------------------------------------------------------------
@@ -947,17 +978,42 @@ class CopilotSession : AgentSession, SdkSessionHandler
 	private string agentName_;
 	private string copilotVersion_;
 
-	// Queued messages waiting for the current turn to finish.
-	private struct PendingMessage
+	// Each message owns its settlement while it waits for readiness, a turn,
+	// or the correlated session.send response.
+	private static final class PendingMessage
 	{
 		ContentBlock[] content;
+		string text;
 		string correlationId;
+		bool isContextBootstrap;
+		Promise!AgentSubmissionReceipt promise;
+		bool settled;
+		bool accepted;
+		TranslatedEvent gatedUserEcho;
+		bool hasGatedUserEcho;
+
+		this(const(ContentBlock)[] content, string text, string correlationId,
+			bool isContextBootstrap)
+		{
+			this.content = content.dup;
+			this.text = text;
+			this.correlationId = correlationId;
+			this.isContextBootstrap = isContextBootstrap;
+			this.promise = new Promise!AgentSubmissionReceipt;
+		}
 	}
 	private PendingMessage[] pendingMessages;
-	private struct ExpectedUserMessage
+	private static final class ExpectedUserMessage
 	{
 		string content;
-		string correlationId;
+		PendingMessage submission;
+		bool nativeEchoSeen;
+
+		this(PendingMessage submission)
+		{
+			this.content = submission.text;
+			this.submission = submission;
+		}
 	}
 	private ExpectedUserMessage[] expectedUserMessages;
 
@@ -965,7 +1021,6 @@ class CopilotSession : AgentSession, SdkSessionHandler
 	package void delegate(TranslatedEvent) outputHandler_;
 	package void delegate(string line) stderrHandler_;
 	private void delegate(int status) exitHandler_;
-	private void delegate(string nonce) agentAckHandler_;
 
 	this(SdkProcess server, int tid, string sessionId, string model, string workDir,
 		string[] cmdPrefix = null, ToolDispatchFn toolDispatch = null, string agentName = null)
@@ -1011,15 +1066,144 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		emitEvent(toJson(initEv));
 
 		// Drain queued messages now that the session is ready.
+		drainPendingMessages();
+	}
+
+	private void rejectSubmission(PendingMessage submission, Exception error)
+	{
+		if (submission.settled)
+			return;
+		submission.settled = true;
+		submission.promise.reject(error);
+	}
+
+	private void removeExpectedUserMessage(PendingMessage submission)
+	{
+		foreach (i, expected; expectedUserMessages)
+			if (expected.submission is submission)
+			{
+				expectedUserMessages = expectedUserMessages[0 .. i]
+					~ expectedUserMessages[i + 1 .. $];
+				return;
+			}
+		assert(false, "Copilot submission response has no expected user echo");
+	}
+
+	private void emitAcceptedUserEcho(PendingMessage submission,
+		TranslatedEvent event)
+	{
+		assert(submission.accepted,
+			"Copilot user.message emitted before session.send acceptance");
+		auto output = outputHandler_;
+		// Queue after fulfillment so App commits acceptance before translating it.
+		onNextTick(socketManager, {
+			if (output)
+				output(event);
+		});
+	}
+
+	private void releaseGatedUserEcho(PendingMessage submission)
+	{
+		if (!submission.hasGatedUserEcho)
+			return;
+		auto event = submission.gatedUserEcho;
+		submission.gatedUserEcho = TranslatedEvent.init;
+		submission.hasGatedUserEcho = false;
+		removeExpectedUserMessage(submission);
+		emitAcceptedUserEcho(submission, event);
+	}
+
+	private void rejectUnsettledMessages(Exception error)
+	{
 		auto queued = pendingMessages;
 		pendingMessages = null;
-		foreach (msg; queued)
-			sendMessage(msg.content, msg.correlationId);
+		foreach (submission; queued)
+			rejectSubmission(submission, error);
+
+		auto expected = expectedUserMessages;
+		expectedUserMessages = null;
+		foreach (message; expected)
+			rejectSubmission(message.submission, error);
+	}
+
+	private void resetRejectedSubmission()
+	{
+		turnInProgress = false;
+		nextItemIndex = 0;
+		activeTextItem = ActiveTextItem.init;
+		activeTools = null;
+		hadItemsSinceLastStop_ = false;
+		lastResultText = null;
+		currentAssistantMessageId_ = null;
+		currentSubagentParent_ = null;
+		activeTurnNamespace_ = null;
+	}
+
+	private void drainPendingMessages()
+	{
+		if (!alive_ || !sessionReady_ || turnInProgress
+			|| pendingMessages.length == 0)
+			return;
+		auto submission = pendingMessages[0];
+		pendingMessages = pendingMessages[1 .. $];
+		submitMessage(submission);
+	}
+
+	private void submitMessage(PendingMessage submission)
+	{
+		assert(sessionReady_ && !turnInProgress,
+			"Copilot submission requires a ready idle session");
+		turnInProgress = true;
+		nextItemIndex = 0;
+		activeTextItem = ActiveTextItem.init;
+		activeTools = null;
+		hadItemsSinceLastStop_ = false;
+		expectedUserMessages ~= new ExpectedUserMessage(submission);
+
+		SessionSendParams params;
+		params.sessionId = sessionId;
+		params.prompt = submission.text;
+		try
+		{
+			server.sendRequest("session.send", toJson(params))
+				.then((JsonRpcResponse response) {
+					if (submission.settled)
+						return;
+					if (response.isError)
+					{
+						removeExpectedUserMessage(submission);
+						resetRejectedSubmission();
+						rejectSubmission(submission,
+							new Exception(response.error.get.message));
+						drainPendingMessages();
+						return;
+					}
+					submission.accepted = true;
+					submission.settled = true;
+					submission.promise.fulfill(
+						AgentSubmissionReceipt.appServerAccepted);
+					releaseGatedUserEcho(submission);
+				}, (Exception e) {
+					if (submission.settled)
+						return;
+					removeExpectedUserMessage(submission);
+					resetRejectedSubmission();
+					rejectSubmission(submission, e);
+					drainPendingMessages();
+				}).ignoreResult();
+		}
+		catch (Exception e)
+		{
+			removeExpectedUserMessage(submission);
+			resetRejectedSubmission();
+			rejectSubmission(submission, e);
+			drainPendingMessages();
+		}
 	}
 
 	// ----- AgentSession interface -----
 
-	void sendMessage(const(ContentBlock)[] content, string correlationId = null,
+	Promise!AgentSubmissionReceipt sendMessage(const(ContentBlock)[] content, string correlationId = null,
 		bool isContextBootstrap = false)
 	{
 		// Extract text (only text blocks supported; throw on others).
@@ -1030,63 +1214,26 @@ class CopilotSession : AgentSession, SdkSessionHandler
 			else throw new Exception("Unsupported content block type for Copilot: " ~ b.type);
 		}
 
+		auto submission = new PendingMessage(content, text, correlationId,
+			isContextBootstrap);
 		if (!alive_)
-			return;
-
-		// Queue message if session hasn't been created yet.
-		if (!sessionReady_)
 		{
-			pendingMessages ~= PendingMessage(content.dup, correlationId);
-			return;
+			submission.promise.reject(new Exception(
+				"Copilot session is no longer alive"));
+			return submission.promise;
 		}
 
-		if (turnInProgress)
-		{
-			// Steering: buffer message; send after current turn completes.
-			pendingMessages ~= PendingMessage(content.dup, correlationId);
-		}
+		if (!sessionReady_ || turnInProgress)
+			pendingMessages ~= submission;
 		else
-		{
-			turnInProgress = true;
-			nextItemIndex = 0;
-			activeTextItem = ActiveTextItem.init;
-			activeTools = null;
-			hadItemsSinceLastStop_ = false;
-
-			// SDK session.send returns immediately with messageId.
-			expectedUserMessages ~= ExpectedUserMessage(text, correlationId);
-			// The pending user echo is emitted by the task runner.  The native
-			// user.message notification confirms it with the persisted identity.
-			// Turn completion comes via session.idle event.
-			auto sendCid = correlationId;
-			SessionSendParams sendP;
-			sendP.sessionId = sessionId;
-			sendP.prompt    = text;
-			server.sendRequest("session.send", toJson(sendP))
-			.then((JsonRpcResponse resp) {
-				if (resp.isError)
-				{
-					assert(expectedUserMessages.length > 0
-						&& expectedUserMessages[0].correlationId == sendCid,
-						"Copilot send failure lost its expected user nonce");
-					expectedUserMessages = expectedUserMessages[1 .. $];
-					ProcessStderrEvent sendErrEv;
-					sendErrEv.text = "session.send error: " ~ resp.error.get.message;
-					emitEvent(toJson(sendErrEv));
-				}
-				else
-				{
-					if (sendCid.length > 0 && agentAckHandler_)
-						agentAckHandler_(sendCid);
-				}
-			});
-		}
+			submitMessage(submission);
+		return submission.promise;
 	}
 
 	void invalidatePendingSubmittedMessages()
 	{
-		pendingMessages = null;
-		expectedUserMessages = null;
+		rejectUnsettledMessages(new Exception(
+			"Copilot message submission was invalidated"));
 	}
 
 	@property bool supportsImages() const { return false; }
@@ -1110,6 +1257,8 @@ class CopilotSession : AgentSession, SdkSessionHandler
 	{
 		if (!alive_)
 			return;
+		rejectUnsettledMessages(new Exception(
+			"Copilot session closed before accepting message submission"));
 		if (sessionId.length > 0)
 		{
 			SessionIdParams stopP;
@@ -1124,6 +1273,8 @@ class CopilotSession : AgentSession, SdkSessionHandler
 
 	void closeStdin()
 	{
+		rejectUnsettledMessages(new Exception(
+			"Copilot session closed before accepting message submission"));
 		if (!alive_)
 			return;
 		if (sessionId.length > 0)
@@ -1145,11 +1296,10 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		return false;
 	}
 
-	@property void onAgentAck(void delegate(string nonce) dg) { agentAckHandler_ = dg; }
 	@property void onOutput(void delegate(TranslatedEvent) dg) { outputHandler_ = dg; }
 	@property void onStderr(void delegate(string line) dg) { stderrHandler_ = dg; }
 	@property void onExit(void delegate(int status) dg) { exitHandler_ = dg; }
-	@property bool alive() { return alive_ && !server.dead; }
+	@property bool alive() { return alive_ && (server is null || !server.dead); }
 
 	// ----- SdkSessionHandler interface -----
 
@@ -1431,13 +1581,21 @@ class CopilotSession : AgentSession, SdkSessionHandler
 			stderrHandler_(line);
 	}
 
+	void handleStartupFailure(Exception error)
+	{
+		rejectUnsettledMessages(error);
+		handleExit(1);
+	}
+
 	void handleExit(int status)
 	{
+		rejectUnsettledMessages(new Exception(
+			"Copilot session exited before accepting message submission"));
+		alive_ = false;
 		if (exitHandler_ is null)
 			return;
 		auto cb = exitHandler_;
 		exitHandler_ = null;
-		alive_ = false;
 		int code = gracefulShutdown_ ? 0 : (forcedStop_ ? 1 : status);
 		cb(code);
 	}
@@ -1649,7 +1807,8 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		auto expected = expectedUserMessages[0];
 		assert(message.content == expected.content,
 			"Copilot user.message content differs from its originating send");
-		expectedUserMessages = expectedUserMessages[1 .. $];
+		assert(!expected.nativeEchoSeen,
+			"Copilot submission received multiple native user echoes");
 		ContentBlock content;
 		content.type = "text";
 		content.text = message.content;
@@ -1658,8 +1817,20 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		userEv.item_type = "user_message";
 		userEv.content = [content];
 		userEv.uuid = eventId;
-		userEv.correlation_id = expected.correlationId;
-		emitEvent(toJson(userEv), currentRawJson_);
+		userEv.correlation_id = expected.submission.correlationId;
+		auto translated = TranslatedEvent(toJson(userEv), currentRawJson_,
+			currentEventTs_, 0, expected.submission.isContextBootstrap);
+		if (expected.submission.accepted)
+		{
+			expectedUserMessages = expectedUserMessages[1 .. $];
+			emitAcceptedUserEcho(expected.submission, translated);
+		}
+		else
+		{
+			expected.nativeEchoSeen = true;
+			expected.submission.gatedUserEcho = translated;
+			expected.submission.hasGatedUserEcho = true;
+		}
 	}
 
 	private void handleSessionStart(JSONFragment data)
@@ -1747,13 +1918,8 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		emitEvent(toJson(trEv), currentRawJson_);
 		lastResultText = null;
 
-		// Drain pending messages (steering).
-		if (pendingMessages.length > 0)
-		{
-			auto next = pendingMessages[0];
-			pendingMessages = pendingMessages[1 .. $];
-			sendMessage(next.content, next.correlationId);
-		}
+		// Drain one pending message after the preceding turn has completed.
+		drainPendingMessages();
 	}
 
 	/// Finalize the active text/thinking item: emit item/completed.
@@ -1851,6 +2017,15 @@ private final class OneShotCopilotSession : SdkSessionHandler
 		stderr.writeln("[one-shot-sdk/stderr] " ~ line);
 	}
 
+	void handleStartupFailure(Exception error)
+	{
+		if (!fulfilled_)
+		{
+			fulfilled_ = true;
+			promise_.reject(error);
+		}
+	}
+
 	void handleExit(int status)
 	{
 		if (!fulfilled_)
@@ -1861,6 +2036,85 @@ private final class OneShotCopilotSession : SdkSessionHandler
 			promise_.reject(new Exception(
 				"completeOneShot: process exited with status " ~ to!string(status)));
 		}
+	}
+}
+
+version (unittest) private final class TestCopilotConnection : IConnection
+{
+	string[] sentMessages;
+	private ReadDataHandler readDataHandler;
+
+	@property ConnectionState state()
+	{
+		return ConnectionState.connected;
+	}
+
+	void send(scope Data[] data, int priority = DEFAULT_PRIORITY)
+	{
+		ubyte[] message;
+		foreach (ref datum; data)
+			datum.enter((contents) { message ~= cast(ubyte[]) contents; });
+		sentMessages ~= cast(string) message;
+	}
+	alias send = IConnection.send;
+
+	JsonRpcRequest takeRequest(string expectedMethod)
+	{
+		assert(sentMessages.length > 0,
+			"Copilot test connection has no pending request");
+		auto request = jsonParse!JsonRpcRequest(sentMessages[0]);
+		sentMessages = sentMessages[1 .. $];
+		assert(request.method == expectedMethod,
+			"Unexpected Copilot request method: " ~ request.method);
+		assert(request.id, "Copilot request has no JSON-RPC id");
+		return request;
+	}
+
+	void respond(JsonRpcRequest request, JsonRpcResponse response)
+	{
+		import ae.utils.array : asBytes;
+
+		assert(readDataHandler !is null,
+			"Copilot test connection has no response handler");
+		response.id = request.id;
+		readDataHandler(Data(toJson(response).asBytes));
+	}
+
+	void receive(string message)
+	{
+		import ae.utils.array : asBytes;
+
+		assert(readDataHandler !is null,
+			"Copilot test connection has no response handler");
+		readDataHandler(Data(message.asBytes));
+	}
+
+	void disconnect(string reason = defaultDisconnectReason,
+		DisconnectType type = DisconnectType.requested)
+	{
+		assert(false, reason);
+	}
+	@property void handleConnect(ConnectHandler value) {}
+	@property void handleReadData(ReadDataHandler value) { readDataHandler = value; }
+	@property void handleDisconnect(DisconnectHandler value) {}
+	@property void handleBufferFlushed(BufferFlushedHandler value) {}
+}
+
+version (unittest) private final class TestCopilotSubmissionOutcome
+{
+	int acceptedCount;
+	int rejectedCount;
+	string rejectionMessage;
+
+	this(Promise!AgentSubmissionReceipt promise)
+	{
+		promise.then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.appServerAccepted);
+			acceptedCount++;
+		}, (Exception error) {
+			rejectedCount++;
+			rejectionMessage = error.msg;
+		}).ignoreResult();
 	}
 }
 
@@ -1969,19 +2223,563 @@ private PermissionDecision permissionDecisionForCopilotVersion(string versionTex
 
 unittest
 {
-	auto session = new CopilotSession(null, 1, "session-123", "", ".");
-	session.pendingMessages = [
-		CopilotSession.PendingMessage([ContentBlock("text", "id4")], "id4"),
-		CopilotSession.PendingMessage([ContentBlock("text", "id5")], "id5"),
-	];
-	session.expectedUserMessages = [
-		CopilotSession.ExpectedUserMessage("id4", "id4"),
-		CopilotSession.ExpectedUserMessage("id5", "id5"),
-	];
-	session.invalidatePendingSubmittedMessages();
-	assert(session.pendingMessages.length == 0);
+	import ae.net.asockets : socketManager;
+	import std.algorithm.searching : canFind;
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager,
+				"nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	JsonRpcResponse acceptedResponse(string resultJson = `{}`)
+	{
+		JsonRpcResponse response;
+		response.result = jsonParse!(typeof(response.result))(resultJson);
+		return response;
+	}
+
+	JsonRpcResponse rejectedResponse(string message)
+	{
+		JsonRpcResponse response;
+		response.error = JsonRpcError.fromCode(
+			JsonRpcErrorCode.invalidRequest, message);
+		return response;
+	}
+
+	void assertPending(TestCopilotSubmissionOutcome outcome)
+	{
+		assert(outcome.acceptedCount == 0 && outcome.rejectedCount == 0);
+	}
+
+	void assertAcceptedOnce(TestCopilotSubmissionOutcome outcome)
+	{
+		assert(outcome.acceptedCount == 1 && outcome.rejectedCount == 0);
+	}
+
+	void assertRejectedOnce(TestCopilotSubmissionOutcome outcome,
+		string expectedMessage = null)
+	{
+		assert(outcome.acceptedCount == 0 && outcome.rejectedCount == 1);
+		assert(outcome.rejectionMessage.length > 0);
+		if (expectedMessage.length > 0)
+			assert(outcome.rejectionMessage == expectedMessage);
+	}
+
+	// The create owner leaves a production sendMessage promise pending until
+	// session readiness, then the matching codec response accepts it once.
+	{
+		auto connection = new TestCopilotConnection;
+		auto server = makeTestSdkProcess(connection);
+		SessionConfig config;
+		config.model = "test-model";
+		auto session = attachSession(server, 1, "create-success", null,
+			"test-model", "/test/workdir", null, null, config);
+		auto createRequest = connection.takeRequest("session.create");
+		auto createParams = jsonParse!SessionCreateParams(
+			toJson(createRequest.params));
+		assert(createParams.sessionId == session.sessionId
+			&& createParams.model == "test-model"
+			&& createParams.workingDirectory == "/test/workdir");
+
+		string[] emitted;
+		session.onOutput = (TranslatedEvent event) {
+			emitted ~= event.translated;
+		};
+		auto submission = new TestCopilotSubmissionOutcome(
+			session.sendMessage([ContentBlock("text", "pre-ready")],
+				"pre-ready-nonce", true));
+		assertPending(submission);
+		assert(session.pendingMessages.length == 1);
+		assert(connection.sentMessages.length == 0);
+
+		connection.respond(createRequest, acceptedResponse());
+		drainPromiseNextTicks();
+		assertPending(submission);
+		assert(session.sessionReady_ && session.pendingMessages.length == 0
+			&& session.expectedUserMessages.length == 1);
+		assert(emitted.length == 1
+			&& emitted[0].canFind(`"type":"session/init"`));
+		emitted = null;
+
+		auto sendRequest = connection.takeRequest("session.send");
+		auto sendParams = jsonParse!SessionSendParams(toJson(sendRequest.params));
+		assert(sendParams.sessionId == session.sessionId
+			&& sendParams.prompt == "pre-ready");
+		connection.respond(sendRequest,
+			acceptedResponse(`{"messageId":"accepted-pre-ready"}`));
+		drainPromiseNextTicks();
+		assertAcceptedOnce(submission);
+		assert(session.turnInProgress);
+		assert(emitted.length == 0,
+			"session.send acceptance fabricated a translated event");
+
+		session.invalidatePendingSubmittedMessages();
+		drainPromiseNextTicks();
+		assertAcceptedOnce(submission);
+	}
+
+	// A successful response and its native user echo can be read back-to-back.
+	// The App acceptance continuation must run before either echo is emitted.
+	{
+		auto connection = new TestCopilotConnection;
+		auto server = makeTestSdkProcess(connection);
+		auto session = new CopilotSession(server, 7, "echo-order",
+			"test-model", "/test/workdir");
+		server.registerSession("echo-order", session);
+		session.onSessionStarted("test-model", "/test/workdir");
+
+		bool firstAccepted;
+		bool secondAccepted;
+		string[] correlations;
+		session.onOutput = (TranslatedEvent event) {
+			if (!event.translated.canFind(`"item_type":"user_message"`))
+				return;
+			auto user = jsonParse!ItemStartedEvent(event.translated);
+			if (user.correlation_id == "first-nonce")
+				assert(firstAccepted);
+			else
+			{
+				assert(user.correlation_id == "second-nonce");
+				assert(secondAccepted);
+			}
+			correlations ~= user.correlation_id;
+		};
+
+		session.sendMessage([ContentBlock("text", "first prompt")],
+			"first-nonce").then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.appServerAccepted);
+			firstAccepted = true;
+		}).ignoreResult();
+		auto firstRequest = connection.takeRequest("session.send");
+		connection.respond(firstRequest, acceptedResponse());
+		connection.receive(`{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"echo-order","event":{"id":"first-native","timestamp":"2026-07-24T00:00:00Z","type":"user.message","data":{"content":"first prompt"}}}}`);
+		assert(!firstAccepted && correlations.length == 0);
+		drainPromiseNextTicks();
+		assert(firstAccepted && correlations == ["first-nonce"]);
+
+		session.handleSessionIdle();
+		session.sendMessage([ContentBlock("text", "second prompt")],
+			"second-nonce").then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.appServerAccepted);
+			secondAccepted = true;
+		}).ignoreResult();
+		auto secondRequest = connection.takeRequest("session.send");
+		connection.respond(secondRequest, acceptedResponse());
+		connection.receive(`{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"echo-order","event":{"id":"second-native","timestamp":"2026-07-24T00:00:01Z","type":"user.message","data":{"content":"second prompt"}}}}`);
+		assert(!secondAccepted && correlations == ["first-nonce"]);
+		drainPromiseNextTicks();
+		assert(secondAccepted && correlations == ["first-nonce", "second-nonce"]);
+	}
+
+	// A rejected session.send restores the idle state, rejects only its own
+	// record, and immediately submits the queued successor with a distinct ID.
+	{
+		auto connection = new TestCopilotConnection;
+		auto server = makeTestSdkProcess(connection);
+		auto session = new CopilotSession(server, 2, "send-rejection",
+			"test-model", "/test/workdir");
+		string[] emitted;
+		session.onOutput = (TranslatedEvent event) {
+			emitted ~= event.translated;
+		};
+		session.onSessionStarted("test-model", "/test/workdir");
+		emitted = null;
+
+		auto rejected = new TestCopilotSubmissionOutcome(
+			session.sendMessage([ContentBlock("text", "reject me")], "reject"));
+		auto rejectedRequest = connection.takeRequest("session.send");
+		auto successor = new TestCopilotSubmissionOutcome(
+			session.sendMessage([ContentBlock("text", "accept me")], "successor"));
+		assertPending(rejected);
+		assertPending(successor);
+		assert(session.pendingMessages.length == 1);
+
+		connection.respond(rejectedRequest,
+			rejectedResponse("session.send rejected"));
+		drainPromiseNextTicks();
+		assertRejectedOnce(rejected, "session.send rejected");
+		assertPending(successor);
+		assert(session.pendingMessages.length == 0
+			&& session.expectedUserMessages.length == 1
+			&& session.turnInProgress);
+		assert(emitted.length == 0,
+			"session.send rejection fabricated a turn result or acknowledgment");
+
+		auto successorRequest = connection.takeRequest("session.send");
+		auto successorParams = jsonParse!SessionSendParams(
+			toJson(successorRequest.params));
+		assert(successorParams.prompt == "accept me");
+		assert(rejectedRequest.id.toJson() != successorRequest.id.toJson());
+		connection.respond(successorRequest,
+			acceptedResponse(`{"messageId":"accepted-successor"}`));
+		drainPromiseNextTicks();
+		assertRejectedOnce(rejected, "session.send rejected");
+		assertAcceptedOnce(successor);
+		assert(emitted.length == 0);
+	}
+
+	void exerciseLifecycleLoss(string label,
+		void delegate(CopilotSession) loseLifecycle, bool remainsAlive)
+	{
+		auto connection = new TestCopilotConnection;
+		auto server = makeTestSdkProcess(connection);
+		auto session = new CopilotSession(server, 3, "lifecycle-" ~ label,
+			"test-model", "/test/workdir");
+		session.onSessionStarted("test-model", "/test/workdir");
+
+		auto inFlight = new TestCopilotSubmissionOutcome(
+			session.sendMessage([ContentBlock("text", label ~ " in flight")],
+				label ~ "-flight"));
+		auto captured = connection.takeRequest("session.send");
+		auto queued = new TestCopilotSubmissionOutcome(
+			session.sendMessage([ContentBlock("text", label ~ " queued")],
+				label ~ "-queued"));
+		assert(session.expectedUserMessages.length == 1
+			&& session.pendingMessages.length == 1);
+
+		loseLifecycle(session);
+		loseLifecycle(session);
+		drainPromiseNextTicks();
+		assertRejectedOnce(inFlight);
+		assertRejectedOnce(queued);
+		assert(session.alive_ == remainsAlive);
+		assert(session.expectedUserMessages.length == 0
+			&& session.pendingMessages.length == 0);
+
+		connection.respond(captured,
+			acceptedResponse(`{"messageId":"late-` ~ label ~ `"}`));
+		drainPromiseNextTicks();
+		assertRejectedOnce(inFlight);
+		assertRejectedOnce(queued);
+		assert(session.expectedUserMessages.length == 0
+			&& session.pendingMessages.length == 0);
+		assert(connection.sentMessages.length == 0,
+			"late response drained or resurrected a submission");
+	}
+
+	exerciseLifecycleLoss("invalidation",
+		(CopilotSession session) {
+			session.invalidatePendingSubmittedMessages();
+		}, true);
+	exerciseLifecycleLoss("exit",
+		(CopilotSession session) {
+			session.handleExit(17);
+		}, false);
+
+	void exerciseCloseOwner(string label,
+		void delegate(CopilotSession) closeOwner, int expectedExitStatus)
+	{
+		auto connection = new TestCopilotConnection;
+		auto server = makeTestSdkProcess(connection);
+		auto sessionId = "close-" ~ label;
+		auto session = new CopilotSession(server, 4, sessionId,
+			"test-model", "/test/workdir");
+		server.registerSession(sessionId, session);
+		session.onSessionStarted("test-model", "/test/workdir");
+
+		int[] exitStatuses;
+		session.onExit = (int status) { exitStatuses ~= status; };
+		auto inFlight = new TestCopilotSubmissionOutcome(
+			session.sendMessage([ContentBlock("text", label ~ " in flight")],
+				label ~ "-flight"));
+		auto captured = connection.takeRequest("session.send");
+		auto queued = new TestCopilotSubmissionOutcome(
+			session.sendMessage([ContentBlock("text", label ~ " queued")],
+				label ~ "-queued"));
+
+		closeOwner(session);
+		closeOwner(session);
+		auto abortRequest = connection.takeRequest("session.abort");
+		auto abortParams = jsonParse!SessionIdParams(toJson(abortRequest.params));
+		assert(abortParams.sessionId == sessionId);
+		assert(connection.sentMessages.length == 0);
+		drainPromiseNextTicks();
+		assertRejectedOnce(inFlight);
+		assertRejectedOnce(queued);
+		assert(exitStatuses == [expectedExitStatus]);
+		assert(server.dead && !session.alive);
+
+		connection.respond(captured,
+			acceptedResponse(`{"messageId":"late-close"}`));
+		drainPromiseNextTicks();
+		assertRejectedOnce(inFlight);
+		assertRejectedOnce(queued);
+		assert(connection.sentMessages.length == 0);
+	}
+
+	exerciseCloseOwner("stdin",
+		(CopilotSession session) { session.closeStdin(); }, 0);
+	exerciseCloseOwner("stop",
+		(CopilotSession session) { session.stop(); }, 1);
+
+	// Ping rejection exercises SdkProcess.failStartup and the registered
+	// session callback, including a message queued before SDK readiness.
+	{
+		auto connection = new TestCopilotConnection;
+		auto server = makeTestSdkProcess(connection, true);
+		auto pingRequest = connection.takeRequest("ping");
+		auto session = new CopilotSession(server, 5, "ping-failure",
+			"test-model", "/test/workdir");
+		server.registerSession("ping-failure", session);
+		auto queued = new TestCopilotSubmissionOutcome(
+			session.sendMessage([ContentBlock("text", "wait for ping")],
+				"ping-queued"));
+		assertPending(queued);
+
+		connection.respond(pingRequest, rejectedResponse("ping rejected"));
+		drainPromiseNextTicks();
+		assertRejectedOnce(queued, "ping rejected");
+		assert(server.state == SdkProcess.State.failed && server.dead);
+		assert(!session.alive_);
+
+		session.handleStartupFailure(new Exception("duplicate ping failure"));
+		drainPromiseNextTicks();
+		assertRejectedOnce(queued, "ping rejected");
+	}
+
+	void exerciseSessionSetupFailure(string resumeSessionId,
+		string expectedMethod)
+	{
+		auto connection = new TestCopilotConnection;
+		auto server = makeTestSdkProcess(connection);
+		SessionConfig config;
+		config.model = "test-model";
+		auto sessionId = resumeSessionId.length > 0
+			? resumeSessionId : "create-failure";
+		auto session = attachSession(server, 6, sessionId, resumeSessionId,
+			"test-model", "/test/workdir", null, null, config);
+		auto setupRequest = connection.takeRequest(expectedMethod);
+		if (resumeSessionId.length > 0)
+		{
+			auto params = jsonParse!SessionResumeParams(
+				toJson(setupRequest.params));
+			assert(params.sessionId == sessionId
+				&& params.model == "test-model");
+			assert(session.replayMode);
+		}
+		else
+		{
+			auto params = jsonParse!SessionCreateParams(
+				toJson(setupRequest.params));
+			assert(params.sessionId == sessionId
+				&& params.model == "test-model"
+				&& params.workingDirectory == "/test/workdir");
+		}
+
+		string[] emitted;
+		session.onOutput = (TranslatedEvent event) {
+			emitted ~= event.translated;
+		};
+		auto queued = new TestCopilotSubmissionOutcome(
+			session.sendMessage([ContentBlock("text", "queued setup")],
+				"setup-queued"));
+		assertPending(queued);
+		assert(connection.sentMessages.length == 0);
+
+		connection.respond(setupRequest,
+			rejectedResponse("setup rejected"));
+		drainPromiseNextTicks();
+		auto expectedError = expectedMethod ~ " error: setup rejected";
+		assertRejectedOnce(queued, expectedError);
+		assert(!session.alive_ && !session.sessionReady_);
+		assert(session.pendingMessages.length == 0
+			&& session.expectedUserMessages.length == 0);
+		assert(connection.sentMessages.length == 0);
+		if (resumeSessionId.length > 0)
+		{
+			assert(!session.replayMode);
+			assert(emitted.length == 1
+				&& emitted[0].canFind(expectedError));
+		}
+		else
+			assert(emitted.length == 0);
+
+		session.handleStartupFailure(new Exception("duplicate setup failure"));
+		drainPromiseNextTicks();
+		assertRejectedOnce(queued, expectedError);
+	}
+
+	exerciseSessionSetupFailure(null, "session.create");
+	exerciseSessionSetupFailure("resume-failure", "session.resume");
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import std.algorithm.searching : canFind;
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager,
+				"nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	JsonRpcResponse acceptedResponse()
+	{
+		JsonRpcResponse response;
+		response.result = jsonParse!(typeof(response.result))(`{}`);
+		return response;
+	}
+
+	auto connection = new TestCopilotConnection;
+	auto server = makeTestSdkProcess(connection);
+	auto session = new CopilotSession(server, 7, "pre-echo-order",
+		"test-model", "/test/workdir");
+	server.registerSession("pre-echo-order", session);
+	session.onSessionStarted("test-model", "/test/workdir");
+
+	TranslatedEvent[] userEchoes;
+	session.onOutput = (TranslatedEvent event) {
+		if (event.translated.canFind(`"item_type":"user_message"`))
+			userEchoes ~= event;
+	};
+	bool systemAccepted;
+	bool userAccepted;
+	session.sendMessage([ContentBlock("text", "[SYSTEM: internal reminder]")])
+		.then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.appServerAccepted);
+			systemAccepted = true;
+		}).ignoreResult();
+	auto systemRequest = connection.takeRequest("session.send");
+	connection.respond(systemRequest, acceptedResponse());
+	drainPromiseNextTicks();
+	assert(systemAccepted && session.expectedUserMessages.length == 1);
+
+	// Copilot can declare the preceding turn idle before it emits that turn's
+	// native user echo. A following user submission must remain independently
+	// accepted and retain its place behind the system message's echo.
+	session.handleSessionIdle();
+	session.sendMessage([ContentBlock("text", "ordinary prompt")], "user-nonce")
+		.then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.appServerAccepted);
+			userAccepted = true;
+		}).ignoreResult();
+	auto userRequest = connection.takeRequest("session.send");
+	connection.respond(userRequest, acceptedResponse());
+	drainPromiseNextTicks();
+	assert(systemAccepted && userAccepted);
+	assert(session.expectedUserMessages.length == 2);
+	assert(userEchoes.length == 0);
+
+	connection.receive(`{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"pre-echo-order","event":{"id":"native-system","timestamp":"2026-07-24T00:00:00Z","type":"user.message","data":{"content":"[SYSTEM: internal reminder]"}}}}`);
+	drainPromiseNextTicks();
+	assert(userEchoes.length == 1);
+	auto systemEcho = jsonParse!ItemStartedEvent(userEchoes[0].translated);
+	assert(systemEcho.correlation_id.length == 0);
+	assert(systemEcho.content.length == 1
+		&& systemEcho.content[0].text == "[SYSTEM: internal reminder]");
+
+	connection.receive(`{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"pre-echo-order","event":{"id":"native-user","timestamp":"2026-07-24T00:00:01Z","type":"user.message","data":{"content":"ordinary prompt"}}}}`);
+	drainPromiseNextTicks();
+	assert(userEchoes.length == 2);
+	auto userEcho = jsonParse!ItemStartedEvent(userEchoes[1].translated);
+	assert(userEcho.correlation_id == "user-nonce");
+	assert(userEcho.content.length == 1
+		&& userEcho.content[0].text == "ordinary prompt");
 	assert(session.expectedUserMessages.length == 0);
-	assert(CopilotSession.PendingMessage([ContentBlock("text", "id6")], "id6").correlationId == "id6");
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import std.algorithm.searching : canFind;
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager,
+				"nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	JsonRpcResponse acceptedResponse()
+	{
+		JsonRpcResponse response;
+		response.result = jsonParse!(typeof(response.result))(`{}`);
+		return response;
+	}
+
+	auto connection = new TestCopilotConnection;
+	auto server = makeTestSdkProcess(connection);
+	auto session = new CopilotSession(server, 8, "two-nonce-pre-echo",
+		"test-model", "/test/workdir");
+	server.registerSession("two-nonce-pre-echo", session);
+	session.onSessionStarted("test-model", "/test/workdir");
+
+	TranslatedEvent[] userEchoes;
+	session.onOutput = (TranslatedEvent event) {
+		if (event.translated.canFind(`"item_type":"user_message"`))
+			userEchoes ~= event;
+	};
+	bool firstAccepted;
+	bool secondAccepted;
+	session.sendMessage([ContentBlock("text", "first prompt")], "first-nonce")
+		.then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.appServerAccepted);
+			firstAccepted = true;
+		}).ignoreResult();
+	auto firstRequest = connection.takeRequest("session.send");
+	auto firstParams = jsonParse!SessionSendParams(toJson(firstRequest.params));
+	assert(firstParams.prompt == "first prompt");
+	connection.respond(firstRequest, acceptedResponse());
+	drainPromiseNextTicks();
+	assert(firstAccepted && session.expectedUserMessages.length == 1);
+
+	// Copilot can become idle before its first user.message event reaches us.
+	// Submit and accept a second nonce-bearing prompt before either native echo.
+	session.handleSessionIdle();
+	session.sendMessage([ContentBlock("text", "second prompt")], "second-nonce")
+		.then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.appServerAccepted);
+			secondAccepted = true;
+		}).ignoreResult();
+	auto secondRequest = connection.takeRequest("session.send");
+	auto secondParams = jsonParse!SessionSendParams(toJson(secondRequest.params));
+	assert(secondParams.prompt == "second prompt");
+	connection.respond(secondRequest, acceptedResponse());
+	drainPromiseNextTicks();
+	assert(firstAccepted && secondAccepted
+		&& session.expectedUserMessages.length == 2 && userEchoes.length == 0);
+
+	connection.receive(`{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"two-nonce-pre-echo","event":{"id":"native-first","timestamp":"2026-07-24T00:00:00Z","type":"user.message","data":{"content":"first prompt"}}}}`);
+	drainPromiseNextTicks();
+	assert(userEchoes.length == 1);
+	auto firstEcho = jsonParse!ItemStartedEvent(userEchoes[0].translated);
+	assert(firstEcho.correlation_id == "first-nonce"
+		&& firstEcho.content.length == 1
+		&& firstEcho.content[0].text == "first prompt");
+
+	connection.receive(`{"jsonrpc":"2.0","method":"session.event","params":{"sessionId":"two-nonce-pre-echo","event":{"id":"native-second","timestamp":"2026-07-24T00:00:01Z","type":"user.message","data":{"content":"second prompt"}}}}`);
+	drainPromiseNextTicks();
+	assert(userEchoes.length == 2);
+	auto secondEcho = jsonParse!ItemStartedEvent(userEchoes[1].translated);
+	assert(secondEcho.correlation_id == "second-nonce"
+		&& secondEcho.content.length == 1
+		&& secondEcho.content[0].text == "second prompt"
+		&& session.expectedUserMessages.length == 0);
 }
 
 unittest
@@ -1995,6 +2793,7 @@ unittest
 unittest
 {
 	import std.algorithm : canFind;
+
 	auto session = new CopilotSession(null, 1, "session-123", "", ".");
 	session.startReplay();
 
@@ -2008,13 +2807,35 @@ unittest
 
 unittest
 {
+	import ae.net.asockets : socketManager;
 	import std.algorithm : canFind;
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager,
+				"nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
 	auto session = new CopilotSession(null, 1, "session-123", "", ".");
 	string[] output;
 	session.outputHandler_ = (event) { output ~= event.translated; };
+	auto internalSubmission = new CopilotSession.PendingMessage(
+		[ContentBlock("text", "[SYSTEM: internal]")], "[SYSTEM: internal]", null, false);
+	auto ordinarySubmission = new CopilotSession.PendingMessage(
+		[ContentBlock("text", "ordinary")], "ordinary", "nonce-1", false);
+	internalSubmission.accepted = true;
+	ordinarySubmission.accepted = true;
 	session.expectedUserMessages = [
-		CopilotSession.ExpectedUserMessage("[SYSTEM: internal]", null),
-		CopilotSession.ExpectedUserMessage("ordinary", "nonce-1"),
+		new CopilotSession.ExpectedUserMessage(internalSubmission),
+		new CopilotSession.ExpectedUserMessage(ordinarySubmission),
 	];
 
 	SdkEvent internal;
@@ -2022,6 +2843,7 @@ unittest
 	internal.type = "user.message";
 	internal.data = jsonParse!(typeof(internal.data))(`{"content":"[SYSTEM: internal]"}`);
 	session.handleEvent(internal);
+	drainPromiseNextTicks();
 	assert(output.length == 1);
 	assert(output[0].canFind(`"uuid":"native-system-1"`));
 	assert(!output[0].canFind(`"correlation_id"`));
@@ -2031,6 +2853,7 @@ unittest
 	user.type = "user.message";
 	user.data = jsonParse!(typeof(user.data))(`{"content":"ordinary"}`);
 	session.handleEvent(user);
+	drainPromiseNextTicks();
 	assert(output.length == 2);
 	assert(output[1].canFind(`"uuid":"native-user-1"`));
 	assert(output[1].canFind(`"correlation_id":"nonce-1"`));

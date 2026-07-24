@@ -14,6 +14,7 @@ import ae.utils.json : JSONFragment, JSONOptional, JSONPartial;
 import ae.utils.promise : Promise, PromiseQueue;
 import ae.utils.statequeue : StateQueue;
 
+import cydo.agent.session : AgentSubmissionReceipt;
 import cydo.protocol : ContentBlock, ItemStartedEvent;
 import cydo.runtime.launch.types : ProcessLaunch;
 import cydo.domain.storage.persistence : LoadedHistory, noSourceLine;
@@ -514,6 +515,13 @@ struct PendingContinuation
 	string handoffPrompt; // only set for Kind.handoff
 }
 
+struct AcceptedNativeEcho
+{
+	AgentSubmissionReceipt receipt;
+	string nonce;
+	ulong generation;
+}
+
 struct TaskData
 {
 	this(int tid, string workspace, string projectPath)
@@ -576,9 +584,10 @@ struct TaskData
 	// Runtime state (not persisted)
 	/// Nonces of messages accepted in this session lifetime; cleared on exit.
 	bool[string] recentNonces;
-	/// Nonce of the last user message sent to the agent; tagged onto the
-	/// agent's user_message echo so the reducer can dedupe by nonce alone.
-	string pendingUserNonce;
+	/// Native user echoes belonging to accepted submissions in this history lineage.
+	AcceptedNativeEcho[] acceptedNativeEchoes;
+	/// Browser nonce delivery leases held until the matching submission settles.
+	ulong[string] inFlightUiNonceGeneration;
 	ProcessLaunch launch;
 	HistoryStore history;     // unified: JSONL file events + live stdout events
 	StateQueue!ProcessState* processQueue;
@@ -632,6 +641,13 @@ struct TaskData
 		queueTailAwaitingUuids = null;
 		queueTailAwaitingNonces = null;
 		sentNonceFifo = null;
+	}
+
+	void clearSubmissionCorrelationState()
+	{
+		acceptedNativeEchoes = null;
+		inFlightUiNonceGeneration = null;
+		clearQueueTailState();
 	}
 
 	void setLastSessionStatus(string translatedStatus, long ts)

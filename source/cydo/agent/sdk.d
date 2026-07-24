@@ -118,6 +118,7 @@ package(cydo.agent) interface SdkSessionHandler
 	Promise!SdkPermissionResult handlePermissionRequest(SdkPermissionRequest params);
 	Promise!SdkToolCallResult handleToolCall(SdkToolCallRequest params);
 	void handleStderr(string line);
+	void handleStartupFailure(Exception error);
 	void handleExit(int status);
 }
 
@@ -227,8 +228,14 @@ class SdkProcess
 		sendPing();
 	}
 
+	version (unittest) private this(IConnection connection,
+		bool sendInitializationPing)
+	{
+		initializeTestSdkProcess(this, connection, sendInitializationPing);
+	}
+
 	@property State state() { return state_; }
-	@property bool dead() { return state_ == State.dead || process.dead; }
+	@property bool dead() { return state_ == State.failed || state_ == State.dead || process.dead; }
 
 	void registerSession(string sessionId, SdkSessionHandler handler)
 	{
@@ -283,8 +290,7 @@ class SdkProcess
 		process.killAfterTimeout(3.seconds);
 	}
 
-	/// Queue an action for when the server is ready. Runs immediately if
-	/// already ready; silently dropped if failed/dead.
+	/// Queue an action for when the server is ready. Runs immediately if ready.
 	void onReady(void delegate() dg)
 	{
 		if (state_ == State.ready)
@@ -320,7 +326,7 @@ class SdkProcess
 		.then((JsonRpcResponse resp) {
 			if (resp.isError)
 			{
-				state_ = State.failed;
+				failStartup(new Exception(resp.error.get.message));
 				return;
 			}
 			int protocolVersion = 0;
@@ -333,7 +339,7 @@ class SdkProcess
 
 			if (protocolVersion < 2)
 			{
-				state_ = State.failed;
+				failStartup(new Exception("Copilot SDK protocol version is unsupported"));
 				return;
 			}
 			state_ = State.ready;
@@ -343,7 +349,60 @@ class SdkProcess
 				dg();
 		})
 		.except((Exception e) {
-			state_ = State.failed;
+			failStartup(e);
 		});
 	}
+
+	private void failStartup(Exception error)
+	{
+		if (state_ == State.failed || state_ == State.dead)
+			return;
+		state_ = State.failed;
+		readyQueue = null;
+		auto handlers = sessions.values;
+		foreach (handler; handlers)
+			handler.handleStartupFailure(error);
+	}
+}
+
+version (unittest) private final class TestSdkProcess : SdkProcess
+{
+	this(IConnection connection, bool sendInitializationPing)
+	{
+		super(connection, sendInitializationPing);
+	}
+
+	override @property bool dead()
+	{
+		return state_ == State.failed || state_ == State.dead;
+	}
+
+	override void shutdown()
+	{
+		if (dead)
+			return;
+		state_ = State.dead;
+		auto sessionsCopy = sessions.values;
+		foreach (session; sessionsCopy)
+			session.handleExit(1);
+	}
+}
+
+version (unittest) private void initializeTestSdkProcess(SdkProcess server,
+	IConnection connection, bool sendInitializationPing)
+{
+	server.codec = new JsonRpcCodec(connection);
+	auto router = new SdkServerRouter(server);
+	server.serverDispatcher = jsonRpcDispatcher!ISdkServer(router);
+	server.codec.handleRequest = &server.serverDispatcher.dispatch;
+	if (sendInitializationPing)
+		server.sendPing();
+	else
+		server.state_ = SdkProcess.State.ready;
+}
+
+version (unittest) package(cydo.agent) SdkProcess makeTestSdkProcess(
+	IConnection connection, bool sendInitializationPing = false)
+{
+	return new TestSdkProcess(connection, sendInitializationPing);
 }

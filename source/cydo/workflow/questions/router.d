@@ -96,8 +96,6 @@ private:
 	/// legitimately receive the answer; any other state is a logic error.
 	void reactivateAskerAfterAnswer(int askerTid)
 	{
-		import std.exception : enforce;
-
 		auto askerTd = host_.getTask(askerTid);
 		if (askerTd is null)
 			return;
@@ -105,7 +103,7 @@ private:
 			host_.transitionTask(askerTid, TaskStatus.waiting,
 				TaskStatus.active, TaskNotificationChange.clearBody);
 		else
-			enforce(askerTd.status == TaskStatus.active,
+			assert(askerTd.status == TaskStatus.active,
 				"Ask answer delivered with asker in unexpected status: "
 				~ cast(string) askerTd.status);
 	}
@@ -428,16 +426,14 @@ private:
 	void deliverInjectedQuestion(QuestionRoute route, string message)
 	{
 		auto sendQuestion = (QuestionRoute currentRoute) {
-			if (currentRoute.qid !in questionRoutes_)
-				return;
+			assert((currentRoute.qid in questionRoutes_) !is null,
+				"Question route disappeared before injected delivery");
 
 			auto currentAnswerer = host_.getTask(currentRoute.answererTid);
-			if (currentAnswerer is null || !host_.isTaskAlive(currentRoute.answererTid))
-			{
-				failQuestionRoute(currentRoute.qid,
-					"Session ended while waiting for Ask response");
-				return;
-			}
+			assert(currentAnswerer !is null,
+				"Injected question answerer task must exist");
+			assert(host_.isTaskAlive(currentRoute.answererTid),
+				"Injected question answerer session must be live");
 
 			if (currentAnswerer.status != TaskStatus.active)
 				host_.transitionTaskFrom(currentRoute.answererTid,
@@ -449,36 +445,44 @@ private:
 			string prompt;
 			string meta;
 			string promptNonce;
-			if (currentRoute.afterAnswer
-				== QuestionAfterAnswer.completeAnswererOnIdle)
+			try
 			{
-				auto followUpMsgSubject = followUpFromParentSubject(currentRoute.qid);
-				auto followUpBody = host_.readPromptFile(
-					"prompts/follow_up_from_parent.md",
-					currentAnswerer.projectPath, [
-						"message": message,
-						"qid": to!string(currentRoute.qid),
-					]);
-				prompt = wrapKnownSystemMessage(host_.systemKeyword(),
-					KnownSystemMessageKind.followUpFromParent, followUpBody,
-					followUpMsgSubject);
-				meta = host_.buildKnownSystemMessageMeta(
-					KnownSystemMessageKind.followUpFromParent,
-					followUpMsgSubject,
-					["message": message], "message");
-				promptNonce = "follow-up:" ~ to!string(currentRoute.qid);
+				if (currentRoute.afterAnswer
+					== QuestionAfterAnswer.completeAnswererOnIdle)
+				{
+					auto followUpMsgSubject = followUpFromParentSubject(currentRoute.qid);
+					auto followUpBody = host_.readPromptFile(
+						"prompts/follow_up_from_parent.md",
+						currentAnswerer.projectPath, [
+							"message": message,
+							"qid": to!string(currentRoute.qid),
+						]);
+					prompt = wrapKnownSystemMessage(host_.systemKeyword(),
+						KnownSystemMessageKind.followUpFromParent, followUpBody,
+						followUpMsgSubject);
+					meta = host_.buildKnownSystemMessageMeta(
+						KnownSystemMessageKind.followUpFromParent,
+						followUpMsgSubject,
+						["message": message], "message");
+					promptNonce = "follow-up:" ~ to!string(currentRoute.qid);
+				}
+				else
+				{
+					prompt = makeQuestionMessage(currentRoute.askerTid, currentRoute.qid,
+						message, currentAnswerer.projectPath);
+					auto qftSubject = questionFromTaskSubject(currentRoute.askerTid,
+						currentRoute.qid);
+					meta = host_.buildKnownSystemMessageMeta(
+						KnownSystemMessageKind.questionFromTask, qftSubject,
+						["message": message], "message");
+					promptNonce = "question:" ~ to!string(currentRoute.qid);
+				}
 			}
-			else
+			catch (Exception e)
 			{
-				prompt = makeQuestionMessage(currentRoute.askerTid, currentRoute.qid,
-					message, currentAnswerer.projectPath);
-				auto qftSubject = questionFromTaskSubject(currentRoute.askerTid,
-					currentRoute.qid);
-				meta = host_.buildKnownSystemMessageMeta(
-					KnownSystemMessageKind.questionFromTask, qftSubject,
-					["message": message], "message");
-				promptNonce = "question:" ~ to!string(currentRoute.qid);
+				assert(0, "Unable to prepare injected question prompt: " ~ e.msg);
 			}
+
 			Promise!void sendPromise;
 			try
 			{
@@ -490,25 +494,23 @@ private:
 				failQuestionRoute(currentRoute.qid,
 					"Failed to submit Ask question to task "
 						~ to!string(currentRoute.answererTid) ~ ": " ~ e.msg);
-				return;
+				return resolve();
 			}
 
-			sendPromise.then(() {
-				if (auto routePtr = currentRoute.qid in questionRoutes_)
-					(*routePtr).delivered = true;
+			return sendPromise.then(() {
+				auto routePtr = currentRoute.qid in questionRoutes_;
+				assert(routePtr !is null,
+					"Question route disappeared before injected delivery acceptance");
+				(*routePtr).delivered = true;
 			}, (Exception e) {
 				failQuestionRoute(currentRoute.qid,
 					"Failed to submit Ask question to task "
 						~ to!string(currentRoute.answererTid) ~ ": " ~ e.msg);
-			}).ignoreResult();
+			});
 		};
 
-		if (host_.getTask(route.answererTid) is null)
-		{
-			failQuestionRoute(route.qid,
-				"Target task not found: " ~ to!string(route.answererTid));
-			return;
-		}
+		assert(host_.getTask(route.answererTid) !is null,
+			"Injected question target task must exist");
 
 		auto answererTd = host_.getTask(route.answererTid);
 		if (answererTd.status == TaskStatus.waiting && answererTd.isProcessing)
@@ -517,14 +519,7 @@ private:
 				auto routePtr = route.qid in questionRoutes_;
 				if (routePtr is null)
 					return;
-				auto currentAnswerer = host_.getTask((*routePtr).answererTid);
-				if (currentAnswerer is null || !host_.isTaskAlive((*routePtr).answererTid))
-				{
-					failQuestionRoute((*routePtr).qid,
-						"Session ended while waiting for Ask response");
-					return;
-				}
-				sendQuestion(*routePtr);
+				sendQuestion(*routePtr).ignoreResult();
 			});
 			return;
 		}
@@ -542,16 +537,18 @@ private:
 			return;
 		}
 
-		reactivationPromise.then(() {
+		auto deliveryPromise = reactivationPromise.then(() {
 			auto routePtr = route.qid in questionRoutes_;
-			if (routePtr is null)
-				return;
-			sendQuestion(*routePtr);
+			assert(routePtr !is null,
+				"Question route disappeared during target reactivation");
+			return sendQuestion(*routePtr);
 		}, (Exception e) {
 			failQuestionRoute(route.qid,
 				"Failed to reactivate Ask target "
 					~ to!string(route.answererTid) ~ ": " ~ e.msg);
-		}).ignoreResult();
+			return resolve();
+		});
+		deliveryPromise.ignoreResult();
 	}
 
 	void deferOrDeliverAnswer(QuestionRoute route, McpResult answerResult)
@@ -701,8 +698,10 @@ unittest
 {
 	import ae.net.asockets : socketManager;
 	import ae.utils.promise : reject;
+	import core.exception : AssertError;
 	import cydo.domain.tasks.model : BatchSignal;
 	import cydo.workflow.batch.router : BatchConsumeKind;
+	import std.exception : assertThrown;
 
 	void drainPromiseNextTicks()
 	{
@@ -742,6 +741,7 @@ unittest
 		size_t finalReactivations;
 		size_t finalSends;
 		bool checkDeliveredGate;
+		bool assertPreSendInvariant;
 		string failureCause;
 		string expectedError;
 	}
@@ -826,6 +826,14 @@ unittest
 			finalReactivations: 1,
 			finalSends: 1,
 			checkDeliveredGate: true,
+		),
+		DeliveryCase(
+			name: "illegal post-reactivation state asserts before injected send",
+			childStatus: TaskStatus.waiting,
+			gateReactivation: true,
+			initialReactivations: 1,
+			routesAfterStart: 1,
+			assertPreSendInvariant: true,
 		),
 	];
 
@@ -961,7 +969,14 @@ unittest
 		if (test.gateReactivation)
 		{
 			assert(sendCalls == 0, test.name);
+			if (test.assertPreSendInvariant)
+				tasks[2].status = TaskStatus.importable;
 			reactivationGate.fulfill();
+			if (test.assertPreSendInvariant)
+			{
+				assertThrown!AssertError(drainPromiseNextTicks());
+				continue;
+			}
 		}
 
 		drainPromiseNextTicks();

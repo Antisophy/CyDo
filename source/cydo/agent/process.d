@@ -233,7 +233,7 @@ class AgentProcess
 	void sendMessage(string line)
 	{
 		if (dead)
-			return;
+			throw new Exception("Agent process is no longer running");
 		stdoutLines.send(Data(line.asBytes));
 	}
 

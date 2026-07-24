@@ -2,7 +2,6 @@ module cydo.workflow.tasks.subtask_delivery;
 
 import std.array : join;
 import std.conv : to;
-import std.exception : enforce;
 import std.file : exists;
 import std.logger : errorf, infof, tracef, warningf;
 import std.process : execute;
@@ -10,7 +9,7 @@ import std.range : retro;
 import std.string : splitLines, strip;
 
 import ae.utils.json : toJson;
-import ae.utils.promise : Promise;
+import ae.utils.promise : Promise, reject, resolve;
 
 import cydo.domain.tasks.model : TaskData, TaskStatus;
 import cydo.domain.tasks.lifecycle : TaskNotificationChange;
@@ -39,10 +38,12 @@ struct SubtaskResultDeliveryHost
 	void delegate(int childTid) markLiveDelivered;
 	Promise!void delegate(int tid) ensureProcessQueueAlive;
 	bool delegate(int tid, out string sessionState) canSendSystemMessage;
-	void delegate(int tid, KnownSystemMessageKind kind, string body) sendKnownSystemMessage;
+	Promise!void delegate(int tid, KnownSystemMessageKind kind, string body) sendKnownSystemMessage;
 	void delegate(int parentTid, int childTid) removeTaskDependency;
 	bool delegate(int tid) taskAlive;
 	void delegate(void delegate() cb) onNextTick;
+	void delegate(int tid, string subject, string body)
+		appendAndBroadcastRecoveryDeliveryDiagnostic;
 }
 
 class SubtaskResultDelivery
@@ -101,17 +102,17 @@ public:
 		return true;
 	}
 
-	void deliverWaitingParentResultsIfReady(int tid)
+	Promise!void deliverWaitingParentResultsIfReady(int tid)
 	{
 		auto parentTid = host_.parentTaskForChild(tid);
 		if (parentTid <= 0)
-			return;
+			return resolve();
 
 		if (host_.wasLiveDelivered(tid))
 		{
 			tracef("onExit Branch B: child tid=%d already delivered to live batch, skipping fallback",
 				tid);
-			return;
+			return resolve();
 		}
 
 		auto td = requireTask(tid, "Completed child task must exist while delivering parent fallback results");
@@ -121,7 +122,7 @@ public:
 		if (host_.getTask(parentTid) is null)
 		{
 			tracef("onExit Branch B: parent tid=%d not in tasks", parentTid);
-			return;
+			return resolve();
 		}
 
 		foreach (childTid; host_.childTaskIds(parentTid))
@@ -133,21 +134,21 @@ public:
 			{
 				tracef("onExit Branch B: sibling tid=%d still %s, deferring batch delivery",
 					childTid, child.status);
-				return;
+				return resolve();
 			}
 		}
 
-		deliverBatchResults(parentTid);
+		return deliverBatchResults(parentTid);
 	}
 
-	void deliverBatchFallbackIfReady(int parentTid)
+	Promise!void deliverBatchFallbackIfReady(int parentTid)
 	{
 		if (host_.getTask(parentTid) is null)
-			return;
+			return resolve();
 
 		auto children = host_.childTaskIds(parentTid);
 		if (children.length == 0)
-			return;
+			return resolve();
 
 		foreach (childTid; children)
 		{
@@ -155,41 +156,63 @@ public:
 			if (child !is null
 				&& child.status != "completed"
 				&& child.status != "failed")
-				return;
+				return resolve();
 		}
 
-		deliverBatchResults(parentTid);
+		return deliverBatchResults(parentTid);
 	}
 
-	void deliverBatchResults(int parentTid)
+	Promise!void deliverBatchResults(int parentTid)
 	{
 		if (host_.getTask(parentTid) is null)
-			return;
+			return resolve();
 
-		host_.ensureProcessQueueAlive(parentTid).then(() {
-			actuallyDeliverBatchResults(parentTid);
-		}).except((Exception e) {
-			errorf("deliverBatchResults: failed for parent %d: %s", parentTid, e.msg);
-		});
+		try
+			return host_.ensureProcessQueueAlive(parentTid).then(() {
+				return actuallyDeliverBatchResults(parentTid);
+			});
+		catch (Exception e)
+			return reject!void(e);
 	}
 
-	void sendSystemRestartNudge(int tid)
+	Promise!void sendSystemRestartNudge(int tid)
 	{
 		if (host_.getTask(tid) is null)
-			return;
+			return resolve();
 
+		auto attempt = new Promise!void;
 		host_.onNextTick(() {
 			if (host_.getTask(tid) is null)
+			{
+				attempt.fulfill();
 				return;
+			}
 			if (!host_.taskAlive(tid))
+			{
+				attempt.fulfill();
 				return;
+			}
 
 			enum nudgeBody = "Your session was interrupted by a harness restart. "
 				~ "Continue from where you left off. If you had a tool call in progress "
 				~ "(Task, Handoff, SwitchMode, or any other tool), retry it.";
-			host_.sendKnownSystemMessage(tid, KnownSystemMessageKind.restartNudge,
-				nudgeBody);
+			try
+			{
+				host_.sendKnownSystemMessage(tid, KnownSystemMessageKind.restartNudge,
+					nudgeBody).then(() {
+					attempt.fulfill();
+				}, (Exception e) {
+					handleRecoveryDeliveryFailure(tid, e);
+					attempt.fulfill();
+				}).ignoreResult();
+			}
+			catch (Exception e)
+			{
+				handleRecoveryDeliveryFailure(tid, e);
+				attempt.fulfill();
+			}
 		});
+		return attempt;
 	}
 
 private:
@@ -232,7 +255,7 @@ private:
 			{
 				auto logResult = execute(["git", "-C", host_.worktreePath(td),
 					"log", "--format=%H", td.taskStartHead ~ "..HEAD"]);
-				enforce(logResult.status == 0,
+				assert(logResult.status == 0,
 					"Failed to collect commits for task " ~ to!string(tid)
 					~ " (git status " ~ to!string(logResult.status) ~ "): "
 					~ logResult.output.strip);
@@ -248,14 +271,14 @@ private:
 		return result;
 	}
 
-	void actuallyDeliverBatchResults(int parentTid)
+	Promise!void actuallyDeliverBatchResults(int parentTid)
 	{
 		import ae.utils.json : toJson;
 
 		if (host_.getTask(parentTid) is null)
 		{
 			tracef("deliverBatchResults: parent tid=%d not in tasks, skipping", parentTid);
-			return;
+			return resolve();
 		}
 
 		string sessionState;
@@ -263,15 +286,14 @@ private:
 		{
 			warningf("actuallyDeliverBatchResults: parent tid=%d session %s, retrying via deliverBatchResults",
 				parentTid, sessionState);
-			deliverBatchResults(parentTid);
-			return;
+			return deliverBatchResults(parentTid);
 		}
 
 		auto children = host_.childTaskIds(parentTid);
 		if (children.length == 0)
 		{
 			tracef("deliverBatchResults: parent tid=%d has no children in taskDeps", parentTid);
-			return;
+			return resolve();
 		}
 
 		string[] resultJsons;
@@ -283,7 +305,7 @@ private:
 		}
 
 		if (resultJsons.length == 0)
-			return;
+			return resolve();
 
 		infof("deliverBatchResults: delivering %d result(s) to parent tid=%d",
 			resultJsons.length, parentTid);
@@ -295,18 +317,272 @@ private:
 			~ "<task_results>\n" ~ resultsArray ~ "\n</task_results>\n\n"
 			~ "Continue from where you left off. Process these results as if they "
 			~ "were returned normally by the Task tool.";
-		host_.sendKnownSystemMessage(parentTid, KnownSystemMessageKind.subTaskResults,
-			body);
+		try
+		{
+			return host_.sendKnownSystemMessage(parentTid,
+				KnownSystemMessageKind.subTaskResults, body).then(() {
+				foreach (childTid; children)
+					host_.removeTaskDependency(parentTid, childTid);
+			}, (Exception e) {
+				handleRecoveryDeliveryFailure(parentTid, e);
+			});
+		}
+		catch (Exception e)
+		{
+			handleRecoveryDeliveryFailure(parentTid, e);
+			return resolve();
+		}
+	}
 
-		foreach (childTid; children)
-			host_.removeTaskDependency(parentTid, childTid);
+	void handleRecoveryDeliveryFailure(int parentTid, Exception error)
+	{
+		auto parent = requireTask(parentTid,
+			"Recovered delivery parent must exist when handling submission failure");
+		if (parent.status == TaskStatus.failed)
+			return;
+		assert(parent.status == TaskStatus.waiting || parent.status == TaskStatus.active
+			|| parent.status == TaskStatus.alive,
+			"Recovered delivery failed outside waiting, active, or alive parent state");
+		if (parent.status == TaskStatus.active)
+			host_.transitionTask(parentTid, TaskStatus.active, TaskStatus.waiting,
+				TaskNotificationChange.preserve);
+		else if (parent.status == TaskStatus.alive)
+			host_.transitionTask(parentTid, TaskStatus.alive, TaskStatus.waiting,
+				TaskNotificationChange.preserve);
+		parent.isProcessing = false;
+		host_.appendAndBroadcastRecoveryDeliveryDiagnostic(parentTid,
+			"Failed to deliver recovered sub-task results", error.msg);
 	}
 
 	TaskData* requireTask(int tid, string message)
 	{
 		auto td = host_.getTask(tid);
-		enforce(td !is null, message);
+		assert(td !is null, message);
 		return td;
+	}
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager,
+				"nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	enum SubmissionFailure
+	{
+		none,
+		synchronous,
+		asynchronous,
+	}
+
+	struct DeliveryCase
+	{
+		string name;
+		SubmissionFailure failure;
+		TaskStatus initialParentStatus;
+		bool initialParentProcessing;
+		string failureMessage;
+		bool ownerFailsBeforeRejection;
+	}
+
+	auto cases = [
+		DeliveryCase(
+			"gated submission commits recovered results after acceptance",
+			SubmissionFailure.none,
+			TaskStatus.waiting,
+			false,
+			"",
+			false,
+		),
+		DeliveryCase(
+			"synchronous submission rejection leaves the parent retryable",
+			SubmissionFailure.synchronous,
+			TaskStatus.waiting,
+			true,
+			"simulated synchronous submission rejection",
+			false,
+		),
+		DeliveryCase(
+			"asynchronous submission rejection restores the parent for retry",
+			SubmissionFailure.asynchronous,
+			TaskStatus.active,
+			true,
+			"simulated asynchronous submission rejection",
+			false,
+		),
+		DeliveryCase(
+			"already-failed parent receives no recovery duplicate",
+			SubmissionFailure.asynchronous,
+			TaskStatus.waiting,
+			false,
+			"simulated asynchronous submission rejection",
+			true,
+		),
+	];
+
+	foreach (test; cases)
+	{
+		TaskData[int] tasks;
+		tasks[1] = TaskData(1, "local", "/tmp/cydo-recovery-delivery");
+		tasks[1].status = test.initialParentStatus;
+		tasks[1].isProcessing = test.initialParentProcessing;
+		tasks[2] = TaskData(2, "local", "/tmp/cydo-recovery-delivery");
+		tasks[2].status = TaskStatus.completed;
+		tasks[2].resultText = "first recovered result";
+		tasks[3] = TaskData(3, "local", "/tmp/cydo-recovery-delivery");
+		tasks[3].status = TaskStatus.completed;
+		tasks[3].resultText = "second recovered result";
+
+		int[] dependencies = [2, 3];
+		int[] removedChildren;
+		size_t sendCalls;
+		size_t activationCalls;
+		size_t restoreWaitingCalls;
+		size_t recoveryDiagnosticCalls;
+		string[] diagnosticSubjects;
+		string[] diagnosticBodies;
+		auto submissionGate = new Promise!void;
+
+		auto delivery = new SubtaskResultDelivery(SubtaskResultDeliveryHost(
+			getTask: (int tid) {
+				auto task = tid in tasks;
+				return task is null ? null : task;
+			},
+			outputPath: (const TaskData* task) => "",
+			worktreePath: (const TaskData* task) => "",
+			taskProducesCommitOutput: (string projectPath, string taskType) => false,
+			transitionTask: (int tid, TaskStatus expectedFrom, TaskStatus to,
+				TaskNotificationChange notification) {
+				assert(tid == 1, test.name);
+				assert(tasks[tid].status == expectedFrom, test.name);
+				if (expectedFrom == TaskStatus.active && to == TaskStatus.waiting)
+					restoreWaitingCalls++;
+				tasks[tid].status = to;
+			},
+			childTaskIds: (int parentTid) {
+				assert(parentTid == 1, test.name);
+				return dependencies;
+			},
+			ensureProcessQueueAlive: (int tid) {
+				assert(tid == 1, test.name);
+				return resolve();
+			},
+			canSendSystemMessage: (int tid, out string sessionState) {
+				assert(tid == 1, test.name);
+				sessionState = "";
+				return true;
+			},
+			sendKnownSystemMessage: (int tid, KnownSystemMessageKind kind,
+				string body) {
+				assert(tid == 1, test.name);
+				assert(kind == KnownSystemMessageKind.subTaskResults, test.name);
+				sendCalls++;
+				if (test.failure == SubmissionFailure.synchronous)
+					throw new Exception(test.failureMessage);
+				return submissionGate.then(() {
+					assert(tasks[tid].status == TaskStatus.waiting, test.name);
+					activationCalls++;
+					tasks[tid].status = TaskStatus.active;
+					tasks[tid].isProcessing = true;
+				});
+			},
+			removeTaskDependency: (int parentTid, int childTid) {
+				assert(parentTid == 1, test.name);
+				removedChildren ~= childTid;
+				foreach (i, dependency; dependencies)
+					if (dependency == childTid)
+					{
+						dependencies = dependencies[0 .. i]
+							~ dependencies[i + 1 .. $];
+						return;
+					}
+				assert(false, test.name);
+			},
+			appendAndBroadcastRecoveryDeliveryDiagnostic:
+				(int tid, string subject, string body) {
+					assert(tid == 1, test.name);
+					recoveryDiagnosticCalls++;
+					diagnosticSubjects ~= subject;
+					diagnosticBodies ~= body;
+				},
+		));
+
+		bool deliverySettled;
+		bool deliveryRejected;
+		delivery.deliverBatchResults(1).then(() {
+			deliverySettled = true;
+		}, (Exception e) {
+			deliveryRejected = true;
+		}).ignoreResult();
+		drainPromiseNextTicks();
+
+		assert(sendCalls == 1, test.name);
+		assert(deliverySettled
+			== (test.failure == SubmissionFailure.synchronous), test.name);
+		assert(!deliveryRejected, test.name);
+
+		if (test.failure == SubmissionFailure.none)
+		{
+			assert(tasks[1].status == TaskStatus.waiting, test.name);
+			assert(!tasks[1].isProcessing, test.name);
+			assert(activationCalls == 0, test.name);
+			assert(removedChildren.length == 0, test.name);
+			assert(dependencies == [2, 3], test.name);
+
+			submissionGate.fulfill();
+			drainPromiseNextTicks();
+
+			assert(tasks[1].status == TaskStatus.active, test.name);
+			assert(tasks[1].isProcessing, test.name);
+			assert(activationCalls == 1, test.name);
+			assert(removedChildren == [2, 3], test.name);
+			assert(dependencies.length == 0, test.name);
+			assert(recoveryDiagnosticCalls == 0, test.name);
+		}
+		else
+		{
+			if (test.ownerFailsBeforeRejection)
+			{
+				tasks[1].status = TaskStatus.failed;
+				tasks[1].resultText = "runner-owned failure";
+			}
+			if (test.failure == SubmissionFailure.asynchronous)
+				submissionGate.reject(new Exception(test.failureMessage));
+			drainPromiseNextTicks();
+
+			assert(tasks[1].status == (test.ownerFailsBeforeRejection
+				? TaskStatus.failed : TaskStatus.waiting), test.name);
+			assert(!tasks[1].isProcessing, test.name);
+			assert(activationCalls == 0, test.name);
+			assert(removedChildren.length == 0, test.name);
+			assert(dependencies == [2, 3], test.name);
+			assert(recoveryDiagnosticCalls == (test.ownerFailsBeforeRejection ? 0 : 1),
+				test.name);
+			if (!test.ownerFailsBeforeRejection)
+			{
+				assert(diagnosticSubjects == ["Failed to deliver recovered sub-task results"],
+					test.name);
+				assert(diagnosticBodies == [test.failureMessage], test.name);
+			}
+			assert(restoreWaitingCalls
+				== (test.failure == SubmissionFailure.asynchronous
+					&& !test.ownerFailsBeforeRejection ? 1 : 0),
+				test.name);
+		}
+
+		assert(deliverySettled && !deliveryRejected, test.name);
 	}
 }
 

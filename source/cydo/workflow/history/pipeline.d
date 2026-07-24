@@ -429,8 +429,6 @@ class HistoryEventPipeline
 			return;
 		td.history.appendLive(data, null);
 		host_.sendToSubscribed(tid, data);
-		if (nonce.length > 0)
-			td.pendingUserNonce = nonce;
 		td.pendingSteeringTexts ~= extractContentText(uiContent);
 	}
 

@@ -10,13 +10,13 @@ import std.math : isNaN;
 import std.typecons : Nullable;
 
 import ae.utils.json : JSONExtras, JSONFragment, JSONName, JSONOptional, JSONPartial, jsonParse, toJson;
-import ae.utils.promise : Promise;
+import ae.utils.promise : Promise, reject, resolve;
 import ae.utils.time.types : AbsTime;
 
 import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary, PersistedHistoryBoundaryKind, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
 import cydo.protocol;
 import cydo.agent.process : AgentProcess, FramingMode;
-import cydo.agent.session : AgentSession;
+import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.runtime.config : AgentDriver;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
@@ -869,26 +869,31 @@ class ClaudeCodeSession : AgentSession
 
 	/// Send a user message formatted as Claude stream-json input.
 	/// correlationId is accepted for interface compatibility but not used:
-	/// claude has no separable agent-ack signal between stdin-write and the
-	/// user-line echo, so state 2 is intentionally skipped.
-	void sendMessage(const(ContentBlock)[] content, string correlationId = null,
+	/// Claude has no separable app-server acknowledgment beyond local enqueue.
+	Promise!AgentSubmissionReceipt sendMessage(const(ContentBlock)[] content, string correlationId = null,
 		bool isContextBootstrap = false)
 	{
-		// Use plain string content when possible (single text block) for backward
-		// compatibility with Claude CLI's JSONL format.  Array content is only
-		// needed when images or multiple blocks are present.
-		JSONFragment claudeContent;
-		if (content.length == 1 && content[0].type == "text")
-			claudeContent = JSONFragment(toJson(content[0].text));
-		else
-			claudeContent = buildClaudeContentBlocks(content);
-		auto input = ClaudeInput(
-			"user",
-			ClaudeInputMessage("user", claudeContent),
-			"default",
-			null,
-		);
-		process.sendMessage(toJson(input));
+		try
+		{
+			// Use plain string content when possible (single text block) for backward
+			// compatibility with Claude CLI's JSONL format.  Array content is only
+			// needed when images or multiple blocks are present.
+			JSONFragment claudeContent;
+			if (content.length == 1 && content[0].type == "text")
+				claudeContent = JSONFragment(toJson(content[0].text));
+			else
+				claudeContent = buildClaudeContentBlocks(content);
+			auto input = ClaudeInput(
+				"user",
+				ClaudeInputMessage("user", claudeContent),
+				"default",
+				null,
+			);
+			process.sendMessage(toJson(input));
+		}
+		catch (Exception e)
+			return reject!AgentSubmissionReceipt(e);
+		return resolve(AgentSubmissionReceipt.localEnqueued);
 	}
 
 	void invalidatePendingSubmittedMessages() {}
@@ -930,10 +935,6 @@ class ClaudeCodeSession : AgentSession
 	{
 		return true;
 	}
-
-	// No-op: claude has no separable agent-ack signal; state 2 is skipped.
-	@property void onAgentAck(void delegate(string nonce) dg) {}
-
 
 	@property void onOutput(void delegate(TranslatedEvent) dg)
 	{
@@ -1516,6 +1517,89 @@ unittest
 	assert(history.subject == "Agent error");
 	assert(history.body == "history reasoninghistory error");
 	assert(historyEvents[0].raw == historyRaw);
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager,
+				"nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	void assertRejected(Promise!AgentSubmissionReceipt submission,
+		string expectedMessage)
+	{
+		bool fulfilled;
+		string rejectionMessage;
+		submission.then((AgentSubmissionReceipt receipt) {
+			fulfilled = true;
+		}, (Exception error) {
+			rejectionMessage = error.msg;
+		}).ignoreResult();
+		drainPromiseNextTicks();
+		assert(!fulfilled && rejectionMessage == expectedMessage);
+	}
+
+	// A live local stdin enqueue is Claude's only submission receipt; it must
+	// not wait for an app-server response that Claude does not provide.
+	{
+		auto session = new ClaudeCodeSession("true");
+		scope(exit) session.stop();
+
+		bool fulfilled;
+		session.sendMessage([ContentBlock("text", "local enqueue")],
+			"ignored-nonce").then((AgentSubmissionReceipt receipt) {
+			assert(receipt == AgentSubmissionReceipt.localEnqueued);
+			fulfilled = true;
+		}).ignoreResult();
+		drainPromiseNextTicks();
+		assert(fulfilled);
+	}
+
+	// A disconnected local transport rejects through the returned promise.
+	{
+		auto session = new ClaudeCodeSession("true");
+		scope(exit) session.stop();
+		session.process.forceClosePipes();
+
+		Promise!AgentSubmissionReceipt submission;
+		try
+			submission = session.sendMessage([ContentBlock("text", "dead")]);
+		catch (Exception error)
+			assert(false, "sendMessage threw instead of returning a rejection: "
+				~ error.msg);
+		assertRejected(submission, "Agent process is no longer running");
+	}
+
+	// Content conversion failures likewise belong to the promise contract,
+	// rather than escaping synchronously before a caller can attach rejection
+	// handling.
+	{
+		auto session = new ClaudeCodeSession("true");
+		scope(exit) session.stop();
+
+		Promise!AgentSubmissionReceipt submission;
+		try
+			submission = session.sendMessage([
+				ContentBlock("unsupported", "cannot serialize"),
+			]);
+		catch (Exception error)
+			assert(false, "sendMessage threw instead of returning a rejection: "
+				~ error.msg);
+		assertRejected(submission,
+			"Unsupported content block type for Claude: unsupported");
+	}
 }
 
 private:
