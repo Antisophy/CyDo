@@ -629,6 +629,13 @@ export function matchPattern(userText) {
         'rg -n --context=3 "semantic shell" /tmp/tests/e2e/semantic-shell.spec.ts',
     };
 
+  // "fail with usage limit" → the mock API answers HTTP 429 usage_limit_reached,
+  // which the agent binary turns into a terminal turn error.
+  // Kept after the "call task ..." patterns so a parent prompt like
+  // "call task research fail with usage limit" still creates the sub-task.
+  if (/fail with usage limit/i.test(userText))
+    return { type: "usage_limit_error" };
+
   // "reply with "<text>""
   match = userText.match(/reply with "([^"]*)"/i);
   if (match) return { type: "text", text: match[1] };

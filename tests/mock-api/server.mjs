@@ -657,6 +657,19 @@ function handleResponses(req, res) {
       return;
     }
 
+    // Terminal usage-limit failure: Codex maps a 429 with
+    // {"error":{"type":"usage_limit_reached"}} to a fatal UsageLimitReached
+    // turn error (no retries).
+    if (intent?.type === "usage_limit_error") {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: { type: "usage_limit_reached", resets_at: null },
+        }),
+      );
+      return;
+    }
+
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",

@@ -14,7 +14,7 @@ package struct CodexSessionRouteTarget
 	void delegate(DeltaParams, string, string) handleDelta;
 	void delegate(TerminalInteractionParams, string) handleTerminalInteraction;
 	void delegate(ItemCompletedParams, string) handleItemCompleted;
-	void delegate(string) handleTurnCompleted;
+	void delegate(TurnCompletedParams, string) handleTurnCompleted;
 	void delegate(TurnRef) handleTurnStarted;
 	void delegate(TokenUsageUpdatedParams, string) handleTokenUsageUpdated;
 	void delegate(int) onServerExit;
@@ -66,7 +66,7 @@ package interface ICodexServer
 	Promise!void itemCompleted(ItemCompletedParams params);
 
 	@RPCName("turn/completed")
-	Promise!void turnCompleted(ThreadIdParams params);
+	Promise!void turnCompleted(TurnCompletedParams params);
 
 	@RPCName("thread/compacted")
 	Promise!void threadCompacted(ThreadIdParams params);
@@ -120,13 +120,13 @@ private string buildRawNotification(string method, string paramsJson)
 	return `{"jsonrpc":"2.0","method":"` ~ method ~ `","params":` ~ paramsJson ~ `}`;
 }
 
-private string extractErrorMessage(ErrorParams params)
+package string extractCodexErrorMessage(SO error)
 {
 	string message;
-	if (params.error)
+	if (error)
 	{
 		@JSONPartial static struct ErrorInfo { @JSONOptional string message; }
-		try { message = jsonParse!ErrorInfo(toJson(params.error)).message; }
+		try { message = jsonParse!ErrorInfo(toJson(error)).message; }
 		catch (Exception) {}
 	}
 	return message;
@@ -137,7 +137,7 @@ private TranslatedEvent makeAgentErrorTranslatedEvent(ErrorParams params)
 	TaskDiagnosticEvent ev;
 	ev.severity = params.willRetry ? TaskDiagnosticSeverity.warning : TaskDiagnosticSeverity.error;
 	ev.subject = params.willRetry ? "Agent error (retrying)" : "Agent error";
-	ev.body = extractErrorMessage(params);
+	ev.body = extractCodexErrorMessage(params.error);
 	if (ev.body.length == 0)
 		ev.body = "Unknown error";
 	return TranslatedEvent(toJson(ev), buildRawNotification("error", toJson(params)));
@@ -347,11 +347,11 @@ package class CodexServerRouter : ICodexServer
 		return resolve();
 	}
 
-	Promise!void turnCompleted(ThreadIdParams params)
+	Promise!void turnCompleted(TurnCompletedParams params)
 	{
 		auto raw = buildRawNotification("turn/completed", toJson(params));
 		routeToSession(params.threadId,
-			(session) => session.handleTurnCompleted(raw));
+			(session) => session.handleTurnCompleted(params, raw));
 		return resolve();
 	}
 

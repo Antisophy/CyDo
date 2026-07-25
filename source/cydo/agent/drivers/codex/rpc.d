@@ -207,6 +207,21 @@ struct TurnRef
 	string id;
 }
 
+@JSONPartial
+struct CompletedTurn
+{
+	@JSONOptional string id;
+	@JSONOptional string status;
+	@JSONOptional SO error; // TurnError {message, codexErrorInfo, additionalDetails}; null unless status is "failed"
+}
+
+@RPCFlatten @JSONPartial
+struct TurnCompletedParams
+{
+	string threadId;
+	@JSONOptional CompletedTurn turn;
+}
+
 @RPCFlatten @JSONPartial
 struct TurnStartedParams
 {

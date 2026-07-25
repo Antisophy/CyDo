@@ -1674,7 +1674,7 @@ class CodexSession : AgentSession
 			activeItemId_ = null;
 	}
 
-	package void handleTurnCompleted(string rawNotification)
+	package void handleTurnCompleted(TurnCompletedParams params, string rawNotification)
 	{
 		turnInProgress = false;
 		activeTurnId_ = null;
@@ -1696,12 +1696,25 @@ class CodexSession : AgentSession
 		// 2. turn/result — always emitted
 		if (outputHandler_)
 		{
+			import cydo.agent.drivers.codex.app_server : extractCodexErrorMessage;
 			import cydo.protocol : TurnResultEvent, UsageInfo;
 			TurnResultEvent tre;
-			tre.subtype = "success";
 			tre.num_turns = 1;
 			tre.usage = UsageInfo(0, 0);
 			tre.result = lastResultText_;
+			if (params.turn.status == "failed")
+			{
+				auto message = extractCodexErrorMessage(params.turn.error);
+				if (message.length == 0)
+					message = "Unknown error";
+				tre.subtype = "error";
+				tre.is_error = true;
+				tre.errors = [message];
+				tre.result = lastResultText_.length > 0
+					? lastResultText_ ~ "\n\n" ~ message : message;
+			}
+			else
+				tre.subtype = "success";
 			outputHandler_(TranslatedEvent(toJson(tre), rawNotification));
 		}
 		lastResultText_ = null;
@@ -1822,11 +1835,74 @@ unittest
 	auto realStarted = jsonParse!StartedNotification(
 		`{"params":{"turnId":"turn","item":{"id":"message","type":"agentMessage"}}}`);
 	session.handleItemStarted(realStarted.params, "message-start");
-	session.handleTurnCompleted("turn-complete");
+	session.handleTurnCompleted(TurnCompletedParams("thread"), "turn-complete");
 	int stops;
 	foreach (event; emitted)
 		if (event.canFind(`"type":"turn/stop"`)) stops++;
 	assert(stops == 1);
+}
+
+unittest
+{
+	@JSONPartial struct EmittedTurnResult
+	{
+		string type;
+		string subtype;
+		@JSONOptional bool is_error;
+		@JSONOptional string result;
+		@JSONOptional string[] errors;
+	}
+	@JSONPartial struct CompletedNotification { TurnCompletedParams params; }
+	@JSONPartial struct StartedNotification { ItemStartedParams params; }
+
+	// A terminal turn failure (e.g. usage limit exceeded) must surface the
+	// error in the turn/result event instead of reporting an empty success.
+	auto session = new CodexSession(cast(AppServerProcess) null, 1, SessionConfig.init);
+	string[] emitted;
+	session.onOutput((TranslatedEvent ev) { emitted ~= ev.translated; });
+	auto failed = jsonParse!CompletedNotification(
+		`{"params":{"threadId":"thread-failed","turn":{"id":"turn-1","status":"failed",`
+		~ `"error":{"message":"You've hit your usage limit.",`
+		~ `"codexErrorInfo":"usageLimitExceeded","additionalDetails":null}}}}`);
+	session.handleTurnCompleted(failed.params, "raw-failed");
+	auto ev = jsonParse!EmittedTurnResult(emitted[$ - 1]);
+	assert(ev.type == "turn/result");
+	assert(ev.subtype == "error");
+	assert(ev.is_error);
+	assert(ev.result == "You've hit your usage limit.");
+	assert(ev.errors == ["You've hit your usage limit."]);
+	auto agent = new CodexAgent;
+	assert(agent.isTurnResult(emitted[$ - 1]));
+	assert(agent.extractResultText(emitted[$ - 1]) == "You've hit your usage limit.");
+
+	// A failed turn that produced partial agent text keeps that text and
+	// appends the error message.
+	auto partialStarted = jsonParse!StartedNotification(
+		`{"params":{"threadId":"thread-failed","turnId":"turn-2",`
+		~ `"item":{"id":"msg","type":"agentMessage","text":"Partial answer."}}}`);
+	session.handleItemStarted(partialStarted.params, "partial-start");
+	session.handleTurnCompleted(failed.params, "raw-failed");
+	ev = jsonParse!EmittedTurnResult(emitted[$ - 1]);
+	assert(ev.is_error);
+	assert(ev.result == "Partial answer.\n\nYou've hit your usage limit.");
+	assert(ev.errors == ["You've hit your usage limit."]);
+
+	// A failed turn with no error payload still reports an error.
+	auto failedNoDetail = jsonParse!CompletedNotification(
+		`{"params":{"threadId":"thread-failed","turn":{"id":"turn-3","status":"failed","error":null}}}`);
+	session.handleTurnCompleted(failedNoDetail.params, "raw-failed-no-detail");
+	ev = jsonParse!EmittedTurnResult(emitted[$ - 1]);
+	assert(ev.is_error);
+	assert(ev.result == "Unknown error");
+	assert(ev.errors == ["Unknown error"]);
+
+	// A successful turn keeps the success subtype.
+	auto ok = jsonParse!CompletedNotification(
+		`{"params":{"threadId":"thread-failed","turn":{"id":"turn-4","status":"completed","error":null}}}`);
+	session.handleTurnCompleted(ok.params, "raw-ok");
+	ev = jsonParse!EmittedTurnResult(emitted[$ - 1]);
+	assert(ev.subtype == "success");
+	assert(!ev.is_error);
 }
 
 unittest
@@ -2143,7 +2219,8 @@ unittest
 		`{"jsonrpc":"2.0","method":"item/commandExecution/outputDelta","params":{"threadId":"thread-ask","turnId":"turn-ask","itemId":"mcp-call-ask","delta":"late-output-marker\n"}}`;
 
 	auto lateDelta = jsonParse!DeltaNotification(lateDeltaPayload);
-	session.handleTurnCompleted(`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-ask"}}`);
+	session.handleTurnCompleted(TurnCompletedParams("thread-ask"),
+		`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-ask"}}`);
 	session.handleDelta(lateDelta.params, "output_delta", lateDeltaPayload);
 
 	auto lateDeltaEvent = jsonParse!EmittedDeltaEvent(emitted[$ - 1]);

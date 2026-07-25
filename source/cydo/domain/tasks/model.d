@@ -587,6 +587,7 @@ struct TaskData
 	Promise!ProcessState killPromise;  // non-null during active Dead transition
 	bool isProcessing = false;
 	bool hadTurnResult = false;    // true after first turn/result in this session lifetime
+	bool lastTurnFailed = false;   // is_error of the most recent turn/result (terminal agent error)
 	bool wasKilledByUser = false;  // set when user explicitly kills via stop button
 	bool undoStopInProgress; // true while undo fallback owns post-stop reload/finalization
 	bool stdinClosed = false;      // set after closeStdin, cleared on session restart/exit

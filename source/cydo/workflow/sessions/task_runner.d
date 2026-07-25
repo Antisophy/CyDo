@@ -7,7 +7,7 @@ import std.exception : enforce;
 import std.path : buildPath, dirName;
 import std.logger : infof, tracef, warningf;
 
-import ae.utils.json : JSONPartial, jsonParse, toJson;
+import ae.utils.json : JSONOptional, JSONPartial, jsonParse, toJson;
 import ae.utils.promise : Promise, reject, resolve;
 
 import cydo.agent.contract : Agent, SessionConfig;
@@ -99,6 +99,26 @@ unittest
 {
 	assertThrown!Exception(isAssistantTurnWork(
 		TranslatedEvent(`{"type":"item/started"`, null)));
+}
+
+/// Whether a translated turn/result event reports a terminal agent error
+/// (e.g. Codex usage limit exceeded) instead of a normal completion.
+private bool isErrorTurnResult(string translated)
+{
+	@JSONPartial struct ResultProbe
+	{
+		@JSONOptional bool is_error;
+	}
+
+	return jsonParse!ResultProbe(translated).is_error;
+}
+
+unittest
+{
+	assert(isErrorTurnResult(
+		`{"type":"turn/result","subtype":"error","is_error":true,"result":"limit"}`));
+	assert(!isErrorTurnResult(`{"type":"turn/result","subtype":"success","result":"ok"}`));
+	assert(!isErrorTurnResult(`{"type":"turn/result"}`));
 }
 
 struct TaskSessionLaunch
@@ -393,6 +413,7 @@ class TaskSessionRunner
 			"Task must have a task_type before spawning session");
 		td.wasKilledByUser = false;
 		td.hadTurnResult = false;
+		td.lastTurnFailed = false;
 		td.stdinClosed = false;
 		td.clearLastSessionStatus();
 		td.compactionReminderInFlight = false;
@@ -452,6 +473,7 @@ class TaskSessionRunner
 				return;
 
 			current.resultText = taskAgent.extractResultText(ev.translated);
+			current.lastTurnFailed = isErrorTurnResult(ev.translated);
 
 			bool hasOnYield = taskHasOnYield(current);
 			if (host_.hasPendingSubTask(tid) || current.pendingContinuation !is null
@@ -468,7 +490,10 @@ class TaskSessionRunner
 				}
 				else if (host_.hasPendingSubTask(tid))
 				{
-					if (current.pendingContinuation is null && !hasOnYield)
+					// A terminally-errored turn must not finalize the sub-task
+					// as a success; onExit delivers the failure instead.
+					if (current.pendingContinuation is null && !hasOnYield
+						&& !current.lastTurnFailed)
 					{
 						auto missingOutputs = host_.checkDeclaredOutputs(tid);
 						if (missingOutputs is null)
@@ -483,8 +508,11 @@ class TaskSessionRunner
 				if (current is null)
 					return;
 
+				// After a terminal agent error, prodding the agent to answer a
+				// pending child question would just fail again — close instead.
 				bool hasPendingChildQuestion =
 					current.pendingContinuation is null
+					&& !current.lastTurnFailed
 					&& host_.hasPendingChildQuestion(tid);
 
 				if (hasPendingChildQuestion)
@@ -660,7 +688,7 @@ class TaskSessionRunner
 			}
 
 			bool consumerWaiting = host_.hasPendingSubTask(tid) || host_.hasTaskDependency(tid);
-			if (cleanExit && consumerWaiting)
+			if (cleanExit && consumerWaiting && !current.lastTurnFailed)
 			{
 				auto missing = host_.checkDeclaredOutputs(tid);
 				if (missing !is null && !current.outputEnforcementAttempted)
@@ -680,11 +708,11 @@ class TaskSessionRunner
 			bool statusWasAlreadyTarget;
 			if (current.status == TaskStatus.completed)
 				statusWasAlreadyTarget = true;
-			else if (exitCode == 0 && host_.hasPendingSubTask(tid))
+			else if (exitCode == 0 && !current.lastTurnFailed && host_.hasPendingSubTask(tid))
 				deliveredPendingSubTask = host_.finalizeCompletedSubTask(tid, false);
 			else
 			{
-				auto targetStatus = exitCode == 0
+				auto targetStatus = exitCode == 0 && !current.lastTurnFailed
 					? TaskStatus.completed : TaskStatus.failed;
 				host_.persistResultText(tid, current.resultText);
 				if (current.status != targetStatus)
