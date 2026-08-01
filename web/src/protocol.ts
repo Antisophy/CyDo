@@ -205,6 +205,7 @@ export interface TasksListMessage {
     task_type?: string;
     entry_point?: string;
     agent_name?: string;
+    driver?: string;
     archived?: boolean;
     archiving?: boolean;
     draft?: string;
@@ -234,6 +235,7 @@ export interface TaskUpdatedMessage {
     task_type?: string;
     entry_point?: string;
     agent_name?: string;
+    driver?: string;
     archived?: boolean;
     archiving?: boolean;
     draft?: string;

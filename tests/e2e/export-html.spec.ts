@@ -1,5 +1,5 @@
 import { spawnSync } from "child_process";
-import { unlinkSync, writeFileSync } from "fs";
+import { readFileSync, unlinkSync, writeFileSync } from "fs";
 
 import {
   test,
@@ -55,6 +55,17 @@ test("export-html creates viewable HTML file", { tag: "@claude-only" }, async ({
     expect(await sidebarItems.count()).toBeGreaterThan(0);
 
     await expect(page.locator(".input-textarea")).toHaveCount(0);
+
+    // Assert on the embedded JSON blob directly rather than rendered DOM:
+    // the exported HTML loads shiki/mermaid from the esm.sh CDN, unreachable
+    // in a network-sandboxed nix build.
+    const html = readFileSync(outputPath, "utf8");
+    const match = html.match(
+      /<script id="cydo-export-data" type="application\/json">([\s\S]*?)<\/script>/,
+    );
+    expect(match).toBeTruthy();
+    const data = JSON.parse(match![1]);
+    expect(data.tasks.find((t: { tid: number }) => t.tid === Number(tid))?.driver).toBe("claude");
   } finally {
     try {
       unlinkSync(outputPath);

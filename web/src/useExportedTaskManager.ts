@@ -31,6 +31,7 @@ interface ExportTaskEntry {
   created_at?: number;
   last_active?: number;
   agent_name?: string;
+  driver?: string;
   entry_point?: string;
 }
 
@@ -98,6 +99,7 @@ function buildTasksFromExportData(data: ExportData): Map<string, TaskState> {
       entry.entry_point,
       entry.archiving ?? false,
       entry.canStop ?? entry.alive ?? false,
+      entry.driver,
     );
     const events = data.events?.[String(entry.tid)] ?? [];
     for (let i = 0; i < events.length; i++) {

@@ -20,6 +20,7 @@ import type {
   ContentBlock,
   HistoryBoundary,
   Notice,
+  TasksListMessage,
 } from "./protocol";
 import type { CydoMeta, TaskState } from "./types";
 import { makeTaskState } from "./types";
@@ -248,6 +249,87 @@ export function receiveServerError(
     return { serverError, tasks: nextTasks };
   }
   return { serverError, tasks };
+}
+
+/** Snapshot entry shape shared by tasks_list and task_updated messages. */
+export type TaskSnapshotEntry = TasksListMessage["tasks"][number];
+
+/** Build (or merge) the TaskState a tasks_list/task_updated snapshot entry seeds. */
+export function taskStateFromEntry(
+  entry: TaskSnapshotEntry,
+  existing: TaskState | undefined,
+  existingUuid: string | undefined,
+): TaskState {
+  const workspace = entry.workspace || "";
+  const projectPath = entry.project_path || "";
+  if (!existing || !existingUuid) {
+    const base = makeTaskState(
+      entry.tid,
+      entry.alive,
+      entry.resumable,
+      entry.title,
+      false,
+      workspace,
+      projectPath,
+      entry.parent_tid || undefined,
+      entry.relation_type || undefined,
+      entry.status || "pending",
+      entry.isProcessing || false,
+      entry.stdinClosed || false,
+      entry.needsAttention || false,
+      entry.hasPendingQuestion || false,
+      entry.task_type || undefined,
+      entry.archived || false,
+      entry.created_at || undefined,
+      entry.last_active || undefined,
+      entry.agent_name || undefined,
+      entry.entry_point || undefined,
+      entry.archiving || false,
+      entry.canStop ?? entry.alive,
+      entry.driver || undefined,
+    );
+    return {
+      ...base,
+      uuid: existingUuid ?? base.uuid,
+      serverDraft: entry.draft || undefined,
+      error: entry.error || undefined,
+    };
+  }
+  // If a task becomes resumable but has no messages loaded,
+  // reset historyLoaded so JSONL history gets requested
+  // (e.g. forked tasks with pre-existing JSONL).
+  const needsHistory =
+    entry.resumable && existing.messages.length === 0 && existing.historyLoaded;
+  return {
+    ...existing,
+    alive: entry.alive,
+    resumable: entry.resumable,
+    isProcessing: entry.isProcessing || false,
+    stdinClosed: entry.stdinClosed || false,
+    canStop: entry.canStop ?? entry.alive,
+    needsAttention: entry.needsAttention || false,
+    hasPendingQuestion: entry.hasPendingQuestion || false,
+    historyLoaded: needsHistory ? false : existing.historyLoaded,
+    title: entry.title || existing.title,
+    workspace: workspace || existing.workspace,
+    projectPath: projectPath || existing.projectPath,
+    parentTid: entry.parent_tid || existing.parentTid,
+    relationType: entry.relation_type || existing.relationType,
+    status: entry.status || existing.status,
+    taskType: entry.task_type || existing.taskType,
+    entryPoint: entry.entry_point || existing.entryPoint,
+    agentName: entry.agent_name || existing.agentName,
+    driver: entry.driver || existing.driver,
+    suggestions:
+      entry.isProcessing && !existing.isProcessing
+        ? undefined
+        : existing.suggestions,
+    archived: entry.archived || false,
+    archiving: entry.archiving || false,
+    error: entry.error || undefined,
+    createdAt: entry.created_at || existing.createdAt,
+    lastActive: entry.last_active || existing.lastActive,
+  };
 }
 
 /// Extract text content from a user message event (for unconfirmed display).
@@ -923,86 +1005,14 @@ export function useTaskManager(
           for (const entry of msg.tasks) {
             // Skip recently deleted draft tasks
             if (deletedDraftTid.current === entry.tid) continue;
-            const workspace = entry.workspace || "";
-            const projectPath = entry.project_path || "";
             const existingUuid = tidToUuid.get(entry.tid);
             const existing = existingUuid
               ? liveStates.get(existingUuid)
               : undefined;
-            if (!existing || !existingUuid) {
-              const base = makeTaskState(
-                entry.tid,
-                entry.alive,
-                entry.resumable,
-                entry.title,
-                false,
-                workspace,
-                projectPath,
-                entry.parent_tid || undefined,
-                entry.relation_type || undefined,
-                entry.status || "pending",
-                entry.isProcessing || false,
-                entry.stdinClosed || false,
-                entry.needsAttention || false,
-                entry.hasPendingQuestion || false,
-                entry.task_type || undefined,
-                entry.archived || false,
-                entry.created_at || undefined,
-                entry.last_active || undefined,
-                entry.agent_name || undefined,
-                entry.entry_point || undefined,
-                entry.archiving || false,
-                entry.canStop ?? entry.alive,
-              );
-              const t: TaskState = {
-                ...base,
-                uuid: existingUuid ?? base.uuid,
-                serverDraft: entry.draft || undefined,
-                error: entry.error || undefined,
-              };
-              liveStates.set(t.uuid, t);
-              tidToUuid.set(entry.tid, t.uuid);
-              updates.set(t.uuid, t);
-            } else {
-              // If a task becomes resumable but has no messages loaded,
-              // reset historyLoaded so JSONL history gets requested
-              // (e.g. forked tasks with pre-existing JSONL).
-              const needsHistory =
-                entry.resumable &&
-                existing.messages.length === 0 &&
-                existing.historyLoaded;
-              const updated: TaskState = {
-                ...existing,
-                alive: entry.alive,
-                resumable: entry.resumable,
-                isProcessing: entry.isProcessing || false,
-                stdinClosed: entry.stdinClosed || false,
-                canStop: entry.canStop ?? entry.alive,
-                needsAttention: entry.needsAttention || false,
-                hasPendingQuestion: entry.hasPendingQuestion || false,
-                historyLoaded: needsHistory ? false : existing.historyLoaded,
-                title: entry.title || existing.title,
-                workspace: workspace || existing.workspace,
-                projectPath: projectPath || existing.projectPath,
-                parentTid: entry.parent_tid || existing.parentTid,
-                relationType: entry.relation_type || existing.relationType,
-                status: entry.status || existing.status,
-                taskType: entry.task_type || existing.taskType,
-                entryPoint: entry.entry_point || existing.entryPoint,
-                agentName: entry.agent_name || existing.agentName,
-                suggestions:
-                  entry.isProcessing && !existing.isProcessing
-                    ? undefined
-                    : existing.suggestions,
-                archived: entry.archived || false,
-                archiving: entry.archiving || false,
-                error: entry.error || undefined,
-                createdAt: entry.created_at || existing.createdAt,
-                lastActive: entry.last_active || existing.lastActive,
-              };
-              liveStates.set(existingUuid, updated);
-              updates.set(existingUuid, updated);
-            }
+            const state = taskStateFromEntry(entry, existing, existingUuid);
+            liveStates.set(state.uuid, state);
+            tidToUuid.set(entry.tid, state.uuid);
+            updates.set(state.uuid, state);
           }
           setTasks((prev) => {
             const next = new Map(prev);
@@ -1017,82 +1027,13 @@ export function useTaskManager(
           const entry = msg.task;
           // Skip updates for recently deleted draft tasks
           if (deletedDraftTid.current === entry.tid) break;
-          const workspace = entry.workspace || "";
-          const projectPath = entry.project_path || "";
           const existingUuid = tidToUuid.get(entry.tid);
           const existing = existingUuid
             ? liveStates.get(existingUuid)
             : undefined;
-          let taskUpdated: TaskState;
-          if (!existing || !existingUuid) {
-            const base = makeTaskState(
-              entry.tid,
-              entry.alive,
-              entry.resumable,
-              entry.title,
-              false,
-              workspace,
-              projectPath,
-              entry.parent_tid || undefined,
-              entry.relation_type || undefined,
-              entry.status || "pending",
-              entry.isProcessing || false,
-              entry.stdinClosed || false,
-              entry.needsAttention || false,
-              entry.hasPendingQuestion || false,
-              entry.task_type || undefined,
-              entry.archived || false,
-              entry.created_at || undefined,
-              entry.last_active || undefined,
-              entry.agent_name || undefined,
-              entry.entry_point || undefined,
-              entry.archiving || false,
-              entry.canStop ?? entry.alive,
-            );
-            taskUpdated = {
-              ...base,
-              uuid: existingUuid ?? base.uuid,
-              serverDraft: entry.draft || undefined,
-              error: entry.error || undefined,
-            };
-            liveStates.set(taskUpdated.uuid, taskUpdated);
-            tidToUuid.set(entry.tid, taskUpdated.uuid);
-          } else {
-            const needsHistory =
-              entry.resumable &&
-              existing.messages.length === 0 &&
-              existing.historyLoaded;
-            taskUpdated = {
-              ...existing,
-              alive: entry.alive,
-              resumable: entry.resumable,
-              isProcessing: entry.isProcessing || false,
-              stdinClosed: entry.stdinClosed || false,
-              canStop: entry.canStop ?? entry.alive,
-              needsAttention: entry.needsAttention || false,
-              hasPendingQuestion: entry.hasPendingQuestion || false,
-              historyLoaded: needsHistory ? false : existing.historyLoaded,
-              title: entry.title || existing.title,
-              workspace: workspace || existing.workspace,
-              projectPath: projectPath || existing.projectPath,
-              parentTid: entry.parent_tid || existing.parentTid,
-              relationType: entry.relation_type || existing.relationType,
-              status: entry.status || existing.status,
-              taskType: entry.task_type || existing.taskType,
-              entryPoint: entry.entry_point || existing.entryPoint,
-              agentName: entry.agent_name || existing.agentName,
-              suggestions:
-                entry.isProcessing && !existing.isProcessing
-                  ? undefined
-                  : existing.suggestions,
-              archived: entry.archived || false,
-              archiving: entry.archiving || false,
-              error: entry.error || undefined,
-              createdAt: entry.created_at || existing.createdAt,
-              lastActive: entry.last_active || existing.lastActive,
-            };
-            liveStates.set(existingUuid, taskUpdated);
-          }
+          const taskUpdated = taskStateFromEntry(entry, existing, existingUuid);
+          liveStates.set(taskUpdated.uuid, taskUpdated);
+          tidToUuid.set(entry.tid, taskUpdated.uuid);
           setTasks((prev) => {
             const next = new Map(prev);
             next.set(taskUpdated.uuid, taskUpdated);

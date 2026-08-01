@@ -75,15 +75,10 @@ string exportTaskData(ref Persistence persistence, Persistence.TaskRow[] taskRow
 		string project_path;
 		string task_type;
 		string agent_name;
+		string driver;  // resolved runtime driver; empty for orphaned agents
 		long created_at;
 		long last_active;
 	}
-
-	TaskExport[] taskExports;
-	foreach (ref t; taskRows)
-		taskExports ~= TaskExport(t.tid, t.title, t.status, t.parentTid,
-			t.relationType, t.workspace, t.projectPath, t.taskType,
-			t.agentName, t.createdAt, t.lastActive);
 
 	// Cache agent instances by configured name
 	Agent[string] agentCache;
@@ -98,6 +93,18 @@ string exportTaskData(ref Persistence persistence, Persistence.TaskRow[] taskRow
 			return a;
 		}
 		return null;
+	}
+
+	TaskExport[] taskExports;
+	foreach (ref t; taskRows)
+	{
+		import std.conv : to;
+
+		auto agent = getAgent(t.agentName);
+		taskExports ~= TaskExport(t.tid, t.title, t.status, t.parentTid,
+			t.relationType, t.workspace, t.projectPath, t.taskType,
+			t.agentName, agent is null ? "" : to!string(agent.driver),
+			t.createdAt, t.lastActive);
 	}
 
 	// Load history events for each task

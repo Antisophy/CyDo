@@ -2913,11 +2913,20 @@ class App
 		return taskSessionRunner.taskCanStop(tid, tasks[tid].stdinClosed);
 	}
 
+	/// Resolved runtime driver for a task's configured agent, or "" if orphaned.
+	private string driverForTask(int tid)
+	{
+		import std.conv : to;
+
+		auto a = tryAgentForTask(tid);
+		return a is null ? "" : to!string(a.driver);
+	}
+
 	private string buildCurrentTasksList()
 	{
 		TaskListEntry[] entries;
 		foreach (tid, ref td; tasks)
-			entries ~= buildTaskEntry(td, taskAlive(tid), taskCanStop(tid));
+			entries ~= buildTaskEntry(td, taskAlive(tid), taskCanStop(tid), driverForTask(tid));
 		return buildTasksList(entries);
 	}
 
@@ -2926,7 +2935,7 @@ class App
 		import ae.utils.json : toJson;
 
 		clientHub.broadcast(toJson(TaskUpdatedMessage("task_updated",
-			buildTaskEntry(tasks[tid], taskAlive(tid), taskCanStop(tid)))));
+			buildTaskEntry(tasks[tid], taskAlive(tid), taskCanStop(tid), driverForTask(tid)))));
 	}
 
 	private void transitionTask(int tid, TaskStatus expectedFrom, TaskStatus to,

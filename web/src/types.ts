@@ -274,7 +274,7 @@ export interface TaskState {
   entryPoint?: string;
   /** Configured agent key (e.g. "work-claude", "codex"). */
   agentName?: string;
-  /** Runtime driver identity from session/init (e.g. "claude", "codex"). */
+  /** Runtime driver identity, from session/init or the task listing snapshot (e.g. "claude", "codex"). */
   driver?: string;
   archived?: boolean;
   archiving?: boolean;

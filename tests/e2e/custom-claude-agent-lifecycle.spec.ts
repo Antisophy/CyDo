@@ -4,9 +4,11 @@ import {
   test,
   expect,
   enterSession,
+  sendMessage,
   killSession,
   responseTimeout,
   assistantText,
+  lastAssistantText,
 } from "./fixtures";
 import type { Page } from "./fixtures";
 
@@ -154,5 +156,52 @@ workspaces:
         hasText: /Import/,
       }),
     ).not.toBeVisible();
+  },
+);
+
+test(
+  "cold-loaded Claude Edit renders driver-qualified file viewer after history reload",
+  { tag: "@claude-only" },
+  async ({ page, agentType }) => {
+    const timeout = responseTimeout(agentType);
+
+    await enterSession(page);
+
+    // Prime Claude's file cache, then edit — Edit tool call with structuredPatch.
+    await sendMessage(page, "read file README.md");
+    await expect(lastAssistantText(page, "Done.")).toBeVisible({ timeout });
+    await sendMessage(page, "edit file README.md replace test with updated");
+    await expect(
+      page.locator(".tool-call").filter({
+        has: page.locator(".tool-name", { hasText: "Edit" }),
+      }),
+    ).toBeVisible({ timeout });
+    await expect(lastAssistantText(page, "Done.")).toBeVisible({ timeout });
+
+    // Force a cold load: on process exit, resetHistoryWatermarkAfterExit
+    // (task_runner.d) resets the HistoryStore, dropping the in-memory buffer
+    // that held the live session/init. The next request_history — triggered
+    // here by reloading the page — re-reads Claude's own JSONL from disk,
+    // which has no session/init record, so Block.driver can only come from
+    // the task snapshot's resolved driver, not a live session/init.
+    await killSession(page, agentType);
+    await page.reload();
+
+    const sidebarItem = page.locator(".sidebar-item[data-tid]").first();
+    await expect(sidebarItem).toBeVisible({ timeout: 15_000 });
+    await sidebarItem.click();
+
+    const editTool = page.locator(".tool-call").filter({
+      has: page.locator(".tool-name", { hasText: "Edit" }),
+    });
+    await expect(editTool).toBeVisible({ timeout: 15_000 });
+
+    // The view-file button only renders when the Edit tool call resolves to
+    // "claude/Edit" — i.e. only when Block.driver was correctly seeded from
+    // the cold-loaded task snapshot.
+    await editTool.locator(".tool-header").hover();
+    await expect(editTool.locator(".tool-view-file")).toBeVisible({
+      timeout: 5_000,
+    });
   },
 );
