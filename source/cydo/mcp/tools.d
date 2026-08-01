@@ -12,7 +12,7 @@ enum string taskToolDescription =
 	~ "lives in the session instructions.\n\n"
 	~ "Each created child appears in the CyDo task tree; the returned `tid` opens that "
 	~ "child session.\n\n"
-	~ "If the backend restarts, CyDo resumes in-flight child tasks and later delivers "
+	~ "If the harness restarts, CyDo resumes in-flight child tasks and later delivers "
 	~ "recovered results to the parent as a system message rather than through the "
 	~ "interrupted Task call.\n\n"
 	~ "Accepted multi-task batches launch every child before waiting, so the children run "

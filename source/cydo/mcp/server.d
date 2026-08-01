@@ -174,7 +174,7 @@ class McpServerImpl : McpProtocol
 		client.handleResponse = (HttpResponse response, string disconnectReason) {
 			if (response is null)
 			{
-				finishError(new Exception("Backend connection failed: " ~ disconnectReason));
+				finishError(new Exception("Harness connection failed: " ~ disconnectReason));
 				return;
 			}
 			try
@@ -184,13 +184,13 @@ class McpServerImpl : McpProtocol
 				if (response.status / 100 != 2)
 				{
 					warningf("MCP proxy: backend returned HTTP %d", response.status);
-					finishError(new Exception("Backend returned HTTP " ~ to!string(response.status)));
+					finishError(new Exception("Harness returned HTTP " ~ to!string(response.status)));
 					return;
 				}
 				finishSuccess(responseText.jsonParse!SO);
 			}
 			catch (Exception e)
-				finishError(new Exception("Failed to parse backend response: " ~ e.msg));
+				finishError(new Exception("Failed to parse harness response: " ~ e.msg));
 		};
 		client.request(httpReq);
 

@@ -184,7 +184,7 @@ public:
 			if (!host_.taskAlive(tid))
 				return;
 
-			enum nudgeBody = "Your session was interrupted by a backend restart. "
+			enum nudgeBody = "Your session was interrupted by a harness restart. "
 				~ "Continue from where you left off. If you had a tool call in progress "
 				~ "(Task, Handoff, SwitchMode, or any other tool), retry it.";
 			host_.sendKnownSystemMessage(tid, KnownSystemMessageKind.restartNudge,

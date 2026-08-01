@@ -1588,7 +1588,7 @@ unittest
 		auto renderedPolicy = generated[createSubTasksHeading.length ..
 			createSubTasksHeading.length + expectedCreateSubTasksPolicy.length];
 		assert(renderedPolicy == expectedCreateSubTasksPolicy, generated);
-		assert(!renderedPolicy.canFind("If the backend restarts"), renderedPolicy);
+		assert(!renderedPolicy.canFind("If the harness restarts"), renderedPolicy);
 		assert(!renderedPolicy.canFind("Accepted multi-task batches"), renderedPolicy);
 		assert(!renderedPolicy.canFind("After this session exits"), renderedPolicy);
 	}

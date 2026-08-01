@@ -105,7 +105,7 @@ test("Claude forwards compact CyDo MCP descriptions to the Anthropic boundary", 
     "Each created child appears in the CyDo task tree; the returned `tid` opens that child session.",
   );
   expect(taskTool!.description).toContain(
-    "If the backend restarts, CyDo resumes in-flight child tasks and later delivers recovered results to the parent as a system message rather than through the interrupted Task call.",
+    "If the harness restarts, CyDo resumes in-flight child tasks and later delivers recovered results to the parent as a system message rather than through the interrupted Task call.",
   );
   expect(taskTool!.description).toContain(
     "Accepted multi-task batches launch every child before waiting, so the children run concurrently.",
