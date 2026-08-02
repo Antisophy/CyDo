@@ -40,7 +40,9 @@ export function UserMessage({ message }: Props) {
         message.isMeta ? " meta-message" : ""
       }${message.isSteering ? " steering-message" : ""}${
         message.isCompactSummary ? " compact-summary-message" : ""
-      }${message.isSynthetic ? " synthetic-message" : ""}`}
+      }${message.isSynthetic ? " synthetic-message" : ""}${
+        message.removed ? " removed-message" : ""
+      }`}
     >
       {message.isCompactSummary && (
         <div class="message-meta">
@@ -55,6 +57,11 @@ export function UserMessage({ message }: Props) {
       {message.isSteering && !message.isMeta && (
         <div class="message-meta">
           <span class="meta-badge steering">steering</span>
+        </div>
+      )}
+      {message.removed && (
+        <div class="message-meta">
+          <span class="meta-badge removed">not delivered</span>
         </div>
       )}
       {message.isSynthetic &&

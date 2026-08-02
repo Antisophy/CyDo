@@ -66,10 +66,10 @@ import cydo.agent.contract : Agent;
 import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
 	HistoryBoundary, ItemStartedEvent, SessionRateLimitEvent, TaskDiagnosticEvent, TaskDiagnosticSeverity,
 	TaskEventEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
-	UnconfirmedUserEventEnvelope, extractContentText;
+	UnconfirmedUserEventEnvelope, UserMessageConsumedEvent, extractContentText;
 import cydo.agent.session : AgentSession;
 import cydo.agent.drivers.codex : CodexSession;
-import cydo.runtime.config : AgentConfig, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
+import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
 import cydo.domain.storage.persistence : Persistence, openDatabase;
 import cydo.server.config_resolution : loadRuntimeConfig, reloadRuntimeConfig;
 import cydo.runtime.launch.sandbox : cleanup, resolveExecutablePath, runtimeDir;
@@ -477,7 +477,6 @@ class App
 			},
 		));
 		historyPipeline = new HistoryEventPipeline(HistoryEventPipelineHost(
-			taskAlive: &taskAlive,
 			getTask: (int tid) => tid in tasks ? &tasks[tid] : null,
 			tryAgentForTask: &tryAgentForTask,
 			effectiveCwd: (int tid) {
@@ -748,6 +747,7 @@ class App
 			emitTaskReload(tid, "history_lineage");
 			jsonlTracker.startJsonlWatch(tid);
 		};
+		jsonlTracker.onJsonlLine = &onTailedJsonlLine;
 
 		// Load task type definitions
 		auto types = taskTypeCatalog.getTaskTypes();
@@ -1440,109 +1440,13 @@ class App
 		if (shouldSendCompactionReminder)
 			maybeSendCompactionReminderSteering(tid);
 
+		// Queue-operation records reach us via the JSONL tail
+		// (onTailedJsonlLine), not the agent's stdout; any that appear in a
+		// translated event stream (pre-2.1.2xx CLIs) are simply consumed.
 		if (isQueueOperation(plan.currentEvent.translated))
 		{
-			auto op = jsonParse!QueueOperationProbe(plan.currentEvent.translated);
-			if (op.operation == "enqueue")
-			{
-				if (op.content.startsWith(systemMessagePrefix(
-					config.system_keyword,
-					KnownSystemMessageKind.postCompactionTaskModeReminder)))
-					td.compactionReminderInFlight = true;
-				td.enqueueSteering(op.content, plan.currentEvent.translated);
-				plan.consumeCurrent = true;
-				return plan;
-			}
-
-			if ((op.operation == "dequeue" || op.operation == "remove")
-				&& td.hasPendingDequeuedSteering())
-			{
-				string pendingText, pendingRaw;
-				if (td.popPendingDequeuedSteering(pendingText, pendingRaw))
-				{
-					auto pendingSteeringEv = buildSyntheticUserEvent(pendingText, true);
-					plan.prependedEvents ~= TranslatedEvent(
-						toJsonWithSyntheticUserMeta(pendingText, pendingSteeringEv, tid),
-						pendingRaw.length > 0 ? pendingRaw : null,
-						plan.currentEvent.ts);
-				}
-			}
-
-			if (op.operation == "dequeue")
-			{
-				string text, enqueueRaw;
-				if (td.popSteering(text, enqueueRaw))
-					td.setPendingDequeuedSteering(text, enqueueRaw);
-				else
-					td.clearPendingDequeuedSteering();
-				plan.consumeCurrent = true;
-				return plan;
-			}
-			else if (op.operation == "remove")
-			{
-				string text, enqueueRaw;
-				if (td.popSteering(text, enqueueRaw))
-				{
-					auto steeringEv = buildSyntheticUserEvent(text, true);
-					plan.prependedEvents ~= TranslatedEvent(
-						toJsonWithSyntheticUserMeta(text, steeringEv, tid),
-						enqueueRaw.length > 0 ? enqueueRaw : null,
-						plan.currentEvent.ts);
-				}
-				plan.consumeCurrent = true;
-				return plan;
-			}
-
 			plan.consumeCurrent = true;
 			return plan;
-		}
-
-		if (td.hasPendingDequeuedSteering())
-		{
-			auto ta = agentForTask(tid);
-			if (plan.currentEvent.raw.length > 0 && ta.isAssistantMessageLine(plan.currentEvent.raw))
-			{
-				string pendingText, pendingRaw;
-				if (td.popPendingDequeuedSteering(pendingText, pendingRaw))
-				{
-					auto steeringEv = buildSyntheticUserEvent(pendingText, true);
-					plan.prependedEvents ~= TranslatedEvent(
-						toJsonWithSyntheticUserMeta(pendingText, steeringEv, tid),
-						pendingRaw.length > 0 ? pendingRaw : null,
-						plan.currentEvent.ts);
-				}
-			}
-			else if (plan.currentEvent.translated.canFind(`"type":"item/started"`)
-				&& plan.currentEvent.translated.canFind(`"item_type":"user_message"`))
-			{
-				@JSONPartial static struct SteeringEchoProbe
-				{
-					string type;
-					string item_type;
-					@JSONOptional bool is_steering;
-					@JSONOptional string uuid;
-				}
-				try
-				{
-					auto probe = jsonParse!SteeringEchoProbe(plan.currentEvent.translated);
-					if (probe.type == "item/started"
-						&& probe.item_type == "user_message"
-						&& probe.is_steering)
-					{
-						if (probe.uuid.length > 0 && !probe.uuid.startsWith("enqueue-"))
-						{
-							import cydo.protocol : ItemStartedEvent;
-							auto userEv = jsonParse!ItemStartedEvent(plan.currentEvent.translated);
-							userEv.uuid = null;
-							plan.currentEvent.translated = toJson(userEv);
-						}
-						td.clearPendingDequeuedSteering();
-					}
-				}
-				catch (Exception)
-				{
-				}
-			}
 		}
 
 		if (isCompactionReminderSteerFailureEvent(plan.currentEvent.translated))
@@ -1889,6 +1793,10 @@ class App
 			? content
 			: content.filter!(b => b.type != "image").array;
 		session.sendMessage(toSend, nonce, isContextBootstrap);
+		// The queue tail (onTailedJsonlLine) links enqueue records to sends
+		// FIFO; only claude sessions produce queue-operation records.
+		if (agentForTask(tid).driver == AgentDriver.claude)
+			td.sentNonceFifo ~= nonce is null ? "" : nonce;
 		td.isProcessing = true;
 		touchTask(tid);
 		td.needsAttention = false;
@@ -2321,6 +2229,128 @@ class App
 		clientHub.sendToSubscribed(tid, Data(toJson(ackEnv).representation));
 	}
 
+	/// Consume a complete JSONL line delivered by the live tail. Claude
+	/// ≥2.1.2xx records queue operations only in the session file, so this is
+	/// where the live queue lifecycle of user messages is observed: an enqueue
+	/// links the record to the oldest unmatched send nonce, a dequeue moves the
+	/// entry to the awaiting-echo stage, and the echo user line yields the
+	/// user_message/consumed confirmation carrying the CLI's own steering
+	/// classification. A remove yields the "removed" confirmation — the
+	/// message was withdrawn without ever being consumed.
+	private void onTailedJsonlLine(int tid, string line, int lineNum)
+	{
+		import std.algorithm : startsWith;
+
+		auto td = tid in tasks;
+		if (td is null)
+			return;
+
+		if (isQueueOperation(line))
+		{
+			QueueOperationProbe op;
+			try
+				op = jsonParse!QueueOperationProbe(line);
+			catch (Exception e)
+			{
+				tracef("tail: queue op parse error: %s", e.msg);
+				return;
+			}
+			if (op.operation == "enqueue")
+			{
+				if (op.content.startsWith(systemMessagePrefix(
+					config.system_keyword,
+					KnownSystemMessageKind.postCompactionTaskModeReminder)))
+					td.compactionReminderInFlight = true;
+				string nonce;
+				if (td.sentNonceFifo.length > 0)
+				{
+					nonce = td.sentNonceFifo[0];
+					td.sentNonceFifo = td.sentNonceFifo[1 .. $];
+				}
+				td.queueTailQueuedUuids ~= format!"enqueue-%d"(lineNum);
+				td.queueTailQueuedNonces ~= nonce;
+			}
+			else if (op.operation == "dequeue")
+			{
+				if (td.queueTailQueuedUuids.length > 0)
+				{
+					td.queueTailAwaitingUuids ~= td.queueTailQueuedUuids[0];
+					td.queueTailAwaitingNonces ~= td.queueTailQueuedNonces[0];
+					td.queueTailQueuedUuids = td.queueTailQueuedUuids[1 .. $];
+					td.queueTailQueuedNonces = td.queueTailQueuedNonces[1 .. $];
+				}
+			}
+			else if (op.operation == "remove")
+			{
+				if (td.queueTailQueuedUuids.length > 0)
+				{
+					emitUserMessageConsumed(tid, td.queueTailQueuedUuids[0],
+						"removed", td.queueTailQueuedNonces[0]);
+					td.queueTailQueuedUuids = td.queueTailQueuedUuids[1 .. $];
+					td.queueTailQueuedNonces = td.queueTailQueuedNonces[1 .. $];
+				}
+			}
+			return;
+		}
+
+		if (td.queueTailAwaitingUuids.length == 0)
+			return;
+		auto ta = tryAgentForTask(tid);
+		if (ta is null)
+			return;
+
+		if (ta.isUserMessageLine(line))
+		{
+			auto ts = ta.translateHistoryLine(line, lineNum);
+			if (ts.length == 0)
+				return;
+			@JSONPartial static struct TypeProbe { string type; }
+			if (jsonParse!TypeProbe(ts[0].translated).type != "item/started")
+				return; // tool_result etc. — keep awaiting the echo
+			auto ev = jsonParse!ItemStartedEvent(ts[0].translated);
+			// Prefer the echo's native uuid — it matches the bubble the live
+			// stdout echo created; the enqueue anchor is the fallback.
+			auto uuid = ev.uuid.length > 0 ? ev.uuid : td.queueTailAwaitingUuids[0];
+			emitUserMessageConsumed(tid, uuid,
+				ev.is_steering ? "steering" : "turn_start",
+				td.queueTailAwaitingNonces[0], uuid);
+		}
+		else if (ta.isAssistantMessageLine(line))
+		{
+			// No echo before assistant output: the output proves consumption;
+			// turn openers always echo first, so classify as steering.
+			emitUserMessageConsumed(tid, td.queueTailAwaitingUuids[0],
+				"steering", td.queueTailAwaitingNonces[0]);
+		}
+		else
+			return;
+		td.queueTailAwaitingUuids = td.queueTailAwaitingUuids[1 .. $];
+		td.queueTailAwaitingNonces = td.queueTailAwaitingNonces[1 .. $];
+	}
+
+	/// Append a user_message/consumed confirmation to task history and
+	/// broadcast it to subscribed clients.
+	private void emitUserMessageConsumed(int tid, string uuid, string consumedAs,
+		string nonce, string nativeUuid = null)
+	{
+		import std.datetime : Clock;
+
+		auto td = tid in tasks;
+		if (td is null)
+			return;
+		auto ev = UserMessageConsumedEvent(uuid: uuid, consumed_as: consumedAs);
+		if (nonce.length > 0)
+			ev.correlation_id = nonce;
+		if (nativeUuid.length > 0)
+			ev.native_uuid = nativeUuid;
+		auto translated = toJson(ev);
+		tracef("queue-tail: consumed tid=%d uuid=%s as=%s nonce=%s", tid, uuid,
+			consumedAs, nonce);
+		td.history.appendLive(Data(toJson(TaskEventEnvelope(tid, Clock.currStdTime,
+			JSONFragment(translated))).representation), null);
+		broadcastAppendedTaskEvent(tid, translated);
+	}
+
 	private void broadcastAppendedTaskEvent(int tid, string translated)
 	{
 		import std.datetime : Clock;
@@ -2416,6 +2446,7 @@ class App
 		if (tid !in tasks)
 			return;
 		jsonlTracker.invalidateLineage(tid);
+		tasks[tid].clearQueueTailState();
 		auto ta = tryAgentForTask(tid);
 		{
 			Watermark wm;

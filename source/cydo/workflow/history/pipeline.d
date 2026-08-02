@@ -17,8 +17,8 @@ import ae.utils.time.types : AbsTime;
 import cydo.agent.contract : Agent, PersistedHistoryBoundaryKind;
 import cydo.protocol : ContentBlock, ItemStartedEvent, TaskEventEnvelope,
 	TaskHistoryBoundaryReplacedEnvelope, TaskEventSeqEnvelope, TranslatedEvent,
-	UnconfirmedUserEventEnvelope, HistoryBoundary, HistoryBoundaryKind,
-	extractContentText;
+	UnconfirmedUserEventEnvelope, UserMessageConsumedEvent, HistoryBoundary,
+	HistoryBoundaryKind, extractContentText;
 import cydo.runtime.config : AgentDriver;
 import cydo.domain.storage.persistence : LoadedHistory;
 import cydo.domain.tasks.model : QueueOperationProbe, TaskData, TaskHistoryEndMessage,
@@ -55,7 +55,6 @@ struct HistoryEventPipelineHost
 	void delegate(int tid, string line) ensureAgentSessionIdFromEvent;
 	bool delegate(int tid, string translated) updateClaudeUsageFromEvent;
 	HistoryBroadcastPlan delegate(int tid, TranslatedEvent ev) planBroadcast;
-	bool delegate(int tid) taskAlive;
 }
 
 class HistoryEventPipeline
@@ -88,12 +87,15 @@ class HistoryEventPipeline
 
 		bool hasQueueOps = false;
 		int userMsgFromJsonl = 0;
-		string[] steeringStash;
-		int[] steeringEnqueueLineNums;
-		string[] steeringEnqueueRawLines;
-		string lastDequeuedText;
-		int lastDequeuedEnqueueLineNum;
-		string lastDequeuedRawLine;
+		// Queue reconstruction: the enqueue record is the authoritative "user
+		// sent this" fact and emits the message immediately (pending
+		// presentation, identity enqueue-N). Dequeue moves the front entry to
+		// the awaiting-echo stage; the following echo user line is swallowed
+		// and replaced by a user_message/consumed confirmation carrying the
+		// CLI's own steering classification. Entries still queued at EOF stay
+		// pending — a killed session's unconsumed steer remains visible.
+		string[] queuedUuids;
+		string[] awaitingEchoUuids;
 		auto stripTransientStatus = (TranslatedEvent[] events) {
 			foreach (ref e; events)
 				e.translated = host_.injectAgentNameIntoSessionInit(e.translated, td.agentName);
@@ -128,63 +130,48 @@ class HistoryEventPipeline
 					if (op.operation == "enqueue")
 					{
 						hasQueueOps = true;
-						steeringStash ~= op.content;
-						steeringEnqueueLineNums ~= lineNum;
-						steeringEnqueueRawLines ~= line;
+						auto enqueueUuid = format!"enqueue-%d"(lineNum);
+						queuedUuids ~= enqueueUuid;
+						auto synEv = buildSyntheticUserEvent(op.content, false, true);
+						synEv.uuid = enqueueUuid;
+						return stripTransientStatus([TranslatedEvent(
+							toJsonWithSyntheticUserMeta(op.content, synEv, tid),
+							line, AbsTime.init, lineNum)]);
+					}
+					else if (op.operation == "dequeue")
+					{
+						if (queuedUuids.length > 0)
+						{
+							awaitingEchoUuids ~= queuedUuids[0];
+							queuedUuids = queuedUuids[1 .. $];
+						}
 						return [];
 					}
-					else if (op.operation == "dequeue" || op.operation == "remove")
+					else if (op.operation == "remove")
 					{
 						TranslatedEvent[] result;
-						if (lastDequeuedText.length > 0)
+						if (queuedUuids.length > 0)
 						{
-							auto synEv = buildSyntheticUserEvent(lastDequeuedText);
-							result ~= TranslatedEvent(toJsonWithSyntheticUserMeta(lastDequeuedText, synEv, tid),
-								lastDequeuedRawLine.length > 0 ? lastDequeuedRawLine : null,
-								AbsTime.init, lastDequeuedEnqueueLineNum);
-							lastDequeuedText = null;
-							lastDequeuedEnqueueLineNum = 0;
-							lastDequeuedRawLine = null;
-						}
-						if (steeringStash.length > 0)
-						{
-							auto text = steeringStash[0];
-							auto enqLineNum = steeringEnqueueLineNums[0];
-							auto enqRaw = steeringEnqueueRawLines[0];
-							steeringStash = steeringStash[1 .. $];
-							steeringEnqueueLineNums = steeringEnqueueLineNums[1 .. $];
-							steeringEnqueueRawLines = steeringEnqueueRawLines[1 .. $];
-							if (op.operation == "remove")
-							{
-								auto enqueueUuid = format!"enqueue-%d"(enqLineNum);
-								auto synEv = buildSyntheticUserEvent(text, true);
-								synEv.uuid = enqueueUuid;
-								result ~= TranslatedEvent(toJsonWithSyntheticUserMeta(text, synEv, tid),
-									enqRaw.length > 0 ? enqRaw : null,
-									AbsTime.init, enqLineNum);
-							}
-							else
-							{
-								lastDequeuedText = text;
-								lastDequeuedEnqueueLineNum = enqLineNum;
-								lastDequeuedRawLine = enqRaw;
-							}
+							result ~= TranslatedEvent(toJson(UserMessageConsumedEvent(
+								uuid: queuedUuids[0], consumed_as: "removed")),
+								null, AbsTime.init, lineNum);
+							queuedUuids = queuedUuids[1 .. $];
 						}
 						return stripTransientStatus(result);
 					}
 					return [];
 				}
-				if (lastDequeuedText.length > 0)
+				if (awaitingEchoUuids.length > 0)
 				{
 					if (ta.isUserMessageLine(line))
 					{
 						auto ts = ta.translateHistoryLine(line, lineNum);
 						// a type:"user" JSONL line translates to either an
-						// item/started user_message (the steering echo we're waiting
-						// for) or an item/result (a tool_result that landed while the
-						// turn was mid-tool-use). only the former is the dequeued echo;
-						// parsing an item/result as ItemStartedEvent throws on its
-						// tool_result field, so peek at the type first
+						// item/started user_message (the consumption echo we're
+						// waiting for) or an item/result (a tool_result that landed
+						// while the turn was mid-tool-use). only the former is the
+						// echo; parsing an item/result as ItemStartedEvent throws on
+						// its tool_result field, so peek at the type first
 						bool firstIsItemStarted = false;
 						if (ts.length > 0)
 						{
@@ -194,33 +181,40 @@ class HistoryEventPipeline
 						}
 						if (firstIsItemStarted)
 						{
-							auto savedEnqueueLineNum = lastDequeuedEnqueueLineNum;
-							lastDequeuedText = null;
-							lastDequeuedEnqueueLineNum = 0;
-							auto enqueueUuid = format!"enqueue-%d"(savedEnqueueLineNum);
+							// The consumption echo is the canonical message record:
+							// emit it exactly as the pre-queue-primary pipeline did
+							// (anchors, checkpoints and truncation semantics attach
+							// to it), preceded by the confirmation that tells the
+							// UI to drop the provisional enqueue-emitted bubble.
+							auto enqueueUuid = awaitingEchoUuids[0];
+							awaitingEchoUuids = awaitingEchoUuids[1 .. $];
 							auto ev = jsonParse!ItemStartedEvent(ts[0].translated);
-							if (ev.is_steering)
-								ev.uuid = enqueueUuid;
-							return stripTransientStatus([TranslatedEvent(toJson(ev), ts[0].raw)] ~ ts[1 .. $]);
+							// Persisted echo lines carry no steering flag (it is a
+							// live-stdout-only field); mid-turn consumption is
+							// classified via the assistant-fallback branch below.
+							auto consumed = UserMessageConsumedEvent(
+								uuid: enqueueUuid,
+								consumed_as: "turn_start",
+								native_uuid: ev.uuid.length > 0 ? ev.uuid : enqueueUuid);
+							return stripTransientStatus([
+								TranslatedEvent(toJson(consumed), null, AbsTime.init, lineNum),
+								TranslatedEvent(toJson(ev), ts[0].raw)] ~ ts[1 .. $]);
 						}
 						// not the echo (tool_result, or empty translation): pass
-						// through unchanged and stay deferred for the real echo
+						// through unchanged and stay awaiting the real echo
 						return stripTransientStatus(ts);
 					}
 					if (ta.isAssistantMessageLine(line))
 					{
-						auto enqueueUuid = format!"enqueue-%d"(lastDequeuedEnqueueLineNum);
-						auto synEv = buildSyntheticUserEvent(lastDequeuedText, true);
-						synEv.uuid = enqueueUuid;
-						auto synthetic = toJsonWithSyntheticUserMeta(lastDequeuedText, synEv, tid);
-						auto syntheticRaw = lastDequeuedRawLine.length > 0 ? lastDequeuedRawLine : null;
-						auto syntheticSourceLine = lastDequeuedEnqueueLineNum;
-						lastDequeuedText = null;
-						lastDequeuedEnqueueLineNum = 0;
-						lastDequeuedRawLine = null;
+						// No echo before assistant output. The output proves the
+						// dequeued message was consumed; turn openers always echo
+						// before assistant output, so classify as steering.
+						auto consumed = UserMessageConsumedEvent(
+							uuid: awaitingEchoUuids[0], consumed_as: "steering");
+						awaitingEchoUuids = awaitingEchoUuids[1 .. $];
 						auto ts = ta.translateHistoryLine(line, lineNum);
-						return stripTransientStatus([TranslatedEvent(synthetic, syntheticRaw,
-							AbsTime.init, syntheticSourceLine)] ~ ts);
+						return stripTransientStatus([TranslatedEvent(toJson(consumed),
+							null, AbsTime.init, lineNum)] ~ ts);
 					}
 					return stripTransientStatus(ta.translateHistoryLine(line, lineNum));
 				}
@@ -239,37 +233,6 @@ class HistoryEventPipeline
 				buildOrphanAgentBody(td.agentName,
 					host_.configuredAgentNames is null ? null : host_.configuredAgentNames()));
 
-		// A trailing enqueue with no matching dequeue/remove is a message the
-		// agent never consumed — the session was killed with the steer still
-		// queued. Surface it in history so it isn't silently lost. Skip while
-		// the session is running: the live echo arrives when the agent
-		// dequeues it.
-		if (td.history.isLoaded
-			&& (steeringStash.length > 0 || lastDequeuedText.length > 0)
-			&& (host_.taskAlive is null || !host_.taskAlive(tid)))
-		{
-			import std.datetime : Clock;
-			if (lastDequeuedText.length > 0)
-			{
-				auto synEv = buildSyntheticUserEvent(lastDequeuedText, true);
-				synEv.uuid = format!"enqueue-%d"(lastDequeuedEnqueueLineNum);
-				td.history.appendLive(Data(
-					toJson(TaskEventEnvelope(tid, Clock.currStdTime,
-						JSONFragment(toJsonWithSyntheticUserMeta(lastDequeuedText, synEv, tid)))).representation),
-					lastDequeuedRawLine.length > 0 ? lastDequeuedRawLine : null);
-			}
-			foreach (i, text; steeringStash)
-			{
-				auto synEv = buildSyntheticUserEvent(text, true);
-				synEv.uuid = format!"enqueue-%d"(steeringEnqueueLineNums[i]);
-				td.history.appendLive(Data(
-					toJson(TaskEventEnvelope(tid, Clock.currStdTime,
-						JSONFragment(toJsonWithSyntheticUserMeta(text, synEv, tid)))).representation),
-					steeringEnqueueRawLines[i].length > 0 ? steeringEnqueueRawLines[i] : null);
-			}
-		}
-
-		td.clearPendingDequeuedSteering();
 		if (!hasQueueOps && td.pendingSteeringTexts.length > userMsgFromJsonl)
 		{
 			import std.datetime : Clock;
@@ -313,8 +276,12 @@ class HistoryEventPipeline
 				auto event = extractEventFromEnvelope(bytes.as!(char[]));
 				probe = jsonParse!Probe(event);
 			});
+			// pending user messages are queue-emitted records anchored at
+			// their enqueue line — boundary-worthy so removed/unconsumed
+			// messages stay undoable; consumed ones are dropped by the UI in
+			// favor of the canonical echo (which anchors at the echo line).
 			auto isUser = probe.type == "item/started" && probe.item_type == "user_message"
-				&& !probe.is_meta && !probe.is_synthetic && !probe.pending && !probe.is_sidechain
+				&& !probe.is_meta && !probe.is_synthetic && !probe.is_sidechain
 				&& probe.parent_tool_use_id.length == 0;
 			auto isTurn = probe.type == "turn/stop" && !probe.is_sidechain
 				&& probe.parent_tool_use_id.length == 0;
@@ -574,7 +541,7 @@ class HistoryEventPipeline
 			auto probe = jsonParse!Probe(event);
 			assert((boundary.kind == HistoryBoundaryKind.user
 				&& probe.type == "item/started" && probe.item_type == "user_message"
-				&& !probe.is_meta && !probe.is_synthetic && !probe.pending && !probe.is_sidechain
+				&& !probe.is_meta && !probe.is_synthetic && !probe.is_sidechain
 				&& probe.parent_tool_use_id.length == 0)
 				|| (boundary.kind == HistoryBoundaryKind.agent_turn && probe.type == "turn/stop"
 				&& !probe.is_sidechain && probe.parent_tool_use_id.length == 0),
@@ -916,8 +883,11 @@ unittest
 	import ae.utils.json : JSONFragment, toJson;
 	import cydo.domain.tasks.model : Watermark;
 	import cydo.protocol : HistoryBoundary, HistoryBoundaryKind;
+	// pending is absent here: queue-emitted user messages are pending until
+	// confirmed and remain boundary-eligible (removed/unconsumed messages
+	// must stay undoable).
 	foreach (suffix; [
-		`"is_meta":true`, `"is_synthetic":true`, `"pending":true`,
+		`"is_meta":true`, `"is_synthetic":true`,
 		`"is_sidechain":true`, `"parent_tool_use_id":"tool"`])
 	{
 		TaskData td = TaskData(1, "", "");
@@ -1401,4 +1371,140 @@ unittest
 		AgentDriver.claude, "same-uuid", "same-uuid");
 	HistoryEventPipeline.assertReplayNativeIdentity(
 		AgentDriver.claude, "", "line:2");
+}
+
+// The enqueue record is the authoritative user-message fact: it emits the
+// message immediately with the pending presentation; the dequeue + echo pair
+// swallows the echo and yields a user_message/consumed confirmation carrying
+// the CLI's steering classification; a remove yields "removed"; an enqueue
+// with no confirmation at EOF (session killed with the message still queued)
+// leaves the pending message visible.
+unittest
+{
+	import std.algorithm : canFind;
+	import std.array : join;
+	import std.file : exists, getSize, mkdirRecurse, rmdirRecurse, write;
+	import std.path : buildPath, dirName;
+	import std.process : environment;
+	import cydo.agent.drivers.claude : ClaudeCodeAgent;
+	import cydo.domain.tasks.model : Watermark;
+
+	auto dir = buildPath("/tmp", "cydo-history-enqueue-primary");
+	if (exists(dir))
+		rmdirRecurse(dir);
+	mkdirRecurse(dir);
+	scope(exit) rmdirRecurse(dir);
+
+	auto projectPath = buildPath(dir, "project");
+	mkdirRecurse(projectPath);
+
+	auto oldConfigDir = environment.get("CLAUDE_CONFIG_DIR");
+	environment["CLAUDE_CONFIG_DIR"] = buildPath(dir, "claude");
+	scope(exit)
+	{
+		if (oldConfigDir is null)
+			environment.remove("CLAUDE_CONFIG_DIR");
+		else
+			environment["CLAUDE_CONFIG_DIR"] = oldConfigDir;
+	}
+
+	enum tid = 1;
+	auto td = TaskData(tid, "local", projectPath);
+	td.agentName = "claude";
+	td.agentSessionId = "S";
+	td.worktreeTid = 0;
+
+	Agent agent = new ClaudeCodeAgent();
+	auto jsonlPath = agent.historyPath(td.agentSessionId, projectPath);
+	mkdirRecurse(dirName(jsonlPath));
+
+	auto jsonl = [
+		// consumed as a turn opener: enqueue(1), dequeue(2), echo(3)
+		`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-02T06:00:00Z","sessionId":"S","content":"turn opener"}`,
+		`{"type":"queue-operation","operation":"dequeue","timestamp":"2026-08-02T06:00:01Z","sessionId":"S"}`,
+		`{"type":"user","uuid":"echo-1","message":{"role":"user","content":"turn opener"}}`,
+		// consumed mid-turn with no echo before assistant output: enqueue(4),
+		// dequeue(5), assistant(6) — classified as steering
+		`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-02T06:00:02Z","sessionId":"S","content":"steer text"}`,
+		`{"type":"queue-operation","operation":"dequeue","timestamp":"2026-08-02T06:00:03Z","sessionId":"S"}`,
+		`{"type":"assistant","uuid":"asst-1","message":{"id":"asst-1","content":[{"type":"text","text":"after steer"}],"model":"m","usage":{"input_tokens":1,"output_tokens":1}}}`,
+		// removed without consumption: enqueue(7), remove(8)
+		`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-02T06:00:04Z","sessionId":"S","content":"withdrawn text"}`,
+		`{"type":"queue-operation","operation":"remove","timestamp":"2026-08-02T06:00:05Z","sessionId":"S"}`,
+		// killed with the message still queued: enqueue(9), nothing after
+		`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-08-02T06:00:06Z","sessionId":"S","content":"still queued"}`,
+	].join("\n") ~ "\n";
+	write(jsonlPath, jsonl);
+
+	td.history.reset(Watermark.atBytes(getSize(jsonlPath)));
+
+	HistoryEventPipelineHost host;
+	host.getTask = (int t) => t == tid ? &td : null;
+	host.tryAgentForTask = (int t) => agent;
+	host.effectiveCwd = (int t) => projectPath;
+	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
+	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
+	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";
+	host.sendToSubscribed = (int t, Data d) {};
+	host.subscribe = (WebSocketAdapter ws, int t) {};
+	host.sendHistoryOperations = (WebSocketAdapter ws, int t) {};
+	host.broadcastHistoryOperations = (int t) {};
+	host.sendReplaySupplementalState = (WebSocketAdapter ws, int t) {};
+	host.onHistorySubscribed = (int t) {};
+	host.ensureAgentSessionIdFromEvent = (int t, string line) {};
+	host.updateClaudeUsageFromEvent = (int t, string translated) => false;
+	host.planBroadcast = (int t, TranslatedEvent ev) => HistoryBroadcastPlan.init;
+
+	auto pipeline = new HistoryEventPipeline(host);
+	pipeline.ensureHistoryLoaded(tid);
+	assert(td.history.isLoaded);
+
+	string[] events;
+	foreach (i, ref ev; td.history)
+		events ~= cast(string) ev.toGC();
+
+	// All four messages are present, each emitted from its enqueue record
+	// with the pending presentation and the enqueue anchor as identity.
+	foreach (needle; ["turn opener", "steer text", "withdrawn text", "still queued"])
+	{
+		bool found;
+		foreach (s; events)
+			if (s.canFind(`"user_message"`) && s.canFind(needle)
+				&& s.canFind(`"pending":true`) && s.canFind(`"uuid":"enqueue-`))
+				found = true;
+		assert(found, "missing pending user message: " ~ needle);
+	}
+
+	// The canonical echo message is re-emitted after its confirmation, under
+	// its native identity, and the confirmation carries that identity so the
+	// UI can drop the provisional bubble and anchors resolve either name.
+	bool sawCanonicalEcho, sawNative;
+	foreach (s; events)
+	{
+		if (s.canFind(`"user_message"`) && s.canFind(`"uuid":"echo-1"`))
+			sawCanonicalEcho = true;
+		if (s.canFind(`"user_message/consumed"`) && s.canFind(`"native_uuid":"echo-1"`))
+			sawNative = true;
+	}
+	assert(sawCanonicalEcho, "canonical echo message missing");
+	assert(sawNative, "confirmation must carry the echo native uuid");
+
+	// Confirmations: turn_start for the opener, steering for the steer,
+	// removed for the withdrawn message, and none for the still-queued one.
+	bool sawTurnStart, sawSteering, sawRemoved;
+	foreach (s; events)
+	{
+		if (!s.canFind(`"user_message/consumed"`))
+			continue;
+		if (s.canFind(`"enqueue-1"`) && s.canFind(`"turn_start"`))
+			sawTurnStart = true;
+		if (s.canFind(`"enqueue-4"`) && s.canFind(`"steering"`))
+			sawSteering = true;
+		if (s.canFind(`"enqueue-7"`) && s.canFind(`"removed"`))
+			sawRemoved = true;
+		assert(!s.canFind(`"enqueue-9"`), "still-queued enqueue must have no confirmation");
+	}
+	assert(sawTurnStart, "turn_start confirmation missing");
+	assert(sawSteering, "steering confirmation missing");
+	assert(sawRemoved, "removed confirmation missing");
 }

@@ -207,6 +207,14 @@ export interface ItemResultEvent {
   extras?: Record<string, unknown>;
 }
 
+export interface UserMessageConsumedEvent {
+  type: "user_message/consumed";
+  uuid: string;
+  consumed_as: string;
+  correlation_id?: string;
+  native_uuid?: string;
+}
+
 export interface TurnStopEvent {
   type: "turn/stop";
   model?: string;

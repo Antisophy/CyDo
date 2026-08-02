@@ -54,6 +54,8 @@ export interface DisplayMessage {
   /** Agent echoed this message on receipt (submitted to the harness), but no
    *  assistant output has proven it reached the LLM's context yet. */
   echoPending?: boolean;
+  /** The agent's queue removed this message without consuming it. */
+  removed?: boolean;
   /** Ordered block IDs for assistant messages — references blocks in TaskState.blocks. */
   blockIds?: string[];
   /** True while the assistant turn is still streaming; false after turn/stop. */

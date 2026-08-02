@@ -336,16 +336,19 @@ test("claude skips ack-2 (no agent-ack signal)", { tag: "@claude-only" }, async 
   // By the time the DOM paints, the optimistic placeholder may still be
   // ack-4 or may already have been upgraded to ack-3 by the backend echo.
   await expect(bubble).toHaveClass(/ack-(3|4)/, { timeout: 3_000 });
-  await expect(bubble).toHaveClass(/ack-3/, { timeout: 15_000 });
 
-  // Claude has no agent-ack signal — ack-2 must never appear. The agent's
-  // immediate replay echo must not promote the bubble past ack-3 either:
-  // the turn is stalled, so nothing has proven the message reached the
-  // LLM's context. Wait slightly longer than the ack-3 round-trip to
-  // confirm stability.
+  // Claude has no agent-ack signal — ack-2 must never appear. The bubble
+  // settles at ack-3 (submitted to the harness) until the queue records
+  // confirm consumption; the user_message/consumed confirmation (the agent
+  // dequeued the message into the request) then upgrades it to a plain
+  // confirmed message, even while the request itself is still in flight.
+  await expect(async () => {
+    const cls = (await bubble.getAttribute("class")) ?? "";
+    expect(cls).not.toMatch(/ack-2/);
+    expect(/ack-3/.test(cls) || !/ack-\d/.test(cls)).toBe(true);
+  }).toPass({ timeout: 15_000 });
   await page.waitForTimeout(3_000);
   await expect(bubble).not.toHaveClass(/ack-2/);
-  await expect(bubble).toHaveClass(/ack-3/);
 });
 
 test("late-joining tab sees pending bubble from history", { tag: "@claude-only" }, async ({

@@ -38,6 +38,11 @@ struct JsonlTracker
 	void delegate(int tid, string msg) sendToSubscribed;
 	void delegate(int tid, size_t seq, HistoryBoundary boundary, bool publish, ulong generation) onBoundaryResolved;
 	void delegate(int tid) onLineageInvalidated;
+	/// Called for every complete line the tail reads, with its absolute
+	/// (1-based) line number. Claude ≥2.1.2xx records queue operations only in
+	/// the session file, so this feed is where the live queue lifecycle of
+	/// user messages is observed.
+	void delegate(int tid, string line, int lineNum) onJsonlLine;
 
 	private RefCountedINotify rcINotify;
 	private RefCountedINotify.Handle[int] jsonlWatches;
@@ -355,6 +360,17 @@ struct JsonlTracker
 		{
 			onLineageInvalidated(tid);
 			return;
+		}
+
+		if (onJsonlLine !is null)
+		{
+			int n = lineOffset;
+			foreach (line; completeContent.lineSplitter)
+			{
+				n++;
+				if (line.length > 0)
+					onJsonlLine(tid, line, n);
+			}
 		}
 		foreach (boundary; boundaries)
 		{

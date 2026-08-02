@@ -37,6 +37,7 @@ import type {
   ItemResultEvent,
   TurnStopEvent,
   TurnDeltaEvent,
+  UserMessageConsumedEvent,
   StderrMessage,
   CydoTaskSpawnedEvent,
 } from "./protocol";
@@ -930,8 +931,13 @@ function reduceItemStartedUserMessage(
   );
   const hasSameContent = (m: DisplayMessage) =>
     canonicalUserTextFromDisplayMessage(m) === eventUserText;
+  // Optimistic placeholders never carry a uuid; a pending user message WITH
+  // a uuid is a queue-emitted message from history (identity enqueue-N) that
+  // only its own user_message/consumed confirmation may upgrade — replay
+  // echoes must not displace it.
   const isReplayDisposablePendingUserMsg = (m: DisplayMessage) =>
     isPendingUserMsg(m) &&
+    !m.uuid &&
     (eventNonce ? m.nonce === eventNonce : !m.nonce || hasSameContent(m));
 
   // Extract cydoMeta from the pending placeholder BEFORE the is_replay filter
@@ -1031,6 +1037,7 @@ function reduceItemStartedUserMessage(
       : state.messages.findIndex(
           (m) =>
             isPendingUserMsg(m) &&
+            !m.uuid &&
             (eventNonce ? m.nonce === eventNonce : hasSameContent(m)),
         );
 
@@ -1047,6 +1054,56 @@ function reduceItemStartedUserMessage(
   }
 
   return state;
+}
+
+/// A queue confirmation reported what became of a previously displayed user
+/// message: consumed as a steering injection, consumed as a turn opener, or
+/// removed without being consumed.
+///
+/// When the confirmation targets a provisional enqueue-emitted bubble
+/// (identity "enqueue-N") and names a distinct native identity, the canonical
+/// echo message follows in the same stream — drop the provisional bubble.
+/// Otherwise upgrade the bubble in place: clear the pending presentation and
+/// apply the consumption classification.
+export function reduceUserMessageConsumed(
+  s: SessionState,
+  event: UserMessageConsumedEvent,
+): SessionState {
+  const idx = s.messages.findIndex(
+    (m) =>
+      m.type === "user" &&
+      ((event.uuid && m.uuid === event.uuid) ||
+        (event.correlation_id && m.nonce === event.correlation_id)),
+  );
+  if (idx < 0) return s;
+
+  const target = s.messages[idx]!;
+  const canonicalFollows =
+    event.native_uuid &&
+    event.native_uuid !== event.uuid &&
+    target.uuid?.startsWith("enqueue-");
+  if (canonicalFollows && event.consumed_as !== "removed") {
+    return {
+      ...s,
+      messages: s.messages.filter((_, i) => i !== idx),
+    };
+  }
+
+  return {
+    ...s,
+    messages: s.messages.map((m, i) => {
+      if (i !== idx) return m;
+      const upgraded: DisplayMessage = {
+        ...m,
+        pending: undefined,
+        ackState: undefined,
+        echoPending: undefined,
+      };
+      if (event.consumed_as === "steering") upgraded.isSteering = true;
+      else if (event.consumed_as === "removed") upgraded.removed = true;
+      return upgraded;
+    }),
+  };
 }
 
 export function reduceAgentAck(s: SessionState, nonce: string): SessionState {
@@ -1576,6 +1633,9 @@ export function reduceMessage(
 
     case "item/started":
       return reduceItemStarted(s, msg, seq, ts);
+
+    case "user_message/consumed":
+      return reduceUserMessageConsumed(s, msg);
 
     case "item/delta":
       return reduceItemDelta(s, msg);

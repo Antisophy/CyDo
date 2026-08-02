@@ -280,7 +280,7 @@ int truncateJsonl(string jsonlPath, string afterForkId,
 	if (jsonlPath.length == 0 || !exists(jsonlPath))
 		return -1;
 
-	string output;
+	string[] kept;
 	bool found = false;
 	int removedCount = 0;
 	bool pastTarget = false;
@@ -304,16 +304,28 @@ int truncateJsonl(string jsonlPath, string afterForkId,
 			if (excludeMatch)
 			{
 				removedCount++;
+				// The queue-operation and snapshot lines immediately preceding
+				// the removed message are its run-up (enqueue/dequeue records);
+				// leaving them behind would resurrect the undone message as a
+				// still-queued one on the next history load.
+				while (kept.length > 0 && isNeutralOrQueueOp(kept[$ - 1]))
+				{
+					kept = kept[0 .. $ - 1];
+					removedCount++;
+				}
 				continue;
 			}
 		}
 
-		output ~= line ~ "\n";
+		kept ~= line;
 	}
 
 	if (!found)
 		return -1;
 
+	string output;
+	foreach (line; kept)
+		output ~= line ~ "\n";
 	write(jsonlPath, output);
 	return removedCount;
 }

@@ -607,15 +607,32 @@ struct TaskData
 	void delegate() suggestGenKill;  // cancel one-shot subprocess; null if not running
 	uint suggestGeneration;  // incremented each time generateSuggestions is called
 	string[] lastSuggestions; // most recent suggestions, sent on subscribe
-	// --- enqueuedSteering*: parallel arrays, mutate only via helpers below ---
-	string[] enqueuedSteeringTexts; // stash of enqueued steering message texts
-	string[] enqueuedSteeringRawLines; // parallel: raw JSONL lines for _raw
 	VisibleTurnAnchor[] visibleTurnAnchors;
-	string pendingDequeuedSteeringText;
-	string pendingDequeuedSteeringRawLine;
 	bool compactionReminderInFlight;
 
-	invariant (enqueuedSteeringTexts.length == enqueuedSteeringRawLines.length, "steering texts/rawLines length mismatch");
+	// --- Live queue-tail state: parallel arrays, mutate only via the tail
+	// handler (onTailedJsonlLine). Tracks the agent's message queue as
+	// reconstructed from tailed JSONL queue-operation records, plus the send
+	// nonces awaiting their enqueue record for identity linking. ---
+	string[] queueTailQueuedUuids;
+	string[] queueTailQueuedNonces;
+	string[] queueTailAwaitingUuids;
+	string[] queueTailAwaitingNonces;
+	string[] sentNonceFifo;
+
+	invariant (queueTailQueuedUuids.length == queueTailQueuedNonces.length,
+		"queue tail queued arrays length mismatch");
+	invariant (queueTailAwaitingUuids.length == queueTailAwaitingNonces.length,
+		"queue tail awaiting arrays length mismatch");
+
+	void clearQueueTailState()
+	{
+		queueTailQueuedUuids = null;
+		queueTailQueuedNonces = null;
+		queueTailAwaitingUuids = null;
+		queueTailAwaitingNonces = null;
+		sentNonceFifo = null;
+	}
 
 	void setLastSessionStatus(string translatedStatus, long ts)
 	{
@@ -632,68 +649,6 @@ struct TaskData
 	@property bool hasLastSessionStatus() const
 	{
 		return lastSessionStatus.length > 0;
-	}
-
-	// -- Steering parallel-array helpers --
-
-	/// Enqueue a steering message text and its raw line.
-	void enqueueSteering(string text, string rawLine)
-	{
-		enqueuedSteeringTexts ~= text;
-		enqueuedSteeringRawLines ~= rawLine;
-		assert(enqueuedSteeringTexts.length == enqueuedSteeringRawLines.length);
-	}
-
-	/// Dequeue (pop front) from steering arrays. Returns false if empty.
-	bool dequeueSteering()
-	{
-		if (enqueuedSteeringTexts.length == 0)
-			return false;
-		enqueuedSteeringTexts = enqueuedSteeringTexts[1 .. $];
-		enqueuedSteeringRawLines = enqueuedSteeringRawLines[1 .. $];
-		assert(enqueuedSteeringTexts.length == enqueuedSteeringRawLines.length);
-		return true;
-	}
-
-	/// Pop and return the front steering entry. Returns false if empty.
-	bool popSteering(out string text, out string rawLine)
-	{
-		if (enqueuedSteeringTexts.length == 0)
-			return false;
-		text = enqueuedSteeringTexts[0];
-		rawLine = enqueuedSteeringRawLines[0];
-		enqueuedSteeringTexts = enqueuedSteeringTexts[1 .. $];
-		enqueuedSteeringRawLines = enqueuedSteeringRawLines[1 .. $];
-		assert(enqueuedSteeringTexts.length == enqueuedSteeringRawLines.length);
-		return true;
-	}
-
-	void setPendingDequeuedSteering(string text, string rawLine)
-	{
-		pendingDequeuedSteeringText = text;
-		pendingDequeuedSteeringRawLine = rawLine;
-	}
-
-	bool hasPendingDequeuedSteering() const
-	{
-		return pendingDequeuedSteeringText.length > 0;
-	}
-
-	bool popPendingDequeuedSteering(out string text, out string rawLine)
-	{
-		if (pendingDequeuedSteeringText.length == 0)
-			return false;
-		text = pendingDequeuedSteeringText;
-		rawLine = pendingDequeuedSteeringRawLine;
-		pendingDequeuedSteeringText = null;
-		pendingDequeuedSteeringRawLine = null;
-		return true;
-	}
-
-	void clearPendingDequeuedSteering()
-	{
-		pendingDequeuedSteeringText = null;
-		pendingDequeuedSteeringRawLine = null;
 	}
 
 	private size_t visibleTurnAnchorIndex(size_t seq) const

@@ -300,6 +300,24 @@ struct ItemResultEvent
 	@JSONOptional JSONFragment extras;
 }
 
+/// user_message/consumed — the agent's queue confirmed what became of a
+/// previously displayed user message. The message itself is emitted from the
+/// queue enqueue record (the authoritative "user sent this" fact, shown with
+/// the pending presentation); this confirmation upgrades it once the queue
+/// records prove the outcome: consumed as a mid-turn steering injection,
+/// consumed as an ordinary turn opener, or removed without being consumed.
+struct UserMessageConsumedEvent
+{
+	string type = "user_message/consumed";
+	string uuid;          // identity of the user message being upgraded
+	string consumed_as;   // "steering" | "turn_start" | "removed"
+	@JSONOptional string correlation_id;  // send nonce, when the backend can link it
+	// The consumption echo's own uuid (the CLI's user-line identity). Replay
+	// swallows that line; live sessions display the message under this
+	// identity, so anchor resolution accepts either name.
+	@JSONOptional string native_uuid;
+}
+
 /// turn/stop — the assistant turn has finished (replaces stream/turn_stop + message/assistant).
 struct TurnStopEvent
 {
