@@ -132,6 +132,97 @@ function streamToolUseResponse(
   res.end();
 }
 
+// Stream a message whose first block is a complete Ask tool_use while a
+// second Bash tool_use block keeps trickling input_json_delta for several
+// seconds. Claude Code ≥2.1.2xx dispatches a completed tool_use block
+// eagerly, so the Ask executes while the same assistant message is still
+// streaming — the asker keeps emitting turn work after entering waiting.
+function streamEagerAskThenSlowToolResponse(res, askInput, model) {
+  const msgId = nextMsgId();
+  sseEvent(res, "message_start", {
+    type: "message_start",
+    message: {
+      id: msgId,
+      type: "message",
+      role: "assistant",
+      content: [],
+      model,
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 10, output_tokens: 1 },
+    },
+  });
+  const askToolId = nextToolId();
+  sseEvent(res, "content_block_start", {
+    type: "content_block_start",
+    index: 0,
+    content_block: {
+      type: "tool_use",
+      id: askToolId,
+      name: "mcp__cydo__Ask",
+      input: {},
+      caller: { type: "direct" },
+    },
+  });
+  sseEvent(res, "content_block_delta", {
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "input_json_delta", partial_json: JSON.stringify(askInput) },
+  });
+  sseEvent(res, "content_block_stop", { type: "content_block_stop", index: 0 });
+
+  const bashToolId = nextToolId();
+  sseEvent(res, "content_block_start", {
+    type: "content_block_start",
+    index: 1,
+    content_block: {
+      type: "tool_use",
+      id: bashToolId,
+      name: "Bash",
+      input: {},
+      caller: { type: "direct" },
+    },
+  });
+  const bashInput = JSON.stringify({
+    command: "echo post-ask-work",
+    // Long description → many small input_json_delta chunks. The asker must
+    // demonstrably keep streaming turn work between the Ask dispatch and the
+    // answer delivery, so the deltas have to tick faster than the answerer's
+    // full answer cycle.
+    description:
+      "Work while the Ask is pending. ".repeat(16) + "End of description.",
+  });
+  const chunks = bashInput.match(/.{1,4}/g);
+  // ~25s of trickle: long enough for the child to receive the question,
+  // answer, run its post-answer work, and go idle — the deferred answer
+  // delivery must land while this stream is still in flight.
+  const interval = 25_000 / chunks.length;
+  let i = 0;
+  const timer = setInterval(() => {
+    if (i < chunks.length) {
+      sseEvent(res, "content_block_delta", {
+        type: "content_block_delta",
+        index: 1,
+        delta: { type: "input_json_delta", partial_json: chunks[i++] },
+      });
+    } else {
+      clearInterval(timer);
+      sseEvent(res, "content_block_stop", {
+        type: "content_block_stop",
+        index: 1,
+      });
+      sseEvent(res, "message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "tool_use", stop_sequence: null },
+        usage: { output_tokens: 40 },
+      });
+      sseEvent(res, "message_stop", { type: "message_stop" });
+      res.end();
+    }
+  }, interval);
+  res.on("close", () => clearInterval(timer));
+}
+
 function streamMultiToolUseResponse(
   res,
   toolNames,
@@ -1189,6 +1280,12 @@ function handleMessages(req, res) {
       const toolNames = intent.tool_calls.map((tc) => tc.name);
       const inputs = intent.tool_calls.map((tc) => tc.input);
       streamMultiToolUseResponse(res, toolNames, inputs, model);
+    } else if (intent.type === "eager_ask") {
+      streamEagerAskThenSlowToolResponse(
+        res,
+        { tid: intent.tid, message: intent.message },
+        model,
+      );
     } else if (intent.type === "orphan_then_switchmode") {
       // Step 1: run sleep 999 with a short timeout — the timeout causes Claude
       // to background the sleep, then the tool_result triggers step 2 (SwitchMode).

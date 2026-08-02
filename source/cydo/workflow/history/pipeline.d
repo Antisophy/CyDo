@@ -251,7 +251,7 @@ class HistoryEventPipeline
 			import std.datetime : Clock;
 			if (lastDequeuedText.length > 0)
 			{
-				auto synEv = buildSyntheticUserEvent(lastDequeuedText);
+				auto synEv = buildSyntheticUserEvent(lastDequeuedText, true);
 				synEv.uuid = format!"enqueue-%d"(lastDequeuedEnqueueLineNum);
 				td.history.appendLive(Data(
 					toJson(TaskEventEnvelope(tid, Clock.currStdTime,

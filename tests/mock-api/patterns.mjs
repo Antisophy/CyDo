@@ -309,6 +309,18 @@ export function matchPattern(userText) {
     };
   }
 
+  // "call eager ask <tid> <message>" → Ask streamed as the first block of a
+  // message whose second tool_use block keeps trickling for ~25s. Exercises
+  // Claude Code's eager mid-stream tool dispatch: the Ask executes while the
+  // asker's own turn is still streaming.
+  match = userText.match(/call eager ask (\d+) (.+)/is);
+  if (match)
+    return {
+      type: "eager_ask",
+      tid: parseInt(match[1]),
+      message: match[2].trim(),
+    };
+
   // "call ask <tid> <message>" → Ask with specific tid
   // Must come before "call ask <message>" to avoid capturing tid as message text.
   match = userText.match(/call ask (\d+) (.+)/is);

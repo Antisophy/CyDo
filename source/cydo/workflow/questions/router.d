@@ -88,6 +88,29 @@ private:
 	Promise!McpResult[int] pendingQuestions_;
 	QuestionRoute[int] questionRoutes_;
 
+	/// Return the asker to active after its question was answered.
+	///
+	/// The asker is not necessarily still waiting: the agent dispatches a
+	/// completed Ask tool_use block eagerly, before the rest of its assistant
+	/// message has streamed, and the remaining stream events flip the asker
+	/// back to active (task_runner's assistant-turn-work resume). Both states
+	/// legitimately receive the answer; any other state is a logic error.
+	void reactivateAskerAfterAnswer(int askerTid)
+	{
+		import std.exception : enforce;
+
+		auto askerTd = host_.getTask(askerTid);
+		if (askerTd is null)
+			return;
+		if (askerTd.status == TaskStatus.waiting)
+			host_.transitionTask(askerTid, TaskStatus.waiting,
+				TaskStatus.active, TaskNotificationChange.clearBody);
+		else
+			enforce(askerTd.status == TaskStatus.active,
+				"Ask answer delivered with asker in unexpected status: "
+				~ cast(string) askerTd.status);
+	}
+
 public:
 	this(QuestionRouterHost host, BatchRegistry* batchRegistry)
 	{
@@ -342,8 +365,7 @@ public:
 				auto answerJson = toJson(AnswerResult("answered", callerTidInt, 0,
 					callerTd.title, message,
 					"Use Ask(question) to ask follow-up questions."));
-				host_.transitionTask(route.askerTid, TaskStatus.waiting,
-					TaskStatus.active, TaskNotificationChange.clearBody);
+				reactivateAskerAfterAnswer(route.askerTid);
 				(*questionPromise).fulfill(McpResult.structured(answerJson));
 				clearQuestionRoute(qid);
 
@@ -574,8 +596,7 @@ private:
 				return;
 			}
 
-			host_.transitionTask(currentRoute.askerTid, TaskStatus.waiting,
-				TaskStatus.active, TaskNotificationChange.clearBody);
+			reactivateAskerAfterAnswer(currentRoute.askerTid);
 
 			if (auto qp = currentRoute.qid in pendingQuestions_)
 				(*qp).fulfill(answerResult);

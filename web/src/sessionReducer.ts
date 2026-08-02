@@ -943,6 +943,7 @@ function reduceItemStartedUserMessage(
       );
 
   let state = s;
+  let displacedPlaceholder = false;
 
   if (event.is_replay) {
     // One replay echo accounts for exactly one sent message: displace at
@@ -950,6 +951,7 @@ function reduceItemStartedUserMessage(
     // (distinct nonces) must keep their own bubbles.
     const dropIdx = state.messages.findIndex(isReplayDisposablePendingUserMsg);
     if (dropIdx >= 0) {
+      displacedPlaceholder = true;
       state = {
         ...state,
         messages: state.messages.filter((_, i) => i !== dropIdx),
@@ -1009,6 +1011,15 @@ function reduceItemStartedUserMessage(
       cydoMeta: pendingMsg?.cydoMeta ?? eventCydoMeta,
       ts,
     };
+    if (displacedPlaceholder) {
+      // The agent echoes a replayed user message as soon as it consumes it —
+      // that only proves submission to the harness, not that the LLM has seen
+      // it. Keep the "submitted" presentation; assistant output promotes it
+      // (reduceItemStarted) once the request demonstrably reached the model.
+      echoMsg.ackState = 3;
+      echoMsg.pending = true;
+      echoMsg.echoPending = true;
+    }
 
     // Match the placeholder by nonce. If the event carries a nonce and a
     // pending message with that nonce exists, replace it. Otherwise append
@@ -1063,6 +1074,32 @@ export function reduceItemStarted(
 ): SessionState {
   if (event.item_type === "user_message") {
     return reduceItemStartedUserMessage(s, event, seq, ts);
+  }
+
+  // Top-level assistant output proves the request containing the previously
+  // echoed user messages reached the model — promote them from "submitted to
+  // the harness" to the confirmed in-context presentation.
+  if (
+    !event.parent_tool_use_id &&
+    !event.is_sidechain &&
+    (event.item_type === "text" ||
+      event.item_type === "thinking" ||
+      event.item_type === "tool_use") &&
+    s.messages.some((m) => m.echoPending)
+  ) {
+    s = {
+      ...s,
+      messages: s.messages.map((m) =>
+        m.echoPending
+          ? {
+              ...m,
+              echoPending: undefined,
+              pending: undefined,
+              ackState: undefined,
+            }
+          : m,
+      ),
+    };
   }
 
   const { messages, msgIdx } = getOrCreateStreamingMessage(

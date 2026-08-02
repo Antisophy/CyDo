@@ -1584,6 +1584,67 @@ test("Ask/Answer: answer delivery is deferred until child becomes idle", async (
   ).toBeVisible({ timeout: 90_000 });
 });
 
+test(
+  "Ask/Answer: answer delivery tolerates an eagerly dispatched Ask",
+  { tag: "@claude-only" },
+  async ({ page, agentType }) => {
+    // Claude Code ≥2.1.2xx dispatches a completed tool_use block as soon as
+    // its input finishes streaming, before the rest of the assistant message
+    // has arrived. An Ask issued this way puts the asker into waiting, but
+    // the same message's remaining stream events immediately flip it back to
+    // active — so when the answer is later delivered on the answerer's idle,
+    // the asker is NOT in waiting. This reproduces a production crash where
+    // that delivery hit the strict waiting→active transition and the enforce
+    // brought down the whole backend.
+    test.setTimeout(TALK_TIMEOUT);
+    await enterSession(page);
+
+    // Create a child that completes normally.
+    await sendMessage(page, 'call task research reply with "initial-result"');
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("initial-result", { exact: true })
+        .last(),
+    ).toBeVisible({ timeout: 90_000 });
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("Done.", { exact: true })
+        .last(),
+    ).toBeVisible({ timeout: 30_000 });
+
+    // Wait for the corrective focus_hint (child → parent) to land before
+    // sending the follow-up Ask (see the deferred-delivery test above).
+    await expect(
+      page.locator('.sidebar-item[data-tid="1"].active'),
+    ).toBeVisible({ timeout: 90_000 });
+
+    // The mock streams the Ask as block 0 of a message whose block 1 keeps
+    // trickling for ~25s. The child answers with post-answer work
+    // ("deferred-test" trigger), so delivery defers to the child's idle —
+    // which lands while the parent's stream is still in flight.
+    await sendMessage(page, "call eager ask 2 deferred-test");
+
+    // The answer must reach the parent as the Ask tool result.
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("deferred-answer-result", { exact: true })
+        .last(),
+    ).toBeVisible({ timeout: 90_000 });
+
+    // The parent's trailing Bash tool call must also run to completion —
+    // the turn survives the mid-stream answer delivery.
+    await expect(
+      page
+        .locator('[style*="display: contents"] .message-list')
+        .getByText("post-ask-work", { exact: true })
+        .last(),
+    ).toBeVisible({ timeout: 60_000 });
+  },
+);
+
 test("Ask/Answer: Answer with invalid qid returns error", async ({
   page,
   agentType,

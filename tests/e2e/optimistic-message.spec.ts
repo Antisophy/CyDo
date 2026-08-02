@@ -338,10 +338,14 @@ test("claude skips ack-2 (no agent-ack signal)", { tag: "@claude-only" }, async 
   await expect(bubble).toHaveClass(/ack-(3|4)/, { timeout: 3_000 });
   await expect(bubble).toHaveClass(/ack-3/, { timeout: 15_000 });
 
-  // Claude has no agent-ack signal — ack-2 must never appear.
-  // Wait slightly longer than the ack-3 round-trip to confirm stability.
+  // Claude has no agent-ack signal — ack-2 must never appear. The agent's
+  // immediate replay echo must not promote the bubble past ack-3 either:
+  // the turn is stalled, so nothing has proven the message reached the
+  // LLM's context. Wait slightly longer than the ack-3 round-trip to
+  // confirm stability.
   await page.waitForTimeout(3_000);
   await expect(bubble).not.toHaveClass(/ack-2/);
+  await expect(bubble).toHaveClass(/ack-3/);
 });
 
 test("late-joining tab sees pending bubble from history", { tag: "@claude-only" }, async ({
