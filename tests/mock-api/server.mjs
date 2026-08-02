@@ -937,13 +937,18 @@ function handleMessages(req, res) {
       return;
     }
 
-    const messages = parsed.messages || [];
+    const rawMessages = parsed.messages || [];
+    // Claude Code ≥2.1.2xx interleaves system-role turns (skill/agent-type
+    // listings) into the conversation. Step-sequencing gates below count
+    // conversational messages only, so strip system turns up front.
+    const messages = rawMessages.filter((m) => m.role !== "system");
     if (process.env.MOCK_ANTHROPIC_CAPTURE) {
       appendFileSync(
         process.env.MOCK_ANTHROPIC_CAPTURE,
         JSON.stringify({
           path: req.url || "/v1/messages",
           model: parsed.model || "unknown",
+          messageCount: messages.length,
           userText: extractLastUserText(messages),
           isToolResult: hasToolResult(messages),
           tools: Array.isArray(parsed.tools)

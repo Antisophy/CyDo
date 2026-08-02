@@ -945,12 +945,16 @@ function reduceItemStartedUserMessage(
   let state = s;
 
   if (event.is_replay) {
-    state = {
-      ...state,
-      messages: state.messages.filter(
-        (m) => !isReplayDisposablePendingUserMsg(m),
-      ),
-    };
+    // One replay echo accounts for exactly one sent message: displace at
+    // most one placeholder. Same-content placeholders from other sends
+    // (distinct nonces) must keep their own bubbles.
+    const dropIdx = state.messages.findIndex(isReplayDisposablePendingUserMsg);
+    if (dropIdx >= 0) {
+      state = {
+        ...state,
+        messages: state.messages.filter((_, i) => i !== dropIdx),
+      };
+    }
   }
 
   if (event.pending) {
@@ -1009,16 +1013,20 @@ function reduceItemStartedUserMessage(
     // Match the placeholder by nonce. If the event carries a nonce and a
     // pending message with that nonce exists, replace it. Otherwise append
     // a fresh ack-1 message without disturbing other pending placeholders.
-    const matchIdx = state.messages.findIndex(
-      (m) =>
-        isPendingUserMsg(m) &&
-        (eventNonce ? m.nonce === eventNonce : hasSameContent(m)),
-    );
+    // A replay echo already displaced its placeholder above — it must not
+    // consume a second same-content placeholder here.
+    const matchIdx = event.is_replay
+      ? -1
+      : state.messages.findIndex(
+          (m) =>
+            isPendingUserMsg(m) &&
+            (eventNonce ? m.nonce === eventNonce : hasSameContent(m)),
+        );
 
     const filtered =
       matchIdx >= 0
         ? state.messages.filter((_, i) => i !== matchIdx)
-        : eventNonce
+        : eventNonce || event.is_replay
           ? state.messages
           : state.messages.filter((m) => !isReplayDisposablePendingUserMsg(m));
     const messages = event.is_meta

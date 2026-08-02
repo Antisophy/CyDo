@@ -702,10 +702,13 @@ class ClaudeCodeSession : AgentSession
 			"--settings", `{"fileCheckpointingEnabled": true}`,
 		];
 
-		claudeArgs ~= ["--dangerously-skip-permissions"];
-
+		// Mutually exclusive: Claude Code ≥2.1.2xx gives
+		// --dangerously-skip-permissions precedence over the prompt tool,
+		// which would bypass the configured permission policy entirely.
 		if (config.permissionPolicy.length > 0)
 			claudeArgs ~= ["--permission-prompt-tool", "mcp__cydo__PermissionPrompt"];
+		else
+			claudeArgs ~= ["--dangerously-skip-permissions"];
 
 		if (mcpConfigPath !is null)
 			claudeArgs ~= ["--mcp-config", mcpConfigPath];
@@ -1459,6 +1462,10 @@ private struct McpConfigServer
 	string command;
 	string[] args;
 	McpConfigEnv env;
+	// Claude Code ≥2.1.2xx defers MCP tools behind ToolSearch by default.
+	// cydo's tools are the session's core workflow verbs (Task, SwitchMode,
+	// Ask, …); they must stay in the model's tool list unconditionally.
+	bool alwaysLoad = true;
 }
 
 private struct McpConfigServers { McpConfigServer cydo; }

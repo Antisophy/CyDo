@@ -15,26 +15,43 @@
       pkgsFor = system: import nixpkgs {
         inherit system;
         overlays = [(final: prev: {
-          claude-code = prev.claude-code.overrideAttrs (old: rec {
-            version = "2.1.97";
-            src = prev.fetchzip {
-              url = "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-${version}.tgz";
-              hash = "sha256-J92ILqBJmXyAueUPZ+HYZY0ls3OfN2EAhFyQHTOQF5A=";
-            };
-            npmDeps = prev.fetchNpmDeps {
-              name = "claude-code-${version}-npm-deps";
-              inherit src;
-              postPatch = ''
-                cp ${./nix/claude-code-package-lock.json} package-lock.json
+          # Claude Code stopped shipping the JS bundle on npm; recent versions
+          # publish per-platform native binaries instead. Package those
+          # directly — the linux-x64 binary is byte-identical to what the
+          # official installer deploys.
+          claude-code =
+            let
+              version = "2.1.220";
+              claudeSrc = {
+                x86_64-linux = {
+                  platform = "linux-x64";
+                  hash = "sha256-2D+o94sWreWdAiwpKEF0PGUjQXJRDpA62t3PaZKxsZo=";
+                };
+                aarch64-linux = {
+                  platform = "linux-arm64";
+                  hash = "sha256-ILK1Nj//Q4pG0btQyIX7/aHMlK8iu5HJ5SSIY1e+vho=";
+                };
+              }.${system} or (throw "Claude Code: unsupported system ${system}");
+            in final.stdenv.mkDerivation {
+              pname = "claude-code";
+              inherit version;
+              src = final.fetchzip {
+                url = "https://registry.npmjs.org/@anthropic-ai/claude-code-${claudeSrc.platform}/-/claude-code-${claudeSrc.platform}-${version}.tgz";
+                inherit (claudeSrc) hash;
+              };
+              nativeBuildInputs = [ final.patchelf ];
+              # The Bun-compiled binary carries its JS bundle as trailer data
+              # past the ELF image; stripping or autoPatchelf's section
+              # rewriting corrupts it, leaving the bare Bun runtime. Only the
+              # interpreter may be patched.
+              dontStrip = true;
+              installPhase = ''
+                runHook preInstall
+                install -Dm755 claude $out/bin/claude
+                patchelf --set-interpreter ${final.stdenv.cc.bintools.dynamicLinker} $out/bin/claude
+                runHook postInstall
               '';
-              hash = "sha256-mCyWIb4RRoOuHUzrxFxvkL9oYTjzWihDO5uu7jOrBI8=";
             };
-            postPatch = ''
-              cp ${./nix/claude-code-package-lock.json} package-lock.json
-              substituteInPlace cli.js \
-                    --replace-fail '#!/bin/sh' '#!/usr/bin/env sh'
-            '';
-          });
         })];
         config = {
           allowUnfree = true;

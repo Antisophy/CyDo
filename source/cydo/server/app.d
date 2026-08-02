@@ -477,6 +477,7 @@ class App
 			},
 		));
 		historyPipeline = new HistoryEventPipeline(HistoryEventPipelineHost(
+			taskAlive: &taskAlive,
 			getTask: (int tid) => tid in tasks ? &tasks[tid] : null,
 			tryAgentForTask: &tryAgentForTask,
 			effectiveCwd: (int tid) {

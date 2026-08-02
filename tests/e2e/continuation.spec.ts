@@ -182,6 +182,17 @@ test("handoff replay rebuilds known system message metadata", async ({
   const continuationTid = taskCreatedEvents.find(
     (e) => e.relation_type === "continuation",
   )!.tid;
+
+  // Wait for the continuation to finish before navigating to it. Its session
+  // exit broadcasts a focus_hint back to the ancestor task; clicking earlier
+  // races that hint, which would yank the view away mid-assertion.
+  await expect(
+    page.locator(
+      `.sidebar-item[data-tid="${continuationTid}"] .task-type-icon.completed, ` +
+        `.sidebar-item[data-tid="${continuationTid}"] .task-type-icon.resumable`,
+    ),
+  ).toBeVisible({ timeout });
+
   await page.locator(`.sidebar-item[data-tid="${continuationTid}"]`).click();
   await expect(
     page.locator(`.sidebar-item[data-tid="${continuationTid}"].active`),

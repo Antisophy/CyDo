@@ -530,6 +530,14 @@ class TaskSessionRunner
 			{
 				if (current.onIdleCallbacks.length > 0)
 					host_.drainIdleCallbacksOnExit(tid);
+				else if (host_.shuttingDown())
+				{
+					// The agent aborts its in-flight tool call when shutdown
+					// closes stdin (Claude ≥2.1.2xx emits an error turn result).
+					// Keep the persisted status as-is so the post-restart resume
+					// still sees the task mid-turn and sends the restart nudge.
+					return;
+				}
 				else
 				{
 					host_.onTaskTurnCompletedAlive(tid);

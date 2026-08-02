@@ -55,6 +55,7 @@ struct HistoryEventPipelineHost
 	void delegate(int tid, string line) ensureAgentSessionIdFromEvent;
 	bool delegate(int tid, string translated) updateClaudeUsageFromEvent;
 	HistoryBroadcastPlan delegate(int tid, TranslatedEvent ev) planBroadcast;
+	bool delegate(int tid) taskAlive;
 }
 
 class HistoryEventPipeline
@@ -237,6 +238,36 @@ class HistoryEventPipeline
 			appendTaskDiagnostic(tid, "Failed to load session history",
 				buildOrphanAgentBody(td.agentName,
 					host_.configuredAgentNames is null ? null : host_.configuredAgentNames()));
+
+		// A trailing enqueue with no matching dequeue/remove is a message the
+		// agent never consumed — the session was killed with the steer still
+		// queued. Surface it in history so it isn't silently lost. Skip while
+		// the session is running: the live echo arrives when the agent
+		// dequeues it.
+		if (td.history.isLoaded
+			&& (steeringStash.length > 0 || lastDequeuedText.length > 0)
+			&& (host_.taskAlive is null || !host_.taskAlive(tid)))
+		{
+			import std.datetime : Clock;
+			if (lastDequeuedText.length > 0)
+			{
+				auto synEv = buildSyntheticUserEvent(lastDequeuedText);
+				synEv.uuid = format!"enqueue-%d"(lastDequeuedEnqueueLineNum);
+				td.history.appendLive(Data(
+					toJson(TaskEventEnvelope(tid, Clock.currStdTime,
+						JSONFragment(toJsonWithSyntheticUserMeta(lastDequeuedText, synEv, tid)))).representation),
+					lastDequeuedRawLine.length > 0 ? lastDequeuedRawLine : null);
+			}
+			foreach (i, text; steeringStash)
+			{
+				auto synEv = buildSyntheticUserEvent(text, true);
+				synEv.uuid = format!"enqueue-%d"(steeringEnqueueLineNums[i]);
+				td.history.appendLive(Data(
+					toJson(TaskEventEnvelope(tid, Clock.currStdTime,
+						JSONFragment(toJsonWithSyntheticUserMeta(text, synEv, tid)))).representation),
+					steeringEnqueueRawLines[i].length > 0 ? steeringEnqueueRawLines[i] : null);
+			}
+		}
 
 		td.clearPendingDequeuedSteering();
 		if (!hasQueueOps && td.pendingSteeringTexts.length > userMsgFromJsonl)

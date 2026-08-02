@@ -446,6 +446,10 @@ export function matchPattern(userText) {
         description: "test subtask",
         prompt: match[1].trim(),
         subagent_type: "general-purpose",
+        // Claude Code ≥2.1.2xx defaults native sub-agents to async
+        // ("Async agent launched"); this test exercises the synchronous
+        // nested-rendering flow.
+        run_in_background: false,
       },
     };
 
