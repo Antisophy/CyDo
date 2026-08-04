@@ -965,6 +965,34 @@ function reduceItemStartedUserMessage(
     }
   }
 
+  // A user record's uuid is its identity: the same record can reach the
+  // reducer more than once (overlapping history replays merge without a
+  // reset, and a live echo can precede the replayed copy). Assistant content
+  // dedups through its item ids; user messages appended twice became two
+  // full bubbles. Update the existing bubble in place instead.
+  if (event.uuid) {
+    const dupIdx = state.messages.findIndex(
+      (m) => m.type === "user" && m.uuid === event.uuid,
+    );
+    if (dupIdx >= 0) {
+      return {
+        ...state,
+        messages: state.messages.map((m, i) =>
+          i === dupIdx
+            ? {
+                ...m,
+                content: blocks,
+                seq: seq ?? m.seq,
+                ts: ts ?? m.ts,
+                rawSource: event,
+                cydoMeta: m.cydoMeta ?? eventCydoMeta,
+              }
+            : m,
+        ),
+      };
+    }
+  }
+
   if (event.pending) {
     const id = `user-echo-${++state.msgIdCounter}`;
     const echoMsg: DisplayMessage = {

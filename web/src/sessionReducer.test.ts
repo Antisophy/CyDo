@@ -987,3 +987,49 @@ describe("cydo/task_spawned reducer", () => {
     expect(s.pendingCydoTaskItemIds).toEqual([]);
   });
 });
+
+describe("user message identity dedup", () => {
+  const canonical = (uuid: string, text: string) =>
+    asEvent({
+      type: "item/started",
+      item_id: "cc-user-msg",
+      item_type: "user_message",
+      uuid,
+      content: [{ type: "text", text }],
+      is_replay: true,
+    });
+
+  it("updates in place when the same user record arrives twice", () => {
+    // overlapping history replays merge without a reset, so the same record
+    // can be delivered again; two full bubbles for one prompt is never right
+    let state = reduceMessage(makeState(), canonical("u-1", "same prompt"), 4);
+    state = reduceMessage(state, canonical("u-1", "same prompt"), 9);
+
+    const users = state.messages.filter((m) => m.type === "user");
+    expect(users).toHaveLength(1);
+    expect(users[0]?.seq).toBe(9);
+  });
+
+  it("keeps distinct records as distinct bubbles", () => {
+    let state = reduceMessage(makeState(), canonical("u-1", "first"));
+    state = reduceMessage(state, canonical("u-2", "second"));
+    expect(state.messages.filter((m) => m.type === "user")).toHaveLength(2);
+  });
+
+  it("does not regress an upgraded bubble to pending on re-delivery", () => {
+    let state = reduceMessage(makeState(), canonical("u-1", "prompt"));
+    const again = asEvent({
+      type: "item/started",
+      item_id: "cc-user-msg",
+      item_type: "user_message",
+      uuid: "u-1",
+      content: [{ type: "text", text: "prompt" }],
+      pending: true,
+      is_replay: true,
+    });
+    state = reduceMessage(state, again);
+    const users = state.messages.filter((m) => m.type === "user");
+    expect(users).toHaveLength(1);
+    expect(users[0]?.pending).toBeUndefined();
+  });
+});
