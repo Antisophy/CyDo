@@ -2141,6 +2141,7 @@ private struct CopilotMcpConfigServer
 	string command;
 	string[] args;
 	CopilotMcpConfigEnv env;
+	int timeout = 2_147_483_647;
 }
 
 private struct CopilotMcpConfigServers { CopilotMcpConfigServer cydo; }
