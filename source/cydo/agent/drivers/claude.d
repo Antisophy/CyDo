@@ -68,10 +68,9 @@ class ClaudeCodeAgent : Agent
 		// Claude Code's KX9() guard requires this env var for checkpointing.
 		env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "1";
 
-		// Disable Claude Code's MCP tool idle timeout. The cydo Task tool can run
-		// silently for a long time (a sub-task doing its own work), which would
-		// otherwise be aborted as a stalled MCP call. cydo is the only MCP server
-		// this session registers, so disabling globally is safe.
+		// Disable Claude Code's MCP tool idle watchdog. The generated cydo server
+		// config separately raises its hard wall-clock timeout to the maximum.
+		// CyDo task-interop calls can intentionally block while a sub-task works.
 		env["CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"] = "0";
 	}
 	@property string gitName() { return "Claude Code"; }
@@ -1466,6 +1465,7 @@ private struct McpConfigServer
 	// cydo's tools are the session's core workflow verbs (Task, SwitchMode,
 	// Ask, …); they must stay in the model's tool list unconditionally.
 	bool alwaysLoad = true;
+	int timeout = 2_147_483_647;
 }
 
 private struct McpConfigServers { McpConfigServer cydo; }
