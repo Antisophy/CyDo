@@ -1033,3 +1033,86 @@ describe("user message identity dedup", () => {
     expect(users[0]?.pending).toBeUndefined();
   });
 });
+
+describe("user_message/consumed canonical-follows handling", () => {
+  const provisional = (uuid: string, text: string) =>
+    asEvent({
+      type: "item/started",
+      item_id: "cc-user-msg",
+      item_type: "user_message",
+      uuid,
+      pending: true,
+      content: [{ type: "text", text }],
+      is_replay: true,
+    });
+  const consumed = (fields: object) =>
+    asEvent({ type: "user_message/consumed", ...fields });
+
+  it("upgrades a uuid-less optimistic placeholder in place", () => {
+    // live flow: the optimistic placeholder is the message's display (no
+    // separate echo bubble renders live), so the nonce-correlated
+    // confirmation must upgrade it, never drop it
+    const state0 = {
+      ...makeState(),
+      messages: [
+        {
+          id: "opt-1",
+          type: "user" as const,
+          content: [{ type: "text" as const, text: "hi" }],
+          ackState: 3 as const,
+          nonce: "n-1",
+          pending: true,
+        },
+      ],
+    };
+    const state = reduceMessage(
+      state0,
+      consumed({
+        uuid: "enqueue-10",
+        native_uuid: "native-1",
+        correlation_id: "n-1",
+        consumed_as: "turn_start",
+      }),
+    );
+    const users = state.messages.filter((m) => m.type === "user");
+    expect(users).toHaveLength(1);
+    expect(users[0]?.pending).toBeUndefined();
+  });
+
+  it("heals a stored pair whose confirmation names the echo identity", () => {
+    // histories recorded while the live tail misnamed the confirmation carry
+    // uuid === native_uuid; the FIFO front of the pending enqueue bubbles is
+    // the message it described
+    let state = reduceMessage(makeState(), provisional("enqueue-5", "prompt"));
+    state = reduceMessage(
+      state,
+      consumed({
+        uuid: "native-9",
+        native_uuid: "native-9",
+        consumed_as: "turn_start",
+      }),
+    );
+    expect(state.messages.filter((m) => m.uuid === "enqueue-5")).toHaveLength(
+      0,
+    );
+  });
+
+  it("leaves a genuinely queued later bubble alone", () => {
+    // a correctly named confirmation resolves its own bubble directly and
+    // must not fall back onto some other still-queued message
+    let state = reduceMessage(makeState(), provisional("enqueue-5", "same"));
+    state = reduceMessage(state, provisional("enqueue-6", "same"));
+    state = reduceMessage(
+      state,
+      consumed({
+        uuid: "enqueue-5",
+        native_uuid: "native-9",
+        consumed_as: "turn_start",
+      }),
+    );
+    const remaining = state.messages.filter((m) =>
+      m.uuid?.startsWith("enqueue-"),
+    );
+    expect(remaining.map((m) => m.uuid)).toEqual(["enqueue-6"]);
+  });
+});

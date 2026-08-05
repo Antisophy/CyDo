@@ -2308,12 +2308,18 @@ class App
 			if (jsonParse!TypeProbe(ts[0].translated).type != "item/started")
 				return; // tool_result etc. — keep awaiting the echo
 			auto ev = jsonParse!ItemStartedEvent(ts[0].translated);
-			// Prefer the echo's native uuid — it matches the bubble the live
-			// stdout echo created; the enqueue anchor is the fallback.
-			auto uuid = ev.uuid.length > 0 ? ev.uuid : td.queueTailAwaitingUuids[0];
-			emitUserMessageConsumed(tid, uuid,
+			// The confirmation's identity is the awaited anchor (or the nonce
+			// correlation), matching the provisional or optimistic bubble the
+			// client holds; the echo's own uuid travels as native_uuid so the
+			// client knows the canonical message follows and drops that bubble.
+			// Using the echo uuid as the identity matched nothing (that bubble
+			// does not exist yet), so the nonce correlation upgraded the
+			// optimistic placeholder in place instead, the echo could no longer
+			// displace it, and every live message rendered twice.
+			auto nativeUuid = ev.uuid.length > 0 ? ev.uuid : td.queueTailAwaitingUuids[0];
+			emitUserMessageConsumed(tid, td.queueTailAwaitingUuids[0],
 				ev.is_steering ? "steering" : "turn_start",
-				td.queueTailAwaitingNonces[0], uuid);
+				td.queueTailAwaitingNonces[0], nativeUuid);
 		}
 		else if (ta.isAssistantMessageLine(line))
 		{

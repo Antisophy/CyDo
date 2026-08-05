@@ -1097,15 +1097,45 @@ export function reduceUserMessageConsumed(
   s: SessionState,
   event: UserMessageConsumedEvent,
 ): SessionState {
-  const idx = s.messages.findIndex(
+  let idx = s.messages.findIndex(
     (m) =>
       m.type === "user" &&
       ((event.uuid && m.uuid === event.uuid) ||
         (event.correlation_id && m.nonce === event.correlation_id)),
   );
+  // Histories recorded while the live tail misnamed the confirmation carry
+  // uuid === native_uuid (the echo's identity, which no bubble has yet) and
+  // nonces that replay strips, so the lookup misses and the provisional
+  // survived beside its echo. The queue is FIFO, so such a confirmation can
+  // only describe the oldest still-pending enqueue-emitted bubble; a
+  // correctly named confirmation never reaches this fallback.
+  if (
+    idx < 0 &&
+    event.native_uuid &&
+    event.native_uuid === event.uuid &&
+    event.consumed_as !== "removed"
+  ) {
+    idx = s.messages.findIndex(
+      (m) =>
+        m.type === "user" &&
+        m.pending === true &&
+        !!m.uuid?.startsWith("enqueue-"),
+    );
+    if (idx >= 0) {
+      // the canonical echo follows under its own identity: drop, not upgrade
+      return {
+        ...s,
+        messages: s.messages.filter((_, i) => i !== idx),
+      };
+    }
+  }
   if (idx < 0) return s;
 
   const target = s.messages[idx]!;
+  // Only an enqueue-emitted provisional is superseded by a canonical echo
+  // that follows in the same stream. A uuid-less optimistic placeholder is
+  // the live display of the message itself (no separate echo bubble renders
+  // live), so it upgrades in place below rather than being dropped.
   const canonicalFollows =
     event.native_uuid &&
     event.native_uuid !== event.uuid &&
