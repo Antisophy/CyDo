@@ -939,6 +939,18 @@ function reduceItemStartedUserMessage(
     isPendingUserMsg(m) &&
     !m.uuid &&
     (eventNonce ? m.nonce === eventNonce : !m.nonce || hasSameContent(m));
+  // A replayed canonical echo also supersedes an already-upgraded placeholder:
+  // a consumed confirmation upgrades the placeholder in place (correct live,
+  // where no echo bubble renders), so when the echo does follow on replay the
+  // bubble is no longer pending yet is still the same message. Canonical
+  // messages always carry uuids, so they are never displaced; this widening
+  // applies only to replay echoes, keeping two genuine identical live sends
+  // as two bubbles.
+  const isReplayDisposableUserMsg = (m: DisplayMessage) =>
+    (m.type === "user" &&
+      !m.uuid &&
+      (eventNonce ? m.nonce === eventNonce : !m.nonce || hasSameContent(m))) ||
+    isReplayDisposablePendingUserMsg(m);
 
   // Extract cydoMeta from the pending placeholder BEFORE the is_replay filter
   // removes it from the message list.
@@ -955,7 +967,7 @@ function reduceItemStartedUserMessage(
     // One replay echo accounts for exactly one sent message: displace at
     // most one placeholder. Same-content placeholders from other sends
     // (distinct nonces) must keep their own bubbles.
-    const dropIdx = state.messages.findIndex(isReplayDisposablePendingUserMsg);
+    const dropIdx = state.messages.findIndex(isReplayDisposableUserMsg);
     if (dropIdx >= 0) {
       displacedPlaceholder = true;
       state = {

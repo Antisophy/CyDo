@@ -1097,6 +1097,53 @@ describe("user_message/consumed canonical-follows handling", () => {
     );
   });
 
+  it("replays a stored unconfirmed+consumed+echo sequence as one bubble", () => {
+    // the exact sequence a replayed history delivers for a message sent live:
+    // the unconfirmed placeholder, the consumed confirmation that upgrades it
+    // in place (no echo bubble renders live), then the canonical echo, which
+    // must displace the upgraded placeholder rather than append beside it
+    const state0 = {
+      ...makeState(),
+      messages: [
+        {
+          id: "unconfirmed-1",
+          type: "user" as const,
+          content: [{ type: "text" as const, text: "the prompt" }],
+          ackState: 3 as const,
+          nonce: "corr-1",
+          pending: true,
+        },
+      ],
+    };
+    let state = reduceMessage(
+      state0,
+      consumed({
+        uuid: "enqueue-1",
+        native_uuid: "native-7",
+        correlation_id: "corr-1",
+        consumed_as: "turn_start",
+      }),
+    );
+    // upgraded in place, still one bubble, no longer pending
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]?.pending).toBeUndefined();
+
+    state = reduceMessage(
+      state,
+      asEvent({
+        type: "item/started",
+        item_id: "cc-user-msg",
+        item_type: "user_message",
+        uuid: "native-7",
+        content: [{ type: "text", text: "the prompt" }],
+        is_replay: true,
+      }),
+    );
+    const users = state.messages.filter((m) => m.type === "user");
+    expect(users).toHaveLength(1);
+    expect(users[0]?.uuid).toBe("native-7");
+  });
+
   it("leaves a genuinely queued later bubble alone", () => {
     // a correctly named confirmation resolves its own bubble directly and
     // must not fall back onto some other still-queued message
