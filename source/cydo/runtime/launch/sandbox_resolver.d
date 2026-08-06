@@ -537,11 +537,14 @@ unittest
 		if (exists(root))
 			rmdirRecurse(root);
 	auto sharedPath = buildPath(root, "shared");
+	auto agentOnlyPath = buildPath(root, "selected-agent-only");
 	mkdirRecurse(sharedPath);
+	mkdirRecurse(agentOnlyPath);
 
 	SandboxConfig global;
 	SandboxConfig configuredAgent;
 	SandboxConfig workspace;
+	configuredAgent.paths[agentOnlyPath] = PathMode.rw;
 	auto globalAlias = root ~ "/./shared";
 	auto agentAlias = root ~ "//shared";
 	auto workspaceAlias = root ~ "//./shared";
@@ -562,6 +565,7 @@ unittest
 		== SandboxPathOriginKind.builtinDefault);
 	assert(builtinView.declaration.get.origin.scope_ == "project");
 	assert(builtinView.declaration.get.origin.detail == "project default");
+	assert(!builtin.paths.exact(agentOnlyPath).isNull);
 
 	global.paths[globalAlias] = PathMode.ro;
 	global.isolate_filesystem = SetInfo!bool(false);
@@ -616,19 +620,49 @@ unittest
 	assert(view.declaration.get.origin.scope_ == "selected-workspace");
 	assert(view.declaration.get.origin.detail == "sandbox.paths (" ~ workspaceAlias ~ ")");
 
-	SandboxConfig discoveryGlobal;
-	discoveryGlobal.paths[sharedPath] = PathMode.ro;
-	SandboxConfig discoveryWorkspace;
-	discoveryWorkspace.paths[root ~ "//shared"] = PathMode.always_rw;
+	auto discoveryKey = root;
+	auto discoveryGlobalAlias = root ~ "/.";
+	auto discoveryWorkspaceAlias = root ~ "//.";
 	auto cydoDir = buildPath(root, "bin");
+	auto builtinDiscovery = resolveSandboxForDiscovery(SandboxConfig.init,
+		SandboxConfig.init, discoveryKey, cydoDir, "discovery-workspace");
+	auto builtinDiscoveryView = builtinDiscovery.paths.exact(discoveryKey).get;
+	assert(builtinDiscoveryView.effectiveMode == PathMode.ro);
+	assert(builtinDiscoveryView.declaration.get.mode == PathMode.ro);
+	assert(builtinDiscoveryView.declaration.get.origin.kind
+		== SandboxPathOriginKind.builtinDefault);
+	assert(builtinDiscoveryView.declaration.get.origin.scope_ == "workspace-root");
+	assert(builtinDiscoveryView.declaration.get.origin.detail
+		== "discovery workspace root default");
+	assert(builtinDiscovery.paths.exact(agentOnlyPath).isNull);
+
+	SandboxConfig discoveryGlobal;
+	discoveryGlobal.paths[discoveryGlobalAlias] = PathMode.rw;
+	auto globalDiscovery = resolveSandboxForDiscovery(discoveryGlobal, SandboxConfig.init,
+		discoveryKey, cydoDir, "discovery-workspace");
+	auto globalDiscoveryView = globalDiscovery.paths.exact(discoveryKey).get;
+	assert(globalDiscoveryView.effectiveMode == PathMode.ro);
+	assert(globalDiscoveryView.declaration.get.mode == PathMode.rw);
+	assert(globalDiscoveryView.declaration.get.origin.kind
+		== SandboxPathOriginKind.globalConfig);
+	assert(globalDiscoveryView.declaration.get.origin.scope_ == "global");
+	assert(globalDiscoveryView.declaration.get.origin.detail
+		== "sandbox.paths (" ~ discoveryGlobalAlias ~ ")");
+	assert(globalDiscovery.paths.exact(agentOnlyPath).isNull);
+
+	SandboxConfig discoveryWorkspace;
+	discoveryWorkspace.paths[discoveryWorkspaceAlias] = PathMode.always_rw;
 	auto discovery = resolveSandboxForDiscovery(discoveryGlobal, discoveryWorkspace,
-		root, cydoDir, "discovery-workspace");
-	auto discoveryView = discovery.paths.exact(sharedPath).get;
+		discoveryKey, cydoDir, "discovery-workspace");
+	auto discoveryView = discovery.paths.exact(discoveryKey).get;
 	assert(discoveryView.effectiveMode == PathMode.ro);
 	assert(discoveryView.declaration.get.mode == PathMode.always_rw);
 	assert(discoveryView.declaration.get.origin.kind
 		== SandboxPathOriginKind.workspaceConfig);
 	assert(discoveryView.declaration.get.origin.scope_ == "discovery-workspace");
+	assert(discoveryView.declaration.get.origin.detail
+		== "sandbox.paths (" ~ discoveryWorkspaceAlias ~ ")");
+	assert(discovery.paths.exact(agentOnlyPath).isNull);
 	auto cydoView = discovery.paths.exact(cydoDir).get;
 	assert(cydoView.effectiveMode == PathMode.ro);
 	assert(cydoView.requirement.get.origin.kind
@@ -640,6 +674,7 @@ unittest
 		maskedWorkspace, root, cydoDir, "discovery-workspace");
 	assert(maskedDiscovery.paths.exact(root).get.effectiveMode == PathMode.tmpfs);
 	assert(maskedDiscovery.paths.exact(cydoDir).get.effectiveMode == PathMode.ro);
+	assert(maskedDiscovery.paths.exact(agentOnlyPath).isNull);
 }
 
 unittest
