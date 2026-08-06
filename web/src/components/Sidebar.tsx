@@ -197,7 +197,7 @@ function insertArchiveNodes(nodes: TreeNode[]): TreeNode[] {
   });
 }
 
-function buildTree(tasks: SidebarTask[]): TreeNode[] {
+export function buildTree(tasks: SidebarTask[]): TreeNode[] {
   const tidSet = new Set(tasks.map((t) => t.tid));
   const childMap = new Map<number, SidebarTask[]>();
   const roots: SidebarTask[] = [];
@@ -286,7 +286,7 @@ type EdgeGlow = "none" | "attention" | "asking";
 
 // --- Flattened data item for memoized rendering ---
 
-interface FlatItem {
+export interface FlatItem {
   id: string;
   tid: number;
   depth: number;
@@ -298,6 +298,10 @@ interface FlatItem {
   isArchive: boolean;
   hasPendingQuestion: boolean;
   archiving: boolean;
+  // Collapsed "(X subtasks)" summary row: selecting it navigates to this
+  // task id (the parent), and attention aggregates over these hidden tids.
+  selectId?: string;
+  attentionTids?: number[];
 }
 
 export function computeStatusClass(t: {
@@ -319,7 +323,34 @@ export function computeStatusClass(t: {
   return "";
 }
 
-function flattenTree(
+function collectTasks(node: TreeNode, skipArchived: boolean): SidebarTask[] {
+  const out: SidebarTask[] = [];
+  function walk(n: TreeNode) {
+    if (n.task.isArchiveNode) {
+      if (skipArchived) return;
+    } else {
+      out.push(n.task);
+    }
+    for (const c of n.children) walk(c);
+  }
+  walk(node);
+  return out;
+}
+
+// Statuses safe to fold away: finished work and never-started tasks.
+// Anything in flight (alive, processing, waiting, asking, interrupted) is not.
+function isCollapsible(t: SidebarTask): boolean {
+  return (
+    t.status === "completed" || t.status === "failed" || t.status === "pending"
+  );
+}
+
+function subtreeCollapsible(node: TreeNode): boolean {
+  if (node.task.isArchiveNode) return true;
+  return isCollapsible(node.task) && node.children.every(subtreeCollapsible);
+}
+
+export function flattenTree(
   tree: TreeNode[],
   activeTaskId: string | null,
   taskTypes: TypeInfo[],
@@ -376,7 +407,52 @@ function flattenTree(
       archiving: !!t.archiving,
     });
 
-    for (let i = 0; i < node.children.length; i++) {
+    // Collapse the leading run of fully-collapsible subtrees into one summary
+    // row, unless the parent itself is selected or the selection is inside
+    // that run. Children with running work always stay visible.
+    let collapsed: TreeNode[] = [];
+    if (node.id !== activeTaskId) {
+      let end = 0;
+      while (
+        end < node.children.length &&
+        subtreeCollapsible(node.children[end]!)
+      )
+        end++;
+      const prefix = node.children.slice(0, end);
+      const selectionInPrefix =
+        activeTaskId !== null &&
+        prefix.some(
+          (c) => c.id === activeTaskId || hasDescendant(c, activeTaskId),
+        );
+      const realCount = prefix.filter((c) => !c.task.isArchiveNode).length;
+      if (realCount >= 2 && !selectionInPrefix) collapsed = prefix;
+    }
+    if (collapsed.length > 0) {
+      const hidden = collapsed.flatMap((c) => collectTasks(c, false));
+      // Color the summary icon by the hidden tasks' shared status, gray when
+      // mixed. Archived tasks don't vote: they stay hidden even on expand.
+      const statuses = new Set(
+        collapsed
+          .flatMap((c) => collectTasks(c, true))
+          .map((h) => computeStatusClass(h)),
+      );
+      const isLast = collapsed.length === node.children.length;
+      items.push({
+        id: `subtasks:${t.tid}`,
+        selectId: node.id,
+        tid: t.tid,
+        depth: depth + 1,
+        guides: isLast ? guides : guides | (1 << depth),
+        statusClass: statuses.size === 1 ? [...statuses][0]! : "",
+        title: `(${collapsed.filter((c) => !c.task.isArchiveNode).length} subtasks)`,
+        iconName: "subtasks",
+        isArchive: false,
+        hasPendingQuestion: hidden.some((h) => h.hasPendingQuestion),
+        archiving: false,
+        attentionTids: hidden.map((h) => h.tid),
+      });
+    }
+    for (let i = collapsed.length; i < node.children.length; i++) {
       const isLast = i === node.children.length - 1;
       walk(
         node.children[i]!,
@@ -406,6 +482,7 @@ const SidebarItem = memo(function SidebarItem({
   hasPendingQuestion,
   archiving,
   href,
+  selectId,
   onSelect,
   onArchive,
 }: {
@@ -422,6 +499,7 @@ const SidebarItem = memo(function SidebarItem({
   hasPendingQuestion: boolean;
   archiving: boolean;
   href: string;
+  selectId?: string;
   onSelect: (id: string) => void;
   onArchive?: (tid: number) => void;
 }) {
@@ -469,16 +547,21 @@ const SidebarItem = memo(function SidebarItem({
       href={href}
       class={`sidebar-item${isActive ? " active" : ""}${
         hasPendingQuestion ? " asking" : hasAttention ? " attention" : ""
-      }${depth === 0 ? " top-level" : ""}`}
+      }${depth === 0 ? " top-level" : ""}${
+        selectId !== undefined ? " sidebar-subtasks-summary" : ""
+      }`}
       data-tid={id}
       onClick={(e: MouseEvent) => {
-        if (shouldHandleSidebarAltArchive(e.altKey, !!onArchive, archiving)) {
+        if (
+          selectId === undefined &&
+          shouldHandleSidebarAltArchive(e.altKey, !!onArchive, archiving)
+        ) {
           e.preventDefault();
           onArchive?.(parseInt(id, 10));
           return;
         }
         if (!isPlainLeftClick(e)) return;
-        onSelect(id);
+        onSelect(selectId ?? id);
       }}
     >
       {treeConnectors}
@@ -819,10 +902,15 @@ export const Sidebar = memo(function Sidebar({
                 iconName={item.iconName}
                 isArchive={item.isArchive}
                 isActive={item.id === activeTaskId}
-                hasAttention={attention.has(item.tid)}
+                hasAttention={
+                  item.attentionTids
+                    ? item.attentionTids.some((tid) => attention.has(tid))
+                    : attention.has(item.tid)
+                }
                 hasPendingQuestion={item.hasPendingQuestion}
                 archiving={item.archiving}
-                href={getTaskHref(item.id)}
+                href={getTaskHref(item.selectId ?? item.id)}
+                selectId={item.selectId}
                 onSelect={handleSelect}
                 onArchive={handleArchive}
               />

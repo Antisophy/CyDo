@@ -749,6 +749,11 @@ body,
   cursor: pointer;
 }
 
+.sidebar-subtasks-summary .sidebar-label {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
 .archive-placeholder {
   color: var(--text-dim);
   font-style: italic;
