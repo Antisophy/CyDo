@@ -52,9 +52,15 @@ Memory injection is gated by the `memory: bool` field on each task type
 (default `false`). Set `memory: true` on a task type to receive the memory
 preamble in its first user message. The `.cydo/memory/` directory remains
 sandbox-writable for all task types regardless of this flag, via the
-`always_rw` carve-out. When injection is enabled and `MEMORY.md` is absent,
-CyDo creates it as an empty file on the first task that runs. An empty or
-whitespace-only file renders the placeholder `(Memory is currently empty.)`
+`always_rw` carve-out. CyDo always creates and registers the exact canonical
+base-repository path `<repoPath>/.cydo/memory/` for every task type, including
+when it is beneath an ancestor mask. A mask parent does not suppress this
+memory mount. An exact explicit user `ro`, `tmpfs`, `empty_dir`, or
+`empty_file` declaration at that memory key conflicts with the mandatory write
+requirement and fails launch; compatible exact host-backed declarations join
+upward to the required access. When injection is enabled and `MEMORY.md` is
+absent, CyDo creates it as an empty file on the first task that runs. An empty
+or whitespace-only file renders the placeholder `(Memory is currently empty.)`
 instead of a blank block.
 
 In the production config, only the `verify` task type opts into memory

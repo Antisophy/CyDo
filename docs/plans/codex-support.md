@@ -947,19 +947,29 @@ directory before spawning the app-server process.
 
 ### Sandbox configuration (CRITICAL)
 
+> **Historical implementation-plan note.** The surrounding implementation
+> choices are retained as plan history. The current sandbox contract is the
+> declaration, transform, and requirement model below.
+
 CyDo uses bwrap for filesystem sandboxing. Codex also uses bwrap internally.
 Nested bwrap fails on kernels with restricted unprivileged user namespaces.
 
-CyDo's sandbox is a layered merge: global config → per-workspace config →
-agent's `configureSandbox()` additions. The bwrap whitelist (ro/rw paths)
-enforces filesystem isolation. Network is always shared (`--share-net`
-hardcoded). Read-only task types downgrade all paths to ro before the agent
-layer runs, so agent-added paths (like `~/.codex`) stay rw even in
-read-only mode.
+The current runtime model is:
+
+```text
+built-in defaults -> global -> selected-agent -> workspace declarations
+-> task transform -> joined driver requirements
+```
+
+The bwrap whitelist enforces filesystem isolation. Network is always shared
+(`--share-net` hardcoded). Agent requirements run after the task transform and
+join with the exact configured path state.
 
 **`CodexAgent.configureSandbox()`** adds:
-- `~/.codex` as rw (Codex config/session data)
-- Directory containing `codex` binary as ro
+- `CODEX_HOME` as an exact writable requirement derived from the merged launch
+  environment (defaulting to `~/.codex` for Codex config/session data)
+- Codex executable, npm package root, and CyDo visibility through the shared
+  writable-ancestor rule
 
 **For Codex sessions inside CyDo's bwrap (normal operation):**
 - `thread/start`: `sandbox: "danger-full-access"` (disables Codex's own sandbox)
@@ -1072,11 +1082,14 @@ explicitly set sandbox in both `thread/start` AND `turn/start`.
 
 ### Read-only task types
 
-For `read_only: true` tasks, CyDo's `resolveSandbox` downgrades all config
-paths to ro before calling `agent.configureSandbox()` — so the bwrap
-whitelist enforces read-only. The Codex `externalSandbox` params are the
-same as for read-write tasks (`networkAccess: "enabled"`) since CyDo's
-bwrap is what actually enforces the restriction.
+For `read_only: true` tasks, `resolveSandbox` applies the task transform after
+declarations and before driver requirements. It reduces ordinary `rw` paths to
+`ro`, but leaves `always_rw` and masks unchanged; it does not blindly rewrite
+every configured mode to `ro`. A later compatible exact driver requirement can
+restore a task-reduced write, while the bwrap whitelist enforces the resulting
+mount plan. The Codex `externalSandbox` params are the same as for read-write
+tasks (`networkAccess: "enabled"`) since CyDo's bwrap is what actually
+enforces the restriction.
 
 ### WebSocket vs stdio transport
 

@@ -66,6 +66,15 @@ This enforces role discipline (plan agents don't accidentally implement, review
 agents don't make fixes) while still allowing agents to run commands, compile
 code, or write throwaway test programs to verify theories.
 
+At the sandbox-path level, task read-only is a transform that runs after
+declarations and before agent requirements. It changes declared/effective
+ordinary `rw` to `ro`, while leaving `always_rw` and masks (`tmpfs`,
+`empty_dir`, and `empty_file`) unchanged. Later exact agent, task, Git, MCP,
+or memory requirements can restore a task-reduced compatible write or create a
+child mount beneath an ancestor mask. Exact hard caps for the base and active
+worktrees remain read-only. An exact explicit user `ro` or mask at a mandatory
+write key fails with both origins instead of being silently overwritten.
+
 A task type is **tree-read-only** if `read_only: true` and every non-forking
 descendant type is also read-only. CyDo uses this to enforce worktree safety:
 spawning a non-tree-read-only sub-task on a worktree that already has an alive
