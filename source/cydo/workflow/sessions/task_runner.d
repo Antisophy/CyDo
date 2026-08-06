@@ -1464,6 +1464,58 @@ unittest
 
 unittest
 {
+	import std.algorithm : canFind;
+
+	withGitMetadataLaunchFixture("cydo-task-runner-git-metadata-conflicts",
+		(GitMetadataLaunchFixture fixture) {
+			auto modes = [PathMode.ro, PathMode.tmpfs, PathMode.empty_dir,
+				PathMode.empty_file];
+			auto modeClauses = ["configured ro declaration",
+				"configured tmpfs declaration", "configured empty_dir declaration",
+				"configured empty_file declaration"];
+			auto accesses = [PathAccess.rw, PathAccess.alwaysRw];
+			auto accessNames = ["rw", "alwaysRw"];
+
+			foreach (modeIndex, mode; modes)
+			foreach (accessIndex, access; accesses)
+			{
+				auto workspace = unrestrictedLaunchTestSandbox();
+				workspace.paths[fixture.linkedGitDir] = mode;
+				AgentSandboxConfig agent;
+				agent.configureSandbox = (ref SandboxPaths paths, ref string[string] env) {};
+				agent.agentName = "selected-agent";
+				agent.workspaceName = "selected-workspace";
+				auto sandbox = launchSandbox.resolveSandbox(
+					unrestrictedLaunchTestSandbox(), SandboxConfig.init, workspace,
+					agent, "", "");
+				auto baseOrigin = SandboxPathOrigin(
+					SandboxPathOriginKind.launchRequirement, fixture.linkedCheckout,
+					"linked checkout Git metadata");
+
+				bool thrown;
+				try
+					launchSandbox.grantGitMetadata(sandbox.paths, fixture.linkedCheckout,
+						access, baseOrigin);
+				catch (Exception e)
+				{
+					thrown = true;
+					foreach (fragment; [fixture.linkedGitDir, modeClauses[modeIndex],
+						"workspaceConfig", "selected-workspace",
+						"sandbox.paths (" ~ fixture.linkedGitDir ~ ")",
+						accessNames[accessIndex], "launchRequirement",
+						fixture.linkedCheckout,
+						"linked checkout Git metadata --git-dir"])
+						assert(e.msg.canFind(fragment), e.msg);
+					assert(!e.msg.canFind("--git-common-dir"), e.msg);
+				}
+				assert(thrown);
+				assert(sandbox.paths.exact(fixture.commonGitDir).isNull);
+			}
+		});
+}
+
+unittest
+{
 	import configy.attributes : SetInfo;
 	import std.algorithm : canFind;
 	import std.file : exists, mkdirRecurse, remove, symlink, write;

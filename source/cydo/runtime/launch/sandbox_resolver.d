@@ -540,33 +540,81 @@ unittest
 	mkdirRecurse(sharedPath);
 
 	SandboxConfig global;
-	global.paths[sharedPath] = PathMode.ro;
 	SandboxConfig configuredAgent;
-	configuredAgent.paths[root ~ "//shared"] = PathMode.rw;
 	SandboxConfig workspace;
-	workspace.paths[root ~ "/./shared"] = PathMode.rw;
+	auto globalAlias = root ~ "/./shared";
+	auto agentAlias = root ~ "//shared";
+	auto workspaceAlias = root ~ "//./shared";
 
 	AgentSandboxConfig agent;
+	agent.configureSandbox = (ref SandboxPaths paths, ref string[string] env) {};
+	agent.agentName = "selected-agent";
+	agent.workspaceName = "selected-workspace";
+
+	global.isolate_filesystem = SetInfo!bool(false);
+	auto builtin = resolveSandbox(global, configuredAgent, workspace, agent,
+		sharedPath, sharedPath);
+	auto builtinView = builtin.paths.exact(sharedPath).get;
+	assert(!builtin.isolate_filesystem);
+	assert(builtinView.effectiveMode == PathMode.rw);
+	assert(builtinView.declaration.get.mode == PathMode.rw);
+	assert(builtinView.declaration.get.origin.kind
+		== SandboxPathOriginKind.builtinDefault);
+	assert(builtinView.declaration.get.origin.scope_ == "project");
+	assert(builtinView.declaration.get.origin.detail == "project default");
+
+	global.paths[globalAlias] = PathMode.ro;
+	global.isolate_filesystem = SetInfo!bool(false);
+	auto globalResolved = resolveSandbox(global, configuredAgent, workspace, agent,
+		sharedPath, sharedPath);
+	auto globalView = globalResolved.paths.exact(sharedPath).get;
+	assert(!globalResolved.isolate_filesystem);
+	assert(globalView.effectiveMode == PathMode.ro);
+	assert(globalView.declaration.get.mode == PathMode.ro);
+	assert(globalView.declaration.get.origin.kind
+		== SandboxPathOriginKind.globalConfig);
+	assert(globalView.declaration.get.origin.scope_ == "global");
+	assert(globalView.declaration.get.origin.detail
+		== "sandbox.paths (" ~ globalAlias ~ ")");
+
+	configuredAgent.paths[agentAlias] = PathMode.always_rw;
+	global.isolate_filesystem = SetInfo!bool(false);
+	auto agentResolved = resolveSandbox(global, configuredAgent, workspace, agent,
+		sharedPath, sharedPath);
+	auto agentView = agentResolved.paths.exact(sharedPath).get;
+	assert(!agentResolved.isolate_filesystem);
+	assert(agentView.effectiveMode == PathMode.always_rw);
+	assert(agentView.declaration.get.mode == PathMode.always_rw);
+	assert(agentView.declaration.get.origin.kind
+		== SandboxPathOriginKind.agentConfig);
+	assert(agentView.declaration.get.origin.scope_ == "selected-agent");
+	assert(agentView.declaration.get.origin.detail
+		== "sandbox.paths (" ~ agentAlias ~ ")");
+
+	workspace.paths[workspaceAlias] = PathMode.rw;
 	agent.configureSandbox = (ref SandboxPaths paths, ref string[string] env) {
 		auto beforeRequirement = paths.exact(sharedPath).get;
 		assert(beforeRequirement.declaration.get.mode == PathMode.rw);
 		assert(beforeRequirement.declaration.get.origin.kind
 			== SandboxPathOriginKind.workspaceConfig);
 		assert(beforeRequirement.declaration.get.origin.scope_ == "selected-workspace");
+		assert(beforeRequirement.declaration.get.origin.detail
+			== "sandbox.paths (" ~ workspaceAlias ~ ")");
 		assert(beforeRequirement.effectiveMode == PathMode.ro);
 		paths.require(sharedPath, PathAccess.rw,
 			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "selected-agent",
 				"restores required write access"));
 	};
-	agent.agentName = "selected-agent";
-	agent.workspaceName = "selected-workspace";
+	global.isolate_filesystem = SetInfo!bool(false);
 	auto resolved = resolveSandbox(global, configuredAgent, workspace, agent,
 		sharedPath, sharedPath, true);
 	auto view = resolved.paths.exact(sharedPath).get;
+	assert(!resolved.isolate_filesystem);
 	assert(view.effectiveMode == PathMode.rw);
+	assert(view.declaration.get.mode == PathMode.rw);
 	assert(view.declaration.get.origin.kind == SandboxPathOriginKind.workspaceConfig);
 	assert(view.declaration.get.origin.scope_ == "selected-workspace");
-	assert(view.declaration.get.origin.detail.canFind(root ~ "/./shared"));
+	assert(view.declaration.get.origin.detail == "sandbox.paths (" ~ workspaceAlias ~ ")");
 
 	SandboxConfig discoveryGlobal;
 	discoveryGlobal.paths[sharedPath] = PathMode.ro;

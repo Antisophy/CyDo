@@ -431,17 +431,210 @@ unittest
 	sandbox.isolate_environment = false;
 	sandbox.env["A"] = "1";
 
-	auto launch = prepareProcessLaunch(sandbox, "/tmp/cydo-launch");
-	launch.sandbox.tempFiles = ["/tmp/original-temp"];
+	auto source = prepareProcessLaunch(sandbox, "/tmp/cydo-launch");
+	source.sandbox.tempFiles = ["/tmp/original-temp"];
+	auto sourcePaths = source.sandbox.paths.snapshot;
+	auto sourceTempFiles = source.sandbox.tempFiles.dup;
+	auto sourceEnv = source.sandbox.env.dup;
+	auto sourcePrefix = source.cmdPrefix.dup;
 
-	auto derived = withProcessLaunchEnv(launch, "B", "2");
-	assert(("B" in launch.sandbox.env) is null);
-	assert(launch.sandbox.tempFiles == ["/tmp/original-temp"]);
-	assert(derived.sandbox.env["B"] == "2");
-	assert(derived.sandbox.tempFiles.length == 0);
-	assert(derived.cmdPrefix[0 .. 3] == ["env", "-C", "/tmp/cydo-launch"]);
-	assert(derived.cmdPrefix.canFind("A=1"));
-	assert(derived.cmdPrefix.canFind("B=2"));
+	auto first = withProcessLaunchEnv(source, "B", "2");
+	auto second = withProcessLaunchEnv(source, "C", "3");
+	assert(source.sandbox.paths.snapshot == sourcePaths);
+	assert(source.sandbox.tempFiles == sourceTempFiles);
+	assert(source.sandbox.env == sourceEnv);
+	assert(source.cmdPrefix == sourcePrefix);
+	assert(("B" in source.sandbox.env) is null);
+	assert(("C" in source.sandbox.env) is null);
+	assert(first.sandbox.env["A"] == "1");
+	assert(first.sandbox.env["B"] == "2");
+	assert(second.sandbox.env["A"] == "1");
+	assert(second.sandbox.env["C"] == "3");
+	assert(first.sandbox.tempFiles.length == 0);
+	assert(second.sandbox.tempFiles.length == 0);
+	assert(first.cmdPrefix[0 .. 3] == ["env", "-C", "/tmp/cydo-launch"]);
+	assert(second.cmdPrefix[0 .. 3] == ["env", "-C", "/tmp/cydo-launch"]);
+	assert(first.cmdPrefix.canFind("A=1"));
+	assert(first.cmdPrefix.canFind("B=2"));
+	assert(second.cmdPrefix.canFind("A=1"));
+	assert(second.cmdPrefix.canFind("C=3"));
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, remove, rmdirRecurse, write;
+	import std.path : buildPath;
+	import cydo.runtime.launch.sandbox_paths : PathAccess;
+
+	auto root = buildPath("/tmp", "cydo-renderer-derived-launch");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto fakeBin = buildPath(root, "bin");
+	mkdirRecurse(fakeBin);
+	write(buildPath(fakeBin, "bwrap"), "");
+	auto oldPath = environment.get("PATH", "");
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	scope (exit) environment["PATH"] = oldPath;
+
+	auto logicalHostMount = buildPath(root, "logical-host-mount");
+	auto logicalSecondHostMount = buildPath(root, "logical-second-host-mount");
+	mkdirRecurse(logicalHostMount);
+	mkdirRecurse(logicalSecondHostMount);
+	string[] plannedMountSubsequence(string[] args, string[] configuredPaths)
+	{
+		bool isConfiguredPath(string path)
+		{
+			foreach (configuredPath; configuredPaths)
+				if (path == configuredPath)
+					return true;
+			return false;
+		}
+
+		string[] result;
+		foreach (i; 0 .. args.length)
+		{
+			if (args[i] == "--tmpfs" && i + 1 < args.length
+				&& isConfiguredPath(args[i + 1]))
+				result ~= args[i .. i + 2];
+			else if ((args[i] == "--ro-bind" || args[i] == "--bind")
+				&& i + 2 < args.length
+				&& (isConfiguredPath(args[i + 1])
+					|| isConfiguredPath(args[i + 2])))
+				result ~= args[i .. i + 3];
+		}
+		return result;
+	}
+
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	sandbox.isolate_processes = false;
+	sandbox.isolate_environment = false;
+	sandbox.env["A"] = "1";
+	sandbox.paths.set(logicalHostMount, PathMode.ro,
+		SandboxPathOrigin(SandboxPathOriginKind.builtinDefault,
+			"derived launch", "logical host mount"));
+	sandbox.paths.set(logicalSecondHostMount, PathMode.ro,
+		SandboxPathOrigin(SandboxPathOriginKind.builtinDefault,
+			"derived launch", "second logical host mount"));
+
+	auto source = prepareProcessLaunch(sandbox, "");
+	auto sourcePaths = source.sandbox.paths.snapshot;
+	auto sourceTempFiles = source.sandbox.tempFiles.dup;
+	auto sourceEnv = source.sandbox.env.dup;
+	auto sourcePrefix = source.cmdPrefix.dup;
+	auto configuredPaths = [logicalHostMount, logicalSecondHostMount];
+	auto sourceMounts = plannedMountSubsequence(sourcePrefix, configuredPaths);
+	assert(sourceMounts == [
+		"--ro-bind", logicalHostMount, logicalHostMount,
+		"--ro-bind", logicalSecondHostMount, logicalSecondHostMount,
+	]);
+
+	auto first = withProcessLaunchEnv(source, "B", "2");
+	auto second = withProcessLaunchEnv(source, "C", "3");
+	scope (exit)
+	{
+		foreach (tempFile; source.sandbox.tempFiles)
+			if (exists(tempFile))
+				remove(tempFile);
+		foreach (tempFile; first.sandbox.tempFiles)
+			if (exists(tempFile))
+				remove(tempFile);
+		foreach (tempFile; second.sandbox.tempFiles)
+			if (exists(tempFile))
+				remove(tempFile);
+	}
+
+	assert(source.sandbox.paths.snapshot == sourcePaths);
+	assert(source.sandbox.tempFiles == sourceTempFiles);
+	assert(source.sandbox.env == sourceEnv);
+	assert(source.cmdPrefix == sourcePrefix);
+	assert(first.sandbox.paths.snapshot == sourcePaths);
+	assert(second.sandbox.paths.snapshot == sourcePaths);
+	assert(first.sandbox.env["A"] == "1");
+	assert(first.sandbox.env["B"] == "2");
+	assert(second.sandbox.env["A"] == "1");
+	assert(second.sandbox.env["C"] == "3");
+	assert(first.cmdPrefix.canFind(["--setenv", "A", "1"]));
+	assert(first.cmdPrefix.canFind(["--setenv", "B", "2"]));
+	assert(second.cmdPrefix.canFind(["--setenv", "A", "1"]));
+	assert(second.cmdPrefix.canFind(["--setenv", "C", "3"]));
+	assert(plannedMountSubsequence(first.cmdPrefix, configuredPaths) == sourceMounts);
+	assert(plannedMountSubsequence(second.cmdPrefix, configuredPaths) == sourceMounts);
+	size_t separator = first.cmdPrefix.length;
+	size_t firstMountStart = first.cmdPrefix.length;
+	size_t secondMountStart = first.cmdPrefix.length;
+	foreach (i; 0 .. first.cmdPrefix.length)
+	{
+		if (first.cmdPrefix[i] == "--")
+		{
+			separator = i;
+		}
+		else if ((first.cmdPrefix[i] == "--ro-bind" || first.cmdPrefix[i] == "--bind")
+			&& i + 2 < first.cmdPrefix.length
+			&& first.cmdPrefix[i + 1] == logicalHostMount
+			&& first.cmdPrefix[i + 2] == logicalHostMount)
+			firstMountStart = i;
+		else if ((first.cmdPrefix[i] == "--ro-bind" || first.cmdPrefix[i] == "--bind")
+			&& i + 2 < first.cmdPrefix.length
+			&& first.cmdPrefix[i + 1] == logicalSecondHostMount
+			&& first.cmdPrefix[i + 2] == logicalSecondHostMount)
+			secondMountStart = i;
+	}
+	assert(separator < first.cmdPrefix.length);
+	assert(firstMountStart < secondMountStart);
+	assert(secondMountStart == firstMountStart + 3);
+	auto divergentFirstPrefix = first.cmdPrefix[0 .. separator].dup;
+	divergentFirstPrefix ~= ["--bind", logicalHostMount, logicalHostMount];
+	divergentFirstPrefix ~= first.cmdPrefix[separator .. $];
+	assert(plannedMountSubsequence(divergentFirstPrefix,
+		configuredPaths) != sourceMounts);
+	auto missingFirstPrefix = first.cmdPrefix[0 .. firstMountStart].dup;
+	missingFirstPrefix ~= first.cmdPrefix[firstMountStart + 3 .. $];
+	assert(plannedMountSubsequence(missingFirstPrefix, configuredPaths) != sourceMounts);
+	auto swappedFirstPrefix = first.cmdPrefix[0 .. firstMountStart].dup;
+	swappedFirstPrefix ~= first.cmdPrefix[secondMountStart .. secondMountStart + 3];
+	swappedFirstPrefix ~= first.cmdPrefix[firstMountStart .. firstMountStart + 3];
+	swappedFirstPrefix ~= first.cmdPrefix[secondMountStart + 3 .. $];
+	assert(plannedMountSubsequence(swappedFirstPrefix, configuredPaths) != sourceMounts);
+
+	auto repeatedSourcePrefix = buildCommandPrefix(source.sandbox, source.workDir);
+	auto repeatedFirstPrefix = buildCommandPrefix(first.sandbox, first.workDir);
+	auto repeatedSecondPrefix = buildCommandPrefix(second.sandbox, second.workDir);
+	assert(plannedMountSubsequence(repeatedSourcePrefix, configuredPaths) == sourceMounts);
+	assert(plannedMountSubsequence(repeatedFirstPrefix, configuredPaths) == sourceMounts);
+	assert(plannedMountSubsequence(repeatedSecondPrefix, configuredPaths) == sourceMounts);
+	assert(source.sandbox.paths.snapshot == sourcePaths);
+	assert(first.sandbox.paths.snapshot == sourcePaths);
+	assert(second.sandbox.paths.snapshot == sourcePaths);
+
+	auto sourceTempFilesBeforeMutation = source.sandbox.tempFiles.dup;
+	auto sourceEnvBeforeMutation = source.sandbox.env.dup;
+	auto secondTempFilesBeforeMutation = second.sandbox.tempFiles.dup;
+	auto secondEnvBeforeMutation = second.sandbox.env.dup;
+	auto derivedTempFile = buildPath(root, "derived-temp");
+	write(derivedTempFile, "");
+	first.sandbox.env["DERIVED_ONLY"] = "present";
+	first.sandbox.tempFiles ~= derivedTempFile;
+	first.sandbox.paths.require(logicalHostMount, PathAccess.rw,
+		SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+			"derived launch", "derived write"));
+	assert(("B" in source.sandbox.env) is null);
+	assert(("C" in source.sandbox.env) is null);
+	assert(("DERIVED_ONLY" in source.sandbox.env) is null);
+	assert(source.sandbox.tempFiles == sourceTempFilesBeforeMutation);
+	assert(source.sandbox.env == sourceEnvBeforeMutation);
+	assert(second.sandbox.tempFiles == secondTempFilesBeforeMutation);
+	assert(second.sandbox.env == secondEnvBeforeMutation);
+	assert(first.sandbox.tempFiles.canFind(derivedTempFile));
+	assert(source.sandbox.paths.snapshot == sourcePaths);
+	assert(second.sandbox.paths.snapshot == sourcePaths);
+	assert(source.sandbox.paths.exact(logicalHostMount).get.effectiveMode == PathMode.ro);
+	assert(second.sandbox.paths.exact(logicalHostMount).get.effectiveMode == PathMode.ro);
+	assert(first.sandbox.paths.exact(logicalHostMount).get.effectiveMode == PathMode.rw);
 }
 
 unittest
