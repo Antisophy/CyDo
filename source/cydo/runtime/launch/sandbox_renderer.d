@@ -9,6 +9,8 @@ import std.string : toStringz;
 
 import core.sys.posix.unistd : X_OK, access;
 
+import ae.sys.file : realPath;
+
 import cydo.runtime.config : PathMode;
 import cydo.runtime.launch.sandbox_materialization : createGitConfigTempFile, createGroupTempFile,
 	createPasswdTempFile, emptyDirPath, emptyFilePath;
@@ -87,7 +89,10 @@ string[] executableMountPaths(string executablePath)
 	}
 
 	addMount(dirName(executablePath));
-	auto resolved = resolveSymlinkChain(executablePath);
+	// Resolve to the physical location: symlink chains with relative targets
+	// (e.g. npm's bin/codex -> ../lib/node_modules/.../codex.js) would
+	// otherwise yield a '..' spelling, which path registration rejects.
+	auto resolved = realPath(executablePath);
 	if (resolved != executablePath)
 		addMount(dirName(resolved));
 	return mounts;
@@ -320,19 +325,6 @@ private:
 bool isExecutableFile(string path)
 {
 	return exists(path) && isFile(path) && access(toStringz(path), X_OK) == 0;
-}
-
-string resolveSymlinkChain(string path)
-{
-	auto current = path;
-	for (int i = 0; i < 32 && exists(current) && isSymlink(current); i++)
-	{
-		auto target = readLink(current);
-		if (!target.startsWith("/"))
-			target = buildPath(dirName(current), target);
-		current = target;
-	}
-	return current;
 }
 
 /// Build an env-based command prefix for non-bwrap mode.
@@ -728,6 +720,38 @@ unittest
 	auto launch = prepareProcessLaunch(sandbox, "", "cydo-test-exec");
 	assert(launch.executablePath == binPath);
 	assert(executableMountPaths(binPath).canFind(binDir));
+}
+
+// An executable reached through a symlink with a relative target (npm's
+// global-install layout) must resolve to its physical package directory,
+// not a '..' spelling, which path registration rejects.
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, symlink, write;
+	import std.process : execute;
+
+	auto root = buildPath("/tmp", "cydo-launch-npm-layout");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto binDir = buildPath(root, "bin");
+	auto pkgBinDir = buildPath(root, "lib", "node_modules", "@openai", "codex", "bin");
+	mkdirRecurse(binDir);
+	mkdirRecurse(pkgBinDir);
+	auto script = buildPath(pkgBinDir, "codex.js");
+	write(script, "#!/bin/sh\nexit 0\n");
+	execute(["chmod", "+x", script]);
+	auto link = buildPath(binDir, "codex");
+	symlink("../lib/node_modules/@openai/codex/bin/codex.js", link);
+
+	auto mounts = executableMountPaths(link);
+	assert(mounts.canFind(binDir));
+	assert(mounts.canFind(realPath(pkgBinDir)));
+	foreach (mount; mounts)
+		assert(!mount.canFind(".."));
 }
 
 unittest
