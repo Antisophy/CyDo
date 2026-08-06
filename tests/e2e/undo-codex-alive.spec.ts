@@ -555,3 +555,105 @@ test(
     });
   },
 );
+
+test(
+  "codex second live undo after an interrupted turn retains earlier history",
+  { tag: "@codex-only" },
+  async ({ page }) => {
+    await enterSession(page);
+
+    // The small Codex model uses the v1 interrupted-turn history marker, which
+    // is persisted as a contextual role=user response item.
+    await page
+      .locator(".task-type-row", { hasText: "system_prompt_test" })
+      .click();
+    await expect(
+      page.locator(".task-type-row.selected .task-type-name"),
+    ).toHaveText("system_prompt_test");
+
+    for (const marker of [
+      "interrupt-undo-one",
+      "interrupt-undo-two",
+      "interrupt-undo-three",
+    ]) {
+      await sendMessage(page, `Please reply with "${marker}"`);
+      await expect(assistantText(page, marker)).toBeVisible({
+        timeout: 90_000,
+      });
+    }
+
+    await openUndoDialogForUserMessage(
+      page,
+      'Please reply with "interrupt-undo-three"',
+    );
+    await expect(page.locator(".undo-dialog-count:visible")).toContainText(
+      "1 message will be removed.",
+    );
+    await page.locator(".btn-undo:visible").click();
+
+    const activeUsers = page.locator(
+      ".message.user-message:visible:not(.pending):not(.meta-message)",
+    );
+    await expect(activeUsers).toHaveCount(2, { timeout: 15_000 });
+    await expect(assistantText(page, "interrupt-undo-one")).toBeVisible();
+    await expect(assistantText(page, "interrupt-undo-two")).toBeVisible();
+
+    const retainedContextProbe =
+      "check context contains aW50ZXJydXB0LXVuZG8tb25l";
+    await sendMessage(page, retainedContextProbe);
+    await expect(
+      assistantText(page, "context-check-passed").last(),
+    ).toBeVisible({ timeout: 90_000 });
+    await expect(activeUsers).toHaveCount(3, { timeout: 15_000 });
+
+    const interrupted = "stall session interrupt-undo-running";
+    await sendMessage(page, interrupted);
+    await expect(
+      page.locator(".message.user-message:visible:not(.pending)", {
+        hasText: interrupted,
+      }),
+    ).toBeVisible({ timeout: 90_000 });
+    await expect(page.locator(".btn-stop:visible")).toBeVisible();
+    await page.locator(".btn-stop:visible").click();
+    await expect(page.locator(".btn-stop:visible")).toHaveCount(0, {
+      timeout: 90_000,
+    });
+    await expect(activeUsers).toHaveCount(4, { timeout: 15_000 });
+
+    await openUndoDialogForUserMessage(
+      page,
+      'Please reply with "interrupt-undo-two"',
+    );
+    // Only interrupt-undo-two, the probe, and the interrupted prompt are
+    // active user turns, so the correct rollback count is three.
+    const secondUndoCount = page.locator(".undo-dialog-count:visible");
+    await expect(secondUndoCount).toContainText("messages will be removed.");
+    const secondUndoPreview = await secondUndoCount.innerText();
+    await page.locator(".btn-undo:visible").click();
+
+    await expect(activeUsers).toHaveCount(1, { timeout: 15_000 });
+    await expect(
+      page.locator(".message.assistant-message:visible"),
+    ).toHaveCount(1, { timeout: 15_000 });
+    await expect(
+      page.locator(".message.user-message:visible", {
+        hasText: "interrupt-undo-one",
+      }),
+    ).toBeVisible();
+    await expect(assistantText(page, "interrupt-undo-one")).toBeVisible();
+
+    await sendMessage(page, retainedContextProbe);
+    const contextProbe = assistantText(
+      page,
+      /context-check-(?:passed|failed)/,
+    ).last();
+    await expect(contextProbe).toBeVisible({ timeout: 90_000 });
+    expect({
+      secondUndoPreview,
+      retainedContext: await contextProbe.innerText(),
+    }).toEqual({
+      secondUndoPreview: "3 messages will be removed.",
+      retainedContext: "context-check-passed",
+    });
+  },
+);

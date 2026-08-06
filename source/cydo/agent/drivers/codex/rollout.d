@@ -156,8 +156,12 @@ package PersistedHistoryBoundary[] extractPersistedHistoryBoundariesImpl(string 
 			continue;
 		if (probe.isUserMessage && !seenTaskStarted)
 			continue;
-		if (probe.isUserMessage && isCodexContextOnlyUserMessageLine(line))
-			continue;
+		if (probe.isUserMessage)
+		{
+			auto classification = classifyCodexUserMessageLine(line);
+			if (isCodexContextOnlyUserMessage(classification))
+				continue;
+		}
 		ids ~= PersistedHistoryBoundary("line:" ~ to!string(lineNum),
 			probe.isUserMessage ? PersistedHistoryBoundaryKind.user : PersistedHistoryBoundaryKind.agent_turn, null);
 	}
@@ -171,10 +175,35 @@ package bool isCodexContextOnlyUserText(string text)
 	auto trimmed = text.stripLeft;
 	return trimmed.startsWith("<permissions instructions>")
 		|| trimmed.startsWith("<environment_context>")
-		|| trimmed.startsWith("[SYSTEM:");
+		|| trimmed.startsWith("[SYSTEM:")
+		|| isCodexTurnAbortedUserText(trimmed);
 }
 
-package bool isCodexContextOnlyUserMessageLine(string line)
+package bool isCodexTurnAbortedUserText(string text)
+{
+	import std.ascii : toLower;
+	import std.string : stripLeft, stripRight;
+
+	enum openingMarker = "<turn_aborted>";
+	enum closingMarker = "</turn_aborted>";
+
+	auto leftTrimmed = text.stripLeft;
+	if (leftTrimmed.length < openingMarker.length)
+		return false;
+	foreach (i, c; openingMarker)
+		if (leftTrimmed[i].toLower != c)
+			return false;
+
+	auto trimmed = leftTrimmed.stripRight;
+	if (trimmed.length < closingMarker.length)
+		return false;
+	foreach (i, c; closingMarker)
+		if (trimmed[trimmed.length - closingMarker.length + i].toLower != c)
+			return false;
+	return true;
+}
+
+package bool extractCodexUserMessageText(string line, out string text)
 {
 	@JSONPartial
 	static struct Probe
@@ -201,14 +230,52 @@ package bool isCodexContextOnlyUserMessageLine(string line)
 		if (probe.payload.type != "message" || probe.payload.role != "user"
 			|| probe.payload.content.json is null)
 			return false;
-		string text;
 		foreach (ref block; jsonParse!(TextBlock[])(probe.payload.content.json))
 			if (block.type == "input_text" || block.type == "text")
 				text ~= block.text;
-		return isCodexContextOnlyUserText(text);
+		return true;
 	}
 	catch (Exception)
 		return false;
+}
+
+package enum CodexUserMessageLineClassification
+{
+	normal,
+	contextOnly,
+	turnAborted,
+}
+
+package CodexUserMessageLineClassification classifyCodexUserMessageLine(string line)
+{
+	string text;
+	if (!extractCodexUserMessageText(line, text))
+		return CodexUserMessageLineClassification.normal;
+	if (isCodexTurnAbortedUserText(text))
+		return CodexUserMessageLineClassification.turnAborted;
+	return isCodexContextOnlyUserText(text)
+		? CodexUserMessageLineClassification.contextOnly
+		: CodexUserMessageLineClassification.normal;
+}
+
+package bool isCodexContextOnlyUserMessage(
+	CodexUserMessageLineClassification classification)
+{
+	return classification != CodexUserMessageLineClassification.normal;
+}
+
+package bool isCodexContextOnlyUserMessageLine(string line)
+{
+	return isCodexContextOnlyUserMessage(classifyCodexUserMessageLine(line));
+}
+
+/// True when a parsed role=user response item represents a Codex rollback turn.
+/// `[SYSTEM:]` retains its existing replay semantics; the Codex-generated
+/// abort fragment does not form a separate rollback turn.
+package bool isCodexRollbackEligibleUserMessage(
+	CodexUserMessageLineClassification classification)
+{
+	return classification != CodexUserMessageLineClassification.turnAborted;
 }
 
 enum CodexActiveUserTurnsAfterStatus
@@ -308,7 +375,9 @@ bool[int] computeRollbackSkipLines(string content)
 			rollbacks ~= RollbackInfo(lineNum, probe.rollbackNumTurns);
 			continue;
 		}
-		if (seenTaskStarted && probe.isUserMessage)
+		if (seenTaskStarted && probe.isUserMessage
+			&& isCodexRollbackEligibleUserMessage(
+				classifyCodexUserMessageLine(line)))
 			userTurnStarts ~= TurnBoundary(lineNum);
 	}
 
@@ -454,6 +523,93 @@ unittest
 		assert(afterSecond.status == CodexActiveUserTurnsAfterStatus.ok);
 		assert(afterSecond.count == 2,
 			"rollback count should include all active user segments");
+	}
+
+	// A v1 interrupted turn persists a contextual role=user abort marker. It
+	// belongs to the interrupted prompt rather than a separate Codex turn.
+	{
+		string beforeSecondRollback =
+			`{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"interrupt-undo-one"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"interrupt-undo-two"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"interrupt-undo-three"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"context-probe"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"interrupt-undo-running"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"}]}}`;
+
+		auto afterSelected = countActiveUserTurnsAfterForkId(
+			beforeSecondRollback, "line:4");
+		assert(afterSelected.status == CodexActiveUserTurnsAfterStatus.ok);
+		assert(afterSelected.count == 2,
+			"the contextual v1 abort marker must not count as an active user turn");
+
+		auto skip = computeRollbackSkipLines(beforeSecondRollback ~ "\n" ~
+			`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":3}}`);
+		assert(2 !in skip && 3 !in skip,
+			"the second rollback must retain Codex's earlier first-turn prefix");
+		foreach (line; 4 .. 14)
+			assert(line in skip,
+				"both rollback suffixes must be omitted during replay");
+	}
+
+	// Only a complete abort wrapper is contextual in Codex. Opening-only and
+	// trailing-content lookalikes remain ordinary rollback turns.
+	foreach (abortLikeText; [
+		`<turn_aborted>\nThe user interrupted the previous turn on purpose.`,
+		`<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>\nordinary user text`,
+	])
+	{
+		string beforeRollback =
+			`{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"retained-prefix"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"` ~ abortLikeText ~ `"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}`;
+
+		auto afterPrefix = countActiveUserTurnsAfterForkId(
+			beforeRollback, "line:2");
+		assert(afterPrefix.status == CodexActiveUserTurnsAfterStatus.ok);
+		assert(afterPrefix.count == 1,
+			"abort-like ordinary user text must count as a rollback turn");
+
+		auto skip = computeRollbackSkipLines(beforeRollback ~ "\n" ~
+			`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`);
+		assert(2 !in skip && 3 !in skip,
+			"replay must retain the prefix before an ordinary abort-like turn");
+		foreach (line; 4 .. 7)
+			assert(line in skip,
+				"replay must remove the ordinary abort-like turn and rollback marker");
+	}
+
+	// Codex matches contextual abort wrappers case-insensitively after trimming
+	// outer whitespace. This record must not consume a rollback turn.
+	{
+		string beforeRollback =
+			`{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"retained-prefix"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"interrupted-turn"}]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
+			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"  \n<TURN_ABORTED>\nThe user interrupted the previous turn on purpose.\n</TURN_ABORTED>\n\t  "}]}}`;
+
+		auto afterPrefix = countActiveUserTurnsAfterForkId(
+			beforeRollback, "line:2");
+		assert(afterPrefix.status == CodexActiveUserTurnsAfterStatus.ok);
+		assert(afterPrefix.count == 1,
+			"a case-insensitive complete abort wrapper must not count as a turn");
+
+		auto skip = computeRollbackSkipLines(beforeRollback ~ "\n" ~
+			`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`);
+		assert(2 !in skip && 3 !in skip,
+			"replay must retain the prefix before the interrupted turn");
+		foreach (line; 4 .. 8)
+			assert(line in skip,
+				"replay must remove the interrupted turn and contextual abort record");
 	}
 
 	// CyDo's injected session instruction is persisted as a user response_item,
