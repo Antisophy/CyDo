@@ -282,6 +282,67 @@ describe("session init and metadata reducers", () => {
 });
 
 describe("history boundary replacement", () => {
+  it("materializes an empty text user message for history boundary replacement", () => {
+    const userMessage = {
+      type: "item/started" as const,
+      item_type: "user_message" as const,
+      item_id: "empty-user",
+      content: [{ type: "text" as const, text: "" }],
+    };
+    const materialized = reduceMessage(makeState(), userMessage, 4);
+
+    expect(materialized.messages).toHaveLength(1);
+    expect(materialized.messages[0]).toMatchObject({
+      type: "user",
+      content: [{ type: "text", text: "" }],
+      rawSource: userMessage,
+      seq: 4,
+    });
+    expect(materialized.messages[0]).not.toHaveProperty("pending");
+
+    const replacement = {
+      ...userMessage,
+      history_boundary: { anchor: "empty-user", kind: "user" as const },
+    };
+    expect(
+      replaceHistoryBoundary(
+        materialized,
+        replacement,
+        4,
+      ).replacementEvents.get(4),
+    ).toEqual(replacement);
+  });
+
+  it("materializes missing user content for history boundary replacement", () => {
+    const userMessage = {
+      type: "item/started" as const,
+      item_type: "user_message" as const,
+      item_id: "empty-user",
+      content: [],
+    };
+    const materialized = reduceMessage(makeState(), userMessage, 4);
+
+    expect(materialized.messages).toHaveLength(1);
+    expect(materialized.messages[0]).toMatchObject({
+      type: "user",
+      content: [{ type: "text", text: "" }],
+      rawSource: userMessage,
+      seq: 4,
+    });
+
+    const replacement = {
+      ...userMessage,
+      history_boundary: { anchor: "empty-user", kind: "user" as const },
+    };
+    expect(
+      replaceHistoryBoundary(
+        materialized,
+        replacement,
+        4,
+      ).replacementEvents.get(4),
+    ).toEqual(replacement);
+  });
+
   it("replaces only the matching raw contribution", () => {
     const at4 = {
       type: "item/started",

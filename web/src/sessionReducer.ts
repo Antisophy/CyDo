@@ -992,66 +992,59 @@ function reduceItemStartedUserMessage(
     return { ...state, messages };
   }
 
-  const hasContent = blocks.some(
-    (b) =>
-      (b.type === "text" && (b.text ?? "").trim().length > 0) ||
-      b.type !== "text",
-  );
-  if (hasContent) {
-    const id = `user-echo-${++state.msgIdCounter}`;
-    const echoMsg: DisplayMessage = {
-      id,
-      type: "user" as const,
-      content: blocks,
-      isSidechain: event.is_sidechain,
-      isSynthetic: event.is_synthetic || undefined,
-      isMeta: event.is_meta || undefined,
-      isSteering: event.is_steering || undefined,
-      isCompactSummary: event.isCompactSummary || undefined,
-      parentToolUseId: event.parent_tool_use_id,
-      extraFields: getExtras(event),
-      rawSource: event,
-      seq,
-      uuid: event.uuid,
-      nonce: event.is_replay ? undefined : pendingMsg?.nonce,
-      cydoMeta: pendingMsg?.cydoMeta ?? eventCydoMeta,
-      ts,
-    };
-    if (displacedPlaceholder) {
-      // The agent echoes a replayed user message as soon as it consumes it —
-      // that only proves submission to the harness, not that the LLM has seen
-      // it. Keep the "submitted" presentation; assistant output promotes it
-      // (reduceItemStarted) once the request demonstrably reached the model.
-      echoMsg.ackState = 3;
-      echoMsg.pending = true;
-      echoMsg.echoPending = true;
-    }
-
-    // Match the placeholder by nonce. If the event carries a nonce and a
-    // pending message with that nonce exists, replace it. Otherwise append
-    // a fresh ack-1 message without disturbing other pending placeholders.
-    // A replay echo already displaced its placeholder above — it must not
-    // consume a second same-content placeholder here.
-    const matchIdx = event.is_replay
-      ? -1
-      : state.messages.findIndex(
-          (m) =>
-            isPendingUserMsg(m) &&
-            !m.uuid &&
-            (eventNonce ? m.nonce === eventNonce : hasSameContent(m)),
-        );
-
-    const filtered =
-      matchIdx >= 0
-        ? state.messages.filter((_, i) => i !== matchIdx)
-        : eventNonce || event.is_replay
-          ? state.messages
-          : state.messages.filter((m) => !isReplayDisposablePendingUserMsg(m));
-    const messages = event.is_meta
-      ? [...filtered, echoMsg]
-      : insertBeforeStreaming(filtered, echoMsg);
-    state = { ...state, messages };
+  const id = `user-echo-${++state.msgIdCounter}`;
+  const echoMsg: DisplayMessage = {
+    id,
+    type: "user" as const,
+    content: blocks,
+    isSidechain: event.is_sidechain,
+    isSynthetic: event.is_synthetic || undefined,
+    isMeta: event.is_meta || undefined,
+    isSteering: event.is_steering || undefined,
+    isCompactSummary: event.isCompactSummary || undefined,
+    parentToolUseId: event.parent_tool_use_id,
+    extraFields: getExtras(event),
+    rawSource: event,
+    seq,
+    uuid: event.uuid,
+    nonce: event.is_replay ? undefined : pendingMsg?.nonce,
+    cydoMeta: pendingMsg?.cydoMeta ?? eventCydoMeta,
+    ts,
+  };
+  if (displacedPlaceholder) {
+    // The agent echoes a replayed user message as soon as it consumes it —
+    // that only proves submission to the harness, not that the LLM has seen
+    // it. Keep the "submitted" presentation; assistant output promotes it
+    // (reduceItemStarted) once the request demonstrably reached the model.
+    echoMsg.ackState = 3;
+    echoMsg.pending = true;
+    echoMsg.echoPending = true;
   }
+
+  // Match the placeholder by nonce. If the event carries a nonce and a
+  // pending message with that nonce exists, replace it. Otherwise append
+  // a fresh ack-1 message without disturbing other pending placeholders.
+  // A replay echo already displaced its placeholder above — it must not
+  // consume a second same-content placeholder here.
+  const matchIdx = event.is_replay
+    ? -1
+    : state.messages.findIndex(
+        (m) =>
+          isPendingUserMsg(m) &&
+          !m.uuid &&
+          (eventNonce ? m.nonce === eventNonce : hasSameContent(m)),
+      );
+
+  const filtered =
+    matchIdx >= 0
+      ? state.messages.filter((_, i) => i !== matchIdx)
+      : eventNonce || event.is_replay
+        ? state.messages
+        : state.messages.filter((m) => !isReplayDisposablePendingUserMsg(m));
+  const messages = event.is_meta
+    ? [...filtered, echoMsg]
+    : insertBeforeStreaming(filtered, echoMsg);
+  state = { ...state, messages };
 
   return state;
 }
