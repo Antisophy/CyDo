@@ -60,7 +60,7 @@ import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
 	UnconfirmedUserEventEnvelope, extractContentText;
 import cydo.agent.session : AgentSession;
 import cydo.agent.terminal : TerminalProcess;
-import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
+import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, SandboxConfig, WorkspaceConfig;
 import cydo.domain.storage.persistence : Persistence, openDatabase;
 import cydo.runtime.launch.sandbox : cleanup, resolveExecutablePath, runtimeDir;
 import cydo.domain.task_types.definition : TaskTypeDef, ContinuationDef, OutputType, WorktreeMode, byName, isInteractive, loadTaskTypes,

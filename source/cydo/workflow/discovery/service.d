@@ -125,7 +125,7 @@ class DiscoveryService
 		foreach (ref ws; config.workspaces)
 		{
 			auto sandbox = resolveSandboxForDiscovery(
-				config.sandbox, ws.sandbox, ws.root, cydoBinaryDir());
+				config.sandbox, ws.sandbox, ws.root, cydoBinaryDir(), ws.name);
 			auto cmdPrefix = buildCommandPrefix(sandbox, "/");
 			auto isProjectExpr = ws.project_discovery.is_project;
 			auto recurseWhenExpr = ws.project_discovery.recurse_when;

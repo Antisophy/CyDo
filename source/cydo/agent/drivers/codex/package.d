@@ -27,7 +27,9 @@ public import cydo.agent.drivers.codex.rpc;
 import cydo.protocol : ContentBlock, ProcessStderrEvent, SessionCompactedEvent,
 	TranslatedEvent, extrasToFragment;
 import cydo.agent.session : AgentSession;
-import cydo.runtime.config : AgentDriver, PathMode;
+import cydo.runtime.config : AgentDriver;
+import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
+	SandboxPathOriginKind, SandboxPaths;
 import cydo.runtime.launch.types : ProcessLaunch;
 import cydo.runtime.launch.sandbox : cleanup, cydoBinaryDir, cydoBinaryPath, effectiveEnvValue,
 	executableMountPaths, resolveExecutablePath;
@@ -56,39 +58,30 @@ class CodexAgent : Agent
 		histSeenTaskStarted_ = false;
 	}
 
-	void configureSandbox(ref PathMode[string] paths, ref string[string] env)
+	void configureSandbox(ref SandboxPaths paths, ref string[string] env)
 	{
-		import std.algorithm : startsWith;
 		import std.process : environment;
-
-		void addIfNotRw(string path, PathMode mode)
-		{
-			if (path.length == 0)
-				return;
-			if (mode == PathMode.ro)
-			{
-				if (auto existing = path in paths)
-					if (*existing == PathMode.rw)
-						return;
-				foreach (existing, existingMode; paths)
-					if (existingMode == PathMode.rw && path.startsWith(existing ~ "/"))
-						return;
-			}
-			paths[path] = mode;
-		}
 
 		// Codex home directory (config, sessions)
 		auto home = environment.get("HOME", "/tmp");
-		auto codexHome = environment.get("CODEX_HOME", buildPath(home, ".codex"));
-		paths[codexHome] = PathMode.rw;
+		auto codexHome = effectiveEnvValue(env, "CODEX_HOME", buildPath(home, ".codex"));
+		paths.require(codexHome, PathAccess.rw,
+			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "codex",
+				"CODEX_HOME"));
 
 		auto codexPath = resolveExecutablePath(executableName(env), env);
 		foreach (path; executableMountPaths(codexPath))
-			addIfNotRw(path, PathMode.ro);
+			paths.requireReadVisible(path,
+				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "codex",
+					"Codex executable"));
 		if (dirName(codexPath) == home ~ "/.npm-packages/bin")
-			addIfNotRw(home ~ "/.npm-packages", PathMode.ro);
+			paths.requireReadVisible(home ~ "/.npm-packages",
+				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "codex",
+					"Codex npm package root"));
 
-		addIfNotRw(cydoBinaryDir(), PathMode.ro);
+		paths.requireReadVisible(cydoBinaryDir(),
+			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "codex",
+				"CyDo binary"));
 
 		// Pass through Codex-required env vars so they survive --clearenv
 		void passthrough(string key)
@@ -945,6 +938,152 @@ class CodexAgent : Agent
 
 		return OneShotHandle(promise, &cancel);
 	}
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir, write;
+	import std.path : buildPath;
+	import std.process : environment, execute;
+	import cydo.runtime.config : PathMode, SandboxConfig;
+	import cydo.runtime.launch.sandbox_resolver : resolveSandbox;
+	import cydo.runtime.launch.types : AgentSandboxConfig;
+
+	auto root = buildPath(tempDir(), "cydo-codex-configure-sandbox");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto environmentKeys = ["HOME", "PATH", "CODEX_HOME", "OPENAI_API_KEY",
+		"OPENAI_BASE_URL", "CODEX_API_KEY"];
+	string[string] previousEnvironment;
+	bool[string] hadEnvironment;
+	foreach (key; environmentKeys)
+	{
+		hadEnvironment[key] = key in environment;
+		previousEnvironment[key] = environment.get(key, "");
+	}
+	scope (exit)
+	{
+		foreach (key; environmentKeys)
+		{
+			if (hadEnvironment[key])
+				environment[key] = previousEnvironment[key];
+			else
+				environment.remove(key);
+		}
+	}
+
+	auto home = buildPath(root, "home");
+	auto codexHome = buildPath(home, "configured-codex-home");
+	auto npmRoot = buildPath(home, ".npm-packages");
+	auto executableDir = buildPath(npmRoot, "bin");
+	auto executable = buildPath(executableDir, "codex");
+	mkdirRecurse(codexHome);
+	mkdirRecurse(executableDir);
+	write(executable, "#!/bin/sh\nexit 0\n");
+	execute(["chmod", "+x", executable]);
+	environment["HOME"] = home;
+	environment["CODEX_HOME"] = codexHome;
+	environment["OPENAI_API_KEY"] = "test-openai-key";
+	environment["OPENAI_BASE_URL"] = "https://codex.test.invalid/v1";
+	environment["CODEX_API_KEY"] = "test-codex-key";
+	environment["PATH"] = executableDir;
+
+	auto agent = new CodexAgent;
+	auto cydoDir = cydoBinaryDir();
+	assert(cydoDir.length > 0);
+
+	SandboxConfig global;
+	global.paths = [
+		executableDir: PathMode.rw,
+		cydoDir: PathMode.always_rw,
+	];
+	global.env = [
+		"CYDO_CODEX_BIN": executable,
+		"PATH": executableDir,
+	];
+	auto executableMounts = executableMountPaths(resolveExecutablePath(executable, global.env));
+	assert(executableMounts.length == 1);
+	assert(executableMounts[0] == executableDir);
+	AgentSandboxConfig agentSandbox;
+	agentSandbox.configureSandbox = (ref SandboxPaths paths, ref string[string] env) {
+		agent.configureSandbox(paths, env);
+	};
+	agentSandbox.agentName = "codex";
+	agentSandbox.workspaceName = "test";
+	auto resolved = resolveSandbox(global, SandboxConfig.init, SandboxConfig.init,
+		agentSandbox, "");
+
+	auto executableView = resolved.paths.exact(executableDir).get;
+	assert(executableView.declaration.get.mode == PathMode.rw);
+	assert(executableView.effectiveMode == PathMode.rw);
+	auto cydoView = resolved.paths.exact(cydoDir).get;
+	assert(cydoView.declaration.get.mode == PathMode.always_rw);
+	assert(cydoView.effectiveMode == PathMode.always_rw);
+
+	auto stateHome = resolved.paths.exact(codexHome).get;
+	assert(stateHome.declaration.isNull);
+	assert(stateHome.requirement.get.access == PathAccess.rw);
+	assert(stateHome.effectiveMode == PathMode.rw);
+	assert(resolved.env["PATH"] == executableDir);
+	assert(resolved.env["CODEX_HOME"] == codexHome);
+	assert(resolved.env["OPENAI_API_KEY"] == "test-openai-key");
+	assert(resolved.env["OPENAI_BASE_URL"] == "https://codex.test.invalid/v1");
+	assert(resolved.env["CODEX_API_KEY"] == "test-codex-key");
+
+	// A configured launch value must select the same writable state home that
+	// the sandboxed process receives, rather than the host-only fallback.
+	auto configuredCodexHome = buildPath(home, "sandbox-codex-home");
+	SandboxConfig configuredGlobal;
+	configuredGlobal.env = [
+		"CYDO_CODEX_BIN": executable,
+		"PATH": executableDir,
+		"CODEX_HOME": configuredCodexHome,
+	];
+	auto configuredResolved = resolveSandbox(configuredGlobal, SandboxConfig.init,
+		SandboxConfig.init, agentSandbox, "");
+	auto configuredStateHome = configuredResolved.paths.exact(configuredCodexHome).get;
+	assert(configuredStateHome.declaration.isNull);
+	assert(configuredStateHome.requirement.get.access == PathAccess.rw);
+	assert(configuredStateHome.effectiveMode == PathMode.rw);
+	assert(configuredResolved.paths.exact(codexHome).isNull);
+	assert(configuredResolved.env["CODEX_HOME"] == configuredCodexHome);
+
+	// Missing launch values retain Codex's host-environment passthrough.
+	SandboxPaths defaultPaths;
+	string[string] defaultEnv = ["CYDO_CODEX_BIN": executable];
+	agent.configureSandbox(defaultPaths, defaultEnv);
+	assert(defaultEnv["PATH"] == executableDir);
+	assert(defaultEnv["CODEX_HOME"] == codexHome);
+	assert(defaultEnv["OPENAI_API_KEY"] == "test-openai-key");
+	assert(defaultEnv["OPENAI_BASE_URL"] == "https://codex.test.invalid/v1");
+	assert(defaultEnv["CODEX_API_KEY"] == "test-codex-key");
+	foreach (path; executableMounts)
+		assert(defaultPaths.exact(path).get.effectiveMode == PathMode.ro);
+	auto npmView = defaultPaths.exact(npmRoot).get;
+	assert(npmView.requirement.get.access == PathAccess.ro);
+	assert(npmView.effectiveMode == PathMode.ro);
+
+	// Writable ancestors satisfy read visibility without producing a child mount.
+	auto origin = SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+		"codex test", "pre-existing host access");
+	SandboxPaths ancestorPaths;
+	auto executableParent = dirName(executableDir);
+	auto cydoParent = dirName(cydoDir);
+	ancestorPaths.require(executableParent, PathAccess.rw, origin);
+	ancestorPaths.require(cydoParent, PathAccess.alwaysRw, origin);
+	string[string] ancestorEnv = [
+		"CYDO_CODEX_BIN": executable,
+		"PATH": executableDir,
+	];
+	agent.configureSandbox(ancestorPaths, ancestorEnv);
+	assert(ancestorPaths.exact(executableParent).get.effectiveMode == PathMode.rw);
+	assert(ancestorPaths.exact(executableDir).isNull);
+	assert(ancestorPaths.exact(cydoParent).get.effectiveMode == PathMode.always_rw);
+	assert(ancestorPaths.exact(cydoDir).isNull);
 }
 
 private class AppServerStartupGate

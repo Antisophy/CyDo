@@ -17,7 +17,9 @@ import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary,
 import cydo.protocol;
 import cydo.agent.process : AgentProcess, FramingMode;
 import cydo.agent.session : AgentSession;
-import cydo.runtime.config : AgentDriver, PathMode;
+import cydo.runtime.config : AgentDriver;
+import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
+	SandboxPathOriginKind, SandboxPaths;
 import cydo.runtime.launch.types : ProcessLaunch, ResolvedSandbox;
 import cydo.runtime.launch.sandbox : buildCommandPrefix, cleanup, cydoBinaryDir, cydoBinaryPath,
 	effectiveEnvValue, executableMountPaths, resolveExecutablePath;
@@ -26,36 +28,27 @@ import cydo.foundation.text.title : truncateTitle;
 /// Agent descriptor for Claude Code CLI.
 class ClaudeCodeAgent : Agent
 {
-	void configureSandbox(ref PathMode[string] paths, ref string[string] env)
+	void configureSandbox(ref SandboxPaths paths, ref string[string] env)
 	{
-		import std.algorithm : startsWith;
-
-		void addIfNotRw(string path, PathMode mode)
-		{
-			if (path.length == 0)
-				return;
-			// Don't add ro if this exact path or a parent is already rw
-			if (mode == PathMode.ro)
-			{
-				if (auto existing = path in paths)
-					if (*existing == PathMode.rw || *existing == PathMode.always_rw)
-						return;
-				foreach (existing, existingMode; paths)
-					if ((existingMode == PathMode.rw || existingMode == PathMode.always_rw) && path.startsWith(existing ~ "/"))
-						return;
-			}
-			paths[path] = mode;
-		}
-
-		paths[expandTilde("~/.claude")]              = PathMode.rw;
-		paths[expandTilde("~/.claude.json")]         = PathMode.rw;
-		paths[expandTilde("~/.local/share/claude")]  = PathMode.ro;
+		paths.require(expandTilde("~/.claude"), PathAccess.rw,
+			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "claude",
+				"Claude state directory"));
+		paths.require(expandTilde("~/.claude.json"), PathAccess.rw,
+			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "claude",
+				"Claude state file"));
+		paths.require(expandTilde("~/.local/share/claude"), PathAccess.ro,
+			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "claude",
+				"Claude data directory"));
 
 		foreach (path; executableMountPaths(resolveExecutablePath(executableName(env), env)))
-			addIfNotRw(path, PathMode.ro);
+			paths.requireReadVisible(path,
+				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "claude",
+					"Claude executable"));
 
 		// Add the cydo binary's directory so the MCP server can be spawned inside the sandbox
-		addIfNotRw(cydoBinaryDir(), PathMode.ro);
+		paths.requireReadVisible(cydoBinaryDir(),
+			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "claude",
+				"CyDo binary"));
 
 		if ("PATH" !in env)
 		{
@@ -665,6 +658,126 @@ class ClaudeCodeAgent : Agent
 
 		return OneShotHandle(promise, &cancel);
 	}
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir, write;
+	import std.path : buildPath;
+	import std.process : environment, execute;
+	import cydo.runtime.config : PathMode, SandboxConfig;
+	import cydo.runtime.launch.sandbox_resolver : resolveSandbox;
+	import cydo.runtime.launch.types : AgentSandboxConfig;
+
+	auto root = buildPath(tempDir(), "cydo-claude-configure-sandbox");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto environmentKeys = ["HOME", "PATH"];
+	string[string] previousEnvironment;
+	bool[string] hadEnvironment;
+	foreach (key; environmentKeys)
+	{
+		hadEnvironment[key] = key in environment;
+		previousEnvironment[key] = environment.get(key, "");
+	}
+	scope (exit)
+	{
+		foreach (key; environmentKeys)
+		{
+			if (hadEnvironment[key])
+				environment[key] = previousEnvironment[key];
+			else
+				environment.remove(key);
+		}
+	}
+
+	auto home = buildPath(root, "home");
+	auto executableDir = buildPath(root, "bin");
+	auto executable = buildPath(executableDir, "claude");
+	mkdirRecurse(home);
+	mkdirRecurse(executableDir);
+	write(executable, "#!/bin/sh\nexit 0\n");
+	execute(["chmod", "+x", executable]);
+	environment["HOME"] = home;
+	environment["PATH"] = executableDir;
+
+	auto agent = new ClaudeCodeAgent;
+	auto cydoDir = cydoBinaryDir();
+	assert(cydoDir.length > 0);
+
+	SandboxConfig global;
+	global.paths = [
+		executableDir: PathMode.rw,
+		cydoDir: PathMode.always_rw,
+	];
+	global.env = [
+		"CYDO_CLAUDE_BIN": executable,
+		"PATH": executableDir,
+	];
+	auto executableMounts = executableMountPaths(resolveExecutablePath(executable, global.env));
+	assert(executableMounts.length == 1);
+	assert(executableMounts[0] == executableDir);
+	AgentSandboxConfig agentSandbox;
+	agentSandbox.configureSandbox = (ref SandboxPaths paths, ref string[string] env) {
+		agent.configureSandbox(paths, env);
+	};
+	agentSandbox.agentName = "claude";
+	agentSandbox.workspaceName = "test";
+	auto resolved = resolveSandbox(global, SandboxConfig.init, SandboxConfig.init,
+		agentSandbox, "");
+
+	auto executableView = resolved.paths.exact(executableDir).get;
+	assert(executableView.declaration.get.mode == PathMode.rw);
+	assert(executableView.effectiveMode == PathMode.rw);
+	auto cydoView = resolved.paths.exact(cydoDir).get;
+	assert(cydoView.declaration.get.mode == PathMode.always_rw);
+	assert(cydoView.effectiveMode == PathMode.always_rw);
+
+	auto stateDir = resolved.paths.exact(buildPath(home, ".claude")).get;
+	assert(stateDir.declaration.isNull);
+	assert(stateDir.requirement.get.access == PathAccess.rw);
+	assert(stateDir.effectiveMode == PathMode.rw);
+	auto stateFile = resolved.paths.exact(buildPath(home, ".claude.json")).get;
+	assert(stateFile.declaration.isNull);
+	assert(stateFile.requirement.get.access == PathAccess.rw);
+	assert(stateFile.effectiveMode == PathMode.rw);
+	auto dataDir = resolved.paths.exact(buildPath(home, ".local", "share", "claude")).get;
+	assert(dataDir.declaration.isNull);
+	assert(dataDir.requirement.get.access == PathAccess.ro);
+	assert(dataDir.effectiveMode == PathMode.ro);
+	assert(resolved.env["PATH"] == executableDir);
+	assert(resolved.env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] == "1");
+	assert(resolved.env["CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"] == "0");
+
+	// With no configured PATH, Claude keeps its existing host-PATH defaulting.
+	SandboxPaths defaultPaths;
+	string[string] defaultEnv = ["CYDO_CLAUDE_BIN": executable];
+	agent.configureSandbox(defaultPaths, defaultEnv);
+	assert(defaultEnv["PATH"] == executableDir);
+	foreach (path; executableMounts)
+		assert(defaultPaths.exact(path).get.effectiveMode == PathMode.ro);
+
+	// Writable ancestors satisfy read visibility without producing a child mount.
+	auto origin = SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+		"claude test", "pre-existing host access");
+	SandboxPaths ancestorPaths;
+	auto executableParent = dirName(executableDir);
+	auto cydoParent = dirName(cydoDir);
+	ancestorPaths.require(executableParent, PathAccess.rw, origin);
+	ancestorPaths.require(cydoParent, PathAccess.alwaysRw, origin);
+	string[string] ancestorEnv = [
+		"CYDO_CLAUDE_BIN": executable,
+		"PATH": executableDir,
+	];
+	agent.configureSandbox(ancestorPaths, ancestorEnv);
+	assert(ancestorPaths.exact(executableParent).get.effectiveMode == PathMode.rw);
+	assert(ancestorPaths.exact(executableDir).isNull);
+	assert(ancestorPaths.exact(cydoParent).get.effectiveMode == PathMode.always_rw);
+	assert(ancestorPaths.exact(cydoDir).isNull);
 }
 
 /// Claude Code session using stream-json protocol.

@@ -1,7 +1,6 @@
 module cydo.runtime.launch.sandbox_renderer;
 
-import std.algorithm : canFind, splitter, startsWith, sort;
-import std.array : array;
+import std.algorithm : canFind, splitter, startsWith;
 import std.file : exists, isFile, isSymlink, readLink;
 import std.logger : tracef;
 import std.path : buildPath, dirName, expandTilde;
@@ -13,7 +12,8 @@ import core.sys.posix.unistd : X_OK, access;
 import cydo.runtime.config : PathMode;
 import cydo.runtime.launch.sandbox_materialization : createGitConfigTempFile, createGroupTempFile,
 	createPasswdTempFile, emptyDirPath, emptyFilePath;
-import cydo.runtime.launch.sandbox_resolver : rewriteSandboxPaths;
+import cydo.runtime.launch.sandbox_paths : SandboxPathOrigin, SandboxPathOriginKind;
+import cydo.runtime.launch.sandbox_resolver : planMounts;
 import cydo.runtime.launch.types : ProcessLaunch, ResolvedSandbox;
 
 /// Absolute path to the currently running cydo binary, resolved at
@@ -126,8 +126,8 @@ string[] buildCommandPrefix(ref ResolvedSandbox sandbox, string workDir)
 	{
 		// Restricted mode: selective bind mounts
 
-		// Host-content binds emitted below, tracked as symlink-visibility
-		// providers for rewriteSandboxPaths.
+		// Host-content binds emitted below are symlink-visibility providers for
+		// the configured logical mount plan.
 		string[] builtinMounts;
 
 		// Pseudo-filesystems
@@ -204,30 +204,31 @@ string[] buildCommandPrefix(ref ResolvedSandbox sandbox, string workDir)
 			builtinMounts ~= "/sys/fs/cgroup";
 		}
 
-		// Rewrite here, not in resolveSandbox: paths keep being added between
-		// resolution and launch (task dir, worktree, git dirs), and every one
-		// of them must be rewritten to be mountable.
-		rewriteSandboxPaths(sandbox.paths, builtinMounts);
+		auto plannedMounts = planMounts(sandbox.paths, builtinMounts);
 
-		// Configured path binds — sorted by length so parent dirs are bound before
-		// children. This ensures a child rw bind overrides a parent ro bind.
-		auto sortedPaths = sandbox.paths.byKeyValue.array;
-		sortedPaths.sort!((a, b) => a.key.length < b.key.length);
-		foreach (entry; sortedPaths)
+		// A tmpfs directory parent supports later child binds. The current
+		// read-only empty_dir lowering cannot create missing child mountpoints,
+		// and empty_file is a leaf. This is a representation limitation, not
+		// registry policy.
+		foreach (entry; plannedMounts)
 		{
-			final switch (entry.value)
+			final switch (entry.mode)
 			{
-				case PathMode.ro: args ~= ["--ro-bind", entry.key, entry.key]; break;
-				case PathMode.rw: args ~= ["--bind", entry.key, entry.key]; break;
-				case PathMode.always_rw: args ~= ["--bind", entry.key, entry.key]; break;
+				case PathMode.ro:
+					args ~= ["--ro-bind", entry.source, entry.destination];
+					break;
+				case PathMode.rw:
+				case PathMode.always_rw:
+					args ~= ["--bind", entry.source, entry.destination];
+					break;
 				case PathMode.tmpfs:
-					args ~= ["--tmpfs", entry.key];
+					args ~= ["--tmpfs", entry.destination];
 					break;
 				case PathMode.empty_dir:
-					args ~= ["--ro-bind", emptyDirPath(), entry.key];
+					args ~= ["--ro-bind", emptyDirPath(), entry.destination];
 					break;
 				case PathMode.empty_file:
-					args ~= ["--ro-bind", emptyFilePath(), entry.key];
+					args ~= ["--ro-bind", emptyFilePath(), entry.destination];
 					break;
 			}
 		}
@@ -485,12 +486,20 @@ unittest
 	sandbox.isolate_filesystem = true;
 	sandbox.isolate_processes = false;
 	sandbox.isolate_environment = false;
-	sandbox.paths[wsRoot] = PathMode.ro;
+	sandbox.paths.set(wsRoot, PathMode.ro,
+		SandboxPathOrigin(SandboxPathOriginKind.builtinDefault, "renderer test",
+			"workspace root"));
 	// The default task mounts are canonical, but configured paths retain their
 	// spelling. Both must survive renderer rewriting.
-	sandbox.paths[projectDir] = PathMode.rw;
-	sandbox.paths[wsLink] = PathMode.tmpfs;
-	sandbox.paths[buildPath(tasksLink, "1")] = PathMode.rw;
+	sandbox.paths.set(projectDir, PathMode.rw,
+		SandboxPathOrigin(SandboxPathOriginKind.builtinDefault, "renderer test",
+			"project"));
+	sandbox.paths.set(wsLink, PathMode.tmpfs,
+		SandboxPathOrigin(SandboxPathOriginKind.workspaceConfig, "renderer test",
+			"workspace mask"));
+	sandbox.paths.set(buildPath(tasksLink, "1"), PathMode.rw,
+		SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, "renderer test",
+			"task directory"));
 
 	auto args = buildCommandPrefix(sandbox, "");
 	scope(exit)
@@ -526,4 +535,155 @@ unittest
 	auto launch = prepareProcessLaunch(sandbox, "", "cydo-test-exec");
 	assert(launch.executablePath == binPath);
 	assert(executableMountPaths(binPath).canFind(binDir));
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, remove, rmdirRecurse, write;
+	import std.path : buildPath;
+
+	auto root = buildPath("/tmp", "cydo-renderer-all-modes");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto fakeBin = buildPath(root, "bin");
+	mkdirRecurse(fakeBin);
+	write(buildPath(fakeBin, "bwrap"), "");
+	auto oldPath = environment.get("PATH", "");
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	scope (exit) environment["PATH"] = oldPath;
+
+	auto roPath = buildPath(root, "ro");
+	auto rwPath = buildPath(root, "rw");
+	auto alwaysRwPath = buildPath(root, "always-rw");
+	auto tmpfsPath = buildPath(root, "tmpfs");
+	auto emptyDirPath_ = buildPath(root, "empty-dir");
+	auto emptyFilePath_ = buildPath(root, "empty-file");
+	foreach (path; [roPath, rwPath, alwaysRwPath, tmpfsPath, emptyDirPath_])
+		mkdirRecurse(path);
+	write(emptyFilePath_, "");
+
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	sandbox.isolate_processes = false;
+	sandbox.isolate_environment = false;
+	auto origin = SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+		"renderer modes", "configured mount");
+	sandbox.paths.set(roPath, PathMode.ro, origin);
+	sandbox.paths.set(rwPath, PathMode.rw, origin);
+	sandbox.paths.set(alwaysRwPath, PathMode.always_rw, origin);
+	sandbox.paths.set(tmpfsPath, PathMode.tmpfs, origin);
+	sandbox.paths.set(emptyDirPath_, PathMode.empty_dir, origin);
+	sandbox.paths.set(emptyFilePath_, PathMode.empty_file, origin);
+	auto logicalBefore = sandbox.paths.snapshot;
+
+	auto args = buildCommandPrefix(sandbox, "");
+	auto repeatedArgs = buildCommandPrefix(sandbox, "");
+	scope (exit)
+		foreach (tempFile; sandbox.tempFiles)
+			if (exists(tempFile))
+				remove(tempFile);
+	assert(args.canFind(["--ro-bind", roPath, roPath]));
+	assert(args.canFind(["--bind", rwPath, rwPath]));
+	assert(args.canFind(["--bind", alwaysRwPath, alwaysRwPath]));
+	assert(args.canFind(["--tmpfs", tmpfsPath]));
+	assert(args.canFind(["--ro-bind", emptyDirPath(), emptyDirPath_]));
+	assert(args.canFind(["--ro-bind", emptyFilePath(), emptyFilePath_]));
+	assert(repeatedArgs.canFind(["--ro-bind", roPath, roPath]));
+	assert(repeatedArgs.canFind(["--bind", rwPath, rwPath]));
+	assert(repeatedArgs.canFind(["--bind", alwaysRwPath, alwaysRwPath]));
+	assert(repeatedArgs.canFind(["--tmpfs", tmpfsPath]));
+	assert(repeatedArgs.canFind(["--ro-bind", emptyDirPath(), emptyDirPath_]));
+	assert(repeatedArgs.canFind(["--ro-bind", emptyFilePath(), emptyFilePath_]));
+
+	auto logicalAfter = sandbox.paths.snapshot;
+	assert(logicalAfter.length == logicalBefore.length);
+	foreach (i, view; logicalBefore)
+	{
+		assert(logicalAfter[i].path == view.path);
+		assert(logicalAfter[i].effectiveMode == view.effectiveMode);
+		assert(logicalAfter[i].declaration.get.mode == view.declaration.get.mode);
+		assert(logicalAfter[i].declaration.get.origin.kind == view.declaration.get.origin.kind);
+		assert(logicalAfter[i].declaration.get.origin.scope_
+			== view.declaration.get.origin.scope_);
+		assert(logicalAfter[i].declaration.get.origin.detail
+			== view.declaration.get.origin.detail);
+	}
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, remove, rmdirRecurse, write;
+	import std.path : buildPath;
+
+	size_t sequenceIndex(string[] args, string[] sequence)
+	{
+		foreach (i; 0 .. args.length - sequence.length + 1)
+			if (args[i .. i + sequence.length] == sequence)
+				return i;
+		assert(false, "missing renderer argument sequence");
+	}
+
+	auto root = buildPath("/tmp", "cydo-renderer-tmpfs-children");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto fakeBin = buildPath(root, "bin");
+	mkdirRecurse(fakeBin);
+	write(buildPath(fakeBin, "bwrap"), "");
+	auto oldPath = environment.get("PATH", "");
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	scope (exit) environment["PATH"] = oldPath;
+
+	auto parent = buildPath(root, "masked");
+	auto alpha = buildPath(parent, "alpha");
+	auto bravo = buildPath(parent, "bravo");
+	auto cider = buildPath(parent, "cider");
+	foreach (path; [alpha, bravo, cider])
+		mkdirRecurse(path);
+	auto origin = SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+		"renderer ordering", "configured mount");
+
+	foreach (reverseRegistration; [false, true])
+	{
+		ResolvedSandbox sandbox;
+		sandbox.isolate_filesystem = true;
+		sandbox.isolate_processes = false;
+		sandbox.isolate_environment = false;
+		if (reverseRegistration)
+		{
+			sandbox.paths.set(cider, PathMode.always_rw, origin);
+			sandbox.paths.set(bravo, PathMode.rw, origin);
+			sandbox.paths.set(alpha, PathMode.ro, origin);
+			sandbox.paths.set(parent, PathMode.tmpfs, origin);
+		}
+		else
+		{
+			sandbox.paths.set(parent, PathMode.tmpfs, origin);
+			sandbox.paths.set(alpha, PathMode.ro, origin);
+			sandbox.paths.set(bravo, PathMode.rw, origin);
+			sandbox.paths.set(cider, PathMode.always_rw, origin);
+		}
+
+		auto args = buildCommandPrefix(sandbox, "");
+		scope (exit)
+			foreach (tempFile; sandbox.tempFiles)
+				if (exists(tempFile))
+					remove(tempFile);
+		auto parentIndex = sequenceIndex(args, ["--tmpfs", parent]);
+		auto alphaIndex = sequenceIndex(args, ["--ro-bind", alpha, alpha]);
+		auto bravoIndex = sequenceIndex(args, ["--bind", bravo, bravo]);
+		auto ciderIndex = sequenceIndex(args, ["--bind", cider, cider]);
+		assert(parentIndex < alphaIndex);
+		assert(parentIndex < bravoIndex);
+		assert(parentIndex < ciderIndex);
+		assert(alphaIndex < bravoIndex);
+		assert(bravoIndex < ciderIndex);
+	}
 }

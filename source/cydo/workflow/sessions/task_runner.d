@@ -17,6 +17,8 @@ import cydo.mcp.tool_descriptions : RenderedCydoToolsOptions,
 import cydo.protocol : ItemDeltaEvent, ItemStartedEvent, ProcessExitEvent,
 	ProcessStderrEvent, TranslatedEvent;
 import cydo.runtime.config : AgentDriver, PathMode, SandboxConfig;
+import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
+	SandboxPathOriginKind, SandboxPaths;
 import cydo.runtime.launch.types : AgentSandboxConfig, ProcessLaunch;
 import launchSandbox = cydo.runtime.launch.sandbox;
 import cydo.domain.tasks.model : ProcessState, TaskData, TaskStatus,
@@ -33,6 +35,23 @@ version (unittest) import std.string : strip;
 version (unittest) import cydo.agent.drivers.claude : ClaudeCodeAgent;
 
 package(cydo):
+
+private PathAccess pathAccessFor(PathMode mode)
+{
+	final switch (mode)
+	{
+	case PathMode.ro:
+		return PathAccess.ro;
+	case PathMode.rw:
+		return PathAccess.rw;
+	case PathMode.always_rw:
+		return PathAccess.alwaysRw;
+	case PathMode.tmpfs:
+	case PathMode.empty_dir:
+	case PathMode.empty_file:
+		assert(false, "Git metadata requires an exposed checkout");
+	}
+}
 
 private bool isAssistantTurnWork(TranslatedEvent ev)
 {
@@ -300,45 +319,67 @@ class TaskSessionRunner
 		auto agentNameSandbox = host_.findAgentSandbox(td.agentName);
 		bool readOnly = typeDef !is null && typeDef.read_only;
 		AgentSandboxConfig agentSandbox;
-		agentSandbox.configureSandbox = (ref PathMode[string] paths, ref string[string] env) {
+		agentSandbox.configureSandbox = (ref SandboxPaths paths, ref string[string] env) {
 			taskAgent.configureSandbox(paths, env);
 		};
 		agentSandbox.gitName = taskAgent.gitName;
 		agentSandbox.gitEmail = taskAgent.gitEmail;
+		agentSandbox.agentName = td.agentName;
+		agentSandbox.workspaceName = td.workspace;
 		auto sandbox = launchSandbox.resolveSandbox(host_.globalSandbox(), agentNameSandbox, wsSandbox,
 			agentSandbox, workDir, wsRoot, readOnly);
 
 		if (td.hasWorktree && workDir.length > 0)
-			sandbox.paths[workDir] = PathMode.ro;
+		{
+			sandbox.paths.require(workDir, PathAccess.ro,
+				SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, workDir,
+					"base checkout"));
+			sandbox.paths.restrictExactToReadOnly(workDir,
+				SandboxPathOrigin(SandboxPathOriginKind.exactReadOnly, workDir,
+					"base checkout"));
+		}
 
 		if (workDir.length > 0 && (td.isGitCheckout || td.hasWorktree))
 		{
-			auto workDirMode = workDir in sandbox.paths;
-			enforce(workDirMode !is null, "Sandbox must expose the task checkout: " ~ workDir);
-			final switch (*workDirMode)
+			auto workDirView = sandbox.paths.exact(workDir);
+			enforce(!workDirView.isNull,
+				"Sandbox must expose the task checkout: " ~ workDir);
+			bool maskedCheckout;
+			if (!workDirView.get.declaration.isNull)
 			{
-			case PathMode.ro:
-			case PathMode.rw:
-			case PathMode.always_rw:
-				launchSandbox.grantGitMetadata(sandbox.paths, workDir, *workDirMode);
-				break;
-			case PathMode.tmpfs:
-			case PathMode.empty_dir:
-			case PathMode.empty_file:
-				break;
+				final switch (workDirView.get.declaration.get.mode)
+				{
+				case PathMode.ro:
+				case PathMode.rw:
+				case PathMode.always_rw:
+					break;
+				case PathMode.tmpfs:
+				case PathMode.empty_dir:
+				case PathMode.empty_file:
+					maskedCheckout = true;
+					break;
+				}
 			}
+			if (!maskedCheckout)
+				launchSandbox.grantGitMetadata(sandbox.paths, workDir,
+					pathAccessFor(workDirView.get.effectiveMode),
+					SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, workDir,
+						"checkout Git metadata"));
 		}
 
-		sandbox.paths[tdDir] = PathMode.rw;
+		sandbox.paths.require(tdDir, PathAccess.rw,
+			SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, tdDir,
+				"task directory"));
 
 		// Other tasks' outputs are part of the workflow contract (sub-task
 		// results are delivered to the parent as paths into the sub-tasks'
 		// directories), and the tasks container is not necessarily reachable
 		// through the workspace-root mount (it may live on another volume) —
-		// mount it read-only, unless configuration says otherwise.
+		// mount it read-only.
 		auto tasksRoot = dirName(tdDir);
-		if (tasksRoot !in sandbox.paths)
-			sandbox.paths[tasksRoot] = PathMode.ro;
+		sandbox.paths.require(tasksRoot, PathAccess.ro,
+			SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, tasksRoot,
+				"task root"));
 
 		if (td.hasWorktree && workDir.length > 0)
 		{
@@ -347,25 +388,42 @@ class TaskSessionRunner
 			// workspace-root mount (it may live on another volume).
 			auto wtPath = host_.worktreePath(td);
 			enforce(wtPath.length > 0, "Worktree path must not be empty for worktree task");
-			auto wtMode = readOnly ? PathMode.ro : PathMode.rw;
-			sandbox.paths[wtPath] = wtMode;
-			launchSandbox.grantGitMetadata(sandbox.paths, wtPath, wtMode);
+			auto wtAccess = readOnly ? PathAccess.ro : PathAccess.rw;
+			sandbox.paths.require(wtPath, wtAccess,
+				SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, wtPath,
+					"active worktree"));
+			if (readOnly)
+				sandbox.paths.restrictExactToReadOnly(wtPath,
+					SandboxPathOrigin(SandboxPathOriginKind.exactReadOnly, wtPath,
+						"active worktree"));
+			auto wtView = sandbox.paths.exact(wtPath);
+			assert(!wtView.isNull);
+			launchSandbox.grantGitMetadata(sandbox.paths, wtPath,
+				pathAccessFor(wtView.get.effectiveMode),
+				SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, wtPath,
+					"active worktree Git metadata"));
 		}
 
 		auto reachesWorktree = host_.taskTypeCatalog.reachesWorktreeFor(td.projectPath);
 		if (workDir.length > 0 && (td.isGitCheckout || td.hasWorktree)
 			&& td.taskType in reachesWorktree && reachesWorktree[td.taskType])
-			launchSandbox.grantGitMetadata(sandbox.paths, workDir, PathMode.always_rw);
+			launchSandbox.grantGitMetadata(sandbox.paths, workDir, PathAccess.alwaysRw,
+				SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, workDir,
+					"worktree-reachable checkout Git metadata"));
 
 		auto mcpSocketPath = host_.mcpSocketPath();
 		if (mcpSocketPath.length > 0)
-			sandbox.paths[mcpSocketPath] = PathMode.ro;
+			sandbox.paths.require(mcpSocketPath, PathAccess.ro,
+				SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, mcpSocketPath,
+					"MCP socket"));
 
 		if (workDir.length > 0)
 		{
 			auto memoryDir = buildPath(workDir, ".cydo", "memory");
 			mkdirRecurse(memoryDir);
-			sandbox.paths[memoryDir] = PathMode.always_rw;
+			sandbox.paths.require(memoryDir, PathAccess.alwaysRw,
+				SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, memoryDir,
+					"canonical memory"));
 		}
 
 		sandbox.sharedTmpPath = host_.resolveSharedTmpPath(tid);
@@ -1044,22 +1102,22 @@ version (unittest) private void assertLinkedWorktreeGitMetadataMode(
 			assert(typeDef !is null);
 			auto launch = runner.prepareTaskSessionLaunch(1,
 				new LinkedWorktreeSandboxTestAgent(), typeDef);
-			auto projectMode = fixture.linkedCheckout in launch.processLaunch.sandbox.paths;
-			auto gitDirMode = fixture.linkedGitDir in launch.processLaunch.sandbox.paths;
-			auto gitCommonDirMode = fixture.commonGitDir in launch.processLaunch.sandbox.paths;
-			assert(projectMode !is null, "linked worktree checkout is not mounted");
-			assert(*projectMode == expectedMode);
+			auto projectMode = launch.processLaunch.sandbox.paths.exact(fixture.linkedCheckout);
+			auto gitDirMode = launch.processLaunch.sandbox.paths.exact(fixture.linkedGitDir);
+			auto gitCommonDirMode = launch.processLaunch.sandbox.paths.exact(fixture.commonGitDir);
+			assert(!projectMode.isNull, "linked worktree checkout is not mounted");
+			assert(projectMode.get.effectiveMode == expectedMode);
 			if (projectIsMasked)
 			{
-				assert(gitDirMode is null, "masked checkout granted its git dir");
-				assert(gitCommonDirMode is null, "masked checkout granted its common git dir");
+				assert(gitDirMode.isNull, "masked checkout granted its git dir");
+				assert(gitCommonDirMode.isNull, "masked checkout granted its common git dir");
 			}
 			else
 			{
-				assert(gitDirMode !is null, "linked worktree git dir is not mounted");
-				assert(gitCommonDirMode !is null, "linked worktree common git dir is not mounted");
-				assert(*gitDirMode == *projectMode);
-				assert(*gitCommonDirMode == *projectMode);
+				assert(!gitDirMode.isNull, "linked worktree git dir is not mounted");
+				assert(!gitCommonDirMode.isNull, "linked worktree common git dir is not mounted");
+				assert(gitDirMode.get.effectiveMode == projectMode.get.effectiveMode);
+				assert(gitCommonDirMode.get.effectiveMode == projectMode.get.effectiveMode);
 			}
 		});
 }
@@ -1190,15 +1248,19 @@ version (unittest) private SandboxConfig unrestrictedLaunchTestSandbox()
 
 version (unittest) private TaskSessionRunner gitMetadataTestRunner(
 	TaskData[int]* tasks, TaskTypeCatalog catalog, GitMetadataLaunchFixture fixture,
-	SandboxConfig workspaceSandbox, string worktreePath, string taskCwd)
+	SandboxConfig workspaceSandbox, string worktreePath, string taskCwd,
+	string mcpSocketPath = "", string taskDirPath = "")
 {
 	return new TaskSessionRunner(TaskSessionRunnerHost(
 		getTask: (int tid) {
 			auto task = tid in *tasks;
 			return task is null ? null : &(*tasks)[tid];
 		},
-		taskDir: (const TaskData* td) => buildPath(fixture.root, "tasks", "task"),
-		outputPath: (const TaskData* td) => buildPath(fixture.root, "tasks", "task", "output.md"),
+		taskDir: (const TaskData* td) => taskDirPath.length > 0
+			? taskDirPath : buildPath(fixture.root, "tasks", "task"),
+		outputPath: (const TaskData* td) => taskDirPath.length > 0
+			? buildPath(taskDirPath, "output.md")
+			: buildPath(fixture.root, "tasks", "task", "output.md"),
 		effectiveCwd: (const TaskData* td) => taskCwd,
 		worktreePath: (const TaskData* td) => worktreePath,
 		globalSandbox: () => unrestrictedLaunchTestSandbox(),
@@ -1209,9 +1271,249 @@ version (unittest) private TaskSessionRunner gitMetadataTestRunner(
 		reportMcpToolDescriptionLimit: (string projectPath, string taskType,
 			ToolDescriptionViolation[] violations) {},
 		resolveSharedTmpPath: (int tid) => "",
-		mcpSocketPath: () => "",
+		mcpSocketPath: () => mcpSocketPath,
 		taskTypeCatalog: catalog,
 	));
+}
+
+unittest
+{
+	import std.file : mkdirRecurse, write;
+
+	withGitMetadataLaunchFixture("cydo-task-runner-registry-requirements",
+		(GitMetadataLaunchFixture fixture) {
+			auto catalog = gitMetadataTaskCatalog(fixture,
+				"task_types:\n"
+				~ "  writable:\n"
+				~ "    model_class: large\n"
+				~ "  readonly:\n"
+				~ "    model_class: large\n"
+				~ "    read_only: true\n");
+			auto taskTypes = catalog.getTaskTypesForProject(fixture.linkedCheckout);
+			auto writableDef = taskTypes.byName("writable");
+			auto readonlyDef = taskTypes.byName("readonly");
+			assert(writableDef !is null);
+			assert(readonlyDef !is null);
+
+			auto mcpSocket = buildPath(fixture.root, "mcp.sock");
+			write(mcpSocket, "");
+			TaskData[int] tasks;
+			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+			tasks[1].taskType = "writable";
+			tasks[1].agentName = "claude";
+			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
+				unrestrictedLaunchTestSandbox(), "", fixture.linkedCheckout, mcpSocket);
+			auto writable = runner.prepareTaskSessionLaunch(1,
+				new LinkedWorktreeSandboxTestAgent(), writableDef);
+			auto writablePaths = writable.processLaunch.sandbox.paths;
+			auto taskDir = buildPath(fixture.root, "tasks", "task");
+			auto taskRoot = dirName(taskDir);
+			auto memory = buildPath(fixture.linkedCheckout, ".cydo", "memory");
+			assert(writablePaths.exact(fixture.linkedCheckout).get.effectiveMode == PathMode.rw);
+			assert(writablePaths.exact(fixture.linkedGitDir).get.effectiveMode == PathMode.rw);
+			assert(writablePaths.exact(fixture.commonGitDir).get.effectiveMode == PathMode.rw);
+			assert(writablePaths.exact(taskDir).get.effectiveMode == PathMode.rw);
+			assert(writablePaths.exact(taskRoot).get.effectiveMode == PathMode.ro);
+			assert(writablePaths.exact(mcpSocket).get.effectiveMode == PathMode.ro);
+			assert(writablePaths.exact(memory).get.effectiveMode == PathMode.always_rw);
+			assert(!writablePaths.exact(taskDir).get.requirement.isNull);
+			assert(!writablePaths.exact(taskRoot).get.requirement.isNull);
+			assert(!writablePaths.exact(mcpSocket).get.requirement.isNull);
+			assert(!writablePaths.exact(memory).get.requirement.isNull);
+
+			auto managedCheckout = buildPath(fixture.workspaceRoot, "readonly-managed");
+			assert(execute(["git", "-C", fixture.primaryRepo, "worktree", "add", "--detach",
+				managedCheckout]).status == 0);
+			auto managedGitDir = execute(["git", "-C", managedCheckout, "rev-parse",
+				"--path-format=absolute", "--git-dir"]);
+			assert(managedGitDir.status == 0, managedGitDir.output);
+
+			TaskData[int] readonlyTasks;
+			readonlyTasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+			readonlyTasks[1].taskType = "readonly";
+			readonlyTasks[1].agentName = "claude";
+			readonlyTasks[1].worktreeTid = 1;
+			auto readonlyRunner = gitMetadataTestRunner(&readonlyTasks, catalog, fixture,
+				unrestrictedLaunchTestSandbox(), managedCheckout, managedCheckout, mcpSocket);
+			auto readonly = readonlyRunner.prepareTaskSessionLaunch(1,
+				new LinkedWorktreeSandboxTestAgent(), readonlyDef);
+			auto readonlyPaths = readonly.processLaunch.sandbox.paths;
+			assert(readonlyPaths.exact(fixture.linkedCheckout).get.effectiveMode == PathMode.ro);
+			assert(readonlyPaths.exact(fixture.linkedGitDir).get.effectiveMode == PathMode.ro);
+			assert(readonlyPaths.exact(managedCheckout).get.effectiveMode == PathMode.ro);
+			assert(readonlyPaths.exact(managedGitDir.output.strip).get.effectiveMode == PathMode.ro);
+			assert(readonlyPaths.exact(fixture.commonGitDir).get.effectiveMode == PathMode.ro);
+			assert(readonlyPaths.exact(taskDir).get.effectiveMode == PathMode.rw);
+			assert(readonlyPaths.exact(taskRoot).get.effectiveMode == PathMode.ro);
+			assert(readonlyPaths.exact(mcpSocket).get.effectiveMode == PathMode.ro);
+			assert(readonlyPaths.exact(memory).get.effectiveMode == PathMode.always_rw);
+		});
+}
+
+unittest
+{
+	import std.algorithm : canFind;
+	import std.file : write;
+
+	withGitMetadataLaunchFixture("cydo-task-runner-registry-conflicts",
+		(GitMetadataLaunchFixture fixture) {
+			auto catalog = gitMetadataTaskCatalog(fixture,
+				"task_types:\n"
+				~ "  writable:\n"
+				~ "    model_class: large\n");
+			auto typeDef = catalog.getTaskTypesForProject(fixture.linkedCheckout)
+				.byName("writable");
+			assert(typeDef !is null);
+			auto memory = buildPath(fixture.linkedCheckout, ".cydo", "memory");
+
+			foreach (mode; [PathMode.ro, PathMode.tmpfs])
+			{
+				TaskData[int] tasks;
+				tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+				tasks[1].taskType = "writable";
+				tasks[1].agentName = "claude";
+				auto workspaceSandbox = unrestrictedLaunchTestSandbox();
+				workspaceSandbox.paths[memory] = mode;
+				auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
+					workspaceSandbox, "", fixture.linkedCheckout);
+				bool thrown;
+				try
+					runner.prepareTaskSessionLaunch(1,
+						new LinkedWorktreeSandboxTestAgent(), typeDef);
+				catch (Exception e)
+				{
+					thrown = true;
+					assert(e.msg.canFind(memory), e.msg);
+					assert(e.msg.canFind("workspaceConfig"), e.msg);
+					assert(e.msg.canFind("canonical memory"), e.msg);
+				}
+				assert(thrown);
+			}
+
+			auto mcpSocket = buildPath(fixture.root, "masked-parent-mcp.sock");
+			write(mcpSocket, "");
+			foreach (ancestorMode; [PathMode.rw, PathMode.tmpfs])
+			{
+				TaskData[int] tasks;
+				tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+				tasks[1].taskType = "writable";
+				tasks[1].agentName = "claude";
+				auto workspaceSandbox = unrestrictedLaunchTestSandbox();
+				workspaceSandbox.paths[fixture.root] = ancestorMode;
+				auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
+					workspaceSandbox, "", fixture.linkedCheckout, mcpSocket);
+				auto launch = runner.prepareTaskSessionLaunch(1,
+					new LinkedWorktreeSandboxTestAgent(), typeDef);
+				auto paths = launch.processLaunch.sandbox.paths;
+				auto taskDir = buildPath(fixture.root, "tasks", "task");
+				auto taskRoot = dirName(taskDir);
+				assert(paths.exact(fixture.root).get.effectiveMode == ancestorMode);
+				assert(paths.exact(fixture.linkedCheckout).get.effectiveMode == PathMode.rw);
+				assert(paths.exact(fixture.linkedGitDir).get.effectiveMode == PathMode.rw);
+				assert(paths.exact(fixture.commonGitDir).get.effectiveMode == PathMode.rw);
+				assert(paths.exact(taskDir).get.effectiveMode == PathMode.rw);
+				assert(paths.exact(taskRoot).get.effectiveMode == PathMode.ro);
+				assert(paths.exact(mcpSocket).get.effectiveMode == PathMode.ro);
+				assert(paths.exact(buildPath(fixture.linkedCheckout, ".cydo", "memory"))
+					.get.effectiveMode == PathMode.always_rw);
+			}
+		});
+}
+
+unittest
+{
+	withGitMetadataLaunchFixture("cydo-task-runner-git-requirement-joins",
+		(GitMetadataLaunchFixture fixture) {
+			auto base = SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+				fixture.linkedCheckout, "base checkout");
+			auto worktree = SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+				fixture.primaryRepo, "active worktree");
+			auto reachability = SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+				fixture.linkedCheckout, "worktree-reachable checkout");
+			SandboxPaths forward;
+			launchSandbox.grantGitMetadata(forward, fixture.linkedCheckout, PathAccess.ro, base);
+			launchSandbox.grantGitMetadata(forward, fixture.primaryRepo, PathAccess.rw, worktree);
+			launchSandbox.grantGitMetadata(forward, fixture.linkedCheckout,
+				PathAccess.alwaysRw, reachability);
+			assert(forward.exact(fixture.commonGitDir).get.effectiveMode
+				== PathMode.always_rw);
+
+			SandboxPaths reverse;
+			launchSandbox.grantGitMetadata(reverse, fixture.linkedCheckout,
+				PathAccess.alwaysRw, reachability);
+			launchSandbox.grantGitMetadata(reverse, fixture.primaryRepo, PathAccess.rw, worktree);
+			launchSandbox.grantGitMetadata(reverse, fixture.linkedCheckout, PathAccess.ro, base);
+			assert(reverse.exact(fixture.commonGitDir).get.effectiveMode
+				== PathMode.always_rw);
+
+			SandboxConfig configured;
+			configured.paths[fixture.commonGitDir] = PathMode.always_rw;
+			AgentSandboxConfig agent;
+			agent.configureSandbox = (ref SandboxPaths paths, ref string[string] env) {};
+			agent.agentName = "test-agent";
+			agent.workspaceName = "test-workspace";
+			auto configuredSandbox = launchSandbox.resolveSandbox(SandboxConfig.init,
+				SandboxConfig.init, configured, agent, "", "");
+			launchSandbox.grantGitMetadata(configuredSandbox.paths, fixture.linkedCheckout,
+				PathAccess.ro, base);
+			auto configuredView = configuredSandbox.paths.exact(fixture.commonGitDir).get;
+			assert(configuredView.declaration.get.mode == PathMode.always_rw);
+			assert(configuredView.effectiveMode == PathMode.always_rw);
+		});
+}
+
+unittest
+{
+	import configy.attributes : SetInfo;
+	import std.algorithm : canFind;
+	import std.file : exists, mkdirRecurse, remove, symlink, write;
+	import std.process : environment;
+
+	withGitMetadataLaunchFixture("cydo-task-runner-relocated-task-paths",
+		(GitMetadataLaunchFixture fixture) {
+			auto physicalTaskRoot = buildPath(fixture.root, "moved", "tasks");
+			auto logicalTaskRoot = buildPath(fixture.workspaceRoot, ".cydo", "tasks");
+			auto logicalTaskDir = buildPath(logicalTaskRoot, "task");
+			auto physicalTaskDir = buildPath(physicalTaskRoot, "task");
+			mkdirRecurse(physicalTaskRoot);
+			mkdirRecurse(buildPath(fixture.workspaceRoot, ".cydo"));
+			symlink(physicalTaskRoot, logicalTaskRoot);
+
+			auto fakeBin = buildPath(fixture.root, "bin");
+			mkdirRecurse(fakeBin);
+			write(buildPath(fakeBin, "bwrap"), "");
+			auto oldPath = environment.get("PATH", "");
+			environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+			scope (exit) environment["PATH"] = oldPath;
+
+			auto catalog = gitMetadataTaskCatalog(fixture,
+				"task_types:\n"
+				~ "  writable:\n"
+				~ "    model_class: large\n");
+			auto typeDef = catalog.getTaskTypesForProject(fixture.linkedCheckout)
+				.byName("writable");
+			assert(typeDef !is null);
+			TaskData[int] tasks;
+			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+			tasks[1].taskType = "writable";
+			tasks[1].agentName = "claude";
+			auto workspaceSandbox = unrestrictedLaunchTestSandbox();
+			workspaceSandbox.isolate_filesystem = SetInfo!bool(true);
+			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
+				workspaceSandbox, "", fixture.linkedCheckout, "", logicalTaskDir);
+			auto launch = runner.prepareTaskSessionLaunch(1,
+				new LinkedWorktreeSandboxTestAgent(), typeDef);
+			scope (exit)
+				foreach (tempFile; launch.processLaunch.sandbox.tempFiles)
+					if (exists(tempFile))
+						remove(tempFile);
+			assert(launch.processLaunch.cmdPrefix.canFind([
+				"--ro-bind", physicalTaskRoot, physicalTaskRoot]));
+			assert(launch.processLaunch.cmdPrefix.canFind([
+				"--bind", physicalTaskDir, physicalTaskDir]));
+			assert(!launch.processLaunch.cmdPrefix.canFind(logicalTaskRoot));
+			assert(!launch.processLaunch.cmdPrefix.canFind(logicalTaskDir));
+		});
 }
 
 unittest
@@ -1245,21 +1547,21 @@ unittest
 				unrestrictedLaunchTestSandbox(), managedCheckout, managedCheckout);
 			auto launch = runner.prepareTaskSessionLaunch(1,
 				new LinkedWorktreeSandboxTestAgent(), typeDef);
-			auto workDirMode = fixture.linkedCheckout in launch.processLaunch.sandbox.paths;
-			auto baseGitMode = fixture.linkedGitDir in launch.processLaunch.sandbox.paths;
-			auto worktreeMode = managedCheckout in launch.processLaunch.sandbox.paths;
-			auto managedGitMode = managedGitDir.output.strip in launch.processLaunch.sandbox.paths;
-			auto commonGitMode = fixture.commonGitDir in launch.processLaunch.sandbox.paths;
-			assert(workDirMode !is null);
-			assert(baseGitMode !is null);
-			assert(worktreeMode !is null);
-			assert(managedGitMode !is null);
-			assert(commonGitMode !is null);
-			assert(*workDirMode == PathMode.ro);
-			assert(*baseGitMode == PathMode.ro);
-			assert(*worktreeMode == PathMode.rw);
-			assert(*managedGitMode == PathMode.rw);
-			assert(*commonGitMode == PathMode.rw);
+			auto workDirMode = launch.processLaunch.sandbox.paths.exact(fixture.linkedCheckout);
+			auto baseGitMode = launch.processLaunch.sandbox.paths.exact(fixture.linkedGitDir);
+			auto worktreeMode = launch.processLaunch.sandbox.paths.exact(managedCheckout);
+			auto managedGitMode = launch.processLaunch.sandbox.paths.exact(managedGitDir.output.strip);
+			auto commonGitMode = launch.processLaunch.sandbox.paths.exact(fixture.commonGitDir);
+			assert(!workDirMode.isNull);
+			assert(!baseGitMode.isNull);
+			assert(!worktreeMode.isNull);
+			assert(!managedGitMode.isNull);
+			assert(!commonGitMode.isNull);
+			assert(workDirMode.get.effectiveMode == PathMode.ro);
+			assert(baseGitMode.get.effectiveMode == PathMode.ro);
+			assert(worktreeMode.get.effectiveMode == PathMode.rw);
+			assert(managedGitMode.get.effectiveMode == PathMode.rw);
+			assert(commonGitMode.get.effectiveMode == PathMode.rw);
 		});
 }
 
@@ -1294,15 +1596,15 @@ unittest
 				unrestrictedLaunchTestSandbox(), "", fixture.linkedCheckout);
 			auto launch = runner.prepareTaskSessionLaunch(1,
 				new LinkedWorktreeSandboxTestAgent(), typeDef);
-			auto workDirMode = fixture.linkedCheckout in launch.processLaunch.sandbox.paths;
-			auto gitDirMode = fixture.linkedGitDir in launch.processLaunch.sandbox.paths;
-			auto commonGitMode = fixture.commonGitDir in launch.processLaunch.sandbox.paths;
-			assert(workDirMode !is null);
-			assert(gitDirMode !is null);
-			assert(commonGitMode !is null);
-			assert(*workDirMode == PathMode.ro);
-			assert(*gitDirMode == PathMode.always_rw);
-			assert(*commonGitMode == PathMode.always_rw);
+			auto workDirMode = launch.processLaunch.sandbox.paths.exact(fixture.linkedCheckout);
+			auto gitDirMode = launch.processLaunch.sandbox.paths.exact(fixture.linkedGitDir);
+			auto commonGitMode = launch.processLaunch.sandbox.paths.exact(fixture.commonGitDir);
+			assert(!workDirMode.isNull);
+			assert(!gitDirMode.isNull);
+			assert(!commonGitMode.isNull);
+			assert(workDirMode.get.effectiveMode == PathMode.ro);
+			assert(gitDirMode.get.effectiveMode == PathMode.always_rw);
+			assert(commonGitMode.get.effectiveMode == PathMode.always_rw);
 		});
 }
 
@@ -1383,9 +1685,9 @@ unittest
 			// actually requested worktree child can fail. No metadata is granted.
 			auto launch = runner.prepareTaskSessionLaunch(1,
 				new LinkedWorktreeSandboxTestAgent(), typeDef);
-			auto projectMode = projectPath in launch.processLaunch.sandbox.paths;
-			assert(projectMode !is null);
-			assert(*projectMode == PathMode.rw);
-			assert(fixture.commonGitDir !in launch.processLaunch.sandbox.paths);
+			auto projectMode = launch.processLaunch.sandbox.paths.exact(projectPath);
+			assert(!projectMode.isNull);
+			assert(projectMode.get.effectiveMode == PathMode.rw);
+			assert(launch.processLaunch.sandbox.paths.exact(fixture.commonGitDir).isNull);
 		});
 }

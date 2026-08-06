@@ -20,7 +20,9 @@ import cydo.protocol : ContentBlock, ItemCompletedEvent, ItemDeltaEvent,
 	ProcessStderrEvent, SessionInitEvent, TranslatedEvent, TurnResultEvent,
 	TurnStopEvent, UsageInfo;
 import cydo.agent.session : AgentSession;
-import cydo.runtime.config : AgentDriver, PathMode;
+import cydo.runtime.config : AgentDriver;
+import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
+	SandboxPathOriginKind, SandboxPaths;
 import cydo.runtime.launch.types : ProcessLaunch;
 import cydo.runtime.launch.sandbox : cydoBinaryDir, cydoBinaryPath, effectiveEnvValue,
 	executableMountPaths, resolveExecutablePath;
@@ -47,35 +49,24 @@ class CopilotAgent : Agent
 	// Background thread: sessionId → session directory path (populated by enumerateAllSessions)
 	private string[string] sessionIdToDirPath_;
 
-	void configureSandbox(ref PathMode[string] paths, ref string[string] env)
+	void configureSandbox(ref SandboxPaths paths, ref string[string] env)
 	{
-		import std.algorithm : startsWith;
 		import std.process : environment;
-
-		void addIfNotRw(string path, PathMode mode)
-		{
-			if (path.length == 0)
-				return;
-			if (mode == PathMode.ro)
-			{
-				if (auto existing = path in paths)
-					if (*existing == PathMode.rw)
-						return;
-				foreach (existing, existingMode; paths)
-					if (existingMode == PathMode.rw && path.startsWith(existing ~ "/"))
-						return;
-			}
-			paths[path] = mode;
-		}
 
 		// Copilot home directory (config, sessions, cache)
 		auto home = environment.get("HOME", "/tmp");
-		auto copilotHome = environment.get("COPILOT_HOME", buildPath(home, ".copilot"));
-		paths[copilotHome] = PathMode.rw;
+		auto copilotHome = effectiveEnvValue(env, "COPILOT_HOME", buildPath(home, ".copilot"));
+		paths.require(copilotHome, PathAccess.rw,
+			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "copilot",
+				"COPILOT_HOME"));
 
 		foreach (path; executableMountPaths(resolveExecutablePath(executableName(env), env)))
-			addIfNotRw(path, PathMode.ro);
-		addIfNotRw(cydoBinaryDir(), PathMode.ro);
+			paths.requireReadVisible(path,
+				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "copilot",
+					"Copilot executable"));
+		paths.requireReadVisible(cydoBinaryDir(),
+			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "copilot",
+				"CyDo binary"));
 
 		// Pass through Copilot-required env vars so they survive --clearenv
 		void passthrough(string key)
@@ -746,6 +737,158 @@ class CopilotAgent : Agent
 
 		return OneShotHandle(p, null);
 	}
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir, write;
+	import std.path : buildPath;
+	import std.process : environment, execute;
+	import cydo.runtime.config : PathMode, SandboxConfig;
+	import cydo.runtime.launch.sandbox_resolver : resolveSandbox;
+	import cydo.runtime.launch.types : AgentSandboxConfig;
+
+	auto root = buildPath(tempDir(), "cydo-copilot-configure-sandbox");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto environmentKeys = ["HOME", "PATH", "COPILOT_HOME",
+		"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "COPILOT_MODEL",
+		"HTTPS_PROXY", "NODE_TLS_REJECT_UNAUTHORIZED"];
+	string[string] previousEnvironment;
+	bool[string] hadEnvironment;
+	foreach (key; environmentKeys)
+	{
+		hadEnvironment[key] = key in environment;
+		previousEnvironment[key] = environment.get(key, "");
+	}
+	scope (exit)
+	{
+		foreach (key; environmentKeys)
+		{
+			if (hadEnvironment[key])
+				environment[key] = previousEnvironment[key];
+			else
+				environment.remove(key);
+		}
+	}
+
+	auto home = buildPath(root, "home");
+	auto copilotHome = buildPath(home, "configured-copilot-home");
+	auto executableDir = buildPath(root, "bin");
+	auto executable = buildPath(executableDir, "copilot");
+	mkdirRecurse(copilotHome);
+	mkdirRecurse(executableDir);
+	write(executable, "#!/bin/sh\nexit 0\n");
+	execute(["chmod", "+x", executable]);
+	environment["HOME"] = home;
+	environment["COPILOT_HOME"] = copilotHome;
+	environment["COPILOT_GITHUB_TOKEN"] = "test-copilot-token";
+	environment["GH_TOKEN"] = "test-gh-token";
+	environment["GITHUB_TOKEN"] = "test-github-token";
+	environment["COPILOT_MODEL"] = "test-copilot-model";
+	environment["HTTPS_PROXY"] = "http://copilot.test.invalid:8080";
+	environment["NODE_TLS_REJECT_UNAUTHORIZED"] = "0";
+	environment["PATH"] = executableDir;
+
+	auto agent = new CopilotAgent;
+	auto cydoDir = cydoBinaryDir();
+	assert(cydoDir.length > 0);
+
+	SandboxConfig global;
+	global.paths = [
+		executableDir: PathMode.rw,
+		cydoDir: PathMode.always_rw,
+	];
+	global.env = [
+		"CYDO_COPILOT_BIN": executable,
+		"PATH": executableDir,
+	];
+	auto executableMounts = executableMountPaths(resolveExecutablePath(executable, global.env));
+	assert(executableMounts.length == 1);
+	assert(executableMounts[0] == executableDir);
+	AgentSandboxConfig agentSandbox;
+	agentSandbox.configureSandbox = (ref SandboxPaths paths, ref string[string] env) {
+		agent.configureSandbox(paths, env);
+	};
+	agentSandbox.agentName = "copilot";
+	agentSandbox.workspaceName = "test";
+	auto resolved = resolveSandbox(global, SandboxConfig.init, SandboxConfig.init,
+		agentSandbox, "");
+
+	auto executableView = resolved.paths.exact(executableDir).get;
+	assert(executableView.declaration.get.mode == PathMode.rw);
+	assert(executableView.effectiveMode == PathMode.rw);
+	auto cydoView = resolved.paths.exact(cydoDir).get;
+	assert(cydoView.declaration.get.mode == PathMode.always_rw);
+	assert(cydoView.effectiveMode == PathMode.always_rw);
+
+	auto stateHome = resolved.paths.exact(copilotHome).get;
+	assert(stateHome.declaration.isNull);
+	assert(stateHome.requirement.get.access == PathAccess.rw);
+	assert(stateHome.effectiveMode == PathMode.rw);
+	assert(resolved.env["PATH"] == executableDir);
+	assert(resolved.env["COPILOT_HOME"] == copilotHome);
+	assert(resolved.env["COPILOT_GITHUB_TOKEN"] == "test-copilot-token");
+	assert(resolved.env["GH_TOKEN"] == "test-gh-token");
+	assert(resolved.env["GITHUB_TOKEN"] == "test-github-token");
+	assert(resolved.env["COPILOT_MODEL"] == "test-copilot-model");
+	assert(resolved.env["HTTPS_PROXY"] == "http://copilot.test.invalid:8080");
+	assert(resolved.env["NODE_TLS_REJECT_UNAUTHORIZED"] == "0");
+
+	// A configured launch value must select the same writable state home that
+	// the sandboxed process receives, rather than the host-only fallback.
+	auto configuredCopilotHome = buildPath(home, "sandbox-copilot-home");
+	SandboxConfig configuredGlobal;
+	configuredGlobal.env = [
+		"CYDO_COPILOT_BIN": executable,
+		"PATH": executableDir,
+		"COPILOT_HOME": configuredCopilotHome,
+	];
+	auto configuredResolved = resolveSandbox(configuredGlobal, SandboxConfig.init,
+		SandboxConfig.init, agentSandbox, "");
+	auto configuredStateHome = configuredResolved.paths.exact(configuredCopilotHome).get;
+	assert(configuredStateHome.declaration.isNull);
+	assert(configuredStateHome.requirement.get.access == PathAccess.rw);
+	assert(configuredStateHome.effectiveMode == PathMode.rw);
+	assert(configuredResolved.paths.exact(copilotHome).isNull);
+	assert(configuredResolved.env["COPILOT_HOME"] == configuredCopilotHome);
+
+	// Missing launch values retain Copilot's host-environment passthrough.
+	SandboxPaths defaultPaths;
+	string[string] defaultEnv = ["CYDO_COPILOT_BIN": executable];
+	agent.configureSandbox(defaultPaths, defaultEnv);
+	assert(defaultEnv["PATH"] == executableDir);
+	assert(defaultEnv["COPILOT_HOME"] == copilotHome);
+	assert(defaultEnv["COPILOT_GITHUB_TOKEN"] == "test-copilot-token");
+	assert(defaultEnv["GH_TOKEN"] == "test-gh-token");
+	assert(defaultEnv["GITHUB_TOKEN"] == "test-github-token");
+	assert(defaultEnv["COPILOT_MODEL"] == "test-copilot-model");
+	assert(defaultEnv["HTTPS_PROXY"] == "http://copilot.test.invalid:8080");
+	assert(defaultEnv["NODE_TLS_REJECT_UNAUTHORIZED"] == "0");
+	foreach (path; executableMounts)
+		assert(defaultPaths.exact(path).get.effectiveMode == PathMode.ro);
+
+	// Writable ancestors satisfy read visibility without producing a child mount.
+	auto origin = SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+		"copilot test", "pre-existing host access");
+	SandboxPaths ancestorPaths;
+	auto executableParent = dirName(executableDir);
+	auto cydoParent = dirName(cydoDir);
+	ancestorPaths.require(executableParent, PathAccess.rw, origin);
+	ancestorPaths.require(cydoParent, PathAccess.alwaysRw, origin);
+	string[string] ancestorEnv = [
+		"CYDO_COPILOT_BIN": executable,
+		"PATH": executableDir,
+	];
+	agent.configureSandbox(ancestorPaths, ancestorEnv);
+	assert(ancestorPaths.exact(executableParent).get.effectiveMode == PathMode.rw);
+	assert(ancestorPaths.exact(executableDir).isNull);
+	assert(ancestorPaths.exact(cydoParent).get.effectiveMode == PathMode.always_rw);
+	assert(ancestorPaths.exact(cydoDir).isNull);
 }
 
 // ---------------------------------------------------------------------------

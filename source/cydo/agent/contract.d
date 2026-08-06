@@ -4,7 +4,8 @@ import ae.utils.promise : Promise;
 
 import cydo.protocol : TranslatedEvent;
 import cydo.agent.session : AgentSession;
-import cydo.runtime.config : AgentDriver, PathMode;
+import cydo.runtime.config : AgentDriver;
+import cydo.runtime.launch.sandbox_paths : SandboxPaths;
 import cydo.runtime.launch.types : ProcessLaunch;
 
 /// Per-session configuration passed to createSession.
@@ -66,10 +67,9 @@ struct PersistedHistoryBoundary {
 /// the runtime AgentSession interface.
 interface Agent
 {
-	/// Add sandbox path and env requirements for this agent software.
-	/// Called with already-merged paths/env from config layers;
-	/// implementations should avoid downgrading existing rw entries to ro.
-	void configureSandbox(ref PathMode[string] paths, ref string[string] env);
+	/// Add joined sandbox requirements and environment for this agent software.
+	/// Drivers cannot write declarations and must never downgrade access.
+	void configureSandbox(ref SandboxPaths paths, ref string[string] env);
 
 	/// Git identity for commits made by this agent.
 	@property string gitName();

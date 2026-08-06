@@ -60,6 +60,14 @@ struct SandboxPathView
 	Nullable!SandboxPathOrigin finalReadOnlyBy;
 }
 
+struct PlannedSandboxMount
+{
+	string source;
+	string destination;
+	PathMode mode;
+	SandboxPathOrigin[] origins;
+}
+
 /// Owns the normalized logical sandbox path namespace.
 ///
 /// The postblit gives this value type ownership of its associative array. D

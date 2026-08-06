@@ -3389,9 +3389,9 @@ unittest
 	assert(!app.tasks[41].isGitCheckout);
 	auto codexLaunch = runner.prepareTaskSessionLaunch(41, new TestCodexPromptAgent(),
 		currentTypeDef());
-	auto codexProjectMode = projectPath in codexLaunch.processLaunch.sandbox.paths;
-	assert(codexProjectMode !is null);
-	final switch (*codexProjectMode)
+	auto codexProjectMode = codexLaunch.processLaunch.sandbox.paths.exact(projectPath);
+	assert(!codexProjectMode.isNull);
+	final switch (codexProjectMode.get.effectiveMode)
 	{
 	case PathMode.ro:
 	case PathMode.rw:
@@ -3406,9 +3406,9 @@ unittest
 	app.tasks[41].agentName = "claude";
 	auto claudeLaunch = runner.prepareTaskSessionLaunch(41, new TestClaudePromptAgent(),
 		currentTypeDef());
-	auto claudeProjectMode = projectPath in claudeLaunch.processLaunch.sandbox.paths;
-	assert(claudeProjectMode !is null);
-	final switch (*claudeProjectMode)
+	auto claudeProjectMode = claudeLaunch.processLaunch.sandbox.paths.exact(projectPath);
+	assert(!claudeProjectMode.isNull);
+	final switch (claudeProjectMode.get.effectiveMode)
 	{
 	case PathMode.ro:
 	case PathMode.rw:
@@ -3424,9 +3424,9 @@ unittest
 	app.tasks[41].agentName = "copilot";
 	auto copilotLaunch = runner.prepareTaskSessionLaunch(41, new TestCopilotPromptAgent(),
 		currentTypeDef());
-	auto copilotProjectMode = projectPath in copilotLaunch.processLaunch.sandbox.paths;
-	assert(copilotProjectMode !is null);
-	final switch (*copilotProjectMode)
+	auto copilotProjectMode = copilotLaunch.processLaunch.sandbox.paths.exact(projectPath);
+	assert(!copilotProjectMode.isNull);
+	final switch (copilotProjectMode.get.effectiveMode)
 	{
 	case PathMode.ro:
 	case PathMode.rw:
