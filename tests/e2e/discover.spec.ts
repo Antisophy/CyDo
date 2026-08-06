@@ -11,7 +11,16 @@
 import { test, expect } from "@playwright/test";
 import { spawn, spawnSync, execFileSync } from "child_process";
 import type { ChildProcess } from "child_process";
-import { mkdirSync, rmSync, symlinkSync, writeFileSync, existsSync } from "fs";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -189,6 +198,103 @@ test(
       await killBackend(proc);
       rmSync(workDir, { recursive: true, force: true });
       rmSync(wsRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Real Bubblewrap tmpfs directory-parent child carve-out
+// ---------------------------------------------------------------------------
+
+test(
+  "real Bubblewrap tmpfs directory parent exposes a child bind, not empty_dir/empty_file descendants",
+  { tag: "@claude-only" },
+  () => {
+    const bwrapCandidates = ["/run/wrappers/bin/bwrap", "/usr/bin/bwrap"];
+    const bwrapPath = bwrapCandidates.find(
+      (path) => {
+        try {
+          accessSync(path, constants.X_OK);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+    );
+    if (bwrapPath === undefined) {
+      if (!bwrapCandidates.some(existsSync)) {
+        test.skip(
+          true,
+          "real Bubblewrap is absent from /run/wrappers/bin/bwrap and /usr/bin/bwrap",
+        );
+        return;
+      }
+      throw new Error(
+        `fixed Bubblewrap path exists but is not executable: ${bwrapCandidates.filter(existsSync).join(", ")}`,
+      );
+    }
+
+    // This covers only a tmpfs directory parent: empty_dir cannot create a
+    // missing descendant mountpoint, and empty_file is necessarily a leaf.
+    const fixtureRoot = mkdtempSync("/tmp/cydo-bwrap-tmpfs-");
+    try {
+      const fixtureName = fixtureRoot.split("/").at(-1)!;
+      const hostParent = `${fixtureRoot}/host-parent`;
+      const hostChild = `${fixtureRoot}/host-child`;
+      const parentMarker = `host-parent-marker-${fixtureName}`;
+      const parentValue = `host-parent-value-${fixtureName}`;
+      const childMarker = `host-child-marker-${fixtureName}`;
+      const childValue = `host-child-value-${fixtureName}`;
+      const childDestination = `${hostParent}/child`;
+
+      mkdirSync(hostParent);
+      mkdirSync(hostChild);
+      writeFileSync(`${hostParent}/${parentMarker}`, `${parentValue}\n`);
+      writeFileSync(`${hostChild}/${childMarker}`, `${childValue}\n`);
+
+      const probe = [
+        `if [ -e "${hostParent}/${parentMarker}" ]; then`,
+        "  printf 'host-parent-marker=visible\\n'",
+        "else",
+        "  printf 'host-parent-marker=absent\\n'",
+        "fi",
+        `if [ -f "${childDestination}/${childMarker}" ]; then`,
+        `  IFS= read -r child_value < "${childDestination}/${childMarker}"`,
+        "  printf 'host-child-marker=%s\\n' \"$child_value\"",
+        "else",
+        "  printf 'host-child-marker=missing\\n'",
+        "fi",
+      ].join("\n");
+      const result = spawnSync(
+        bwrapPath,
+        [
+          "--ro-bind",
+          "/",
+          "/",
+          "--tmpfs",
+          hostParent,
+          "--ro-bind",
+          hostChild,
+          childDestination,
+          "/bin/sh",
+          "-c",
+          probe,
+        ],
+        { encoding: "utf8" },
+      );
+      const diagnostics = [
+        `bwrap: ${bwrapPath}`,
+        `status: ${result.status}`,
+        `stdout:\n${result.stdout}`,
+        `stderr:\n${result.stderr}`,
+      ].join("\n");
+
+      expect(result.status, diagnostics).toBe(0);
+      expect(result.stdout, diagnostics).toBe(
+        `host-parent-marker=absent\nhost-child-marker=${childValue}\n`,
+      );
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
     }
   },
 );
