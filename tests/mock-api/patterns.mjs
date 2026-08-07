@@ -696,6 +696,12 @@ export function matchPattern(userText) {
       timeout: parseInt(match[1]),
     };
 
+  // Delay the API response while the real Claude CLI records the submitted
+  // user message in JSONL. This makes persisted-history confirmation arrive
+  // before Claude's stdout replay for ordering-sensitive integration tests.
+  match = userText.match(/run delayed command (.+)/i);
+  if (match) return { type: "shell", command: match[1].trim(), delay: 750 };
+
   // "run command <cmd>"
   match = userText.match(/run command (.+)/i);
   if (match) return { type: "shell", command: match[1].trim() };

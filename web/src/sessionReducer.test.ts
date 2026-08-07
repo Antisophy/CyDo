@@ -482,6 +482,122 @@ describe("history boundary replacement", () => {
 });
 
 describe("live user echo reconciliation", () => {
+  const prompt = "reconcile this replayed user message";
+  const correlationId = "replay-correlation";
+  const nativeUuid = "native-user-uuid";
+  const replaySeq = 47;
+
+  const replayUserEvent = {
+    type: "item/started" as const,
+    item_type: "user_message",
+    item_id: "cc-user-msg",
+    content: [{ type: "text" as const, text: prompt }],
+    is_replay: true,
+    uuid: nativeUuid,
+  };
+  const consumedEvent = {
+    type: "user_message/consumed" as const,
+    uuid: nativeUuid,
+    native_uuid: nativeUuid,
+    correlation_id: correlationId,
+    consumed_as: "turn_start",
+  };
+  const firstAssistantItem = {
+    type: "item/started" as const,
+    item_type: "tool_use",
+    item_id: "assistant-tool",
+    name: "Bash",
+  };
+
+  function makeUnconfirmedState() {
+    return {
+      ...makeState(),
+      messages: [
+        {
+          id: "opt-user",
+          type: "user" as const,
+          content: [{ type: "text" as const, text: prompt }],
+          ackState: 3 as const,
+          pending: true,
+          nonce: correlationId,
+          isProvisional: true,
+        },
+      ],
+      msgIdCounter: 1,
+    };
+  }
+
+  function userMessages(state: TaskState) {
+    return state.messages.filter((message) => message.type === "user");
+  }
+
+  function expectPendingUser(state: TaskState) {
+    expect(userMessages(state)).toEqual([
+      expect.objectContaining({
+        content: [{ type: "text", text: prompt }],
+        ackState: 3,
+        pending: true,
+      }),
+    ]);
+  }
+
+  function expectConfirmedUser(state: TaskState) {
+    expect(userMessages(state)).toHaveLength(1);
+    expect(userMessages(state)[0]?.ackState).toBeUndefined();
+    expect(userMessages(state)[0]?.pending).toBeUndefined();
+    expect(userMessages(state)[0]?.echoPending).toBeUndefined();
+  }
+
+  function expectCanonicalReplayUser(state: TaskState) {
+    expect(userMessages(state)).toEqual([
+      expect.objectContaining({
+        content: [{ type: "text", text: prompt }],
+        uuid: nativeUuid,
+        seq: replaySeq,
+        rawSource: replayUserEvent,
+      }),
+    ]);
+  }
+
+  it("keeps the replay-backed user message pending until a later confirmation", () => {
+    let state: TaskState = makeUnconfirmedState();
+    expectPendingUser(state);
+
+    state = reduceMessage(state, replayUserEvent, replaySeq);
+    expectPendingUser(state);
+    expect(userMessages(state)[0]).toMatchObject({ echoPending: true });
+    expectCanonicalReplayUser(state);
+
+    state = reduceMessage(state, consumedEvent);
+    expectConfirmedUser(state);
+    expectCanonicalReplayUser(state);
+
+    state = reduceMessage(state, firstAssistantItem, replaySeq + 1);
+    expectConfirmedUser(state);
+    expectCanonicalReplayUser(state);
+  });
+
+  it("keeps an early confirmation when its replayed user message arrives later", () => {
+    let state: TaskState = makeUnconfirmedState();
+    expectPendingUser(state);
+
+    state = reduceMessage(state, consumedEvent);
+    expectConfirmedUser(state);
+    expect(userMessages(state)[0]).toMatchObject({
+      isProvisional: true,
+      expectedNativeUuid: nativeUuid,
+    });
+
+    state = reduceMessage(state, replayUserEvent, replaySeq);
+    expectConfirmedUser(state);
+    expectCanonicalReplayUser(state);
+    expect(userMessages(state)[0]).not.toHaveProperty("isProvisional");
+
+    state = reduceMessage(state, firstAssistantItem, replaySeq + 1);
+    expectConfirmedUser(state);
+    expectCanonicalReplayUser(state);
+  });
+
   it("keeps a confirmed echo non-pending when its agent acknowledgement arrives late", () => {
     const nonce = "steering-nonce";
     const placeholder = {

@@ -54,6 +54,10 @@ export interface DisplayMessage {
   /** Agent echoed this message on receipt (submitted to the harness), but no
    *  assistant output has proven it reached the LLM's context yet. */
   echoPending?: boolean;
+  /** Local user placeholder awaiting its canonical raw-backed replay. */
+  isProvisional?: boolean;
+  /** Native UUID named by a confirmation received before the canonical replay. */
+  expectedNativeUuid?: string;
   /** The agent's queue removed this message without consuming it. */
   removed?: boolean;
   /** Ordered block IDs for assistant messages — references blocks in TaskState.blocks. */

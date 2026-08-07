@@ -1307,12 +1307,19 @@ function handleMessages(req, res) {
         model,
       );
     } else if (intent.type === "shell" || intent.type === "background_shell") {
-      streamToolUseResponse(
-        res,
-        "Bash",
-        { command: intent.command, description: "Running command" },
-        model,
-      );
+      const respond = () =>
+        streamToolUseResponse(
+          res,
+          "Bash",
+          { command: intent.command, description: "Running command" },
+          model,
+        );
+      if (intent.delay) {
+        const timer = setTimeout(respond, intent.delay);
+        res.on("close", () => clearTimeout(timer));
+      } else {
+        respond();
+      }
     } else {
       // tool_call — map generic names to Anthropic tool names
       let toolName = intent.name;

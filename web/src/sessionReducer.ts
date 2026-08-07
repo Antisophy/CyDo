@@ -922,6 +922,8 @@ function reduceItemStartedUserMessage(
 
   const isPendingUserMsg = (m: DisplayMessage) =>
     m.type === "user" && m.ackState !== undefined && m.ackState > 1;
+  const isProvisionalUserMsg = (m: DisplayMessage) =>
+    m.type === "user" && m.isProvisional === true;
   const eventNonce = (event as unknown as { correlation_id?: string })
     .correlation_id;
   const eventCydoMeta = (event as unknown as { meta?: CydoMeta }).meta;
@@ -931,17 +933,19 @@ function reduceItemStartedUserMessage(
   );
   const hasSameContent = (m: DisplayMessage) =>
     canonicalUserTextFromDisplayMessage(m) === eventUserText;
-  // Optimistic placeholders never carry a uuid; a pending user message WITH
-  // a uuid is a queue-emitted message from history (identity enqueue-N) that
-  // only its own user_message/consumed confirmation may upgrade — replay
-  // echoes must not displace it.
-  const isReplayDisposablePendingUserMsg = (m: DisplayMessage) =>
-    isPendingUserMsg(m) &&
-    !m.uuid &&
+  // Only local optimistic/unconfirmed bubbles are displaced by a replay.
+  // Queue-emitted history bubbles retain their enqueue-N identity until their
+  // own user_message/consumed confirmation removes them.
+  const isReplayDisposableProvisionalUserMsg = (m: DisplayMessage) =>
+    isProvisionalUserMsg(m) &&
+    m.expectedNativeUuid === undefined &&
     (eventNonce ? m.nonce === eventNonce : !m.nonce || hasSameContent(m));
+  const isExpectedReplayProvisionalUserMsg = (m: DisplayMessage) =>
+    isProvisionalUserMsg(m) &&
+    m.expectedNativeUuid !== undefined &&
+    m.expectedNativeUuid === event.uuid;
 
-  // Extract cydoMeta from the pending placeholder BEFORE the is_replay filter
-  // removes it from the message list.
+  // Extract cydoMeta from a pending placeholder before replay removes it.
   const pendingMsg = eventNonce
     ? s.messages.find((m) => isPendingUserMsg(m) && m.nonce === eventNonce)
     : s.messages.find(
@@ -949,15 +953,22 @@ function reduceItemStartedUserMessage(
       );
 
   let state = s;
-  let displacedPlaceholder = false;
+  let displacedPlaceholder: DisplayMessage | undefined;
 
   if (event.is_replay) {
     // One replay echo accounts for exactly one sent message: displace at
-    // most one placeholder. Same-content placeholders from other sends
-    // (distinct nonces) must keep their own bubbles.
-    const dropIdx = state.messages.findIndex(isReplayDisposablePendingUserMsg);
+    // most one placeholder. A prior queue confirmation gives an exact native
+    // UUID match; otherwise retain the nonce/content matching for replays
+    // that arrive first.
+    const expectedDropIdx = state.messages.findIndex(
+      isExpectedReplayProvisionalUserMsg,
+    );
+    const dropIdx =
+      expectedDropIdx >= 0
+        ? expectedDropIdx
+        : state.messages.findIndex(isReplayDisposableProvisionalUserMsg);
     if (dropIdx >= 0) {
-      displacedPlaceholder = true;
+      displacedPlaceholder = state.messages[dropIdx];
       state = {
         ...state,
         messages: state.messages.filter((_, i) => i !== dropIdx),
@@ -1000,7 +1011,8 @@ function reduceItemStartedUserMessage(
     isSidechain: event.is_sidechain,
     isSynthetic: event.is_synthetic || undefined,
     isMeta: event.is_meta || undefined,
-    isSteering: event.is_steering || undefined,
+    isSteering:
+      event.is_steering || displacedPlaceholder?.isSteering || undefined,
     isCompactSummary: event.isCompactSummary || undefined,
     parentToolUseId: event.parent_tool_use_id,
     extraFields: getExtras(event),
@@ -1008,10 +1020,12 @@ function reduceItemStartedUserMessage(
     seq,
     uuid: event.uuid,
     nonce: event.is_replay ? undefined : pendingMsg?.nonce,
-    cydoMeta: pendingMsg?.cydoMeta ?? eventCydoMeta,
+    cydoMeta:
+      displacedPlaceholder?.cydoMeta ?? pendingMsg?.cydoMeta ?? eventCydoMeta,
+    removed: displacedPlaceholder?.removed,
     ts,
   };
-  if (displacedPlaceholder) {
+  if (displacedPlaceholder?.pending) {
     // The agent echoes a replayed user message as soon as it consumes it —
     // that only proves submission to the harness, not that the LLM has seen
     // it. Keep the "submitted" presentation; assistant output promotes it
@@ -1040,7 +1054,9 @@ function reduceItemStartedUserMessage(
       ? state.messages.filter((_, i) => i !== matchIdx)
       : eventNonce || event.is_replay
         ? state.messages
-        : state.messages.filter((m) => !isReplayDisposablePendingUserMsg(m));
+        : state.messages.filter(
+            (m) => !isReplayDisposableProvisionalUserMsg(m),
+          );
   const messages = event.is_meta
     ? [...filtered, echoMsg]
     : insertBeforeStreaming(filtered, echoMsg);
@@ -1092,6 +1108,8 @@ export function reduceUserMessageConsumed(
         ackState: undefined,
         echoPending: undefined,
       };
+      if (m.isProvisional && event.native_uuid)
+        upgraded.expectedNativeUuid = event.native_uuid;
       if (event.consumed_as === "steering") upgraded.isSteering = true;
       else if (event.consumed_as === "removed") upgraded.removed = true;
       return upgraded;

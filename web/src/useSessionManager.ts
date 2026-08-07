@@ -756,7 +756,14 @@ export function useTaskManager(
         );
         if (idx >= 0) {
           messages = messages.map((m, i) =>
-            i === idx ? { ...m, ackState: 3 as const, pending: true } : m,
+            i === idx
+              ? {
+                  ...m,
+                  ackState: 3 as const,
+                  pending: true,
+                  isProvisional: true,
+                }
+              : m,
           );
           const updated = { ...prev, messages };
           liveStates.set(uuid, updated);
@@ -782,7 +789,7 @@ export function useTaskManager(
             pending: true,
             nonce: correlationId,
             cydoMeta: meta,
-            rawSource: msg,
+            isProvisional: true,
           },
         ],
       };
@@ -1770,6 +1777,7 @@ export function useTaskManager(
                 ackState: 4 as const,
                 pending: true,
                 nonce,
+                isProvisional: true,
               },
             ],
           };
