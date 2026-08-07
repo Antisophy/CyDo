@@ -1,7 +1,8 @@
 import { test as base } from "@playwright/test";
 import { execFileSync, spawn } from "child_process";
-import { mkdirSync, symlinkSync, writeFileSync } from "fs";
+import { mkdirSync, symlinkSync } from "fs";
 import { join } from "path";
+import { writeTestConfig } from "../e2e/test-config";
 
 type WorkerFixtures = {
   backend: { baseURL: string };
@@ -73,13 +74,16 @@ const test = base.extend<WorkerFixtures>({
       mkdirSync(`${workDir}/data`, { recursive: true });
       symlinkSync("/tmp/cydo-test-workspace/defs", `${workDir}/defs`);
       mkdirSync(`${workerHome}/.config/cydo`, { recursive: true });
-      writeFileSync(
+      writeTestConfig(
         `${workerHome}/.config/cydo/config.yaml`,
         [
           "default_agent: claude",
-          "sandbox:",
-          "  env:",
-          '    CYDO_TEST_TITLE: "Sandbox Env Title"',
+          "agents:",
+          "  claude:",
+          "    driver: claude",
+          "    sandbox:",
+          "      env:",
+          '        CYDO_TEST_TITLE: "Sandbox Env Title"',
           "workspaces:",
           "  local:",
           "    root: /tmp/cydo-test-workspace",

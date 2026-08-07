@@ -19,6 +19,7 @@ import { test, expect } from "@playwright/test";
 import { spawn } from "child_process";
 import type { ChildProcess } from "child_process";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { writeTestConfig } from "./test-config";
 
 // ---------------------------------------------------------------------------
 // Helpers (following discover.spec.ts pattern)
@@ -130,7 +131,7 @@ test("Import group node in sidebar expands on click and navigates correctly", { 
 
   writeFileSync(`${claudeProjectsDir}/${sessionId}.jsonl`, jsonlContent);
 
-  writeFileSync(
+  writeTestConfig(
     `${workerHome}/.config/cydo/config.yaml`,
     ["workspaces:", "  testws:", `    root: ${projectPath}`].join("\n") + "\n",
   );
@@ -228,7 +229,7 @@ test("importable session appears on startup, history loads, Import Session promo
   writeFileSync(`${claudeProjectsDir}/${sessionId}.jsonl`, jsonlContent);
 
   // Workspace config pointing at the test workspace.
-  writeFileSync(
+  writeTestConfig(
     `${workerHome}/.config/cydo/config.yaml`,
     ["workspaces:", "  testws:", `    root: ${projectPath}`].join("\n") + "\n",
   );
@@ -368,7 +369,7 @@ test("import replay drops durable session/status rows but keeps compact boundary
 
   writeFileSync(`${claudeProjectsDir}/${sessionId}.jsonl`, jsonlContent);
 
-  writeFileSync(
+  writeTestConfig(
     `${workerHome}/.config/cydo/config.yaml`,
     ["workspaces:", "  testws:", `    root: ${projectPath}`].join("\n") + "\n",
   );

@@ -1,4 +1,4 @@
-import { writeFileSync } from "fs";
+import { writeTestConfig } from "./test-config";
 
 import {
   test,
@@ -39,7 +39,7 @@ test(
   "custom Claude agent keeps configured name across draft, init, and reload",
   { tag: "@claude-only" },
   async ({ page, agentType }) => {
-    writeFileSync(
+    writeTestConfig(
       "/tmp/playwright-home/.config/cydo/config.yaml",
       `default_agent: claude
 agents:

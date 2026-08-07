@@ -2,6 +2,7 @@ import { test, expect } from "@playwright/test";
 import { execFileSync, spawn } from "child_process";
 import type { ChildProcess } from "child_process";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { writeTestConfig } from "./test-config";
 
 const BACKEND_PORT =
   process.env.CYDO_TEST_PORT ?? process.env.CYDO_LISTEN_PORT ?? "3940";
@@ -90,7 +91,7 @@ function initGitRepo(dir: string): void {
 }
 
 function writeConfig(configPath: string, workspaceRoot: string): void {
-  writeFileSync(
+  writeTestConfig(
     configPath,
     [
       "workspaces:",
@@ -108,7 +109,7 @@ function writeConfigWithoutNested(
   configPath: string,
   workspaceRoot: string,
 ): void {
-  writeFileSync(
+  writeTestConfig(
     configPath,
     [
       "workspaces:",

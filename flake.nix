@@ -306,17 +306,50 @@ EOF
 
           fake-bwrap = pkgs.writeShellScript "bwrap" ''
             chdir=""
+            clearenv=0
+            clearenvKeys=()
+            clearenvValues=()
+
+            setenvAfterClearenv() {
+              local key="$1"
+              local value="$2"
+              local i
+              for i in "''${!clearenvKeys[@]}"; do
+                if [[ "''${clearenvKeys[$i]}" == "$key" ]]; then
+                  clearenvValues[$i]="$key=$value"
+                  return
+                fi
+              done
+              clearenvKeys+=("$key")
+              clearenvValues+=("$key=$value")
+            }
+
             while [[ $# -gt 0 ]]; do
               case "$1" in
                 --) shift; break ;;
-                --setenv) export "$2=$3"; shift 3 ;;
+                --setenv)
+                  if [[ "$clearenv" == 1 ]]; then
+                    setenvAfterClearenv "$2" "$3"
+                  else
+                    export "$2=$3"
+                  fi
+                  shift 3
+                  ;;
                 --chdir) chdir="$2"; shift 2 ;;
-                --clearenv) shift ;;
+                --clearenv)
+                  clearenv=1
+                  clearenvKeys=()
+                  clearenvValues=()
+                  shift
+                  ;;
                 --bind|--ro-bind|--symlink|--dev|--proc|--tmpfs) shift 2 ;;
                 *) shift ;;
               esac
             done
             [[ -n "$chdir" ]] && cd "$chdir"
+            if [[ "$clearenv" == 1 ]]; then
+              exec env -i "''${clearenvValues[@]}" "$@"
+            fi
             exec "$@"
           '';
 
@@ -351,6 +384,22 @@ EOF
             DISABLE_TELEMETRY = "1";
             DISABLE_AUTOUPDATER = "1";
             CLAUDE_CONFIG_DIR = "/tmp/screenshot-claude-home";
+            CLAUDE_CODE_ENTRYPOINT = "";
+            CLAUDE_CODE_OAUTH_TOKEN = "";
+            CYDO_REAL_CLAUDE_BIN = "";
+
+            OPENAI_BASE_URL = "";
+            OPENAI_API_KEY = "";
+            CODEX_API_KEY = "";
+            CODEX_HOME = "";
+
+            COPILOT_HOME = "";
+            COPILOT_GITHUB_TOKEN = "";
+            GH_TOKEN = "";
+            GITHUB_TOKEN = "";
+            COPILOT_MODEL = "";
+            HTTPS_PROXY = "";
+            NODE_TLS_REJECT_UNAUTHORIZED = "";
 
             CYDO_AUTH_USER = "user";
             CYDO_AUTH_PASS = "screenshot";
@@ -360,17 +409,50 @@ EOF
             buildPhase = let
               fake-bwrap-local = pkgs.writeShellScript "bwrap" ''
                 chdir=""
+                clearenv=0
+                clearenvKeys=()
+                clearenvValues=()
+
+                setenvAfterClearenv() {
+                  local key="$1"
+                  local value="$2"
+                  local i
+                  for i in "''${!clearenvKeys[@]}"; do
+                    if [[ "''${clearenvKeys[$i]}" == "$key" ]]; then
+                      clearenvValues[$i]="$key=$value"
+                      return
+                    fi
+                  done
+                  clearenvKeys+=("$key")
+                  clearenvValues+=("$key=$value")
+                }
+
                 while [[ $# -gt 0 ]]; do
                   case "$1" in
                     --) shift; break ;;
-                    --setenv) export "$2=$3"; shift 3 ;;
+                    --setenv)
+                      if [[ "$clearenv" == 1 ]]; then
+                        setenvAfterClearenv "$2" "$3"
+                      else
+                        export "$2=$3"
+                      fi
+                      shift 3
+                      ;;
                     --chdir) chdir="$2"; shift 2 ;;
-                    --clearenv) shift ;;
+                    --clearenv)
+                      clearenv=1
+                      clearenvKeys=()
+                      clearenvValues=()
+                      shift
+                      ;;
                     --bind|--ro-bind|--symlink|--dev|--proc|--tmpfs) shift 2 ;;
                     *) shift ;;
                   esac
                 done
                 [[ -n "$chdir" ]] && cd "$chdir"
+                if [[ "$clearenv" == 1 ]]; then
+                  exec env -i "''${clearenvValues[@]}" "$@"
+                fi
                 exec "$@"
               '';
             in runInTmpfsNs pkgs ''
@@ -413,7 +495,8 @@ EOF
 
               # ── CyDo workspace config ─────────────────────────────────
               mkdir -p /tmp/playwright-home/.config/cydo
-              cat > /tmp/playwright-home/.config/cydo/config.yaml <<'CYDO_CFG'
+              cat ${./tests/e2e/agent-sandbox-env.yaml} > /tmp/playwright-home/.config/cydo/config.yaml
+              cat >> /tmp/playwright-home/.config/cydo/config.yaml <<'CYDO_CFG'
               default_agent: claude
               workspaces:
                 personal:
@@ -520,12 +603,42 @@ EOF
           # Real bwrap can't run inside Nix's build sandbox.
           fake-bwrap = pkgs.writeShellScript "bwrap" ''
             chdir=""
+            clearenv=0
+            clearenvKeys=()
+            clearenvValues=()
+
+            setenvAfterClearenv() {
+              local key="$1"
+              local value="$2"
+              local i
+              for i in "''${!clearenvKeys[@]}"; do
+                if [[ "''${clearenvKeys[$i]}" == "$key" ]]; then
+                  clearenvValues[$i]="$key=$value"
+                  return
+                fi
+              done
+              clearenvKeys+=("$key")
+              clearenvValues+=("$key=$value")
+            }
+
             while [[ $# -gt 0 ]]; do
               case "$1" in
                 --) shift; break ;;
-                --setenv) export "$2=$3"; shift 3 ;;
+                --setenv)
+                  if [[ "$clearenv" == 1 ]]; then
+                    setenvAfterClearenv "$2" "$3"
+                  else
+                    export "$2=$3"
+                  fi
+                  shift 3
+                  ;;
                 --chdir) chdir="$2"; shift 2 ;;
-                --clearenv) shift ;;
+                --clearenv)
+                  clearenv=1
+                  clearenvKeys=()
+                  clearenvValues=()
+                  shift
+                  ;;
                 --symlink|--dev|--proc|--tmpfs) shift 2 ;;
                 --bind|--ro-bind)
                   if [ ! -e "$2" ]; then
@@ -538,6 +651,9 @@ EOF
               esac
             done
             [[ -n "$chdir" ]] && cd "$chdir"
+            if [[ "$clearenv" == 1 ]]; then
+              exec env -i "''${clearenvValues[@]}" "$@"
+            fi
             exec "$@"
           '';
 
@@ -585,7 +701,20 @@ EOF
 
             OPENAI_BASE_URL = "http://127.0.0.1:9000/v1";
             OPENAI_API_KEY = "test-key-mock";
+            CODEX_API_KEY = "";
             CODEX_HOME = "/tmp/codex-test-home";
+
+            CLAUDE_CODE_ENTRYPOINT = "";
+            CLAUDE_CODE_OAUTH_TOKEN = "";
+            CYDO_REAL_CLAUDE_BIN = "";
+
+            COPILOT_HOME = "";
+            COPILOT_GITHUB_TOKEN = "";
+            GH_TOKEN = "";
+            GITHUB_TOKEN = "";
+            COPILOT_MODEL = "";
+            HTTPS_PROXY = "";
+            NODE_TLS_REJECT_UNAUTHORIZED = "";
 
             # Fixed port env vars — fixtures inherit these
             CYDO_LISTEN_PORT = "3940";
@@ -667,7 +796,8 @@ EOF
               ''}
 
               mkdir -p /tmp/playwright-home/.config/cydo
-              cat > /tmp/playwright-home/.config/cydo/config.yaml <<CYDO_CFG
+              cat ${./tests/e2e/agent-sandbox-env.yaml} > /tmp/playwright-home/.config/cydo/config.yaml
+              cat >> /tmp/playwright-home/.config/cydo/config.yaml <<CYDO_CFG
               default_agent: ${agentType}
               log_level: trace
               workspaces:

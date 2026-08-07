@@ -1,4 +1,4 @@
-import { writeFileSync } from "fs";
+import { writeTestConfig } from "./test-config";
 import {
   test,
   expect,
@@ -14,7 +14,7 @@ test("permission_policy djinja expression: allow branch auto-approves matching t
 }) => {
 
   // Djinja expression: allow Bash, deny everything else.
-  writeFileSync(
+  writeTestConfig(
     "/tmp/playwright-home/.config/cydo/config.yaml",
     `default_agent: claude
 workspaces:
@@ -48,7 +48,7 @@ test("permission_policy djinja expression: deny branch blocks non-matching tools
 }) => {
 
   // Djinja expression: deny Bash, allow everything else.
-  writeFileSync(
+  writeTestConfig(
     "/tmp/playwright-home/.config/cydo/config.yaml",
     `default_agent: claude
 workspaces:
@@ -83,7 +83,7 @@ test("permission_policy deny literal: all tool calls are blocked", { tag: "@clau
   agentType,
 }) => {
 
-  writeFileSync(
+  writeTestConfig(
     "/tmp/playwright-home/.config/cydo/config.yaml",
     `default_agent: claude
 workspaces:

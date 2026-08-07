@@ -15,6 +15,7 @@ import { test, expect } from "@playwright/test";
 import { spawn, execFileSync } from "child_process";
 import type { ChildProcess } from "child_process";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { writeTestConfig } from "./test-config";
 
 // ---------------------------------------------------------------------------
 // Helpers (following discover.spec.ts / session-import.spec.ts pattern)
@@ -206,7 +207,7 @@ test(
     initGitRepo(sharedProject);
 
     // Config with two workspaces pointing at the same root.
-    writeFileSync(
+    writeTestConfig(
       `${workerHome}/.config/cydo/config.yaml`,
       [
         "workspaces:",

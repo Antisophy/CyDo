@@ -21,6 +21,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "fs";
+import { writeTestConfig } from "./test-config";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -168,7 +169,7 @@ test(
 
     // project-beta is masked with an empty_dir overlay in the sandbox config
     // so the discovery process cannot see its .git directory.
-    writeFileSync(
+    writeTestConfig(
       `${workerHome}/.config/cydo/config.yaml`,
       [
         "workspaces:",
@@ -317,7 +318,7 @@ test(
 
     // Initial config: only the existing test workspace.
     const configPath = `${workerHome}/.config/cydo/config.yaml`;
-    writeFileSync(
+    writeTestConfig(
       configPath,
       ["workspaces:", "  ws1:", "    root: /tmp/cydo-test-workspace"].join(
         "\n",
@@ -339,7 +340,7 @@ test(
       // Update config to add a second workspace.
       // The backend watches config.yaml via inotify (closeWrite event) and
       // calls discoverAllWorkspaces() + broadcasts workspaces_list on change.
-      writeFileSync(
+      writeTestConfig(
         configPath,
         [
           "workspaces:",
@@ -381,7 +382,7 @@ test(
     const { workDir, workerHome } = createWorkDir("fail");
 
     // "badws" points at a path that does not exist.
-    writeFileSync(
+    writeTestConfig(
       `${workerHome}/.config/cydo/config.yaml`,
       [
         "workspaces:",
@@ -449,7 +450,7 @@ test(
     // plain-dir: empty directory — should NOT be discovered
     mkdirSync(`${wsRoot}/plain-dir`, { recursive: true });
 
-    writeFileSync(
+    writeTestConfig(
       `${workerHome}/.config/cydo/config.yaml`,
       [
         "workspaces:",
@@ -502,7 +503,7 @@ test(
     initGitRepo(`${wsRoot}/mono`);
     initGitRepo(`${wsRoot}/mono/sub`);
 
-    writeFileSync(
+    writeTestConfig(
       `${workerHome}/.config/cydo/config.yaml`,
       [
         "workspaces:",
@@ -552,7 +553,7 @@ test(
     mkdirSync(`${wsRoot}/beta`, { recursive: true });
     mkdirSync(`${wsRoot}/gamma`, { recursive: true });
 
-    writeFileSync(
+    writeTestConfig(
       `${workerHome}/.config/cydo/config.yaml`,
       [
         "workspaces:",
@@ -604,7 +605,7 @@ test(
     const configPath = `${workerHome}/.config/cydo/config.yaml`;
 
     // With depth limit 2: d is NOT reachable (scanning stops at depth 2)
-    writeFileSync(
+    writeTestConfig(
       configPath,
       [
         "workspaces:",
@@ -627,7 +628,7 @@ test(
       ).not.toBeVisible({ timeout: 10_000 });
 
       // Increase depth limit to 4: d IS reachable now
-      writeFileSync(
+      writeTestConfig(
         configPath,
         [
           "workspaces:",

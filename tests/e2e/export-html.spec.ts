@@ -1,5 +1,5 @@
 import { spawnSync } from "child_process";
-import { readFileSync, unlinkSync, writeFileSync } from "fs";
+import { readFileSync, unlinkSync } from "fs";
 
 import {
   test,
@@ -10,6 +10,7 @@ import {
   responseTimeout,
   lastAssistantText,
 } from "./fixtures";
+import { writeTestConfig } from "./test-config";
 
 test("export-html creates viewable HTML file", { tag: "@claude-only" }, async ({ page, backend, agentType }, testInfo) => {
 
@@ -78,7 +79,7 @@ test("export-html creates viewable HTML file", { tag: "@claude-only" }, async ({
 test("export-html includes transcript for custom Claude-backed agent", { tag: "@claude-only" }, async ({ page, agentType }) => {
   const outputPath = "/tmp/cydo-export-custom-agent.html";
 
-  writeFileSync(
+  writeTestConfig(
     "/tmp/playwright-home/.config/cydo/config.yaml",
     `default_agent: claude
 agents:

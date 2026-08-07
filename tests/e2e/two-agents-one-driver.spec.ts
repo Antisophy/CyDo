@@ -1,7 +1,8 @@
 import { test as base } from "@playwright/test";
 import { execFileSync, spawn } from "child_process";
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { mkdirSync, rmSync, symlinkSync } from "fs";
 import { join } from "path";
+import { writeTestConfig } from "./test-config";
 
 type WorkerFixtures = {
   backend: { baseURL: string };
@@ -74,7 +75,7 @@ const test = base.extend<WorkerFixtures>({
       mkdirSync(`${workDir}/data`, { recursive: true });
       symlinkSync("/tmp/cydo-test-workspace/defs", `${workDir}/defs`);
       mkdirSync(`${workerHome}/.config/cydo`, { recursive: true });
-      writeFileSync(
+      writeTestConfig(
         `${workerHome}/.config/cydo/config.yaml`,
         [
           "default_agent: work-claude",
@@ -193,6 +194,22 @@ test("two agents sharing a driver get separate sandbox envs", async ({
       d.title === "Personal Title",
     30_000,
   );
+  const resultWork = waitForMessage(
+    ws,
+    (d) =>
+      d.tid === tidWork &&
+      d.event?.type === "turn/result" &&
+      d.event?.subtype === "success",
+    30_000,
+  );
+  const resultPersonal = waitForMessage(
+    ws,
+    (d) =>
+      d.tid === tidPersonal &&
+      d.event?.type === "turn/result" &&
+      d.event?.subtype === "success",
+    30_000,
+  );
 
   for (const tid of [tidWork, tidPersonal]) {
     ws.send(
@@ -204,8 +221,7 @@ test("two agents sharing a driver get separate sandbox envs", async ({
     );
   }
 
-  await titleWork;
-  await titlePersonal;
+  await Promise.all([titleWork, titlePersonal, resultWork, resultPersonal]);
 
   ws.close();
 });

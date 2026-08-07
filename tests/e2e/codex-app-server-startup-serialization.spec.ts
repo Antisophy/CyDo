@@ -10,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "fs";
+import { writeTestConfig } from "./test-config";
 
 type StartupRecord = {
   pid: number;
@@ -167,7 +168,7 @@ exec "$CYDO_REAL_CODEX_BIN" "$@"
       { mode: 0o755 },
     );
 
-    writeFileSync(
+    writeTestConfig(
       `${workerHome}/.config/cydo/config.yaml`,
       [
         "default_agent: shared-alpha",
@@ -367,7 +368,7 @@ exec "$CYDO_REAL_CODEX_BIN" "$@"
       { mode: 0o755 },
     );
 
-    writeFileSync(
+    writeTestConfig(
       `${workerHome}/.config/cydo/config.yaml`,
       [
         "default_agent: delayed-codex",

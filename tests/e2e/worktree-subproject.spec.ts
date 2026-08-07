@@ -2,6 +2,7 @@ import { test, expect } from "@playwright/test";
 import { spawn, execFileSync } from "child_process";
 import type { ChildProcess } from "child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
+import { writeTestConfig } from "./test-config";
 
 const BACKEND_URL = "http://localhost:3940";
 
@@ -94,7 +95,7 @@ function setupMonorepo(workerHome: string, wsRoot: string): {
   execFileSync("git", ["-C", repoDir, "add", "."]);
   execFileSync("git", ["-C", repoDir, "commit", "-qm", "init"]);
 
-  writeFileSync(
+  writeTestConfig(
     `${workerHome}/.config/cydo/config.yaml`,
     [
       "workspaces:",

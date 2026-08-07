@@ -1,4 +1,4 @@
-import { writeFileSync } from "fs";
+import { writeTestConfig } from "./test-config";
 import {
   test,
   expect,
@@ -15,7 +15,7 @@ test("permission_policy allow auto-approves tool calls via PermissionPrompt", { 
 
   // Configure the workspace with permission_policy: allow so the backend passes
   // --permission-prompt-tool to Claude and our PermissionPrompt MCP tool handles it.
-  writeFileSync(
+  writeTestConfig(
     "/tmp/playwright-home/.config/cydo/config.yaml",
     `default_agent: claude
 workspaces:

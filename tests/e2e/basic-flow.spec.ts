@@ -1,4 +1,3 @@
-import { writeFileSync } from "fs";
 import {
   test,
   expect,
@@ -8,6 +7,7 @@ import {
   assistantText,
   lastAssistantText,
 } from "./fixtures";
+import { writeTestConfig } from "./test-config";
 
 test("page loads and shows CyDo branding", { tag: "@no-codex" }, async ({ page, agentType }) => {
   await page.goto("/");
@@ -103,7 +103,7 @@ test("codex tool call renders output content", { tag: "@codex-only" }, async ({ 
 test("codex agent type indicator", { tag: "@codex-only" }, async ({ page, agentType }) => {
   // Configure default_agent: claude so codex is a non-default agent.
   // The banner indicator shows only when agent_name differs from the default.
-  writeFileSync(
+  writeTestConfig(
     "/tmp/playwright-home/.config/cydo/config.yaml",
     `default_agent: claude
 log_level: trace

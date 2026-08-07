@@ -4,6 +4,7 @@ import type { ChildProcess } from "child_process";
 import { execFileSync, spawn } from "child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
+import { writeTestConfig } from "./test-config";
 
 import type { Page } from "./fixtures";
 import {
@@ -390,7 +391,7 @@ isolatedTest("editing the second identical raw line rewrites that physical JSONL
       duplicateRawLine,
     ].join("\n") + "\n",
   );
-  writeFileSync(
+  writeTestConfig(
     `${workerHome}/.config/cydo/config.yaml`,
     ["workspaces:", "  testws:", `    root: ${projectPath}`].join("\n") + "\n",
   );
@@ -504,7 +505,7 @@ isolatedTest("editing replayed steering raw JSON rewrites the earlier enqueue li
       discoverabilityRawLine,
     ].join("\n") + "\n",
   );
-  writeFileSync(
+  writeTestConfig(
     `${workerHome}/.config/cydo/config.yaml`,
     ["workspaces:", "  testws:", `    root: ${projectPath}`].join("\n") + "\n",
   );

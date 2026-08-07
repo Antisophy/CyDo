@@ -1,4 +1,4 @@
-import { writeFileSync } from "fs";
+import { writeTestConfig } from "./test-config";
 import {
   test,
   expect,
@@ -13,7 +13,7 @@ test("permission_policy ask: Allow button approves the tool call", { tag: "@clau
   agentType,
 }) => {
 
-  writeFileSync(
+  writeTestConfig(
     "/tmp/playwright-home/.config/cydo/config.yaml",
     `default_agent: claude
 workspaces:
@@ -52,7 +52,7 @@ test("permission_policy ask: Deny button blocks the tool call", { tag: "@claude-
   agentType,
 }) => {
 
-  writeFileSync(
+  writeTestConfig(
     "/tmp/playwright-home/.config/cydo/config.yaml",
     `default_agent: claude
 workspaces:

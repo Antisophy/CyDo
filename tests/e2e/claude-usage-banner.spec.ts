@@ -6,7 +6,7 @@ import {
   assistantText,
   responseTimeout,
 } from "./fixtures";
-import { writeFileSync } from "fs";
+import { writeTestConfig } from "./test-config";
 
 test.use({
   backendEnv: {
@@ -54,7 +54,7 @@ test("custom Claude-backed agent still updates the Claude usage banner", { tag: 
   page,
   agentType,
 }) => {
-  writeFileSync(
+  writeTestConfig(
     "/tmp/playwright-home/.config/cydo/config.yaml",
     `default_agent: claude
 agents:
