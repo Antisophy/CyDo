@@ -852,6 +852,12 @@ body,
   opacity: 1;
 }
 
+/* The copy button participates in the actions row instead of overlaying it */
+.message-actions > .btn-copy {
+  position: static;
+  opacity: 1;
+}
+
 .msg-action-btn,
 .btn-copy,
 .markdown-toggle-btn {

@@ -12,6 +12,7 @@ import { outbox, type OutboxEntry } from "../outbox";
 import { hasAnsi, renderAnsi } from "../ansi";
 import { AssistantMessage } from "./AssistantMessage";
 import { UserMessage } from "./UserMessage";
+import { CopyButton } from "./CopyButton";
 import { useDevMode } from "../devMode";
 import { Markdown } from "./Markdown";
 import { TaskDiagnosticView } from "./TaskDiagnosticView";
@@ -533,6 +534,16 @@ const MessageView = memo(
       setEditing(false);
     }, [uuid, onEdit, editText]);
 
+    const userCopyText =
+      msg.type === "user"
+        ? msg.content
+            .filter(
+              (b): b is { type: "text"; text: string } => b.type === "text",
+            )
+            .map((b) => b.text)
+            .join("\n")
+        : "";
+
     if (msg.subtype === "metadata" && !devMode) return null;
 
     let inner;
@@ -668,6 +679,7 @@ const MessageView = memo(
         class={`message-wrapper${showSource ? " show-source" : ""}`}
       >
         <div class="message-actions">
+          {userCopyText && !msg.cydoMeta && <CopyButton text={userCopyText} />}
           {uuid && onEdit && (
             <button
               class="msg-action-btn edit-btn"

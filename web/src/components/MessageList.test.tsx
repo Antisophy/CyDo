@@ -480,4 +480,44 @@ describe("MessageList task diagnostics", () => {
     expect(html).toContain("Nudge");
     expect(html).toContain('title="Edit message"');
   });
+
+  it("renders a copy button in the actions row for user messages", () => {
+    const user: DisplayMessage = {
+      id: "u",
+      type: "user",
+      content: [{ type: "text", text: "hello there" }],
+    };
+    const html = renderToString(
+      <MessageList
+        taskTid={1}
+        messages={[user]}
+        blocks={new Map()}
+        replacementEvents={new Map()}
+        isProcessing={false}
+        bandStatus=""
+      />,
+    );
+    expect(html).toContain("btn-copy");
+  });
+
+  it("renders no copy button for image-only user messages", () => {
+    const user: DisplayMessage = {
+      id: "u",
+      type: "user",
+      content: [
+        { type: "image", data: "aGk=", media_type: "image/png" } as never,
+      ],
+    };
+    const html = renderToString(
+      <MessageList
+        taskTid={1}
+        messages={[user]}
+        blocks={new Map()}
+        replacementEvents={new Map()}
+        isProcessing={false}
+        bandStatus=""
+      />,
+    );
+    expect(html).not.toContain("btn-copy");
+  });
 });
