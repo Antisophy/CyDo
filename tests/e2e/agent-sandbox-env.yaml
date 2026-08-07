@@ -12,6 +12,8 @@ sandbox:
     OPENAI_BASE_URL: "{{ env.OPENAI_BASE_URL }}"
     OPENAI_API_KEY: "{{ env.OPENAI_API_KEY }}"
     CODEX_API_KEY: "{{ env.CODEX_API_KEY }}"
+    CODEX_HOME: "{{ env.CODEX_HOME }}"
+    COPILOT_HOME: "{{ env.COPILOT_HOME }}"
     COPILOT_GITHUB_TOKEN: "{{ env.COPILOT_GITHUB_TOKEN }}"
     GH_TOKEN: "{{ env.GH_TOKEN }}"
     GITHUB_TOKEN: "{{ env.GITHUB_TOKEN }}"

@@ -356,6 +356,10 @@ static:
 		import ae.utils.json : jsonParse;
 		import cydo.agent.contract : Agent;
 		import cydo.domain.task_types.definition : substituteVars;
+		import cydo.runtime.launch.sandbox : prepareProcessLaunch;
+		import cydo.runtime.launch.types : ProcessLaunch;
+		import cydo.workflow.history.native_history : ConfiguredNativeHistoryContext,
+			resolveNativeHistoryContext;
 
 		initLogger();
 		auto config = loadRuntimeConfig();
@@ -406,10 +410,17 @@ static:
 		}
 		auto prompt = substituteVars(readText(promptPath), ["conversation": history]);
 
+		auto selectedAgentName = replayConfiguredAgentName(meta, config);
 		Agent agent;
+		ProcessLaunch launch;
 		try
-			agent = createConfiguredAgent(config,
-				replayConfiguredAgentName(meta, config));
+		{
+			agent = createConfiguredAgent(config, selectedAgentName);
+			auto context = ConfiguredNativeHistoryContext(selectedAgentName, "", "", false);
+			auto resolved = resolveNativeHistoryContext(config, agent, context);
+			launch = prepareProcessLaunch(resolved.sandbox, resolved.rule,
+				resolved.profile, "", agent.executableName(resolved.sandbox.env));
+		}
 		catch (Exception e)
 		{
 			stderr.writeln("Error: ", e.msg);
@@ -419,16 +430,28 @@ static:
 
 		// Run the one-shot and print result to stdout
 		bool failed;
-		auto handle = agent.completeOneShot(prompt, "small");
-		handle.promise.then((string result) {
-			import std.stdio : writeln;
-			if (result.length == 0)
-				stderr.writeln("Warning: got empty response from agent");
-			writeln(result);
-		}).except((Exception e) {
+		try
+		{
+			auto handle = agent.completeOneShot(prompt, "small", launch);
+			handle.promise.then((string result) {
+				import std.stdio : writeln;
+				if (result.length == 0)
+					stderr.writeln("Warning: got empty response from agent");
+				writeln(result);
+			}).except((Exception e) {
+				stderr.writeln("Error: ", e.msg);
+				failed = true;
+			}).finish({
+				cleanup(launch.sandbox);
+			}).ignoreResult();
+		}
+		catch (Exception e)
+		{
+			cleanup(launch.sandbox);
 			stderr.writeln("Error: ", e.msg);
-			failed = true;
-		}).ignoreResult();
+			import core.stdc.stdlib : exit;
+			exit(1);
+		}
 
 		socketManager.loop();
 

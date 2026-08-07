@@ -6,7 +6,7 @@ import cydo.protocol : TranslatedEvent;
 import cydo.agent.session : AgentSession;
 import cydo.runtime.config : AgentDriver, ModelSpec;
 import cydo.runtime.launch.sandbox_paths : SandboxPaths;
-import cydo.runtime.launch.types : ProcessLaunch;
+import cydo.runtime.launch.types : NativeHistoryRule, ProcessLaunch;
 
 /// Per-session configuration passed to createSession.
 struct SessionConfig
@@ -82,6 +82,9 @@ interface Agent
 	/// Used for code paths that switch on driver-specific behavior
 	/// (history rollback, codex SIGTERM, claude-anchor logic).
 	@property AgentDriver driver();
+
+	/// Native-history profile selection declared by this concrete driver.
+	@property NativeHistoryRule nativeHistoryRule();
 
 	/// Resolve the executable name/path to launch for this agent using the
 	/// effective sandbox environment (including config-provided overrides).
@@ -201,10 +204,9 @@ interface Agent
 	/// Must be safe to call from a background thread (no shared mutable state).
 	string matchProject(string sessionId, const string[] knownProjectPaths);
 
-	/// Run a one-shot LLM completion using the same task-scoped process launch
-	/// context as the parent session when the caller needs sandbox env/cwd parity.
+	/// Run a one-shot LLM completion using the supplied process launch context.
 	OneShotHandle completeOneShot(string prompt, string modelClass,
-		ProcessLaunch launch = ProcessLaunch.init);
+		ProcessLaunch launch);
 }
 
 /// Handle returned by completeOneShot, containing the result promise and a

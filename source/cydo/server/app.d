@@ -568,11 +568,8 @@ class App
 			outputPath: &taskPathResolver.outputPath,
 			effectiveCwd: &taskPathResolver.effectiveCwd,
 			worktreePath: &taskPathResolver.worktreePath,
-			globalSandbox: () => config.sandbox,
-			findWorkspaceSandbox: &findWorkspaceSandbox,
-			findWorkspaceRoot: &taskPathResolver.findWorkspaceRoot,
+			currentConfig: () => &config,
 			findWorkspacePermissionPolicy: &findWorkspacePermissionPolicy,
-			findAgentSandbox: &findAgentSandbox,
 			reportMcpToolDescriptionLimit: &reportMcpToolDescriptionLimit,
 			resolveSharedTmpPath: &resolveSharedTmpPath,
 			mcpSocketPath: () => transport.mcpSocketPath,
@@ -2707,28 +2704,12 @@ class App
 		return config.default_task_type;
 	}
 
-	private SandboxConfig findWorkspaceSandbox(string workspaceName)
-	{
-		foreach (ref ws; config.workspaces)
-			if (ws.name == workspaceName)
-				return ws.sandbox;
-		return SandboxConfig.init;
-	}
-
 	private string findWorkspacePermissionPolicy(string workspaceName)
 	{
 		foreach (ref ws; config.workspaces)
 			if (ws.name == workspaceName && ws.permission_policy.length > 0)
 				return ws.permission_policy;
 		return "";
-	}
-
-	private SandboxConfig findAgentSandbox(string agentName)
-	{
-		if (config.agents !is null)
-			if (auto ac = agentName in config.agents)
-				return ac.sandbox;
-		return SandboxConfig.init;
 	}
 
 	/// Returns the HEAD SHA of the worktree (or main checkout) that the
@@ -4554,6 +4535,28 @@ unittest
 	mkdirRecurse(projectPath);
 
 	App app = new App();
+	app.config.sandbox = SandboxConfig(
+		isolate_filesystem: SetInfo!bool(false),
+		isolate_processes: SetInfo!bool(false),
+		isolate_environment: SetInfo!bool(false),
+	);
+	app.config.workspaces = [WorkspaceConfig(name: "local", root: workspaceRoot,
+		sandbox: app.config.sandbox)];
+	AgentConfig codexConfig;
+	codexConfig.driver = SetInfo!AgentDriver(AgentDriver.codex, true);
+	codexConfig.sandbox = app.config.sandbox;
+	codexConfig.sandbox.env["CODEX_HOME"] = buildPath(tmp, "codex-profile");
+	app.config.agents["codex"] = codexConfig;
+	AgentConfig claudeConfig;
+	claudeConfig.driver = SetInfo!AgentDriver(AgentDriver.claude, true);
+	claudeConfig.sandbox = app.config.sandbox;
+	claudeConfig.sandbox.env["CLAUDE_CONFIG_DIR"] = buildPath(tmp, "claude-profile");
+	app.config.agents["claude"] = claudeConfig;
+	AgentConfig copilotConfig;
+	copilotConfig.driver = SetInfo!AgentDriver(AgentDriver.copilot, true);
+	copilotConfig.sandbox = app.config.sandbox;
+	copilotConfig.sandbox.env["COPILOT_HOME"] = buildPath(tmp, "copilot-profile");
+	app.config.agents["copilot"] = copilotConfig;
 	app.taskDirTemplate = "{{ workspace_root }}/.cydo/tasks/{{ tid }}";
 	app.taskTypeCatalog = new TaskTypeCatalog(buildPath(tmp, "defs"),
 		buildPath(tmp, "defs", "task-types.yaml"),
@@ -4591,23 +4594,8 @@ unittest
 		outputPath: (const TaskData* td) => app.taskPathResolver.outputPath(td),
 		effectiveCwd: (const TaskData* td) => app.taskPathResolver.effectiveCwd(td),
 		worktreePath: (const TaskData* td) => app.taskPathResolver.worktreePath(td),
-		globalSandbox: () => SandboxConfig(
-			isolate_filesystem: SetInfo!bool(false),
-			isolate_processes: SetInfo!bool(false),
-			isolate_environment: SetInfo!bool(false),
-		),
-		findWorkspaceSandbox: (string workspaceName) => SandboxConfig(
-			isolate_filesystem: SetInfo!bool(false),
-			isolate_processes: SetInfo!bool(false),
-			isolate_environment: SetInfo!bool(false),
-		),
-		findWorkspaceRoot: (string workspaceName) => workspaceRoot,
+		currentConfig: () => &app.config,
 		findWorkspacePermissionPolicy: (string workspaceName) => "",
-		findAgentSandbox: (string agentName) => SandboxConfig(
-			isolate_filesystem: SetInfo!bool(false),
-			isolate_processes: SetInfo!bool(false),
-			isolate_environment: SetInfo!bool(false),
-		),
 		reportMcpToolDescriptionLimit: (string projectPath, string taskType,
 			ToolDescriptionViolation[] violations) {},
 		resolveSharedTmpPath: (int tid) => buildPath(tmp, "shared-tmp"),
@@ -4767,6 +4755,20 @@ unittest
 	auto workspaceRoot = buildPath(tmp, "workspace");
 	auto projectPath = buildPath(workspaceRoot, "project");
 	mkdirRecurse(projectPath);
+	auto config = new CydoConfig;
+	config.sandbox = SandboxConfig(
+		isolate_filesystem: SetInfo!bool(false),
+		isolate_processes: SetInfo!bool(false),
+		isolate_environment: SetInfo!bool(false),
+	);
+	config.workspaces = [WorkspaceConfig(name: "local", root: workspaceRoot,
+		sandbox: config.sandbox)];
+	AgentConfig configuredClaude;
+	configuredClaude.driver = SetInfo!AgentDriver(AgentDriver.claude, true);
+	configuredClaude.sandbox = config.sandbox;
+	configuredClaude.sandbox.env["CLAUDE_CONFIG_DIR"] = buildPath(tmp,
+		"claude-profile");
+	config.agents["claude"] = configuredClaude;
 
 	TaskTypeCatalog catalog = new TaskTypeCatalog(buildPath(tmp, "defs"),
 		buildPath(tmp, "defs", "task-types.yaml"),
@@ -4799,23 +4801,8 @@ unittest
 		outputPath: (const TaskData* td) => taskPathResolver.outputPath(td),
 		effectiveCwd: (const TaskData* td) => taskPathResolver.effectiveCwd(td),
 		worktreePath: (const TaskData* td) => taskPathResolver.worktreePath(td),
-		globalSandbox: () => SandboxConfig(
-			isolate_filesystem: SetInfo!bool(false),
-			isolate_processes: SetInfo!bool(false),
-			isolate_environment: SetInfo!bool(false),
-		),
-		findWorkspaceSandbox: (string workspaceName) => SandboxConfig(
-			isolate_filesystem: SetInfo!bool(false),
-			isolate_processes: SetInfo!bool(false),
-			isolate_environment: SetInfo!bool(false),
-		),
-		findWorkspaceRoot: (string workspaceName) => workspaceRoot,
+		currentConfig: () => config,
 		findWorkspacePermissionPolicy: (string workspaceName) => "allow all",
-		findAgentSandbox: (string agentName) => SandboxConfig(
-			isolate_filesystem: SetInfo!bool(false),
-			isolate_processes: SetInfo!bool(false),
-			isolate_environment: SetInfo!bool(false),
-		),
 		reportMcpToolDescriptionLimit: (string projectPathValue,
 			string taskTypeValue, ToolDescriptionViolation[] violations) {
 			reportedProjects ~= projectPathValue;

@@ -1,9 +1,10 @@
 module cydo.runtime.launch.sandbox_renderer;
 
 import std.algorithm : canFind, splitter, startsWith;
-import std.file : exists, isFile, isSymlink, readLink;
+import std.exception : enforce;
+import std.file : exists, isDir, isFile, isSymlink, mkdirRecurse, readLink;
 import std.logger : tracef;
-import std.path : buildPath, dirName, expandTilde;
+import std.path : buildPath, dirName, expandTilde, isAbsolute;
 import std.process : environment;
 import std.string : toStringz;
 
@@ -13,10 +14,14 @@ import ae.sys.file : realPath;
 
 import cydo.runtime.config : PathMode;
 import cydo.runtime.launch.sandbox_materialization : createGitConfigTempFile, createGroupTempFile,
-	createPasswdTempFile, emptyDirPath, emptyFilePath;
-import cydo.runtime.launch.sandbox_paths : SandboxPathOrigin, SandboxPathOriginKind;
+	createPasswdTempFile, cleanup, emptyDirPath, emptyFilePath;
+import cydo.runtime.launch.environment : effectiveChildEnvValue,
+	isolatedChildHomeBaseline, resolveNativeHistoryProfile;
+import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
+	SandboxPathOriginKind;
 import cydo.runtime.launch.sandbox_resolver : planMounts;
-import cydo.runtime.launch.types : ProcessLaunch, ResolvedSandbox;
+import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule,
+	NativeProfileSupportRequirement, ProcessLaunch, ResolvedSandbox;
 
 /// Absolute path to the currently running cydo binary, resolved at
 /// module init to avoid /proc/self/exe returning a "(deleted)" suffix
@@ -275,7 +280,7 @@ string[] buildCommandPrefix(ref ResolvedSandbox sandbox, string workDir)
 	if (sandbox.isolate_environment)
 	{
 		args ~= "--clearenv";
-		args ~= ["--setenv", "HOME", environment.get("HOME", "/tmp")];
+		args ~= ["--setenv", "HOME", isolatedChildHomeBaseline()];
 
 		auto nixPath = environment.get("NIX_PATH", "");
 		if (nixPath.length > 0)
@@ -296,31 +301,94 @@ string[] buildCommandPrefix(ref ResolvedSandbox sandbox, string workDir)
 }
 
 /// Materialize a reusable process launch from a resolved sandbox and cwd.
-ProcessLaunch prepareProcessLaunch(ResolvedSandbox sandbox, string workDir,
-	string executable = "")
+ProcessLaunch prepareProcessLaunch(ResolvedSandbox sandbox,
+	const ref NativeHistoryRule rule, const ref NativeHistoryProfile profile,
+	string workDir, string executable = "")
 {
-	ProcessLaunch launch;
-	launch.sandbox = sandbox;
-	launch.workDir = workDir;
-	launch.executablePath = resolveExecutablePath(executable, launch.sandbox.env);
-	launch.cmdPrefix = buildCommandPrefix(launch.sandbox, workDir);
-	return launch;
+	auto evaluatedProfile = resolveNativeHistoryProfile(sandbox, rule);
+	enforce(profile.driver == rule.driver,
+		"Native history profile driver does not match its launch rule");
+	enforce(profile.driver == evaluatedProfile.driver && profile.root == evaluatedProfile.root,
+		"Native history profile does not match the rendered launch sandbox");
+	return materializeProcessLaunch(sandbox, rule, profile, workDir, executable);
 }
 
 /// Return a launch clone with an additional runtime environment variable.
-/// The command prefix is recompiled from the sandbox model rather than patched
-/// after argv generation. The executable path is intentionally left unchanged;
-/// use this only for env vars that do not affect executable resolution.
+/// Rebuild the clone from the unmaterialized sandbox so its profile paths,
+/// temporary files, executable, and prefix all reflect the overridden child env.
 ProcessLaunch withProcessLaunchEnv(ProcessLaunch launch, string key, string value)
 {
-	launch.sandbox.tempFiles = null;
-	launch.sandbox.env = launch.sandbox.env.dup;
-	launch.sandbox.env[key] = value;
-	launch.cmdPrefix = buildCommandPrefix(launch.sandbox, launch.workDir);
-	return launch;
+	auto sandbox = launch.preProfileSandbox;
+	sandbox.env = launch.preProfileSandbox.env.dup;
+	// The source launch retains ownership of its baseline temporary files.
+	// Materialization records only resources created for this clone.
+	sandbox.tempFiles = null;
+	sandbox.env[key] = value;
+	auto profile = resolveNativeHistoryProfile(sandbox, launch.nativeHistoryRule);
+	return materializeProcessLaunch(sandbox, launch.nativeHistoryRule, profile,
+		launch.workDir, launch.requestedExecutable);
 }
 
 private:
+
+ProcessLaunch materializeProcessLaunch(ResolvedSandbox sandbox,
+	const ref NativeHistoryRule rule, const ref NativeHistoryProfile profile,
+	string workDir, string executable)
+{
+	ProcessLaunch launch;
+	launch.preProfileSandbox = sandbox;
+	launch.preProfileSandbox.env = sandbox.env.dup;
+	launch.preProfileSandbox.tempFiles = sandbox.tempFiles.dup;
+	launch.sandbox = launch.preProfileSandbox;
+	launch.sandbox.env = launch.preProfileSandbox.env.dup;
+	launch.sandbox.tempFiles = launch.preProfileSandbox.tempFiles.dup;
+	launch.nativeHistoryRule = NativeHistoryRule(rule.driver, rule.profileEnvName,
+		rule.homeRelativeDefault, rule.homeSupportRequirements.dup);
+	launch.nativeHistoryProfile = NativeHistoryProfile(profile.driver, profile.root);
+	launch.workDir = workDir;
+	launch.requestedExecutable = executable;
+
+	materializeNativeHistoryProfile(launch.sandbox, rule, profile);
+	launch.executablePath = resolveExecutablePath(executable, launch.sandbox.env);
+	auto prefixTempFileCount = launch.sandbox.tempFiles.length;
+	try
+		launch.cmdPrefix = buildCommandPrefix(launch.sandbox, workDir);
+	catch (Exception e)
+	{
+		ResolvedSandbox prefixTemps;
+		prefixTemps.tempFiles = launch.sandbox.tempFiles[prefixTempFileCount .. $].dup;
+		cleanup(prefixTemps);
+		launch.sandbox.tempFiles = launch.sandbox.tempFiles[0 .. prefixTempFileCount].dup;
+		throw e;
+	}
+	return launch;
+}
+
+void materializeNativeHistoryProfile(ref ResolvedSandbox sandbox,
+	const ref NativeHistoryRule rule, const ref NativeHistoryProfile profile)
+{
+	enforce(profile.root.length > 0 && isAbsolute(profile.root),
+		"Native history launch profile root must be an absolute directory: "
+		~ profile.root);
+	mkdirRecurse(profile.root);
+	enforce(isDir(profile.root),
+		"Native history launch profile root is not a directory: " ~ profile.root);
+	sandbox.paths.require(profile.root, PathAccess.rw,
+		SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+			rule.profileEnvName, "native history profile root"));
+	auto rootView = sandbox.paths.exact(profile.root);
+	enforce(!rootView.isNull && (rootView.get.effectiveMode == PathMode.rw
+		|| rootView.get.effectiveMode == PathMode.always_rw),
+		"Native history launch profile root is capped read-only by sandbox configuration: "
+		~ profile.root);
+
+	auto home = effectiveChildEnvValue(sandbox, "HOME");
+	foreach (requirement; rule.homeSupportRequirements)
+		sandbox.paths.require(buildPath(home.value, requirement.homeRelativePath),
+			requirement.access,
+			SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+				rule.profileEnvName, requirement.purpose));
+}
 
 bool isExecutableFile(string path)
 {
@@ -348,7 +416,7 @@ string[] buildEnvPrefix(ref ResolvedSandbox sandbox, string workDir)
 
 	if (sandbox.isolate_environment)
 	{
-		args ~= "HOME=" ~ environment.get("HOME", "/tmp");
+		args ~= "HOME=" ~ isolatedChildHomeBaseline();
 		auto nixPath = environment.get("NIX_PATH", "");
 		if (nixPath.length > 0)
 			args ~= "NIX_PATH=" ~ nixPath;
@@ -395,21 +463,46 @@ string resolveNixCurrentSystem()
 	return "";
 }
 
+version (unittest) private NativeHistoryRule rendererTestNativeHistoryRule()
+{
+	import cydo.runtime.config : AgentDriver;
+
+	return NativeHistoryRule(AgentDriver.codex,
+		"CYDO_TEST_NATIVE_HISTORY_ROOT", ".cydo-test", null);
+}
+
+version (unittest) private NativeHistoryProfile rendererTestNativeHistoryProfile(
+	ref ResolvedSandbox sandbox, const ref NativeHistoryRule rule, string root)
+{
+	if ("HOME" !in sandbox.env)
+		sandbox.env["HOME"] = "/tmp";
+	sandbox.env[rule.profileEnvName] = root;
+	return resolveNativeHistoryProfile(sandbox, rule);
+}
+
 unittest
 {
+	import std.file : exists, rmdirRecurse;
+
 	ResolvedSandbox sandbox;
 	sandbox.isolate_filesystem = false;
 	sandbox.isolate_processes = false;
 	sandbox.isolate_environment = false;
 	sandbox.env["CYDO_TEST_TOKEN"] = "value";
+	auto profileRoot = "/tmp/cydo-renderer-basic-profile";
+	if (exists(profileRoot))
+		rmdirRecurse(profileRoot);
+	scope (exit)
+		if (exists(profileRoot))
+			rmdirRecurse(profileRoot);
+	auto rule = rendererTestNativeHistoryRule();
+	auto profile = rendererTestNativeHistoryProfile(sandbox, rule, profileRoot);
 
-	auto launch = prepareProcessLaunch(sandbox, "/tmp/cydo-launch");
+	auto launch = prepareProcessLaunch(sandbox, rule, profile, "/tmp/cydo-launch");
 	assert(launch.workDir == "/tmp/cydo-launch");
-	assert(launch.cmdPrefix == [
-		"env",
-		"-C", "/tmp/cydo-launch",
-		"CYDO_TEST_TOKEN=value",
-	]);
+	assert(launch.cmdPrefix[0 .. 3] == ["env", "-C", "/tmp/cydo-launch"]);
+	assert(launch.cmdPrefix.canFind("CYDO_TEST_TOKEN=value"));
+	assert(launch.cmdPrefix.canFind("CYDO_TEST_NATIVE_HISTORY_ROOT=" ~ profileRoot));
 
 	// Preparing a launch should not mutate the caller's sandbox state.
 	assert(sandbox.tempFiles.length == 0);
@@ -417,13 +510,241 @@ unittest
 
 unittest
 {
+	import std.algorithm : canFind;
+	import std.file : exists, mkdirRecurse, remove, rmdirRecurse, write;
+	import std.path : buildPath;
+	import cydo.runtime.config : AgentDriver;
+
+	auto root = buildPath("/tmp", "cydo-launch-native-history-materialization");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto fakeBin = buildPath(root, "bin");
+	auto home = buildPath(root, "home");
+	auto profileRoot = buildPath(root, "claude-profile");
+	auto stateFile = buildPath(home, ".claude.json");
+	auto dataDir = buildPath(home, ".local", "share", "claude");
+	mkdirRecurse(fakeBin);
+	mkdirRecurse(dataDir);
+	write(buildPath(fakeBin, "bwrap"), "");
+	write(stateFile, "{}");
+	auto oldPath = environment.get("PATH", "");
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	scope (exit) environment["PATH"] = oldPath;
+
+	auto rule = NativeHistoryRule(
+		AgentDriver.claude,
+		"CLAUDE_CONFIG_DIR",
+		".claude",
+		[
+			NativeProfileSupportRequirement(".claude.json", PathAccess.rw,
+				"Claude state file"),
+			NativeProfileSupportRequirement(".local/share/claude", PathAccess.ro,
+				"Claude data directory"),
+		],
+	);
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	sandbox.env["HOME"] = home;
+	sandbox.env["CLAUDE_CONFIG_DIR"] = profileRoot;
+	auto profile = resolveNativeHistoryProfile(sandbox, rule);
+	assert(!exists(profileRoot));
+	assert(sandbox.paths.exact(profileRoot).isNull);
+
+	auto launch = prepareProcessLaunch(sandbox, rule, profile, "");
+	scope (exit)
+		foreach (tempFile; launch.sandbox.tempFiles)
+			if (exists(tempFile))
+				remove(tempFile);
+	assert(exists(profileRoot));
+	assert(launch.preProfileSandbox.paths.exact(profileRoot).isNull);
+	auto rootView = launch.sandbox.paths.exact(profileRoot).get;
+	assert(rootView.requirement.get.access == PathAccess.rw);
+	assert(rootView.effectiveMode == PathMode.rw);
+	auto stateView = launch.sandbox.paths.exact(stateFile).get;
+	assert(stateView.requirement.get.access == PathAccess.rw);
+	assert(stateView.effectiveMode == PathMode.rw);
+	auto dataView = launch.sandbox.paths.exact(dataDir).get;
+	assert(dataView.requirement.get.access == PathAccess.ro);
+	assert(dataView.effectiveMode == PathMode.ro);
+	assert(launch.cmdPrefix.canFind(["--bind", profileRoot, profileRoot]));
+	assert(launch.cmdPrefix.canFind(["--bind", stateFile, stateFile]));
+	assert(launch.cmdPrefix.canFind(["--ro-bind", dataDir, dataDir]));
+}
+
+unittest
+{
+	import std.algorithm : canFind;
+	import cydo.runtime.config : AgentDriver;
+
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	sandbox.env["HOME"] = "/tmp/cydo-native-history-invalid-home";
+	sandbox.env["CODEX_HOME"] = "cydo-native-history-relative-root";
+	auto rule = NativeHistoryRule(AgentDriver.codex, "CODEX_HOME", ".codex", null);
+	auto profile = NativeHistoryProfile(AgentDriver.codex,
+		"cydo-native-history-relative-root");
+	bool thrown;
+	try
+		prepareProcessLaunch(sandbox, rule, profile, "");
+	catch (Exception e)
+	{
+		thrown = true;
+		assert(e.msg.canFind("CODEX_HOME"), e.msg);
+	}
+	assert(thrown);
+}
+
+unittest
+{
+	import std.exception : assertThrown;
+	import std.file : SpanMode, dirEntries, exists, mkdirRecurse, rmdirRecurse, write;
+	import std.path : buildPath;
+	import std.process : environment;
+	import cydo.runtime.config : AgentDriver;
+
+	auto root = buildPath("/tmp", "cydo-launch-native-history-readonly-profile");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto fakeBin = buildPath(root, "bin");
+	auto prefixTempDir = buildPath(root, "prefix-temps");
+	auto home = buildPath(root, "home");
+	auto readOnlyWorktree = buildPath(root, "read-only-worktree");
+	mkdirRecurse(fakeBin);
+	mkdirRecurse(prefixTempDir);
+	mkdirRecurse(home);
+	mkdirRecurse(readOnlyWorktree);
+	write(buildPath(fakeBin, "bwrap"), "");
+
+	auto oldPath = environment.get("PATH", "");
+	auto oldTmpDir = environment.get("TMPDIR", "");
+	bool hadTmpDir = "TMPDIR" in environment;
+	scope (exit)
+	{
+		environment["PATH"] = oldPath;
+		if (hadTmpDir)
+			environment["TMPDIR"] = oldTmpDir;
+		else
+			environment.remove("TMPDIR");
+	}
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	environment["TMPDIR"] = prefixTempDir;
+
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	sandbox.env["HOME"] = home;
+	sandbox.env["CODEX_HOME"] = readOnlyWorktree;
+	sandbox.paths.set(readOnlyWorktree, PathMode.rw,
+		SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+			"task checkout", "configured writable checkout"));
+	sandbox.paths.restrictExactToReadOnly(readOnlyWorktree,
+		SandboxPathOrigin(SandboxPathOriginKind.exactReadOnly,
+			"task checkout", "read-only active worktree"));
+	auto rule = NativeHistoryRule(AgentDriver.codex, "CODEX_HOME", ".codex", null);
+	auto profile = resolveNativeHistoryProfile(sandbox, rule);
+
+	bool rejected;
+	try
+		prepareProcessLaunch(sandbox, rule, profile, "");
+	catch (Exception e)
+	{
+		rejected = true;
+		assert(e.msg.canFind("capped read-only"), e.msg);
+	}
+	assert(rejected);
+	foreach (entry; dirEntries(prefixTempDir, SpanMode.shallow))
+		assert(false, "profile writability rejection created prefix temp file: " ~ entry.name);
+}
+
+unittest
+{
+	import std.exception : assertThrown;
+	import std.file : SpanMode, dirEntries, exists, mkdirRecurse, rmdirRecurse, write;
+	import std.path : buildPath;
+	import std.process : environment;
+	import cydo.runtime.config : AgentDriver;
+
+	auto root = buildPath("/tmp", "cydo-launch-native-history-prefix-cleanup");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto fakeBin = buildPath(root, "bin");
+	auto prefixTempDir = buildPath(root, "prefix-temps");
+	auto hostHome = buildPath(root, "host-home");
+	auto childHome = buildPath(root, "child-home");
+	auto profileRoot = buildPath(root, "profile");
+	auto retainedTemp = buildPath(root, "retained-temp");
+	mkdirRecurse(fakeBin);
+	mkdirRecurse(prefixTempDir);
+	mkdirRecurse(buildPath(hostHome, ".config", "git", "config"));
+	mkdirRecurse(childHome);
+	write(buildPath(fakeBin, "bwrap"), "");
+	write(retainedTemp, "retained");
+
+	auto oldHome = environment.get("HOME", "");
+	auto oldPath = environment.get("PATH", "");
+	auto oldTmpDir = environment.get("TMPDIR", "");
+	auto oldUser = environment.get("USER", "");
+	bool hadTmpDir = "TMPDIR" in environment;
+	bool hadUser = "USER" in environment;
+	scope (exit)
+	{
+		environment["HOME"] = oldHome;
+		environment["PATH"] = oldPath;
+		if (hadTmpDir)
+			environment["TMPDIR"] = oldTmpDir;
+		else
+			environment.remove("TMPDIR");
+		if (hadUser)
+			environment["USER"] = oldUser;
+		else
+			environment.remove("USER");
+	}
+	environment["HOME"] = hostHome;
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	environment["TMPDIR"] = prefixTempDir;
+	environment["USER"] = "root";
+
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	sandbox.gitName = "prefix cleanup";
+	sandbox.env["HOME"] = childHome;
+	sandbox.env["CODEX_HOME"] = profileRoot;
+	sandbox.tempFiles = [retainedTemp];
+	auto rule = NativeHistoryRule(AgentDriver.codex, "CODEX_HOME", ".codex", null);
+	auto profile = resolveNativeHistoryProfile(sandbox, rule);
+	assertThrown!Exception(prepareProcessLaunch(sandbox, rule, profile, ""));
+	assert(exists(retainedTemp));
+	foreach (entry; dirEntries(prefixTempDir, SpanMode.shallow))
+		assert(false, "failed prefix materialization leaked temp file: " ~ entry.name);
+}
+
+unittest
+{
+	import std.file : exists, rmdirRecurse;
+
 	ResolvedSandbox sandbox;
 	sandbox.isolate_filesystem = false;
 	sandbox.isolate_processes = false;
 	sandbox.isolate_environment = false;
 	sandbox.env["A"] = "1";
+	auto profileRoot = "/tmp/cydo-renderer-clone-profile";
+	if (exists(profileRoot))
+		rmdirRecurse(profileRoot);
+	scope (exit)
+		if (exists(profileRoot))
+			rmdirRecurse(profileRoot);
+	auto rule = rendererTestNativeHistoryRule();
+	auto profile = rendererTestNativeHistoryProfile(sandbox, rule, profileRoot);
 
-	auto source = prepareProcessLaunch(sandbox, "/tmp/cydo-launch");
+	auto source = prepareProcessLaunch(sandbox, rule, profile, "/tmp/cydo-launch");
 	source.sandbox.tempFiles = ["/tmp/original-temp"];
 	auto sourcePaths = source.sandbox.paths.snapshot;
 	auto sourceTempFiles = source.sandbox.tempFiles.dup;
@@ -450,6 +771,124 @@ unittest
 	assert(first.cmdPrefix.canFind("B=2"));
 	assert(second.cmdPrefix.canFind("A=1"));
 	assert(second.cmdPrefix.canFind("C=3"));
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse;
+	import std.path : buildPath;
+	import cydo.runtime.config : AgentDriver;
+
+	auto root = buildPath("/tmp", "cydo-launch-native-history-clone");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto firstHome = buildPath(root, "first-home");
+	auto secondHome = buildPath(root, "second-home");
+	auto explicitProfile = buildPath(root, "explicit-profile");
+	mkdirRecurse(firstHome);
+	mkdirRecurse(secondHome);
+
+	auto rule = NativeHistoryRule(
+		AgentDriver.claude,
+		"CLAUDE_CONFIG_DIR",
+		".claude",
+		[
+			NativeProfileSupportRequirement(".claude.json", PathAccess.rw,
+				"Claude state file"),
+			NativeProfileSupportRequirement(".local/share/claude", PathAccess.ro,
+				"Claude data directory"),
+		],
+	);
+	ResolvedSandbox sandbox;
+	sandbox.env["HOME"] = firstHome;
+	auto sourceProfile = resolveNativeHistoryProfile(sandbox, rule);
+	auto source = prepareProcessLaunch(sandbox, rule, sourceProfile, "");
+	auto sourcePaths = source.sandbox.paths.snapshot;
+	auto sourceEnv = source.sandbox.env.dup;
+	auto sourcePrefix = source.cmdPrefix.dup;
+	auto oldStateFile = buildPath(firstHome, ".claude.json");
+	auto oldDataDir = buildPath(firstHome, ".local", "share", "claude");
+	assert(source.preProfileSandbox.paths.exact(sourceProfile.root).isNull);
+	assert(source.preProfileSandbox.paths.exact(oldStateFile).isNull);
+	assert(source.preProfileSandbox.paths.exact(oldDataDir).isNull);
+
+	auto homeOverride = withProcessLaunchEnv(source, "HOME", secondHome);
+	auto secondProfileRoot = buildPath(secondHome, ".claude");
+	assert(homeOverride.nativeHistoryProfile.root == secondProfileRoot);
+	assert(exists(secondProfileRoot));
+	assert(homeOverride.sandbox.paths.exact(sourceProfile.root).isNull);
+	assert(homeOverride.sandbox.paths.exact(oldStateFile).isNull);
+	assert(homeOverride.sandbox.paths.exact(oldDataDir).isNull);
+	assert(homeOverride.sandbox.paths.exact(secondProfileRoot).get.effectiveMode == PathMode.rw);
+	assert(homeOverride.sandbox.paths.exact(buildPath(secondHome, ".claude.json"))
+		.get.effectiveMode == PathMode.rw);
+	assert(homeOverride.sandbox.paths.exact(buildPath(secondHome, ".local", "share", "claude"))
+		.get.effectiveMode == PathMode.ro);
+
+	auto profileOverride = withProcessLaunchEnv(source, "CLAUDE_CONFIG_DIR", explicitProfile);
+	assert(profileOverride.nativeHistoryProfile.root == explicitProfile);
+	assert(exists(explicitProfile));
+	assert(profileOverride.sandbox.paths.exact(sourceProfile.root).isNull);
+	assert(profileOverride.sandbox.paths.exact(oldStateFile).get.effectiveMode == PathMode.rw);
+	assert(profileOverride.sandbox.paths.exact(oldDataDir).get.effectiveMode == PathMode.ro);
+
+	assert(source.nativeHistoryProfile.root == sourceProfile.root);
+	assert(source.sandbox.paths.snapshot == sourcePaths);
+	assert(source.sandbox.env == sourceEnv);
+	assert(source.cmdPrefix == sourcePrefix);
+	assert(source.sandbox.paths.exact(sourceProfile.root).get.effectiveMode == PathMode.rw);
+	assert(source.sandbox.paths.exact(oldStateFile).get.effectiveMode == PathMode.rw);
+	assert(source.sandbox.paths.exact(oldDataDir).get.effectiveMode == PathMode.ro);
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse;
+	import std.path : buildPath;
+	import cydo.runtime.config : AgentDriver;
+
+	auto root = buildPath("/tmp", "cydo-launch-native-history-profile-overrides");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto home = buildPath(root, "home");
+	mkdirRecurse(home);
+	NativeHistoryRule[] rules = [
+		NativeHistoryRule(AgentDriver.codex, "CODEX_HOME", ".codex", null),
+		NativeHistoryRule(AgentDriver.copilot, "COPILOT_HOME", ".copilot", null),
+	];
+
+	foreach (rule; rules)
+	{
+		auto sourceRoot = buildPath(root, rule.profileEnvName ~ "-source");
+		auto overrideRoot = buildPath(root, rule.profileEnvName ~ "-override");
+		ResolvedSandbox sandbox;
+		sandbox.env["HOME"] = home;
+		sandbox.env[rule.profileEnvName] = sourceRoot;
+		auto sourceProfile = resolveNativeHistoryProfile(sandbox, rule);
+		auto source = prepareProcessLaunch(sandbox, rule, sourceProfile, "");
+		auto sourcePaths = source.sandbox.paths.snapshot;
+		auto sourceEnv = source.sandbox.env.dup;
+		auto sourceTempFiles = source.sandbox.tempFiles.dup;
+		auto sourcePrefix = source.cmdPrefix.dup;
+
+		auto clone = withProcessLaunchEnv(source, rule.profileEnvName, overrideRoot);
+		assert(clone.nativeHistoryProfile.root == overrideRoot);
+		assert(exists(overrideRoot));
+		assert(clone.sandbox.paths.exact(sourceRoot).isNull);
+		assert(clone.sandbox.paths.exact(overrideRoot).get.effectiveMode == PathMode.rw);
+		assert(source.sandbox.paths.exact(overrideRoot).isNull);
+		assert(source.nativeHistoryProfile.root == sourceRoot);
+		assert(source.sandbox.paths.snapshot == sourcePaths);
+		assert(source.sandbox.env == sourceEnv);
+		assert(source.sandbox.tempFiles == sourceTempFiles);
+		assert(source.cmdPrefix == sourcePrefix);
+	}
 }
 
 unittest
@@ -513,7 +952,10 @@ unittest
 		SandboxPathOrigin(SandboxPathOriginKind.builtinDefault,
 			"derived launch", "second logical host mount"));
 
-	auto source = prepareProcessLaunch(sandbox, "");
+	auto rule = rendererTestNativeHistoryRule();
+	auto profile = rendererTestNativeHistoryProfile(sandbox, rule,
+		buildPath(root, "profile"));
+	auto source = prepareProcessLaunch(sandbox, rule, profile, "");
 	auto sourcePaths = source.sandbox.paths.snapshot;
 	auto sourceTempFiles = source.sandbox.tempFiles.dup;
 	auto sourceEnv = source.sandbox.env.dup;
@@ -699,7 +1141,7 @@ unittest
 
 unittest
 {
-	import std.file : mkdirRecurse, remove, write;
+	import std.file : mkdirRecurse, remove, rmdirRecurse, write;
 	import std.process : execute;
 
 	auto binDir = buildPath("/tmp", "cydo-launch-bin");
@@ -717,7 +1159,15 @@ unittest
 	ResolvedSandbox sandbox;
 	sandbox.env["PATH"] = binDir;
 
-	auto launch = prepareProcessLaunch(sandbox, "", "cydo-test-exec");
+	auto profileRoot = buildPath(binDir, "profile");
+	if (exists(profileRoot))
+		rmdirRecurse(profileRoot);
+	scope (exit)
+		if (exists(profileRoot))
+			rmdirRecurse(profileRoot);
+	auto rule = rendererTestNativeHistoryRule();
+	auto profile = rendererTestNativeHistoryProfile(sandbox, rule, profileRoot);
+	auto launch = prepareProcessLaunch(sandbox, rule, profile, "", "cydo-test-exec");
 	assert(launch.executablePath == binPath);
 	assert(executableMountPaths(binPath).canFind(binDir));
 }

@@ -35,7 +35,7 @@ import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.runtime.config : AgentDriver, ModelSpec, ModelSpecFields;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
-import cydo.runtime.launch.types : ProcessLaunch;
+import cydo.runtime.launch.types : NativeHistoryRule, ProcessLaunch;
 import cydo.runtime.launch.sandbox : cleanup, cydoBinaryDir, cydoBinaryPath, effectiveEnvValue,
 	executableMountPaths, resolveExecutablePath;
 import launchSandbox = cydo.runtime.launch.sandbox;
@@ -67,18 +67,12 @@ class CodexAgent : Agent
 	{
 		import std.process : environment;
 
-		// Codex home directory (config, sessions)
-		auto home = environment.get("HOME", "/tmp");
-		auto codexHome = effectiveEnvValue(env, "CODEX_HOME", buildPath(home, ".codex"));
-		paths.require(codexHome, PathAccess.rw,
-			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "codex",
-				"CODEX_HOME"));
-
 		auto codexPath = resolveExecutablePath(executableName(env), env);
 		foreach (path; executableMountPaths(codexPath))
 			paths.requireReadVisible(path,
 				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "codex",
 					"Codex executable"));
+		auto home = environment.get("HOME", "/tmp");
 		if (dirName(codexPath) == home ~ "/.npm-packages/bin")
 			paths.requireReadVisible(home ~ "/.npm-packages",
 				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "codex",
@@ -102,12 +96,15 @@ class CodexAgent : Agent
 		passthrough("OPENAI_API_KEY");
 		passthrough("OPENAI_BASE_URL");
 		passthrough("CODEX_API_KEY");
-		passthrough("CODEX_HOME");
 	}
 
 	@property string gitName() { return "Codex CLI"; }
 	@property string gitEmail() { return "noreply@openai.com"; }
 	override @property AgentDriver driver() { return AgentDriver.codex; }
+	override @property NativeHistoryRule nativeHistoryRule()
+	{
+		return NativeHistoryRule(AgentDriver.codex, "CODEX_HOME", ".codex", null);
+	}
 	@property string lastMcpConfigPath() { return lastMcpConfigPath_; }
 	string executableName(string[string] env)
 	{
@@ -376,7 +373,7 @@ class CodexAgent : Agent
 		else
 			args = codexArgs;
 
-		auto codexHome = codexHomeForLaunch(launch);
+		auto codexHome = launch.nativeHistoryProfile.root;
 		auto server = new AppServerProcess(args);
 		serverPool[poolKey] = server;
 		AppServerStartupRequest startupRequest;
@@ -881,15 +878,6 @@ class CodexAgent : Agent
 
 	string matchProject(string sessionId, const string[] knownProjectPaths) { return ""; }
 
-	private string codexHomeForLaunch(ProcessLaunch launch)
-	{
-		import std.process : environment;
-
-		auto home = environment.get("HOME", "/tmp");
-		return effectiveEnvValue(launch.sandbox.env, "CODEX_HOME",
-			buildPath(home, ".codex"));
-	}
-
 	private string prepareIsolatedOneShotHome(ProcessLaunch launch)
 	{
 		import std.file : copy, exists, mkdirRecurse;
@@ -898,8 +886,10 @@ class CodexAgent : Agent
 		// Codex 0.139 roots its SQLite state runtime at CODEX_HOME.  Keep
 		// short-lived `codex exec` runs off the app-server's state database,
 		// while preserving the configured provider/auth settings.
-		auto codexHome = codexHomeForLaunch(launch);
+		auto codexHome = launch.nativeHistoryProfile.root;
 		auto oneShotHome = buildPath(codexHome, "oneshot", randomUUID().toString());
+		scope (failure)
+			removeOneShotHome(oneShotHome);
 		mkdirRecurse(oneShotHome);
 
 		auto configPath = buildPath(codexHome, "config.toml");
@@ -945,40 +935,43 @@ class CodexAgent : Agent
 	}
 
 	OneShotHandle completeOneShot(string prompt, string modelClass,
-		ProcessLaunch launch = ProcessLaunch.init)
+		ProcessLaunch launch)
 	{
-		import std.file : rmdirRecurse;
 		import std.string : strip;
 
 		auto promise = new Promise!string;
-		auto oneShotHome = prepareIsolatedOneShotHome(launch);
-		auto oneShotLaunch = launchSandbox.withProcessLaunchEnv(launch, "CODEX_HOME",
-			oneShotHome);
-
-		auto spec = resolveModelSpec(modelClass);
-		auto executablePath = oneShotLaunch.executablePath.length > 0
-			? oneShotLaunch.executablePath
-			: executableName(oneShotLaunch.sandbox.env);
-		auto args = buildOneShotArgs(executablePath, prompt, spec.model, spec.effort,
-			oneShotLaunch.cmdPrefix);
-
+		string oneShotHome;
+		ProcessLaunch oneShotLaunch;
+		bool hasOneShotLaunch;
 		AgentProcess proc;
 		try
+		{
+			oneShotHome = prepareIsolatedOneShotHome(launch);
+			oneShotLaunch = launchSandbox.withProcessLaunchEnv(launch, "CODEX_HOME",
+				oneShotHome);
+			hasOneShotLaunch = true;
+
+			auto spec = resolveModelSpec(modelClass);
+			auto executablePath = oneShotLaunch.executablePath.length > 0
+				? oneShotLaunch.executablePath
+				: executableName(oneShotLaunch.sandbox.env);
+			auto args = buildOneShotArgs(executablePath, prompt, spec.model,
+				spec.effort, oneShotLaunch.cmdPrefix);
+
 			// When sandboxed, cmdPrefix carries the resolved env/cwd. Otherwise
 			// inherit the parent environment, matching AppServerProcess.
 			// --skip-git-repo-check avoids the "not inside a trusted directory"
 			// error when the process CWD is not a git repo root.
 			proc = new AgentProcess(args, noStdin: true,
 				mode: FramingMode.raw, logName: "codex-oneshot");
+		}
 		catch (Exception e)
 		{
-			cleanup(oneShotLaunch.sandbox);
-			try rmdirRecurse(oneShotHome);
-			catch (Exception cleanupError)
-				warningf("completeOneShot: failed to remove %s: %s",
-					oneShotHome, cleanupError.msg);
-			errorf("completeOneShot: failed to spawn codex: %s", e.msg);
-			promise.reject(new Exception("failed to spawn codex: " ~ e.msg));
+			if (hasOneShotLaunch)
+				cleanup(oneShotLaunch.sandbox);
+			removeOneShotHome(oneShotHome);
+			errorf("completeOneShot: failed to prepare or spawn codex: %s", e.msg);
+			promise.reject(new Exception("failed to prepare or spawn codex: " ~ e.msg));
 			return OneShotHandle(promise, null);
 		}
 
@@ -997,10 +990,7 @@ class CodexAgent : Agent
 
 		proc.onExit = (int status) {
 			cleanup(oneShotLaunch.sandbox);
-			try rmdirRecurse(oneShotHome);
-			catch (Exception e)
-				warningf("completeOneShot: failed to remove %s: %s",
-					oneShotHome, e.msg);
+			removeOneShotHome(oneShotHome);
 
 			if (status != 0)
 			{
@@ -1020,6 +1010,18 @@ class CodexAgent : Agent
 		void cancel() { proc.killAfterTimeout(0.seconds); }
 
 		return OneShotHandle(promise, &cancel);
+	}
+
+	private void removeOneShotHome(string oneShotHome)
+	{
+		import std.file : exists, rmdirRecurse;
+
+		if (oneShotHome.length == 0 || !exists(oneShotHome))
+			return;
+		try
+			rmdirRecurse(oneShotHome);
+		catch (Exception e)
+			warningf("completeOneShot: failed to remove %s: %s", oneShotHome, e.msg);
 	}
 }
 
@@ -1107,18 +1109,22 @@ unittest
 	assert(cydoView.declaration.get.mode == PathMode.always_rw);
 	assert(cydoView.effectiveMode == PathMode.always_rw);
 
-	auto stateHome = resolved.paths.exact(codexHome).get;
-	assert(stateHome.declaration.isNull);
-	assert(stateHome.requirement.get.access == PathAccess.rw);
-	assert(stateHome.effectiveMode == PathMode.rw);
+	// Native history is materialized by prepareProcessLaunch, not while the
+	// driver configures executable visibility and credential passthrough.
+	assert(resolved.paths.exact(codexHome).isNull);
+	auto nativeRule = agent.nativeHistoryRule;
+	assert(nativeRule.driver == AgentDriver.codex);
+	assert(nativeRule.profileEnvName == "CODEX_HOME");
+	assert(nativeRule.homeRelativeDefault == ".codex");
+	assert(nativeRule.homeSupportRequirements.length == 0);
 	assert(resolved.env["PATH"] == executableDir);
-	assert(resolved.env["CODEX_HOME"] == codexHome);
+	assert(("CODEX_HOME" in resolved.env) is null);
 	assert(resolved.env["OPENAI_API_KEY"] == "test-openai-key");
 	assert(resolved.env["OPENAI_BASE_URL"] == "https://codex.test.invalid/v1");
 	assert(resolved.env["CODEX_API_KEY"] == "test-codex-key");
 
-	// A configured launch value must select the same writable state home that
-	// the sandboxed process receives, rather than the host-only fallback.
+	// A configured profile selector remains in the resolved child environment,
+	// but configureSandbox must not turn it into a native-history mount.
 	auto configuredCodexHome = buildPath(home, "sandbox-codex-home");
 	SandboxConfig configuredGlobal;
 	configuredGlobal.env = [
@@ -1128,19 +1134,17 @@ unittest
 	];
 	auto configuredResolved = resolveSandbox(configuredGlobal, SandboxConfig.init,
 		SandboxConfig.init, agentSandbox, "");
-	auto configuredStateHome = configuredResolved.paths.exact(configuredCodexHome).get;
-	assert(configuredStateHome.declaration.isNull);
-	assert(configuredStateHome.requirement.get.access == PathAccess.rw);
-	assert(configuredStateHome.effectiveMode == PathMode.rw);
+	assert(configuredResolved.paths.exact(configuredCodexHome).isNull);
 	assert(configuredResolved.paths.exact(codexHome).isNull);
 	assert(configuredResolved.env["CODEX_HOME"] == configuredCodexHome);
 
-	// Missing launch values retain Codex's host-environment passthrough.
+	// Missing launch values do not inherit host CODEX_HOME during driver setup.
 	SandboxPaths defaultPaths;
 	string[string] defaultEnv = ["CYDO_CODEX_BIN": executable];
 	agent.configureSandbox(defaultPaths, defaultEnv);
 	assert(defaultEnv["PATH"] == executableDir);
-	assert(defaultEnv["CODEX_HOME"] == codexHome);
+	assert(("CODEX_HOME" in defaultEnv) is null);
+	assert(defaultPaths.exact(codexHome).isNull);
 	assert(defaultEnv["OPENAI_API_KEY"] == "test-openai-key");
 	assert(defaultEnv["OPENAI_BASE_URL"] == "https://codex.test.invalid/v1");
 	assert(defaultEnv["CODEX_API_KEY"] == "test-codex-key");
@@ -1167,6 +1171,459 @@ unittest
 	assert(ancestorPaths.exact(executableDir).isNull);
 	assert(ancestorPaths.exact(cydoParent).get.effectiveMode == PathMode.always_rw);
 	assert(ancestorPaths.exact(cydoDir).isNull);
+}
+
+unittest
+{
+	import std.algorithm : canFind;
+	import std.file : exists, mkdirRecurse, readText, rmdirRecurse, write;
+	import std.path : buildPath;
+	import std.process : environment;
+	import cydo.runtime.config : PathMode;
+	import cydo.runtime.launch.sandbox : cleanup, prepareProcessLaunch,
+		resolveNativeHistoryProfile;
+	import cydo.runtime.launch.types : ResolvedSandbox;
+
+	auto root = buildPath("/tmp", "cydo-codex-oneshot-native-profile-clone");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto fakeBin = buildPath(root, "bin");
+	auto prefixTempDir = buildPath(root, "prefix-temps");
+	auto childHome = buildPath(root, "child-home");
+	auto suppliedProfile = buildPath(root, "supplied-profile");
+	auto hostProfile = buildPath(root, "host-profile");
+	mkdirRecurse(fakeBin);
+	mkdirRecurse(prefixTempDir);
+	mkdirRecurse(childHome);
+	mkdirRecurse(suppliedProfile);
+	mkdirRecurse(hostProfile);
+	write(buildPath(fakeBin, "bwrap"), "");
+	write(buildPath(suppliedProfile, "config.toml"), "provider = \"supplied\"\n");
+	write(buildPath(hostProfile, "config.toml"), "provider = \"host\"\n");
+
+	auto oldCodexHome = environment.get("CODEX_HOME", "");
+	auto oldHome = environment.get("HOME", "");
+	auto oldPath = environment.get("PATH", "");
+	auto oldTmpDir = environment.get("TMPDIR", "");
+	auto oldUser = environment.get("USER", "");
+	bool hadCodexHome = "CODEX_HOME" in environment;
+	bool hadTmpDir = "TMPDIR" in environment;
+	bool hadUser = "USER" in environment;
+	scope (exit)
+	{
+		if (hadCodexHome)
+			environment["CODEX_HOME"] = oldCodexHome;
+		else
+			environment.remove("CODEX_HOME");
+		environment["HOME"] = oldHome;
+		environment["PATH"] = oldPath;
+		if (hadTmpDir)
+			environment["TMPDIR"] = oldTmpDir;
+		else
+			environment.remove("TMPDIR");
+		if (hadUser)
+			environment["USER"] = oldUser;
+		else
+			environment.remove("USER");
+	}
+	environment["CODEX_HOME"] = hostProfile;
+	environment["HOME"] = childHome;
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	environment["TMPDIR"] = prefixTempDir;
+	environment["USER"] = "root";
+
+	auto agent = new CodexAgent();
+	auto rule = agent.nativeHistoryRule;
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	sandbox.env["HOME"] = childHome;
+	sandbox.env["CODEX_HOME"] = suppliedProfile;
+	auto profile = resolveNativeHistoryProfile(sandbox, rule);
+	auto source = prepareProcessLaunch(sandbox, rule, profile, buildPath(root, "workdir"));
+	bool sourceCleaned;
+	scope (exit)
+		if (!sourceCleaned)
+			cleanup(source.sandbox);
+	auto sourceOwnedTemp = buildPath(root, "source-owned-temp");
+	write(sourceOwnedTemp, "source-owned");
+	source.preProfileSandbox.tempFiles ~= sourceOwnedTemp;
+	source.sandbox.tempFiles ~= sourceOwnedTemp;
+	auto sourcePaths = source.sandbox.paths.snapshot;
+	auto sourceEnv = source.sandbox.env.dup;
+	auto sourceTempFiles = source.sandbox.tempFiles.dup;
+	auto sourcePrefix = source.cmdPrefix.dup;
+	auto sourcePreProfilePaths = source.preProfileSandbox.paths.snapshot;
+	auto sourcePreProfileEnv = source.preProfileSandbox.env.dup;
+	auto sourcePreProfileTempFiles = source.preProfileSandbox.tempFiles.dup;
+	assert(sourceTempFiles.length > 0);
+	assert(sourceTempFiles.canFind(sourceOwnedTemp));
+	assert(sourcePreProfileTempFiles.canFind(sourceOwnedTemp));
+
+	auto oneShotHome = agent.prepareIsolatedOneShotHome(source);
+	assert(dirName(oneShotHome) == buildPath(suppliedProfile, "oneshot"));
+	assert(exists(buildPath(oneShotHome, "shell_snapshots")));
+	assert(readText(buildPath(oneShotHome, "config.toml")) == "provider = \"supplied\"\n");
+	assert(!exists(buildPath(hostProfile, "oneshot")));
+
+	auto clone = launchSandbox.withProcessLaunchEnv(source, "CODEX_HOME", oneShotHome);
+	auto cloneTempFiles = clone.sandbox.tempFiles.dup;
+	assert(clone.nativeHistoryProfile.driver == AgentDriver.codex);
+	assert(clone.nativeHistoryProfile.root == oneShotHome);
+	assert(clone.sandbox.env["CODEX_HOME"] == oneShotHome);
+	assert(clone.sandbox.paths.exact(suppliedProfile).isNull);
+	assert(clone.sandbox.paths.exact(oneShotHome).get.effectiveMode == PathMode.rw);
+	assert(clone.sandbox.tempFiles.length > 0);
+	foreach (tempFile; cloneTempFiles)
+		assert(!sourceTempFiles.canFind(tempFile));
+	assert(!cloneTempFiles.canFind(sourceOwnedTemp));
+	assert(clone.cmdPrefix != sourcePrefix);
+	assert(!clone.cmdPrefix.canFind(suppliedProfile));
+	assert(clone.cmdPrefix.canFind(oneShotHome));
+
+	assert(source.nativeHistoryProfile.driver == AgentDriver.codex);
+	assert(source.nativeHistoryProfile.root == suppliedProfile);
+	assert(source.sandbox.paths.snapshot == sourcePaths);
+	assert(source.sandbox.env == sourceEnv);
+	assert(source.sandbox.tempFiles == sourceTempFiles);
+	assert(source.cmdPrefix == sourcePrefix);
+	assert(source.preProfileSandbox.paths.snapshot == sourcePreProfilePaths);
+	assert(source.preProfileSandbox.env == sourcePreProfileEnv);
+	assert(source.preProfileSandbox.tempFiles == sourcePreProfileTempFiles);
+
+	cleanup(clone.sandbox);
+	foreach (tempFile; cloneTempFiles)
+		assert(!exists(tempFile));
+	foreach (tempFile; sourceTempFiles)
+		assert(exists(tempFile));
+	rmdirRecurse(oneShotHome);
+	assert(!exists(oneShotHome));
+	cleanup(source.sandbox);
+	sourceCleaned = true;
+	assert(!exists(sourceOwnedTemp));
+	assert(source.sandbox.tempFiles.length == 0);
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import std.algorithm : canFind;
+	import std.file : SpanMode, dirEntries, exists, mkdirRecurse, rmdirRecurse, tempDir, write;
+	import std.path : buildPath;
+	import std.process : environment, execute;
+	import cydo.runtime.launch.sandbox : cleanup, prepareProcessLaunch,
+		resolveNativeHistoryProfile;
+	import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
+		SandboxPathOriginKind;
+	import cydo.runtime.launch.types : ResolvedSandbox;
+
+	auto root = buildPath("/tmp", "cydo-codex-oneshot-clone-temp-ownership");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto fakeBin = buildPath(root, "bin");
+	auto fakeBwrap = buildPath(fakeBin, "bwrap");
+	auto fakeCodex = buildPath(fakeBin, "codex");
+	auto hostHome = buildPath(root, "host-home");
+	auto childHome = buildPath(root, "child-home");
+	auto profileRoot = buildPath(root, "profile");
+	mkdirRecurse(fakeBin);
+	mkdirRecurse(buildPath(hostHome, ".config", "git"));
+	mkdirRecurse(childHome);
+	mkdirRecurse(profileRoot);
+	auto shell = environment.get("SHELL", "/bin/sh");
+	auto hostEnv = environment.toAA();
+	auto sleep = resolveExecutablePath("sleep", hostEnv);
+	assert(sleep.length > 0);
+	write(fakeBwrap, "#!" ~ shell ~ "\n"
+		~ "while [ \"$1\" != \"--\" ]; do shift; done\n"
+		~ "shift\n"
+		~ "exec \"$@\"\n");
+	write(fakeCodex, "#!" ~ shell ~ "\n"
+		~ "case \"$*\" in\n"
+		~ "*one-shot-failure*)\n"
+		~ "\t\"" ~ sleep ~ "\" 0.05\n"
+		~ "\tprintf 'one-shot failure\\n' >&2\n"
+		~ "\texit 17\n"
+		~ "\t;;\n"
+		~ "*)\n"
+		~ "\tprintf 'one-shot success\\n'\n"
+		~ "\t;;\n"
+		~ "esac\n");
+	assert(execute(["chmod", "+x", fakeBwrap]).status == 0);
+	assert(execute(["chmod", "+x", fakeCodex]).status == 0);
+
+	auto oldHome = environment.get("HOME", "");
+	auto oldPath = environment.get("PATH", "");
+	auto oldUser = environment.get("USER", "");
+	bool hadUser = "USER" in environment;
+	scope (exit)
+	{
+		environment["HOME"] = oldHome;
+		environment["PATH"] = oldPath;
+		if (hadUser)
+			environment["USER"] = oldUser;
+		else
+			environment.remove("USER");
+	}
+	environment["HOME"] = hostHome;
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	environment["USER"] = "root";
+
+	auto agent = new CodexAgent();
+	auto rule = agent.nativeHistoryRule;
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	sandbox.env["HOME"] = childHome;
+	sandbox.env["PATH"] = fakeBin;
+	sandbox.env["CODEX_HOME"] = profileRoot;
+	sandbox.gitName = "one-shot clone temp ownership";
+	sandbox.paths.require(root, PathAccess.rw,
+		SandboxPathOrigin(SandboxPathOriginKind.launchRequirement,
+			"one-shot clone temp ownership", "test root"));
+	auto profile = resolveNativeHistoryProfile(sandbox, rule);
+	auto source = prepareProcessLaunch(sandbox, rule, profile, "", fakeCodex);
+	bool sourceCleaned;
+	scope (exit)
+		if (!sourceCleaned)
+			cleanup(source.sandbox);
+	auto sourceOwnedTemp = buildPath(root, "source-owned-temp");
+	write(sourceOwnedTemp, "source-owned");
+	source.preProfileSandbox.tempFiles ~= sourceOwnedTemp;
+	source.sandbox.tempFiles ~= sourceOwnedTemp;
+	auto sourcePaths = source.sandbox.paths.snapshot;
+	auto sourceEnv = source.sandbox.env.dup;
+	auto sourceTempFiles = source.sandbox.tempFiles.dup;
+	auto sourcePrefix = source.cmdPrefix.dup;
+	auto sourcePreProfilePaths = source.preProfileSandbox.paths.snapshot;
+	auto sourcePreProfileEnv = source.preProfileSandbox.env.dup;
+	auto sourcePreProfileTempFiles = source.preProfileSandbox.tempFiles.dup;
+	assert(sourceTempFiles.canFind(sourceOwnedTemp));
+	assert(sourcePreProfileTempFiles.canFind(sourceOwnedTemp));
+	auto oneShotParent = buildPath(profileRoot, "oneshot");
+	string[] tempEntries()
+	{
+		string[] entries;
+		foreach (entry; dirEntries(tempDir(), SpanMode.shallow))
+			entries ~= entry.name;
+		return entries;
+	}
+	void assertSourceUnchanged()
+	{
+		assert(source.nativeHistoryProfile.driver == AgentDriver.codex);
+		assert(source.nativeHistoryProfile.root == profileRoot);
+		assert(source.sandbox.paths.snapshot == sourcePaths);
+		assert(source.sandbox.env == sourceEnv);
+		assert(source.sandbox.tempFiles == sourceTempFiles);
+		assert(source.cmdPrefix == sourcePrefix);
+		assert(source.preProfileSandbox.paths.snapshot == sourcePreProfilePaths);
+		assert(source.preProfileSandbox.env == sourcePreProfileEnv);
+		assert(source.preProfileSandbox.tempFiles == sourcePreProfileTempFiles);
+	}
+	void assertOneShotArtifactsRemoved(string outcome, const string[] tempEntriesBefore)
+	{
+		assert(exists(sourceOwnedTemp), outcome ~ " removed source-owned temp file");
+		foreach (tempFile; sourceTempFiles)
+			assert(exists(tempFile), outcome ~ " removed source temp file: " ~ tempFile);
+		if (exists(oneShotParent))
+			foreach (entry; dirEntries(oneShotParent, SpanMode.shallow))
+				assert(false, outcome ~ " leaked one-shot home: " ~ entry.name);
+		foreach (entry; dirEntries(tempDir(), SpanMode.shallow))
+			assert(tempEntriesBefore.canFind(entry.name),
+				outcome ~ " leaked clone prefix temp file: " ~ entry.name);
+		assertSourceUnchanged();
+	}
+
+	auto tempEntriesBeforeSuccess = tempEntries();
+	auto success = agent.completeOneShot("one-shot-success", "small", source);
+	assert(success.cancel !is null);
+	bool fulfilled;
+	bool successRejected;
+	bool baselineAtSuccess;
+	string response;
+	success.promise.then((string result) {
+		fulfilled = true;
+		baselineAtSuccess = exists(sourceOwnedTemp);
+		response = result;
+	}).except((Exception) {
+		successRejected = true;
+	}).ignoreResult();
+	socketManager.loop();
+	assert(fulfilled);
+	assert(!successRejected);
+	assert(response == "one-shot success");
+	assert(baselineAtSuccess);
+	assertOneShotArtifactsRemoved("successful one-shot", tempEntriesBeforeSuccess);
+
+	auto tempEntriesBeforeFailure = tempEntries();
+	auto failure = agent.completeOneShot("one-shot-failure", "small", source);
+	assert(failure.cancel !is null);
+	bool failureFulfilled;
+	bool rejected;
+	bool baselineAtFailure;
+	failure.promise.then((string) {
+		failureFulfilled = true;
+	}).except((Exception) {
+		rejected = true;
+		baselineAtFailure = exists(sourceOwnedTemp);
+	}).ignoreResult();
+	socketManager.loop();
+	assert(!failureFulfilled);
+	assert(rejected);
+	assert(baselineAtFailure);
+	assertOneShotArtifactsRemoved("nonzero one-shot", tempEntriesBeforeFailure);
+
+	cleanup(source.sandbox);
+	sourceCleaned = true;
+	assert(!exists(sourceOwnedTemp));
+	assert(source.sandbox.tempFiles.length == 0);
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import std.file : SpanMode, dirEntries, exists, mkdirRecurse, rmdirRecurse;
+	import std.path : buildPath;
+	import cydo.runtime.launch.types : NativeHistoryProfile, ProcessLaunch;
+
+	auto root = buildPath("/tmp", "cydo-codex-oneshot-settings-copy-failure");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto profileRoot = buildPath(root, "profile");
+	mkdirRecurse(buildPath(profileRoot, "config.toml"));
+
+	ProcessLaunch launch;
+	launch.nativeHistoryProfile = NativeHistoryProfile(AgentDriver.codex, profileRoot);
+	auto handle = (new CodexAgent()).completeOneShot("prompt", "small", launch);
+	assert(handle.cancel is null);
+	bool rejected;
+	handle.promise.except((Exception e) {
+		rejected = true;
+	}).ignoreResult();
+	socketManager.loop();
+	assert(rejected);
+	auto oneShotParent = buildPath(profileRoot, "oneshot");
+	if (exists(oneShotParent))
+		foreach (entry; dirEntries(oneShotParent, SpanMode.shallow))
+			assert(false, "settings-copy failure leaked one-shot home: " ~ entry.name);
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import std.algorithm : canFind;
+	import std.file : SpanMode, dirEntries, exists, mkdirRecurse, rmdirRecurse, write;
+	import std.path : buildPath;
+	import std.process : environment;
+	import cydo.runtime.launch.sandbox : cleanup, prepareProcessLaunch,
+		resolveNativeHistoryProfile;
+	import cydo.runtime.launch.types : ResolvedSandbox;
+
+	auto root = buildPath("/tmp", "cydo-codex-oneshot-clone-materialization-failure");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto fakeBin = buildPath(root, "bin");
+	auto prefixTempDir = buildPath(root, "prefix-temps");
+	auto hostHome = buildPath(root, "host-home");
+	auto childHome = buildPath(root, "child-home");
+	auto profileRoot = buildPath(root, "profile");
+	mkdirRecurse(fakeBin);
+	mkdirRecurse(prefixTempDir);
+	mkdirRecurse(hostHome);
+	mkdirRecurse(childHome);
+	mkdirRecurse(profileRoot);
+	write(buildPath(fakeBin, "bwrap"), "");
+	write(buildPath(profileRoot, "config.toml"), "provider = \"configured\"\n");
+
+	auto oldHome = environment.get("HOME", "");
+	auto oldPath = environment.get("PATH", "");
+	auto oldTmpDir = environment.get("TMPDIR", "");
+	auto oldUser = environment.get("USER", "");
+	bool hadTmpDir = "TMPDIR" in environment;
+	bool hadUser = "USER" in environment;
+	scope (exit)
+	{
+		environment["HOME"] = oldHome;
+		environment["PATH"] = oldPath;
+		if (hadTmpDir)
+			environment["TMPDIR"] = oldTmpDir;
+		else
+			environment.remove("TMPDIR");
+		if (hadUser)
+			environment["USER"] = oldUser;
+		else
+			environment.remove("USER");
+	}
+	environment["HOME"] = hostHome;
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	environment["TMPDIR"] = prefixTempDir;
+	environment["USER"] = "root";
+
+	auto agent = new CodexAgent();
+	auto rule = agent.nativeHistoryRule;
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	sandbox.env["HOME"] = childHome;
+	sandbox.env["CODEX_HOME"] = profileRoot;
+	auto profile = resolveNativeHistoryProfile(sandbox, rule);
+	auto source = prepareProcessLaunch(sandbox, rule, profile, "");
+	cleanup(source.sandbox);
+	source.preProfileSandbox.gitName = "clone materialization failure";
+	mkdirRecurse(buildPath(hostHome, ".config", "git", "config"));
+	auto sourceOwnedTemp = buildPath(root, "source-owned-temp");
+	write(sourceOwnedTemp, "source-owned");
+	source.preProfileSandbox.tempFiles ~= sourceOwnedTemp;
+	source.sandbox.tempFiles ~= sourceOwnedTemp;
+	auto sourcePaths = source.sandbox.paths.snapshot;
+	auto sourceEnv = source.sandbox.env.dup;
+	auto sourceTempFiles = source.sandbox.tempFiles.dup;
+	auto sourcePrefix = source.cmdPrefix.dup;
+	auto sourcePreProfilePaths = source.preProfileSandbox.paths.snapshot;
+	auto sourcePreProfileEnv = source.preProfileSandbox.env.dup;
+	auto sourcePreProfileTempFiles = source.preProfileSandbox.tempFiles.dup;
+	assert(sourceTempFiles.canFind(sourceOwnedTemp));
+	assert(sourcePreProfileTempFiles.canFind(sourceOwnedTemp));
+	bool sourceBaselineCleaned;
+	scope (exit)
+		if (!sourceBaselineCleaned)
+			cleanup(source.sandbox);
+
+	auto handle = agent.completeOneShot("prompt", "small", source);
+	assert(handle.cancel is null);
+	bool rejected;
+	handle.promise.except((Exception e) {
+		rejected = true;
+	}).ignoreResult();
+	socketManager.loop();
+	assert(rejected);
+	assert(exists(sourceOwnedTemp));
+	assert(source.sandbox.paths.snapshot == sourcePaths);
+	assert(source.sandbox.env == sourceEnv);
+	assert(source.sandbox.tempFiles == sourceTempFiles);
+	assert(source.cmdPrefix == sourcePrefix);
+	assert(source.preProfileSandbox.paths.snapshot == sourcePreProfilePaths);
+	assert(source.preProfileSandbox.env == sourcePreProfileEnv);
+	assert(source.preProfileSandbox.tempFiles == sourcePreProfileTempFiles);
+	auto oneShotParent = buildPath(profileRoot, "oneshot");
+	if (exists(oneShotParent))
+		foreach (entry; dirEntries(oneShotParent, SpanMode.shallow))
+			assert(false, "clone materialization failure leaked one-shot home: " ~ entry.name);
+	foreach (entry; dirEntries(prefixTempDir, SpanMode.shallow))
+		assert(false, "clone materialization failure leaked prefix temp file: " ~ entry.name);
+	cleanup(source.sandbox);
+	sourceBaselineCleaned = true;
+	assert(!exists(sourceOwnedTemp));
+	assert(source.sandbox.tempFiles.length == 0);
 }
 
 private class AppServerStartupGate

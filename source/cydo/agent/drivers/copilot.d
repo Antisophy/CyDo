@@ -31,7 +31,8 @@ import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.runtime.config : AgentDriver, ModelSpec, ModelSpecFields;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
-import cydo.runtime.launch.types : ProcessLaunch;
+import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule,
+	ProcessLaunch;
 import cydo.runtime.launch.sandbox : cydoBinaryDir, cydoBinaryPath, effectiveEnvValue,
 	executableMountPaths, resolveExecutablePath;
 import cydo.mcp : McpResult;
@@ -61,13 +62,6 @@ class CopilotAgent : Agent
 	{
 		import std.process : environment;
 
-		// Copilot home directory (config, sessions, cache)
-		auto home = environment.get("HOME", "/tmp");
-		auto copilotHome = effectiveEnvValue(env, "COPILOT_HOME", buildPath(home, ".copilot"));
-		paths.require(copilotHome, PathAccess.rw,
-			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "copilot",
-				"COPILOT_HOME"));
-
 		foreach (path; executableMountPaths(resolveExecutablePath(executableName(env), env)))
 			paths.requireReadVisible(path,
 				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "copilot",
@@ -90,7 +84,6 @@ class CopilotAgent : Agent
 		passthrough("GH_TOKEN");
 		passthrough("GITHUB_TOKEN");
 		passthrough("PATH");
-		passthrough("COPILOT_HOME");
 		passthrough("COPILOT_MODEL");
 		passthrough("HTTPS_PROXY");
 		passthrough("NODE_TLS_REJECT_UNAUTHORIZED");
@@ -99,6 +92,10 @@ class CopilotAgent : Agent
 	@property string gitName() { return "GitHub Copilot"; }
 	@property string gitEmail() { return "noreply@github.com"; }
 	override @property AgentDriver driver() { return AgentDriver.copilot; }
+	override @property NativeHistoryRule nativeHistoryRule()
+	{
+		return NativeHistoryRule(AgentDriver.copilot, "COPILOT_HOME", ".copilot", null);
+	}
 	@property string lastMcpConfigPath() { return lastMcpConfigPath_; }
 	string executableName(string[string] env)
 	{
@@ -117,7 +114,8 @@ class CopilotAgent : Agent
 		string mcpConfigPath = null;
 		if (config.mcpSocketPath.length > 0)
 		{
-			mcpConfigPath = generateCopilotMcpConfig(tid, config.creatableTaskTypes,
+			mcpConfigPath = generateCopilotMcpConfig(tid, launch.nativeHistoryProfile,
+				config.creatableTaskTypes,
 				config.switchModes, config.handoffs, config.includeTools, config.mcpSocketPath);
 			lastMcpConfigPath_ = mcpConfigPath;
 		}
@@ -685,7 +683,7 @@ class CopilotAgent : Agent
 	}
 
 	OneShotHandle completeOneShot(string prompt, string modelClass,
-		ProcessLaunch launch = ProcessLaunch.init)
+		ProcessLaunch launch)
 	{
 		auto p = new Promise!string;
 		auto session = new OneShotCopilotSession(p);
@@ -839,12 +837,16 @@ unittest
 	assert(cydoView.declaration.get.mode == PathMode.always_rw);
 	assert(cydoView.effectiveMode == PathMode.always_rw);
 
-	auto stateHome = resolved.paths.exact(copilotHome).get;
-	assert(stateHome.declaration.isNull);
-	assert(stateHome.requirement.get.access == PathAccess.rw);
-	assert(stateHome.effectiveMode == PathMode.rw);
+	// Native history is materialized by prepareProcessLaunch, not while the
+	// driver configures executable visibility and credential passthrough.
+	assert(resolved.paths.exact(copilotHome).isNull);
+	auto nativeRule = agent.nativeHistoryRule;
+	assert(nativeRule.driver == AgentDriver.copilot);
+	assert(nativeRule.profileEnvName == "COPILOT_HOME");
+	assert(nativeRule.homeRelativeDefault == ".copilot");
+	assert(nativeRule.homeSupportRequirements.length == 0);
 	assert(resolved.env["PATH"] == executableDir);
-	assert(resolved.env["COPILOT_HOME"] == copilotHome);
+	assert(("COPILOT_HOME" in resolved.env) is null);
 	assert(resolved.env["COPILOT_GITHUB_TOKEN"] == "test-copilot-token");
 	assert(resolved.env["GH_TOKEN"] == "test-gh-token");
 	assert(resolved.env["GITHUB_TOKEN"] == "test-github-token");
@@ -852,8 +854,8 @@ unittest
 	assert(resolved.env["HTTPS_PROXY"] == "http://copilot.test.invalid:8080");
 	assert(resolved.env["NODE_TLS_REJECT_UNAUTHORIZED"] == "0");
 
-	// A configured launch value must select the same writable state home that
-	// the sandboxed process receives, rather than the host-only fallback.
+	// A configured profile selector remains in the resolved child environment,
+	// but configureSandbox must not turn it into a native-history mount.
 	auto configuredCopilotHome = buildPath(home, "sandbox-copilot-home");
 	SandboxConfig configuredGlobal;
 	configuredGlobal.env = [
@@ -863,19 +865,17 @@ unittest
 	];
 	auto configuredResolved = resolveSandbox(configuredGlobal, SandboxConfig.init,
 		SandboxConfig.init, agentSandbox, "");
-	auto configuredStateHome = configuredResolved.paths.exact(configuredCopilotHome).get;
-	assert(configuredStateHome.declaration.isNull);
-	assert(configuredStateHome.requirement.get.access == PathAccess.rw);
-	assert(configuredStateHome.effectiveMode == PathMode.rw);
+	assert(configuredResolved.paths.exact(configuredCopilotHome).isNull);
 	assert(configuredResolved.paths.exact(copilotHome).isNull);
 	assert(configuredResolved.env["COPILOT_HOME"] == configuredCopilotHome);
 
-	// Missing launch values retain Copilot's host-environment passthrough.
+	// Missing launch values do not inherit host COPILOT_HOME during driver setup.
 	SandboxPaths defaultPaths;
 	string[string] defaultEnv = ["CYDO_COPILOT_BIN": executable];
 	agent.configureSandbox(defaultPaths, defaultEnv);
 	assert(defaultEnv["PATH"] == executableDir);
-	assert(defaultEnv["COPILOT_HOME"] == copilotHome);
+	assert(("COPILOT_HOME" in defaultEnv) is null);
+	assert(defaultPaths.exact(copilotHome).isNull);
 	assert(defaultEnv["COPILOT_GITHUB_TOKEN"] == "test-copilot-token");
 	assert(defaultEnv["GH_TOKEN"] == "test-gh-token");
 	assert(defaultEnv["GITHUB_TOKEN"] == "test-github-token");
@@ -3156,20 +3156,21 @@ private struct CopilotMcpConfigServers { CopilotMcpConfigServer cydo; }
 private struct CopilotMcpConfig { CopilotMcpConfigServers mcpServers; }
 
 /// Generate a temporary MCP config file for Copilot's --additional-mcp-config flag.
-string generateCopilotMcpConfig(int tid, string creatableTaskTypes,
+string generateCopilotMcpConfig(int tid, const ref NativeHistoryProfile profile,
+	string creatableTaskTypes,
 	string switchModes, string handoffs, string[] includeTools, string mcpSocketPath)
 {
 	import std.array : join;
+	import std.exception : enforce;
 	import std.file : exists, mkdirRecurse, write;
 
 	auto cydoBin = cydoBinaryPath;
 	if (cydoBin.length == 0)
 		return null;
 
-	import std.process : environment;
-	auto home = environment.get("HOME", "/tmp");
-	auto copilotHome = environment.get("COPILOT_HOME", buildPath(home, ".copilot"));
-	auto configDir = buildPath(copilotHome, "mcp-configs");
+	enforce(profile.driver == AgentDriver.copilot,
+		"Copilot MCP config requires a Copilot native history profile");
+	auto configDir = buildPath(profile.root, "mcp-configs");
 	if (!exists(configDir))
 		mkdirRecurse(configDir);
 
@@ -3191,6 +3192,29 @@ string generateCopilotMcpConfig(int tid, string creatableTaskTypes,
 	)));
 	write(configPath, toJson(cfg));
 	return configPath;
+}
+
+unittest
+{
+	import std.exception : assertThrown;
+	import std.file : exists, rmdirRecurse;
+	import std.path : buildPath;
+
+	auto root = buildPath("/tmp", "cydo-copilot-mcp-native-profile");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto profile = NativeHistoryProfile(AgentDriver.copilot,
+		buildPath(root, "supplied-profile"));
+	auto configPath = generateCopilotMcpConfig(43, profile, "", "", "", null, "");
+	assert(configPath == buildPath(profile.root, "mcp-configs", "cydo-43.json"));
+	assert(exists(configPath));
+	auto wrongDriverProfile = NativeHistoryProfile(AgentDriver.codex,
+		buildPath(root, "wrong-driver"));
+	assertThrown!Exception(generateCopilotMcpConfig(43, wrongDriverProfile,
+		"", "", "", null, ""));
 }
 
 /// Extract plain text from a tool result JSONFragment.

@@ -20,7 +20,8 @@ import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.runtime.config : AgentDriver, ModelSpec, ModelSpecFields;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
-import cydo.runtime.launch.types : ProcessLaunch, ResolvedSandbox;
+import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule,
+	NativeProfileSupportRequirement, ProcessLaunch, ResolvedSandbox;
 import cydo.runtime.launch.sandbox : buildCommandPrefix, cleanup, cydoBinaryDir, cydoBinaryPath,
 	effectiveEnvValue, executableMountPaths, resolveExecutablePath;
 import cydo.foundation.text.title : truncateTitle;
@@ -30,16 +31,6 @@ class ClaudeCodeAgent : Agent
 {
 	void configureSandbox(ref SandboxPaths paths, ref string[string] env)
 	{
-		paths.require(expandTilde("~/.claude"), PathAccess.rw,
-			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "claude",
-				"Claude state directory"));
-		paths.require(expandTilde("~/.claude.json"), PathAccess.rw,
-			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "claude",
-				"Claude state file"));
-		paths.require(expandTilde("~/.local/share/claude"), PathAccess.ro,
-			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "claude",
-				"Claude data directory"));
-
 		foreach (path; executableMountPaths(resolveExecutablePath(executableName(env), env)))
 			paths.requireReadVisible(path,
 				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "claude",
@@ -69,6 +60,20 @@ class ClaudeCodeAgent : Agent
 	@property string gitName() { return "Claude Code"; }
 	@property string gitEmail() { return "noreply@anthropic.com"; }
 	override @property AgentDriver driver() { return AgentDriver.claude; }
+	override @property NativeHistoryRule nativeHistoryRule()
+	{
+		return NativeHistoryRule(
+			AgentDriver.claude,
+			"CLAUDE_CONFIG_DIR",
+			".claude",
+			[
+				NativeProfileSupportRequirement(".claude.json", PathAccess.rw,
+					"Claude state file"),
+				NativeProfileSupportRequirement(".local/share/claude", PathAccess.ro,
+					"Claude data directory"),
+			],
+		);
+	}
 	string executableName(string[string] env)
 	{
 		return effectiveEnvValue(env, "CYDO_CLAUDE_BIN", "claude");
@@ -84,7 +89,8 @@ class ClaudeCodeAgent : Agent
 	AgentSession createSession(int tid, string resumeSessionId, ProcessLaunch launch,
 		SessionConfig config = SessionConfig.init)
 	{
-		lastMcpConfigPath_ = generateMcpConfig(tid, config.creatableTaskTypes,
+		lastMcpConfigPath_ = generateMcpConfig(tid, launch.nativeHistoryProfile,
+			config.creatableTaskTypes,
 			config.switchModes, config.handoffs, config.includeTools, config.mcpSocketPath,
 			config.permissionPolicy);
 		auto claudeBin = launch.executablePath.length > 0
@@ -645,7 +651,7 @@ class ClaudeCodeAgent : Agent
 	}
 
 	OneShotHandle completeOneShot(string prompt, string modelClass,
-		ProcessLaunch launch = ProcessLaunch.init)
+		ProcessLaunch launch)
 	{
 		import std.path : buildPath;
 		import std.process : environment;
@@ -750,6 +756,7 @@ unittest
 	}
 
 	auto home = buildPath(root, "home");
+	auto profileRoot = buildPath(root, "configured-claude-profile");
 	auto executableDir = buildPath(root, "bin");
 	auto executable = buildPath(executableDir, "claude");
 	mkdirRecurse(home);
@@ -771,6 +778,7 @@ unittest
 	global.env = [
 		"CYDO_CLAUDE_BIN": executable,
 		"PATH": executableDir,
+		"CLAUDE_CONFIG_DIR": profileRoot,
 	];
 	auto executableMounts = executableMountPaths(resolveExecutablePath(executable, global.env));
 	assert(executableMounts.length == 1);
@@ -791,19 +799,24 @@ unittest
 	assert(cydoView.declaration.get.mode == PathMode.always_rw);
 	assert(cydoView.effectiveMode == PathMode.always_rw);
 
-	auto stateDir = resolved.paths.exact(buildPath(home, ".claude")).get;
-	assert(stateDir.declaration.isNull);
-	assert(stateDir.requirement.get.access == PathAccess.rw);
-	assert(stateDir.effectiveMode == PathMode.rw);
-	auto stateFile = resolved.paths.exact(buildPath(home, ".claude.json")).get;
-	assert(stateFile.declaration.isNull);
-	assert(stateFile.requirement.get.access == PathAccess.rw);
-	assert(stateFile.effectiveMode == PathMode.rw);
-	auto dataDir = resolved.paths.exact(buildPath(home, ".local", "share", "claude")).get;
-	assert(dataDir.declaration.isNull);
-	assert(dataDir.requirement.get.access == PathAccess.ro);
-	assert(dataDir.effectiveMode == PathMode.ro);
+	// Native-history paths belong to the launch phase. configureSandbox only
+	// keeps a configured profile selector in the child environment.
+	assert(resolved.paths.exact(profileRoot).isNull);
+	assert(resolved.paths.exact(buildPath(home, ".claude")).isNull);
+	assert(resolved.paths.exact(buildPath(home, ".claude.json")).isNull);
+	assert(resolved.paths.exact(buildPath(home, ".local", "share", "claude")).isNull);
+	auto nativeRule = agent.nativeHistoryRule;
+	assert(nativeRule.driver == AgentDriver.claude);
+	assert(nativeRule.profileEnvName == "CLAUDE_CONFIG_DIR");
+	assert(nativeRule.homeRelativeDefault == ".claude");
+	assert(nativeRule.homeSupportRequirements.length == 2);
+	assert(nativeRule.homeSupportRequirements[0].homeRelativePath == ".claude.json");
+	assert(nativeRule.homeSupportRequirements[0].access == PathAccess.rw);
+	assert(nativeRule.homeSupportRequirements[1].homeRelativePath
+		== ".local/share/claude");
+	assert(nativeRule.homeSupportRequirements[1].access == PathAccess.ro);
 	assert(resolved.env["PATH"] == executableDir);
+	assert(resolved.env["CLAUDE_CONFIG_DIR"] == profileRoot);
 	assert(resolved.env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] == "1");
 	assert(resolved.env["CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT"] == "0");
 
@@ -812,6 +825,8 @@ unittest
 	string[string] defaultEnv = ["CYDO_CLAUDE_BIN": executable];
 	agent.configureSandbox(defaultPaths, defaultEnv);
 	assert(defaultEnv["PATH"] == executableDir);
+	assert(("CLAUDE_CONFIG_DIR" in defaultEnv) is null);
+	assert(defaultPaths.exact(buildPath(home, ".claude")).isNull);
 	foreach (path; executableMounts)
 		assert(defaultPaths.exact(path).get.effectiveMode == PathMode.ro);
 
@@ -1763,15 +1778,19 @@ private struct McpConfig { McpConfigServers mcpServers; }
 /// switchModes is pre-formatted text describing available SwitchMode continuations.
 /// handoffs is pre-formatted text describing available Handoff continuations.
 /// mcpSocketPath is the absolute path to the backend's UNIX socket for MCP calls.
-string generateMcpConfig(int tid, string creatableTaskTypes = "",
+string generateMcpConfig(int tid, const ref NativeHistoryProfile profile,
+	string creatableTaskTypes = "",
 	string switchModes = "", string handoffs = "", string[] includeTools = null,
 	string mcpSocketPath = "", string permissionPolicy = "")
 {
 	import std.array : join;
+	import std.exception : enforce;
 	import std.file : exists, mkdirRecurse, write;
 	import std.path : buildPath;
 
-	auto configDir = buildPath(expandTilde("~/.claude"), "mcp-configs");
+	enforce(profile.driver == AgentDriver.claude,
+		"Claude MCP config requires a Claude native history profile");
+	auto configDir = buildPath(profile.root, "mcp-configs");
 	if (!exists(configDir))
 		mkdirRecurse(configDir);
 
@@ -1798,6 +1817,28 @@ string generateMcpConfig(int tid, string creatableTaskTypes = "",
 	)));
 	write(configPath, toJson(cfg));
 	return configPath;
+}
+
+unittest
+{
+	import std.exception : assertThrown;
+	import std.file : exists, rmdirRecurse;
+	import std.path : buildPath;
+
+	auto root = buildPath("/tmp", "cydo-claude-mcp-native-profile");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto profile = NativeHistoryProfile(AgentDriver.claude,
+		buildPath(root, "supplied-profile"));
+	auto configPath = generateMcpConfig(42, profile);
+	assert(configPath == buildPath(profile.root, "mcp-configs", "cydo-42.json"));
+	assert(exists(configPath));
+	auto wrongDriverProfile = NativeHistoryProfile(AgentDriver.codex,
+		buildPath(root, "wrong-driver"));
+	assertThrown!Exception(generateMcpConfig(42, wrongDriverProfile));
 }
 
 /// Build a Claude-wire-format content array from agnostic ContentBlock[].

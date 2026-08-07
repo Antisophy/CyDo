@@ -16,11 +16,13 @@ import cydo.mcp.tool_descriptions : RenderedCydoToolsOptions,
 	ToolDescriptionViolation, checkRenderedCydoToolDescriptionViolations;
 import cydo.protocol : ItemDeltaEvent, ItemStartedEvent, ProcessExitEvent,
 	ProcessStderrEvent, TranslatedEvent;
-import cydo.runtime.config : AgentDriver, PathMode, SandboxConfig;
+import cydo.runtime.config : AgentDriver, CydoConfig, PathMode, SandboxConfig;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
 import cydo.runtime.launch.types : AgentSandboxConfig, ProcessLaunch;
 import launchSandbox = cydo.runtime.launch.sandbox;
+import cydo.workflow.history.native_history : ConfiguredNativeHistoryContext,
+	resolveNativeHistoryContext;
 import cydo.domain.tasks.model : ProcessState, TaskData, TaskStatus,
 	WaitingTaskDependencyState;
 import cydo.domain.tasks.lifecycle : TaskNotificationChange;
@@ -33,6 +35,7 @@ version (unittest) import std.exception : assertThrown;
 version (unittest) import std.process : execute;
 version (unittest) import std.string : strip;
 version (unittest) import cydo.agent.drivers.claude : ClaudeCodeAgent;
+version (unittest) import cydo.agent.drivers.copilot : CopilotAgent;
 
 package(cydo):
 
@@ -153,11 +156,8 @@ struct TaskSessionRunnerHost
 	string delegate(const TaskData* td) outputPath;
 	string delegate(const TaskData* td) effectiveCwd;
 	string delegate(const TaskData* td) worktreePath;
-	SandboxConfig delegate() globalSandbox;
-	SandboxConfig delegate(string workspaceName) findWorkspaceSandbox;
-	string delegate(string workspaceName) findWorkspaceRoot;
+	CydoConfig* delegate() currentConfig;
 	string delegate(string workspaceName) findWorkspacePermissionPolicy;
-	SandboxConfig delegate(string agentName) findAgentSandbox;
 	void delegate(string projectPath, string taskType,
 		ToolDescriptionViolation[] violations) reportMcpToolDescriptionLimit;
 	string delegate(int tid) resolveSharedTmpPath;
@@ -316,20 +316,14 @@ class TaskSessionRunner
 		auto taskCwd = host_.effectiveCwd(td);
 		auto chdir = taskCwd.length > 0 ? taskCwd : workDir;
 
-		auto wsSandbox = host_.findWorkspaceSandbox(td.workspace);
-		auto wsRoot = host_.findWorkspaceRoot(td.workspace);
-		auto agentNameSandbox = host_.findAgentSandbox(td.agentName);
 		bool readOnly = typeDef !is null && typeDef.read_only;
-		AgentSandboxConfig agentSandbox;
-		agentSandbox.configureSandbox = (ref SandboxPaths paths, ref string[string] env) {
-			taskAgent.configureSandbox(paths, env);
-		};
-		agentSandbox.gitName = taskAgent.gitName;
-		agentSandbox.gitEmail = taskAgent.gitEmail;
-		agentSandbox.agentName = td.agentName;
-		agentSandbox.workspaceName = td.workspace;
-		auto sandbox = launchSandbox.resolveSandbox(host_.globalSandbox(), agentNameSandbox, wsSandbox,
-			agentSandbox, workDir, wsRoot, readOnly);
+		auto context = ConfiguredNativeHistoryContext(td.agentName, td.workspace,
+			td.repoPath, readOnly);
+		auto nativeHistoryContext = resolveNativeHistoryContext(*host_.currentConfig(),
+			taskAgent, context);
+		enforce(nativeHistoryContext.agent.driver == taskAgent.driver,
+			"Configured native history Agent does not match the task Agent driver");
+		auto sandbox = nativeHistoryContext.sandbox;
 
 		if (td.hasWorktree && workDir.length > 0)
 		{
@@ -429,7 +423,8 @@ class TaskSessionRunner
 		}
 
 		sandbox.sharedTmpPath = host_.resolveSharedTmpPath(tid);
-		td.launch = launchSandbox.prepareProcessLaunch(sandbox, chdir,
+		td.launch = launchSandbox.prepareProcessLaunch(sandbox,
+			nativeHistoryContext.rule, nativeHistoryContext.profile, chdir,
 			taskAgent.executableName(sandbox.env));
 
 		sessionConfig.workspace = td.workspace;
@@ -1360,6 +1355,22 @@ version (unittest) private TaskSessionRunner gitMetadataTestRunner(
 	SandboxConfig workspaceSandbox, string worktreePath, string taskCwd,
 	string mcpSocketPath = "", string taskDirPath = "")
 {
+	import configy.attributes : SetInfo;
+	import cydo.runtime.config : AgentConfig, WorkspaceConfig;
+
+	auto config = new CydoConfig;
+	config.sandbox = unrestrictedLaunchTestSandbox();
+	AgentConfig configuredAgent;
+	configuredAgent.driver = SetInfo!AgentDriver(AgentDriver.claude, true);
+	configuredAgent.sandbox = unrestrictedLaunchTestSandbox();
+	configuredAgent.sandbox.env = [
+		"HOME": buildPath(fixture.root, "home"),
+		"CLAUDE_CONFIG_DIR": buildPath(fixture.root, "claude-profile"),
+	];
+	config.agents["claude"] = configuredAgent;
+	config.workspaces = [WorkspaceConfig(name: "local", root: fixture.workspaceRoot,
+		sandbox: workspaceSandbox)];
+
 	return new TaskSessionRunner(TaskSessionRunnerHost(
 		getTask: (int tid) {
 			auto task = tid in *tasks;
@@ -1372,17 +1383,138 @@ version (unittest) private TaskSessionRunner gitMetadataTestRunner(
 			: buildPath(fixture.root, "tasks", "task", "output.md"),
 		effectiveCwd: (const TaskData* td) => taskCwd,
 		worktreePath: (const TaskData* td) => worktreePath,
-		globalSandbox: () => unrestrictedLaunchTestSandbox(),
-		findWorkspaceSandbox: (string workspaceName) => workspaceSandbox,
-		findWorkspaceRoot: (string workspaceName) => fixture.workspaceRoot,
+		currentConfig: () => config,
 		findWorkspacePermissionPolicy: (string workspaceName) => "",
-		findAgentSandbox: (string agentName) => unrestrictedLaunchTestSandbox(),
 		reportMcpToolDescriptionLimit: (string projectPath, string taskType,
 			ToolDescriptionViolation[] violations) {},
 		resolveSharedTmpPath: (int tid) => "",
 		mcpSocketPath: () => mcpSocketPath,
 		taskTypeCatalog: catalog,
 	));
+}
+
+version (unittest) private void assertRunnerMcpConfigCleanup(
+	string fixtureName, string agentName, string executableEnvName, Agent agent)
+{
+	import ae.net.asockets : socketManager;
+	import ae.utils.statequeue : StateQueue;
+	import configy.attributes : SetInfo;
+	import std.algorithm : canFind;
+	import std.file : exists, write;
+	import cydo.runtime.config : AgentConfig, WorkspaceConfig;
+
+	withGitMetadataLaunchFixture(fixtureName,
+		(GitMetadataLaunchFixture fixture) {
+			auto profileRoot = buildPath(fixture.root, agentName ~ "-profile");
+			auto executable = buildPath(fixture.root, agentName ~ "-blocking-agent");
+			write(executable,
+				"#!/bin/sh\n"
+				~ "while IFS= read -r line; do :; done\n");
+			assert(execute(["chmod", "+x", executable]).status == 0);
+
+			auto catalog = gitMetadataTaskCatalog(fixture,
+				"task_types:\n"
+				~ "  runner:\n"
+				~ "    model_class: large\n");
+			auto mcpSocket = buildPath(fixture.root, "mcp.sock");
+			write(mcpSocket, "");
+
+			auto config = new CydoConfig;
+			config.sandbox = unrestrictedLaunchTestSandbox();
+			AgentConfig configuredAgent;
+			configuredAgent.driver = SetInfo!AgentDriver(agent.driver, true);
+			configuredAgent.sandbox = unrestrictedLaunchTestSandbox();
+			configuredAgent.sandbox.env["HOME"] = buildPath(fixture.root, "agent-home");
+			configuredAgent.sandbox.env[agent.nativeHistoryRule.profileEnvName] = profileRoot;
+			configuredAgent.sandbox.env[executableEnvName] = executable;
+			config.agents[agentName] = configuredAgent;
+			config.workspaces = [WorkspaceConfig(name: "local", root: fixture.workspaceRoot,
+				sandbox: unrestrictedLaunchTestSandbox())];
+
+			TaskData[int] tasks;
+			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+			tasks[1].taskType = "runner";
+			tasks[1].agentName = agentName;
+			auto taskDir = buildPath(fixture.root, "tasks", "task");
+			auto runner = new TaskSessionRunner(TaskSessionRunnerHost(
+				getTask: (int tid) {
+					auto task = tid in tasks;
+					return task is null ? null : &tasks[tid];
+				},
+				taskDir: (const TaskData* td) => taskDir,
+				outputPath: (const TaskData* td) => buildPath(taskDir, "output.md"),
+				effectiveCwd: (const TaskData* td) => fixture.linkedCheckout,
+				worktreePath: (const TaskData* td) => "",
+				currentConfig: () => config,
+				findWorkspacePermissionPolicy: (string workspaceName) => "",
+				reportMcpToolDescriptionLimit: (string projectPath, string taskType,
+					ToolDescriptionViolation[] violations) {},
+				resolveSharedTmpPath: (int tid) => "",
+				mcpSocketPath: () => mcpSocket,
+				agentForTask: (int tid) => agent,
+				tryAgentForTask: (int tid) => agent,
+				clearLastActive: (int tid) {},
+				broadcastTask: (int tid, TranslatedEvent event) {},
+				publishTaskSnapshot: (int tid) {},
+				hasPendingSubTask: (int tid) => false,
+				hasTaskDependency: (int tid) => false,
+				hasPendingChildQuestion: (int tid) => false,
+				touchAndPersistLastActive: (int tid) {},
+				ensureHistoryLoaded: (int tid) {},
+				finalReconcileJsonlIfPresent: (int tid) {},
+				stopJsonlWatch: (int tid) {},
+				failPendingAskUserQuestionOnExit: (int tid) {},
+				failPendingPermissionPromptOnExit: (int tid) {},
+				failPendingAskRouteOnExit: (int tid) {},
+				drainIdleCallbacksOnExit: (int tid) {},
+				cancelExitBackgroundWork: (int tid) {},
+				resetHistoryWatermarkAfterExit: (int tid) {},
+				parentTaskForChild: (int childTid) => 0,
+				deliverWaitingParentResultsIfReady: (int tid) => resolve(),
+				persistResultText: (int tid, string resultText) {},
+				transitionTask: (int tid, TaskStatus expectedFrom, TaskStatus to,
+					TaskNotificationChange notification) {
+					assert(tasks[tid].status == expectedFrom);
+					tasks[tid].status = to;
+				},
+				transitionTaskFrom: (int tid, TaskStatus[] expectedFrom, TaskStatus to,
+					TaskNotificationChange notification) {
+					tasks[tid].status = to;
+				},
+				emitTaskReload: (int tid) {},
+				findAliveAncestor: (int tid) => -1,
+				shuttingDown: () => false,
+				taskTypeCatalog: catalog,
+			));
+			tasks[1].processQueue = new StateQueue!ProcessState(
+				(ProcessState state) => resolve(state), ProcessState.Dead);
+
+			runner.spawnTaskSession(1);
+			auto configPath = buildPath(profileRoot, "mcp-configs", "cydo-1.json");
+			assert(tasks[1].launch.nativeHistoryProfile.root == profileRoot);
+			assert(agent.lastMcpConfigPath == configPath);
+			assert(exists(configPath));
+			assert(tasks[1].launch.sandbox.tempFiles.canFind(configPath));
+
+			runner.closeTaskStdin(1);
+			socketManager.loop();
+
+			assert(runner.sessionForTask(1) is null);
+			assert(!exists(configPath));
+			assert(tasks[1].launch.sandbox.tempFiles.length == 0);
+		});
+}
+
+unittest
+{
+	assertRunnerMcpConfigCleanup("cydo-task-runner-claude-mcp-cleanup", "claude",
+		"CYDO_CLAUDE_BIN", new ClaudeCodeAgent());
+}
+
+unittest
+{
+	assertRunnerMcpConfigCleanup("cydo-task-runner-copilot-mcp-cleanup", "copilot",
+		"CYDO_COPILOT_BIN", new CopilotAgent());
 }
 
 unittest
@@ -1415,9 +1547,19 @@ unittest
 			auto writable = runner.prepareTaskSessionLaunch(1,
 				new LinkedWorktreeSandboxTestAgent(), writableDef);
 			auto writablePaths = writable.processLaunch.sandbox.paths;
+			auto profileRoot = buildPath(fixture.root, "claude-profile");
+			auto configuredHome = buildPath(fixture.root, "home");
 			auto taskDir = buildPath(fixture.root, "tasks", "task");
 			auto taskRoot = dirName(taskDir);
 			auto memory = buildPath(fixture.linkedCheckout, ".cydo", "memory");
+			assert(writable.processLaunch.nativeHistoryProfile.driver == AgentDriver.claude);
+			assert(writable.processLaunch.nativeHistoryProfile.root == profileRoot);
+			assert(writable.processLaunch.preProfileSandbox.paths.exact(profileRoot).isNull);
+			assert(writablePaths.exact(profileRoot).get.effectiveMode == PathMode.rw);
+			assert(writablePaths.exact(buildPath(configuredHome, ".claude.json"))
+				.get.effectiveMode == PathMode.rw);
+			assert(writablePaths.exact(buildPath(configuredHome, ".local", "share", "claude"))
+				.get.effectiveMode == PathMode.ro);
 			assert(writablePaths.exact(fixture.linkedCheckout).get.effectiveMode == PathMode.rw);
 			assert(writablePaths.exact(fixture.linkedGitDir).get.effectiveMode == PathMode.rw);
 			assert(writablePaths.exact(fixture.commonGitDir).get.effectiveMode == PathMode.rw);

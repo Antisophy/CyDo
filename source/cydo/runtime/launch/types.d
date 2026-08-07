@@ -2,6 +2,7 @@ module cydo.runtime.launch.types;
 
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
+import cydo.runtime.config : AgentDriver;
 
 struct AgentSandboxConfig
 {
@@ -27,10 +28,35 @@ struct ResolvedSandbox
 	@property bool useBwrap() const { return isolate_filesystem || isolate_processes; }
 }
 
+struct NativeProfileSupportRequirement
+{
+	string homeRelativePath;
+	PathAccess access;
+	string purpose;
+}
+
+struct NativeHistoryRule
+{
+	AgentDriver driver;
+	string profileEnvName;
+	string homeRelativeDefault;
+	NativeProfileSupportRequirement[] homeSupportRequirements;
+}
+
+struct NativeHistoryProfile
+{
+	AgentDriver driver;
+	string root;
+}
+
 struct ProcessLaunch
 {
+	ResolvedSandbox preProfileSandbox;
 	ResolvedSandbox sandbox;
+	NativeHistoryRule nativeHistoryRule;
+	NativeHistoryProfile nativeHistoryProfile;
 	string workDir;
+	string requestedExecutable;
 	string[] cmdPrefix;
 	string executablePath;
 }
