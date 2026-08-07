@@ -1108,8 +1108,13 @@ export function reduceUserMessageConsumed(
         ackState: undefined,
         echoPending: undefined,
       };
-      if (m.isProvisional && event.native_uuid)
-        upgraded.expectedNativeUuid = event.native_uuid;
+      if (m.isProvisional) {
+        if (event.native_uuid) upgraded.expectedNativeUuid = event.native_uuid;
+        else {
+          upgraded.isProvisional = undefined;
+          upgraded.expectedNativeUuid = undefined;
+        }
+      }
       if (event.consumed_as === "steering") upgraded.isSteering = true;
       else if (event.consumed_as === "removed") upgraded.removed = true;
       return upgraded;

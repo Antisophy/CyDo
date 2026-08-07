@@ -598,6 +598,106 @@ describe("live user echo reconciliation", () => {
     expectCanonicalReplayUser(state);
   });
 
+  it("ends provisional identity after a steering confirmation without a replay", () => {
+    let state: TaskState = makeUnconfirmedState();
+
+    state = reduceMessage(state, {
+      type: "user_message/consumed",
+      uuid: "steering-user-uuid",
+      correlation_id: correlationId,
+      consumed_as: "steering",
+    });
+
+    expect(userMessages(state)[0]).toMatchObject({ isSteering: true });
+    expect(userMessages(state)[0]?.isProvisional).toBeUndefined();
+  });
+
+  it("does not replace a terminal removed message with a later identical replay", () => {
+    const firstNonce = "removed-first";
+    const secondNonce = "replayed-second";
+    const secondUuid = "native-second-uuid";
+    const secondSeq = 48;
+    const secondReplay = {
+      type: "item/started" as const,
+      item_type: "user_message",
+      item_id: "cc-user-msg",
+      content: [{ type: "text" as const, text: prompt }],
+      is_replay: true,
+      uuid: secondUuid,
+    };
+
+    let state: TaskState = {
+      ...makeState(),
+      messages: [
+        {
+          id: "opt-first",
+          type: "user",
+          content: [{ type: "text", text: prompt }],
+          ackState: 3,
+          pending: true,
+          nonce: firstNonce,
+          isProvisional: true,
+        },
+      ],
+      msgIdCounter: 1,
+    };
+
+    state = reduceMessage(state, {
+      type: "user_message/consumed",
+      uuid: "removed-first-uuid",
+      correlation_id: firstNonce,
+      consumed_as: "removed",
+    });
+    expect(userMessages(state)[0]).toMatchObject({
+      id: "opt-first",
+      removed: true,
+    });
+    expect(userMessages(state)[0]?.isProvisional).toBeUndefined();
+
+    state = {
+      ...state,
+      messages: [
+        ...state.messages,
+        {
+          id: "opt-second",
+          type: "user",
+          content: [{ type: "text", text: prompt }],
+          ackState: 3,
+          pending: true,
+          nonce: secondNonce,
+          isProvisional: true,
+        },
+      ],
+      msgIdCounter: 2,
+    };
+
+    state = reduceMessage(state, secondReplay, secondSeq);
+    state = reduceMessage(state, {
+      type: "user_message/consumed",
+      uuid: secondUuid,
+      native_uuid: secondUuid,
+      correlation_id: secondNonce,
+      consumed_as: "turn_start",
+    });
+
+    expect(userMessages(state)).toEqual([
+      expect.objectContaining({
+        id: "opt-first",
+        removed: true,
+      }),
+      expect.objectContaining({
+        uuid: secondUuid,
+        seq: secondSeq,
+        rawSource: secondReplay,
+      }),
+    ]);
+    expect(userMessages(state)[0]?.isProvisional).toBeUndefined();
+    expect(userMessages(state)[1]?.removed).toBeUndefined();
+    expect(userMessages(state).some((message) => message.isProvisional)).toBe(
+      false,
+    );
+  });
+
   it("keeps a confirmed echo non-pending when its agent acknowledgement arrives late", () => {
     const nonce = "steering-nonce";
     const placeholder = {
