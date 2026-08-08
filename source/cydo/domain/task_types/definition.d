@@ -362,9 +362,6 @@ string[] validateTaskTypes(TaskTypeDef[] types, UserEntryPointDef[] entryPoints,
 				errors ~= format("%s: steward should have serial: true", def.name);
 		}
 
-		// Validate enum-like fields
-		if (!["small", "medium", "large"].canFind(def.model_class))
-			errors ~= format("%s: invalid model_class '%s'", def.name, def.model_class);
 		// output_type is validated by D enum deserialization — unknown values cause parse errors
 
 		if (def.allow_native_subagents && def.creatable_tasks.length > 0)
@@ -1151,6 +1148,17 @@ unittest // 3b. Validator accepts configured custom agent names and rejects raw 
 	errors = validateTaskTypes([driver], [], &isConfiguredCustomTestAgent);
 	assert(errors.canFind("driver: agent 'claude' is not a configured agent"),
 		errors.to!string);
+}
+
+unittest // 26. Validator accepts an open-ended model_class label
+{
+	TaskTypeDef t;
+	t.name = "foo";
+	t.model_class = "best";
+	t.agent = "claude";
+
+	auto errors = validateTaskTypes([t], [], &isKnownTestAgent);
+	assert(errors.length == 0, errors.to!string);
 }
 
 unittest // 4. Validator errors on keep_context cluster with disagreeing hardcoded agents (with entry points)
