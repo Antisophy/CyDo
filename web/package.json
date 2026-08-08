@@ -28,6 +28,7 @@
     "@preact/preset-vite": "^2.10.3",
     "@types/dompurify": "^3.0.5",
     "eslint": "^10.1.0",
+    "jsdom": "^30.0.1",
     "prettier": "^3.8.1",
     "stylelint": "^17.11.0",
     "stylelint-value-no-unknown-custom-properties": "^6.1.1",

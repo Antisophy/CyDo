@@ -83,8 +83,18 @@ export function InputBox({
   const internalRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = inputRef ?? internalRef;
   const textRef = useRef(text);
-  textRef.current = text;
   const lastServerDraftRef = useRef<string>(serverDraft ?? "");
+
+  // The single writer for `text`. `textRef` must be updated by the writer, not
+  // during render: preact flushes a component's pending useEffects at the START
+  // of its next render (hooks `options._render`), i.e. before the render body
+  // would refresh a render-time mirror. An effect that reads `textRef` to
+  // decide whether the composer is occupied would therefore see the value from
+  // the *previous* render and clobber text the user typed in the meantime.
+  const applyText = (next: string) => {
+    textRef.current = next;
+    setText(next);
+  };
 
   const saveDraftDebounced = useMemo(
     () => debounce((t: string) => onSaveDraft?.(t), 500),
@@ -107,7 +117,7 @@ export function InputBox({
     // On sessionId change: use in-memory draft if available, else server draft
     const memDraft = drafts.get(sessionId);
     const initial = memDraft !== undefined ? memDraft : (serverDraft ?? "");
-    setText(initial);
+    applyText(initial);
     lastServerDraftRef.current = serverDraft ?? "";
     // Trigger a save if there's content — handles the case where the previous
     // session had onSaveDraft=undefined (e.g. virtual draft tid=0) and its
@@ -124,7 +134,7 @@ export function InputBox({
     if (serverDraft === undefined) return;
     const localText = textRef.current;
     if (localText === "" || localText === lastServerDraftRef.current) {
-      setText(serverDraft);
+      applyText(serverDraft);
       drafts.set(sessionId, serverDraft);
     }
     lastServerDraftRef.current = serverDraft;
@@ -186,7 +196,7 @@ export function InputBox({
     if (!inputDraft) return;
     const next = applyRecoveredInputDraft(inputDraft, textRef.current);
     if (next !== textRef.current) {
-      setText(next);
+      applyText(next);
       drafts.set(sessionId, next);
     }
     onInputDraftConsumed?.();
@@ -195,7 +205,7 @@ export function InputBox({
   const handleChange = (newText: string) => {
     const wasEmpty = textRef.current.trim() === "";
     const isEmpty = newText.trim() === "";
-    setText(newText);
+    applyText(newText);
     drafts.set(sessionId, newText);
     saveDraftDebounced(newText);
     if (wasEmpty && !isEmpty) onContentStart?.();
@@ -268,8 +278,7 @@ export function InputBox({
     // Clear text eagerly: onSend may trigger a re-render that unmounts this
     // InputBox (e.g. draft → active transition).  Without this, the cleanup
     // function saves stale text to `drafts` because setState hasn't flushed.
-    setText("");
-    textRef.current = "";
+    applyText("");
     setImages([]);
     drafts.set(sessionId, "");
     saveDraftDebounced.cancel();
