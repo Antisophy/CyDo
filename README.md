@@ -273,7 +273,7 @@ CyDo reads its configuration from `~/.config/cydo/config.yaml`:
 
 ```yaml
 # Which agent backend to use by default
-default_agent_type: claude
+default_agent: claude
 
 # Workspace definitions — CyDo discovers projects under these roots
 workspaces:
@@ -287,7 +287,25 @@ sandbox:
     ~/projects: rw     # Read-write workspace
   env:
     PATH: "..."        # Environment for sandboxed agents
+
+# Per-driver launch parameters (optional)
+agents:
+  claude:
+    model_aliases:
+      small: haiku                          # scalar form: just the model name
+      large:                                # mapping form: model and/or effort
+        model: opus
+        effort: high
+  codex:
+    model_aliases:
+      large:
+        effort: high    # accepted by claude and codex; codex maps this to model_reasoning_effort
+  copilot:
+    model_aliases:
+      large: claude-opus-4.6   # copilot has no reasoning-effort knob; `effort` here is rejected at config load
 ```
+
+`effort` values are passed to the underlying CLI verbatim, so the accepted values are whatever that CLI accepts.
 
 ## Project Status
 
