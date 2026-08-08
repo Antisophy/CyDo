@@ -151,4 +151,20 @@ describe("Connection client error reporting", () => {
     expect(replacement).toHaveBeenCalledOnce();
     expect(ordinary).not.toHaveBeenCalled();
   });
+
+  it("sends task promotion with its target workspace", () => {
+    const conn = new Connection();
+    conn.connect();
+
+    const ws = MockWebSocket.instances[0]!;
+    conn.promoteTask(7, "destination");
+
+    expect(ws.send).toHaveBeenCalledWith(
+      JSON.stringify({
+        type: "promote_task",
+        tid: 7,
+        workspace: "destination",
+      }),
+    );
+  });
 });

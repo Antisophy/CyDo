@@ -587,7 +587,7 @@ export function WelcomePage({
                           projTasks.map((t) => (
                             <a
                               key={t.uuid}
-                              href={getTaskHref(String(t.tid))}
+                              href={`${getProjectHref(ws.name, proj.name)}/task/${t.tid}`}
                               class={`sidebar-item${
                                 t.tid !== null && attention.has(t.tid)
                                   ? " attention"

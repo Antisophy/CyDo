@@ -6,6 +6,7 @@ import std.format : format;
 import std.logger : infof, tracef;
 import std.path : dirName;
 import std.string : representation;
+import std.typecons : Nullable;
 import std.uuid : randomUUID;
 
 import ae.net.http.websocket : WebSocketAdapter;
@@ -22,8 +23,10 @@ import cydo.protocol : ContentBlock, ItemStartedEvent, TaskEventEnvelope,
 import cydo.runtime.config : AgentDriver;
 import cydo.domain.storage.persistence : LoadedHistory;
 import cydo.domain.tasks.model : QueueOperationProbe, TaskData, TaskHistoryEndMessage,
-	TaskHistoryStartMessage, buildSyntheticUserEvent, extractEventFromEnvelope,
+	TaskHistoryStartMessage, Watermark, buildSyntheticUserEvent, extractEventFromEnvelope,
 	extractTsFromEnvelope, watermarkFromPath;
+import cydo.workflow.history.native_history : HistoryAccess,
+	TaskHistoryResolution, TaskHistoryResolutionKind;
 import cydo.workflow.history.jsonl_store : loadTaskHistory;
 
 package(cydo):
@@ -38,8 +41,9 @@ struct HistoryBroadcastPlan
 struct HistoryEventPipelineHost
 {
 	TaskData* delegate(int tid) getTask;
-	Agent delegate(int tid) tryAgentForTask;
-	string delegate(int tid) effectiveCwd;
+	TaskHistoryResolution delegate(int tid) resolveTaskHistory;
+	void delegate(int tid, const ref TaskHistoryResolution resolution)
+		reportUnavailableHistory;
 	string delegate(string translated, string agentName) injectAgentNameIntoSessionInit;
 	string delegate(string translated, int tid) normalizeKnownSystemMessageMeta;
 	string[] delegate() configuredAgentNames;
@@ -52,7 +56,6 @@ struct HistoryEventPipelineHost
 		bool isContextBootstrap) noteLiveBoundaryCandidate;
 	void delegate(WebSocketAdapter ws, int tid) sendReplaySupplementalState;
 	void delegate(int tid) onHistorySubscribed;
-	void delegate(int tid, string line) ensureAgentSessionIdFromEvent;
 	bool delegate(int tid, string translated) updateClaudeUsageFromEvent;
 	HistoryBroadcastPlan delegate(int tid, TranslatedEvent ev) planBroadcast;
 }
@@ -66,23 +69,56 @@ class HistoryEventPipeline
 		host_ = host;
 	}
 
-	void ensureHistoryLoaded(int tid)
+	/// Returns the resolution used to load history, or null when history was
+	/// already loaded and no resolution was performed.
+	Nullable!TaskHistoryResolution ensureHistoryLoaded(int tid)
+	{
+		return ensureHistoryLoadedImpl(tid, true);
+	}
+
+	/// Exit-path variant of `ensureHistoryLoaded`. On exit, the live binding
+	/// is about to be torn down and re-resolved against config alone by the
+	/// post-exit reset (App.resetHistoryWatermark); that later resolution is
+	/// the sole owner of the unavailable-history diagnostic for the exit
+	/// sequence, so this variant loads history the same way but never reports.
+	Nullable!TaskHistoryResolution ensureHistoryLoadedForExit(int tid)
+	{
+		return ensureHistoryLoadedImpl(tid, false);
+	}
+
+	private Nullable!TaskHistoryResolution ensureHistoryLoadedImpl(int tid,
+		bool reportUnavailable)
 	{
 		auto td = host_.getTask(tid);
 		if (td is null || td.history.isLoaded)
-			return;
+			return Nullable!TaskHistoryResolution.init;
 
-		bool orphan = false;
+		auto resolution = host_.resolveTaskHistory(tid);
+		bool orphan = resolution.kind == TaskHistoryResolutionKind.orphanAgent;
 		string jsonlPath;
 		Agent ta;
-
-		if (td.agentSessionId.length > 0)
+		if (resolution.kind == TaskHistoryResolutionKind.access)
 		{
-			ta = host_.tryAgentForTask(tid);
-			if (!ta)
-				orphan = true;
-			else
-				jsonlPath = ta.historyPath(td.agentSessionId, host_.effectiveCwd(tid));
+			auto access = resolution.requireAccess();
+			ta = access.agent;
+			jsonlPath = access.path;
+		}
+		else if (resolution.kind == TaskHistoryResolutionKind.unavailable)
+		{
+			// Loading is a pipeline-owned invariant that must hold regardless
+			// of who reports: callers such as finalReconcileJsonlIfPresent
+			// require td.history.isLoaded once this returns. Reporting (the
+			// diagnostic append + reload broadcast) is a separate, optional
+			// concern gated by reportUnavailable. On the reporting path
+			// reportUnavailableHistory resets and loads again; the repeat is
+			// idempotent (empty store both times) and the extra generation
+			// bump is inert, so it is left unconditional rather than
+			// coupling this branch to the reporter's internals.
+			td.history.reset(Watermark.unreadable());
+			td.history.load((ulong) => LoadedHistory.init);
+			if (reportUnavailable)
+				host_.reportUnavailableHistory(tid, resolution);
+			return Nullable!TaskHistoryResolution(resolution);
 		}
 
 		bool hasQueueOps = false;
@@ -298,27 +334,24 @@ class HistoryEventPipeline
 					? HistoryBoundaryKind.user : HistoryBoundaryKind.agent_turn,
 				boundaries[0].checkpointUuid), false);
 		}
-		if (!orphan)
+		if (ta !is null)
 			host_.broadcastHistoryOperations(tid);
+		return Nullable!TaskHistoryResolution(resolution);
 	}
 
-	bool resolveFreshPersistedBoundary(int tid, string requestedAnchor,
-		out HistoryBoundary boundary)
+	bool resolveFreshPersistedBoundary(int tid, const ref HistoryAccess access,
+		string requestedAnchor, out HistoryBoundary boundary)
 	{
 		if (requestedAnchor.length == 0)
 			return false;
 		auto source = host_.getTask(tid);
-		if (source is null || source.agentSessionId.length == 0)
+		if (source is null)
 			return false;
-		auto agent = host_.tryAgentForTask(tid);
-		if (!agent)
-			return false;
-		auto path = agent.historyPath(source.agentSessionId, host_.effectiveCwd(tid));
-		if (path.length == 0 || !exists(path))
-			return false;
+		auto agent = access.agent;
+		auto path = access.path;
 
 		auto snapshot = TaskData(tid, source.workspace, source.projectPath);
-		snapshot.agentSessionId = source.agentSessionId;
+		snapshot.agentSessionId = access.sessionId;
 		snapshot.agentName = source.agentName;
 		snapshot.worktreeTid = source.worktreeTid;
 		snapshot.history.reset(watermarkFromPath(path));
@@ -392,7 +425,7 @@ class HistoryEventPipeline
 			else
 				ws.send(msg);
 		}
-		if (td.agentSessionId.length > 0 && host_.tryAgentForTask(tid))
+		if (host_.resolveTaskHistory(tid).kind == TaskHistoryResolutionKind.access)
 			host_.sendHistoryOperations(ws, tid);
 
 		ws.send(Data(toJson(TaskHistoryEndMessage("task_history_end", tid)).representation));
@@ -500,7 +533,6 @@ class HistoryEventPipeline
 		if (ev.ts == AbsTime.init)
 			ev.ts = AbsTime(Clock.currStdTime);
 
-		host_.ensureAgentSessionIdFromEvent(tid, ev.translated);
 		ev.translated = host_.normalizeKnownSystemMessageMeta(ev.translated, tid);
 		host_.updateClaudeUsageFromEvent(tid, ev.translated);
 
@@ -1010,6 +1042,7 @@ unittest
 	import std.process : environment;
 	import cydo.agent.drivers.claude : ClaudeCodeAgent;
 	import cydo.domain.tasks.model : Watermark;
+	import cydo.runtime.launch.types : NativeHistoryProfile;
 
 	auto dir = buildPath("/tmp", "cydo-history-tool-result-after-dequeue");
 	if (exists(dir))
@@ -1038,11 +1071,12 @@ unittest
 	td.worktreeTid = 0;
 
 	Agent agent = new ClaudeCodeAgent();
+	auto profile = NativeHistoryProfile(agent.driver, buildPath(dir, "claude"));
 
 	// enqueue, dequeue, then a type:"user" line carrying a tool_result. The
 	// toolUseResult sidecar makes the translated item/result include a
 	// tool_result field — exactly the field the old strict parse choked on.
-	auto jsonlPath = agent.historyPath(td.agentSessionId, projectPath);
+	auto jsonlPath = agent.historyPath(td.agentSessionId, projectPath, profile);
 	mkdirRecurse(dirName(jsonlPath));
 	auto jsonl = [
 		`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-11T06:00:00Z","sessionId":"S","content":"are you under control?"}`,
@@ -1053,13 +1087,12 @@ unittest
 
 	td.history.reset(Watermark.atBytes(getSize(jsonlPath)));
 
-	// Minimal host: ensureHistoryLoaded on a queue-op history only touches
-	// getTask/tryAgentForTask/effectiveCwd/injectAgentNameIntoSessionInit. The
+	// Minimal host: ensureHistoryLoaded receives its explicit history access.
 	// remaining delegates are stubbed no-ops so a stray call can't null-deref.
 	HistoryEventPipelineHost host;
 	host.getTask = (int t) => t == tid ? &td : null;
-	host.tryAgentForTask = (int t) => agent;
-	host.effectiveCwd = (int t) => projectPath;
+	host.resolveTaskHistory = (int t) => TaskHistoryResolution.access(
+		HistoryAccess(agent, profile, td.agentSessionId, projectPath, jsonlPath));
 	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
 	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
 	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";
@@ -1069,7 +1102,6 @@ unittest
 	host.broadcastHistoryOperations = (int t) {};
 	host.sendReplaySupplementalState = (WebSocketAdapter ws, int t) {};
 	host.onHistorySubscribed = (int t) {};
-	host.ensureAgentSessionIdFromEvent = (int t, string line) {};
 	host.updateClaudeUsageFromEvent = (int t, string translated) => false;
 	host.planBroadcast = (int t, TranslatedEvent ev) => HistoryBroadcastPlan.init;
 
@@ -1101,6 +1133,7 @@ unittest
 	import std.process : environment;
 	import cydo.agent.drivers.claude : ClaudeCodeAgent;
 	import cydo.domain.tasks.model : Watermark;
+	import cydo.runtime.launch.types : NativeHistoryProfile;
 
 	auto dir = buildPath("/tmp", "cydo-history-steering-source-line");
 	if (exists(dir))
@@ -1128,7 +1161,8 @@ unittest
 	td.worktreeTid = 0;
 
 	Agent agent = new ClaudeCodeAgent();
-	auto jsonlPath = agent.historyPath(td.agentSessionId, projectPath);
+	auto profile = NativeHistoryProfile(agent.driver, buildPath(dir, "claude"));
+	auto jsonlPath = agent.historyPath(td.agentSessionId, projectPath, profile);
 	mkdirRecurse(dirName(jsonlPath));
 
 	auto enqueueLine = `{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-11T06:00:00Z","sessionId":"S","content":"queued steering"}`;
@@ -1145,8 +1179,8 @@ unittest
 
 	HistoryEventPipelineHost host;
 	host.getTask = (int t) => t == tid ? &td : null;
-	host.tryAgentForTask = (int t) => agent;
-	host.effectiveCwd = (int t) => projectPath;
+	host.resolveTaskHistory = (int t) => TaskHistoryResolution.access(
+		HistoryAccess(agent, profile, td.agentSessionId, projectPath, jsonlPath));
 	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
 	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
 	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";
@@ -1156,7 +1190,6 @@ unittest
 	host.broadcastHistoryOperations = (int t) {};
 	host.sendReplaySupplementalState = (WebSocketAdapter ws, int t) {};
 	host.onHistorySubscribed = (int t) {};
-	host.ensureAgentSessionIdFromEvent = (int t, string line) {};
 	host.updateClaudeUsageFromEvent = (int t, string translated) => false;
 	host.planBroadcast = (int t, TranslatedEvent ev) => HistoryBroadcastPlan.init;
 
@@ -1243,8 +1276,7 @@ unittest
 	}
 	HistoryEventPipelineHost host;
 	host.getTask = (int t) => t == tid ? &td : null;
-	host.tryAgentForTask = (int t) => null;
-	host.effectiveCwd = (int t) => "";
+	host.resolveTaskHistory = (int t) => TaskHistoryResolution.noSession();
 	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
 	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
 	host.makeTaskDiagnosticEventJson = (string actualSubject, string actualBody) {
@@ -1262,7 +1294,6 @@ unittest
 	host.broadcastHistoryOperations = (int t) {};
 	host.sendReplaySupplementalState = (WebSocketAdapter ws, int t) {};
 	host.onHistorySubscribed = (int t) {};
-	host.ensureAgentSessionIdFromEvent = (int t, string line) {};
 	host.updateClaudeUsageFromEvent = (int t, string translated) => false;
 	host.planBroadcast = (int t, TranslatedEvent ev) => HistoryBroadcastPlan.init;
 
@@ -1386,6 +1417,7 @@ unittest
 	import std.process : environment;
 	import cydo.agent.drivers.claude : ClaudeCodeAgent;
 	import cydo.domain.tasks.model : Watermark;
+	import cydo.runtime.launch.types : NativeHistoryProfile;
 
 	auto dir = buildPath("/tmp", "cydo-history-enqueue-primary");
 	if (exists(dir))
@@ -1413,7 +1445,8 @@ unittest
 	td.worktreeTid = 0;
 
 	Agent agent = new ClaudeCodeAgent();
-	auto jsonlPath = agent.historyPath(td.agentSessionId, projectPath);
+	auto profile = NativeHistoryProfile(agent.driver, buildPath(dir, "claude"));
+	auto jsonlPath = agent.historyPath(td.agentSessionId, projectPath, profile);
 	mkdirRecurse(dirName(jsonlPath));
 
 	auto jsonl = [
@@ -1438,8 +1471,8 @@ unittest
 
 	HistoryEventPipelineHost host;
 	host.getTask = (int t) => t == tid ? &td : null;
-	host.tryAgentForTask = (int t) => agent;
-	host.effectiveCwd = (int t) => projectPath;
+	host.resolveTaskHistory = (int t) => TaskHistoryResolution.access(
+		HistoryAccess(agent, profile, td.agentSessionId, projectPath, jsonlPath));
 	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
 	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
 	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";
@@ -1449,7 +1482,6 @@ unittest
 	host.broadcastHistoryOperations = (int t) {};
 	host.sendReplaySupplementalState = (WebSocketAdapter ws, int t) {};
 	host.onHistorySubscribed = (int t) {};
-	host.ensureAgentSessionIdFromEvent = (int t, string line) {};
 	host.updateClaudeUsageFromEvent = (int t, string translated) => false;
 	host.planBroadcast = (int t, TranslatedEvent ev) => HistoryBroadcastPlan.init;
 

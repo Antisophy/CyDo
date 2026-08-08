@@ -3,6 +3,7 @@ module cydo.agent.drivers.claude;
 import core.time : Duration, seconds;
 
 import std.conv : to;
+import std.exception : enforce;
 import std.format : format;
 import std.path : dirName, expandTilde;
 import std.logger : errorf, tracef, warningf;
@@ -81,9 +82,6 @@ class ClaudeCodeAgent : Agent
 
 	private ModelSpec[string] modelAliasOverrides;
 	private string lastMcpConfigPath_;
-	// Background thread: sessionId → file path (populated by enumerateAllSessions)
-	private string[string] sessionIdToPath_;
-
 	@property string lastMcpConfigPath() { return lastMcpConfigPath_; }
 
 	AgentSession createSession(int tid, string resumeSessionId, ProcessLaunch launch,
@@ -98,33 +96,6 @@ class ClaudeCodeAgent : Agent
 			: executableName(launch.sandbox.env);
 		return new ClaudeCodeSession(claudeBin, resumeSessionId, launch.cmdPrefix,
 			lastMcpConfigPath_, config);
-	}
-
-	string parseSessionId(string line)
-	{
-		import ae.utils.json : jsonParse, JSONPartial;
-		import std.algorithm : canFind;
-
-		// ClaudeCodeSession emits translated session/init events.
-		if (!line.canFind(`"session/init"`) && !line.canFind(`"subtype":"init"`))
-			return null;
-
-		@JSONPartial
-		static struct InitProbe
-		{
-			string type;
-			@JSONOptional string session_id;
-		}
-
-		try
-		{
-			auto probe = jsonParse!InitProbe(line);
-			if (probe.type == "session/init" && probe.session_id.length > 0)
-				return probe.session_id;
-		}
-		catch (Exception e)
-		{ tracef("extractSessionId: parse error: %s", e.msg); }
-		return null;
 	}
 
 	string extractResultText(string line)
@@ -217,19 +188,17 @@ class ClaudeCodeAgent : Agent
 		{ tracef("extractUserContent: all parse attempts failed: %s", e.msg); return ""; }
 	}
 
-	DiscoveredSession[] enumerateAllSessions()
+	DiscoveredSession[] enumerateAllSessions(const ref NativeHistoryProfile profile)
 	{
 		import std.file : DirEntry, dirEntries, exists, isDir, SpanMode;
 		import std.path : baseName, buildPath;
-		import std.process : environment;
 
-		auto home = environment.get("HOME", "/tmp");
-		auto claudeDir = environment.get("CLAUDE_CONFIG_DIR", buildPath(home, ".claude"));
-		auto projectsDir = buildPath(claudeDir, "projects");
+		enforce(profile.driver == driver,
+			"Claude history profile driver does not match Claude");
+		auto projectsDir = buildPath(profile.root, "projects");
 		if (!exists(projectsDir) || !isDir(projectsDir))
 			return [];
 
-		sessionIdToPath_ = null;
 		DiscoveredSession[] result;
 		foreach (DirEntry projEntry; dirEntries(projectsDir, SpanMode.shallow))
 		{
@@ -241,11 +210,11 @@ class ClaudeCodeAgent : Agent
 				foreach (DirEntry fileEntry; dirEntries(projEntry.name, "*.jsonl", SpanMode.shallow))
 				{
 					auto sessionId = baseName(fileEntry.name, ".jsonl");
-					sessionIdToPath_[sessionId] = fileEntry.name;
 					DiscoveredSession ds;
 					ds.sessionId = sessionId;
 					ds.mtime = fileEntry.timeLastModified.stdTime;
 					ds.projectPath = "";
+					ds.exactHistoryPath = fileEntry.name;
 					result ~= ds;
 				}
 			}
@@ -255,18 +224,17 @@ class ClaudeCodeAgent : Agent
 		return result;
 	}
 
-	SessionMeta readSessionMeta(string sessionId)
+	SessionMeta readSessionMeta(const ref DiscoveredSession session)
 	{
 		import std.stdio : File;
-		auto pathp = sessionId in sessionIdToPath_;
-		if (pathp is null)
+		if (session.exactHistoryPath.length == 0)
 			return SessionMeta.init;
 
 		SessionMeta meta;
 		try
 		{
 			int lineCount = 0;
-			auto f = File(*pathp, "r");
+			auto f = File(session.exactHistoryPath, "r");
 			foreach (line; f.byLine)
 			{
 				if (lineCount++ > 50)
@@ -306,19 +274,19 @@ class ClaudeCodeAgent : Agent
 			}
 		}
 		catch (Exception e)
-		{ tracef("readSessionMeta(%s): error: %s", sessionId, e.msg); }
+		{ tracef("readSessionMeta(%s): error: %s", session.sessionId, e.msg); }
 		meta.hasMessages = meta.title.length > 0;
 		return meta;
 	}
 
-	string matchProject(string sessionId, const string[] knownProjectPaths)
+	string matchProject(const ref DiscoveredSession session,
+		const string[] knownProjectPaths)
 	{
 		import std.path : baseName, dirName;
 
-		auto pathp = sessionId in sessionIdToPath_;
-		if (pathp is null)
+		if (session.exactHistoryPath.length == 0)
 			return "";
-		auto dirName_ = baseName(dirName(*pathp));
+		auto dirName_ = baseName(dirName(session.exactHistoryPath));
 		foreach (known; knownProjectPaths)
 		{
 			if (mangleProjectPath(known) == dirName_)
@@ -387,17 +355,24 @@ class ClaudeCodeAgent : Agent
 		assert(agent.resolveModelSpec("").model == "");
 	}
 
-	string historyPath(string sessionId, string projectPath)
+	string historyPath(string sessionId, string effectiveCwd,
+		const ref NativeHistoryProfile profile)
 	{
-		import std.file : getcwd;
 		import std.path : buildPath;
-		import std.process : environment;
+		enforce(profile.driver == driver,
+			"Claude history profile driver does not match Claude");
+		enforce(sessionId.length > 0,
+			"Claude history path requires a session ID");
+		enforce(effectiveCwd.length > 0,
+			"Claude history path requires an effective CWD");
+		return buildPath(profile.root, "projects", mangleProjectPath(effectiveCwd),
+			sessionId ~ ".jsonl");
+	}
 
-		auto home = environment.get("HOME", "/tmp");
-		auto claudeDir = environment.get("CLAUDE_CONFIG_DIR", buildPath(home, ".claude"));
-		auto cwd = projectPath.length > 0 ? projectPath : getcwd();
-
-		return buildPath(claudeDir, "projects", mangleProjectPath(cwd), sessionId ~ ".jsonl");
+	string createHistoryForkDestination(string sessionId, string effectiveCwd,
+		const ref NativeHistoryProfile profile)
+	{
+		return historyPath(sessionId, effectiveCwd, profile);
 	}
 
 	TranslatedEvent[] translateHistoryLine(string line, int lineNum)
@@ -536,9 +511,14 @@ class ClaudeCodeAgent : Agent
 	@property bool supportsDeveloperPrompt() { return true; }
 
 	RewindResult rewindFiles(string sessionId, string afterUuid, string cwd,
-		ProcessLaunch launch = ProcessLaunch.init)
+		ProcessLaunch launch)
 	{
-		import std.process : Config, environment, execute;
+		import std.process : Config, execute;
+
+		enforce(launch.nativeHistoryProfile.driver == driver,
+			"Claude rewind launch does not carry a Claude history profile");
+		enforce(launch.nativeHistoryProfile.root.length > 0,
+			"Claude rewind launch does not carry a history profile root");
 
 		auto claudeBin = launch.executablePath.length > 0
 			? launch.executablePath
@@ -568,18 +548,8 @@ class ClaudeCodeAgent : Agent
 		else
 		{
 			args = shArgs;
-			procEnv = [
-				"CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING": "1",
-				"PATH": environment.get("PATH", ""),
-				"HOME": environment.get("HOME", ""),
-			];
-			foreach (varName; ["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY",
-					"ANTHROPIC_BASE_URL", "NODE_TLS_REJECT_UNAUTHORIZED", "HTTPS_PROXY"])
-			{
-				auto val = environment.get(varName, "");
-				if (val.length > 0)
-					procEnv[varName] = val;
-			}
+			procEnv = launch.sandbox.env.dup;
+			procEnv["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "1";
 		}
 
 		auto result = execute(args, procEnv, Config.none, size_t.max,
@@ -853,6 +823,8 @@ unittest
 class ClaudeCodeSession : AgentSession
 {
 	private AgentProcess process;
+	private string nativeSessionId_;
+	private void delegate(string sessionId) nativeSessionStartedHandler_;
 	private void delegate(TranslatedEvent) outputHandler;
 	private void delegate(string line) stderrHandler;
 	private void delegate(int status) exitHandler;
@@ -1041,6 +1013,28 @@ class ClaudeCodeSession : AgentSession
 		return true;
 	}
 
+	@property void onNativeSessionStarted(void delegate(string sessionId) callback)
+	{
+		nativeSessionStartedHandler_ = callback;
+		if (nativeSessionId_ !is null && nativeSessionStartedHandler_)
+			nativeSessionStartedHandler_(nativeSessionId_);
+	}
+
+	private void notifyNativeSessionStarted(string sessionId)
+	{
+		enforce(sessionId.length > 0,
+			"Claude session initialization did not provide a native session ID");
+		if (nativeSessionId_ !is null)
+		{
+			enforce(nativeSessionId_ == sessionId,
+				"Claude session reported conflicting native session IDs");
+			return;
+		}
+		nativeSessionId_ = sessionId;
+		if (nativeSessionStartedHandler_)
+			nativeSessionStartedHandler_(sessionId);
+	}
+
 	@property void onOutput(void delegate(TranslatedEvent) dg)
 	{
 		outputHandler = dg;
@@ -1094,6 +1088,20 @@ class ClaudeCodeSession : AgentSession
 			import ae.utils.json : toJson;
 			emitEvent(TranslatedEvent(makeUnrecognizedEvent("non-JSON output"), toJson(rawLine)));
 			return;
+		}
+
+		if (probe.type == "system" && probe.subtype == "init")
+		{
+			@JSONPartial static struct InitProbe { @JSONOptional string session_id; }
+			string sessionId;
+			try
+				sessionId = jsonParse!InitProbe(rawLine).session_id;
+			catch (Exception e)
+			{
+				tracef("Claude native session init parse error: %s", e.msg);
+				return;
+			}
+			notifyNativeSessionStarted(sessionId);
 		}
 
 		switch (probe.type)
@@ -1585,6 +1593,31 @@ class ClaudeCodeSession : AgentSession
 			}
 		}
 	}
+}
+
+unittest
+{
+	auto session = new ClaudeCodeSession("true");
+	scope(exit) session.stop();
+	string[] order;
+	session.onNativeSessionStarted = (string sessionId) {
+		order ~= "native:" ~ sessionId;
+	};
+	session.onOutput = (TranslatedEvent event) { order ~= "output"; };
+	session.translateLiveLine(
+		`{"type":"system","subtype":"init","session_id":"claude-native-id"}`);
+	assert(order.length >= 2
+		&& order[0] == "native:claude-native-id"
+		&& order[1] == "output",
+		"Claude must deliver its native ID before translated session initialization");
+
+	auto lateSession = new ClaudeCodeSession("true");
+	scope(exit) lateSession.stop();
+	lateSession.translateLiveLine(
+		`{"type":"system","subtype":"init","session_id":"claude-late-id"}`);
+	string delivered;
+	lateSession.onNativeSessionStarted = (string sessionId) { delivered = sessionId; };
+	assert(delivered == "claude-late-id");
 }
 
 unittest

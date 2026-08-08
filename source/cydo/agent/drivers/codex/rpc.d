@@ -70,14 +70,6 @@ struct ThreadForkParams
 	@JSONOptional JSONFragment config;
 }
 
-struct ThreadForkOutcome
-{
-	bool ok;
-	string threadId;
-	string rawResultJson;
-	string error;
-}
-
 @RPCFlatten @JSONPartial
 struct ThreadRollbackParams
 {

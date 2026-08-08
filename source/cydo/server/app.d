@@ -5,6 +5,7 @@ import core.time : seconds;
 
 import std.algorithm : sort;
 import std.array : appender;
+import std.exception : enforce;
 import std.file : exists, isFile, thisExePath;
 import std.format : format;
 import std.logger : tracef, infof, warningf, errorf, fatalf;
@@ -39,14 +40,20 @@ import cydo.workflow.workspace.worktree_allocator : WorktreeAllocator, WorktreeA
 import cydo.web.client_hub : ClientHub;
 import cydo.runtime.config.watcher : ConfigWatcher, ConfigWatcherHost;
 import cydo.workflow.discovery.service : DiscoveryService, DiscoveryServiceHost,
-	DiscoveryTaskSnapshot, ImportableTaskSpec;
+	DiscoveryTaskSnapshot, ImportableReconciliationCommit, ImportableScanRecord,
+	ImportableTaskSpec;
 import cydo.web.snapshots : buildAgentsList, buildNoticesList,
 	buildServerStatus, buildTaskEntry, buildTasksList, buildTaskTypesList,
 	buildTaskTypesListForProject, buildWorkspacesList;
 import cydo.workflow.history.pipeline : HistoryBroadcastPlan, HistoryEventPipeline,
 	HistoryEventPipelineHost;
+import cydo.workflow.history.native_history : ConfiguredNativeHistoryContext,
+	HistoryAccess, LiveHistoryWatchResolution, ResolvedNativeHistoryContext,
+	TaskHistoryResolution, TaskHistoryResolutionKind, UnavailableHistory,
+	UnavailableHistoryKind, resolveNativeHistoryContext;
 import cydo.workflow.history.abbrev : extractMessageText;
-import cydo.workflow.history.operations : selectHistoryOperations;
+import cydo.workflow.history.operations : CodexForkSourceState,
+	selectHistoryOperations;
 import cydo.runtime.logging : installRobustLogger;
 import cydo.workflow.system_message_normalizer : SystemMessageNormalizer,
 	SystemMessageNormalizerHost;
@@ -70,9 +77,10 @@ import cydo.protocol : AgentAckEnvelope, BatchResultEnvelope, ContentBlock,
 import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.agent.drivers.codex : CodexSession;
 import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
-import cydo.domain.storage.persistence : Persistence, openDatabase;
+import cydo.domain.storage.persistence : LoadedHistory, Persistence, openDatabase;
 import cydo.server.config_resolution : loadRuntimeConfig, reloadRuntimeConfig;
 import cydo.runtime.launch.sandbox : cleanup, resolveExecutablePath, runtimeDir, sharedTmpBaseDir;
+import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule;
 import cydo.domain.task_types.definition : TaskTypeDef, OutputType, WorktreeMode, byName, loadTaskTypes,
 	loadTaskTypeSystemPrompt, renderPrompt, substituteVars,
 	loadProjectMemory, resolveAgent;
@@ -84,7 +92,8 @@ import cydo.domain.tasks.model;
 import cydo.domain.tasks.lifecycle : TaskLifecycle, TaskNotificationChange,
 	isLegalTaskStatusTransition;
 import cydo.foundation.text.title : truncateTitle;
-import cydo.workflow.history.jsonl_store : findNextUserUuid;
+import cydo.workflow.history.jsonl_store : findNextUserUuid,
+	HistoryForkDestination;
 import cydo.workflow.workspace.worktree;
 
 private enum maxToolDescriptionNoticeViolations = 3;
@@ -142,6 +151,8 @@ class App
 	private CydoConfig config;
 	private string taskDirTemplate;
 	private DiscoveryService discoveryService;
+	private ImportableScanRecord[int] importableScanRecords_;
+	private ulong importableScanGeneration_;
 	private ConfigWatcher configWatcher;
 	private Agent agent; // default agent
 	private Agent[string] agentsByName;
@@ -261,20 +272,29 @@ class App
 		));
 		discoveryService = new DiscoveryService(DiscoveryServiceHost(
 			snapshotTasks: &snapshotDiscoveryTasks,
+			snapshotNativeHistoryContexts: &snapshotNativeHistoryContexts,
+			tryConfiguredAgent: &tryCreateConfiguredAppAgent,
+			resolveCurrentNativeHistoryContext: (Agent configured,
+				const ref ConfiguredNativeHistoryContext context) {
+				return resolveNativeHistoryContext(config, configured, context);
+			},
 			loadSessionMetaCache: () => persistence.loadSessionMetaCache(),
 			withMutationTransaction: &withDiscoveryMutationTransaction,
-			importableHistoryPath: &importableHistoryPath,
-			deleteImportableTask: &deleteImportableTask,
-			createImportableTask: &createImportableTask,
+			reconcileImportableTasks: &reconcileImportableTasks,
 			broadcastWorkspaces: &broadcastDiscoveryWorkspaces,
 			broadcastScanStatus: &broadcastDiscoveryScanStatus,
-			deleteSessionMetaCacheEntry: (string driverName, string sessionId) {
-				persistence.deleteSessionMetaCacheEntry(driverName, sessionId);
+			deleteSessionMetaCacheEntry: (string driverName, string profileRoot,
+				string sessionId) {
+				persistence.deleteSessionMetaCacheEntry(driverName, profileRoot, sessionId);
 			},
-			upsertSessionMetaCache: (string driverName, string sessionId, long mtime,
-				string projectPath, string title, bool hasMessages) {
-				persistence.upsertSessionMetaCache(driverName, sessionId, mtime,
-					projectPath, title, hasMessages);
+			deleteSessionMetaCacheGroup: (string driverName, string profileRoot) {
+				persistence.deleteSessionMetaCacheGroup(driverName, profileRoot);
+			},
+			upsertSessionMetaCache: (string driverName, string profileRoot,
+				string sessionId, long mtime, string projectPath, string title,
+				bool hasMessages) {
+				persistence.upsertSessionMetaCache(driverName, profileRoot, sessionId,
+					mtime, projectPath, title, hasMessages);
 			},
 		));
 		configWatcher = new ConfigWatcher(ConfigWatcherHost(
@@ -485,11 +505,8 @@ class App
 		));
 		historyPipeline = new HistoryEventPipeline(HistoryEventPipelineHost(
 			getTask: (int tid) => tid in tasks ? &tasks[tid] : null,
-			tryAgentForTask: &tryAgentForTask,
-			effectiveCwd: (int tid) {
-				auto td = tid in tasks;
-				return taskPathResolver.effectiveCwd(td);
-			},
+			resolveTaskHistory: &resolveTaskHistory,
+			reportUnavailableHistory: &reportUnavailableHistory,
 			injectAgentNameIntoSessionInit: &injectAgentNameIntoSessionInit,
 			normalizeKnownSystemMessageMeta: (string translated, int tid) {
 				return systemMessageNormalizer.normalizeKnownSystemMessageMeta(translated, tid);
@@ -507,19 +524,13 @@ class App
 			},
 			sendHistoryOperations: (WebSocketAdapter ws, int tid) {
 				import cydo.domain.tasks.model : HistoryOperationsMessage;
-				auto session = sessionForTask(tid);
-				auto codex = cast(CodexSession) session;
 				ws.send(Data(toJson(HistoryOperationsMessage("history_operations", tid,
-					selectHistoryOperations(agentForTask(tid).driver, taskAlive(tid),
-						codex !is null && codex.canRollbackThread))).representation));
+					historyOperationsForTask(tid))).representation));
 			},
 			broadcastHistoryOperations: (int tid) {
 				import cydo.domain.tasks.model : HistoryOperationsMessage;
-				auto session = sessionForTask(tid);
-				auto codex = cast(CodexSession) session;
 				auto message = HistoryOperationsMessage("history_operations", tid,
-					selectHistoryOperations(agentForTask(tid).driver, taskAlive(tid),
-						codex !is null && codex.canRollbackThread));
+					historyOperationsForTask(tid));
 				clientHub.sendToSubscribed(tid, Data(toJson(message).representation));
 			},
 			noteLiveBoundaryCandidate: (int tid, size_t seq, string event, string raw, int sourceLine,
@@ -529,7 +540,6 @@ class App
 			},
 			sendReplaySupplementalState: &sendHistoryReplaySupplementalState,
 			onHistorySubscribed: &onHistorySubscribed,
-			ensureAgentSessionIdFromEvent: &ensureHistoryAgentSessionIdFromEvent,
 			updateClaudeUsageFromEvent: &updateClaudeUsageFromEvent,
 			planBroadcast: &planHistoryBroadcast,
 		));
@@ -575,6 +585,9 @@ class App
 			mcpSocketPath: () => transport.mcpSocketPath,
 			agentForTask: &agentForTask,
 			tryAgentForTask: &tryAgentForTask,
+			setAgentSessionId: (int tid, string agentSessionId) {
+				persistence.setAgentSessionId(tid, agentSessionId);
+			},
 			clearLastActive: (int tid) {
 				persistence.clearLastActive(tid);
 			},
@@ -625,22 +638,17 @@ class App
 			startJsonlWatch: (int tid) {
 				jsonlTracker.startJsonlWatch(tid);
 			},
-			ensureHistoryLoaded: (int tid) {
-				historyPipeline.ensureHistoryLoaded(tid);
-			},
-			finalReconcileJsonlIfPresent: (int tid) {
-				jsonlTracker.finalReconcileJsonlIfPresent(tid);
+			ensureHistoryLoadedForExit: (int tid) => historyPipeline.ensureHistoryLoadedForExit(tid),
+			finalReconcileJsonlIfPresent: (int tid, Nullable!TaskHistoryResolution resolution) {
+				jsonlTracker.finalReconcileJsonlIfPresent(tid, resolution);
 			},
 			stopJsonlWatch: (int tid) {
 				jsonlTracker.stopJsonlWatch(tid);
 			},
 			broadcastHistoryOperations: (int tid) {
 				import cydo.domain.tasks.model : HistoryOperationsMessage;
-				auto session = sessionForTask(tid);
-				auto codex = cast(CodexSession) session;
 				auto message = HistoryOperationsMessage("history_operations", tid,
-					selectHistoryOperations(agentForTask(tid).driver, taskAlive(tid),
-						codex !is null && codex.canRollbackThread));
+					historyOperationsForTask(tid));
 				clientHub.sendToSubscribed(tid, Data(toJson(message).representation));
 			},
 			sendSystemRestartNudge: &workflowTools.sendSystemRestartNudge,
@@ -664,8 +672,12 @@ class App
 			stopTask: (int tid) {
 				taskSessionRunner.stopTask(tid);
 			},
-			effectiveCwd: &taskPathResolver.effectiveCwd,
 			prepareTaskSessionLaunch: &prepareTaskSessionLaunch,
+			prepareOperationSessionLaunch: (int tid, Agent taskAgent,
+				TaskTypeDef* typeDef) {
+				return taskSessionRunner.prepareOperationSessionLaunch(tid,
+					taskAgent, typeDef);
+			},
 			taskTypeForProject: (string projectPath, string taskTypeName) {
 				return taskTypeCatalog.getTaskTypesForProject(projectPath).byName(taskTypeName);
 			},
@@ -689,11 +701,22 @@ class App
 			ensureHistoryLoaded: (int tid) {
 				historyPipeline.ensureHistoryLoaded(tid);
 			},
-			resolveFreshPersistedBoundary: (int tid, string requestedAnchor,
-				out HistoryBoundary boundary) {
-				return historyPipeline.resolveFreshPersistedBoundary(tid, requestedAnchor,
-					boundary);
+			resolveTaskHistory: &resolveTaskHistory,
+			reportUnavailableHistory: &reportUnavailableHistory,
+			requireLiveHistoryLaunch: (int tid, const ref HistoryAccess access) {
+				return taskSessionRunner.requireLiveHistoryLaunch(tid, access);
 			},
+			openCodexForkSourceOperation: (int tid,
+				const ref HistoryAccess access) {
+				return taskSessionRunner.openCodexForkSourceOperation(tid, access);
+			},
+			codexForkSourceState: &codexForkSourceState,
+			resolveFreshPersistedBoundary: (int tid, const ref HistoryAccess access,
+				string requestedAnchor, out HistoryBoundary boundary) {
+				return historyPipeline.resolveFreshPersistedBoundary(tid, access,
+					requestedAnchor, boundary);
+			},
+			prepareHistoryForkDestination: &prepareHistoryForkDestination,
 			getUndoJsonl: (int tid) => jsonlTracker.getUndoJsonl(tid),
 			clearUndoJsonl: (int tid) {
 				jsonlTracker.clearUndoJsonl(tid);
@@ -725,16 +748,13 @@ class App
 			broadcastTaskUpdate: &broadcastTaskUpdate,
 			broadcastFocusHint: &broadcastFocusHint,
 		));
-		jsonlTracker.getAgent = &agentForTask;
 		jsonlTracker.getTask = (int tid) => tid in tasks ? &tasks[tid] : null;
+		jsonlTracker.resolveTaskHistory = &resolveTaskHistory;
+		jsonlTracker.resolveLiveHistoryWatch = &resolveLiveHistoryWatch;
 		jsonlTracker.historyGeneration = (int tid) {
 			auto td = tid in tasks;
 			assert(td !is null, "history generation requested for missing task");
 			return td.history.generation;
-		};
-		jsonlTracker.getEffectiveCwd = (int tid) {
-			auto td = tid in tasks;
-			return taskPathResolver.effectiveCwd(td);
 		};
 		jsonlTracker.sendToSubscribed = (int tid, string msg) =>
 			clientHub.sendToSubscribed(tid, Data(msg.representation));
@@ -750,9 +770,16 @@ class App
 			assert(td !is null, "history lineage invalidated for missing task");
 			td.clearSubmissionCorrelationState();
 			jsonlTracker.invalidateLineage(tid);
-			auto path = agentForTask(tid).historyPath(td.agentSessionId,
-				taskPathResolver.effectiveCwd(td));
-			td.history.reset(watermarkFromPath(path));
+			auto resolution = resolveTaskHistory(tid);
+			if (resolution.kind == TaskHistoryResolutionKind.access)
+				td.history.reset(watermarkFromPath(resolution.requireAccess().path));
+			else if (resolution.kind == TaskHistoryResolutionKind.unavailable)
+			{
+				reportUnavailableHistory(tid, resolution);
+				return;
+			}
+			else
+				td.history.reset(Watermark.none());
 			emitTaskReload(tid, "history_lineage");
 			jsonlTracker.startJsonlWatch(tid);
 		};
@@ -795,6 +822,12 @@ class App
 			td.titleGenDone = row.title.length > 0;
 			auto rowTid = row.tid;
 			tasks[rowTid] = move(td);
+			if (tasks[rowTid].status == TaskStatus.importable)
+			{
+				persistence.deleteTask(rowTid);
+				tasks.remove(rowTid);
+				continue;
+			}
 			tasks[rowTid].processQueue = new StateQueue!ProcessState(
 				makeProcessQueueSF(rowTid),
 				ProcessState.Dead,
@@ -815,30 +848,11 @@ class App
 				Watermark wm;
 				if (td2.agentSessionId.length > 0)
 				{
-					auto startTa = tryAgentForTask(rowTid);
-					if (startTa)
-					{
-						// effectiveCwd may throw for tasks whose workspace is no
-						// longer configured — treat as JSONL absent, the same as
-						// an orphan agent: keep deferred and synthesize on demand.
-						string cwd;
-						try
-							cwd = taskPathResolver.effectiveCwd(td2);
-						catch (Exception)
-							cwd = "";
-						if (cwd.length == 0)
-							wm = Watermark.unreadable();
-						else
-						{
-							auto jp = startTa.historyPath(td2.agentSessionId, cwd);
-							auto fromPath = watermarkFromPath(jp);
-							wm = fromPath.isDeferred
-								? fromPath
-								: Watermark.unreadable(); // JSONL absent; load delegate returns empty
-						}
-					}
+					auto resolution = resolveTaskHistory(rowTid);
+					if (resolution.kind == TaskHistoryResolutionKind.access)
+						wm = watermarkFromPath(resolution.requireAccess().path);
 					else
-						wm = Watermark.unreadable(); // Orphan agent: keep deferred so ensureHistoryLoaded synthesizes error
+						wm = Watermark.unreadable();
 				}
 				td2.history.reset(wm);
 			}
@@ -875,10 +889,10 @@ class App
 			{
 				try
 				{
-					auto ta = agentForTask(td.tid);
-					auto jp = ta.historyPath(td.agentSessionId, taskPathResolver.effectiveCwd(&td));
-					if (jp.length > 0)
+					auto resolution = resolveTaskHistory(td.tid);
+					if (resolution.kind == TaskHistoryResolutionKind.access)
 					{
+						auto jp = resolution.requireAccess().path;
 						import std.file : exists, timeLastModified;
 						if (exists(jp))
 						{
@@ -894,7 +908,7 @@ class App
 				td.lastActive = td.createdAt;
 		}
 
-		discoveryService.enumerateSessions(config, agentsByName);
+		discoveryService.enumerateSessions();
 
 		import std.process : environment;
 
@@ -1237,7 +1251,7 @@ class App
 			case "ask_user_response": workflowTools.handleAskUserResponse(json); break;
 			case "permission_prompt_response": workflowTools.handlePermissionPromptResponse(json); break;
 			case "refresh_workspaces": handleRefreshWorkspacesMsg(); break;
-			case "promote_task":     handlePromoteTaskMsg(json); break;
+			case "promote_task":     handlePromoteTaskMsg(ws, json); break;
 			case "set_task_type":    handleSetTaskTypeMsg(json); break;
 			case "set_entry_point":  handleSetEntryPointMsg(json); break;
 			case "set_agent_name":   handleSetAgentNameMsg(json); break;
@@ -1446,13 +1460,6 @@ class App
 			derivedTextJobs.onHistorySubscribed(tid);
 		catch (Exception e)
 			warningf("Error generating suggestions on subscribe: %s", e.msg);
-	}
-
-	private void ensureHistoryAgentSessionIdFromEvent(int tid, string line)
-	{
-		if (line.length == 0 || tid !in tasks || tasks[tid].agentSessionId.length > 0)
-			return;
-		tryExtractAgentSessionId(tid, line);
 	}
 
 	private HistoryBroadcastPlan planHistoryBroadcast(int tid, TranslatedEvent ev)
@@ -1689,6 +1696,8 @@ class App
 		if (td.agentSessionId.length == 0)
 			return;
 		if (taskAlive(tid))
+			return;
+		if (taskSessionRunner.forkSourceOperationInProgress(tid))
 			return;
 		transitionTask(tid, [TaskStatus.pending, TaskStatus.active,
 			TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
@@ -2173,9 +2182,30 @@ class App
 				td.status,
 				td.agentSessionId,
 				td.agentName,
+				td.workspace,
 				td.projectPath,
 			);
 		return snapshot;
+	}
+
+	private ConfiguredNativeHistoryContext[] snapshotNativeHistoryContexts()
+	{
+		import std.algorithm : sort;
+		import std.array : array;
+
+		auto agentNames = config.agents.byKey.array;
+		agentNames.sort();
+		auto workspaceNames = config.workspaces.dup;
+		workspaceNames.sort!((a, b) => a.name < b.name);
+		ConfiguredNativeHistoryContext[] contexts;
+		foreach (agentName; agentNames)
+		{
+			contexts ~= ConfiguredNativeHistoryContext(agentName, "", "", false);
+			foreach (ref workspace; workspaceNames)
+				contexts ~= ConfiguredNativeHistoryContext(agentName, workspace.name,
+					"", false);
+		}
+		return contexts;
 	}
 
 	private void withDiscoveryMutationTransaction(scope void delegate() work)
@@ -2186,46 +2216,88 @@ class App
 		work();
 	}
 
-	private string importableHistoryPath(int tid)
-	{
-		auto td = tid in tasks;
-		assert(td !is null, format!"Importable task %d not found"(tid));
-		return agentForTask(tid).historyPath(td.agentSessionId,
-			taskPathResolver.effectiveCwd(td));
-	}
 
-	private void deleteImportableTask(int tid)
+	private ImportableReconciliationCommit reconcileImportableTasks(
+		ulong scanGeneration, ImportableTaskSpec[] desired)
 	{
-		tasks.remove(tid);
-		persistence.deleteTask(tid);
-		clientHub.broadcast(toJson(TaskDeletedMessage("task_deleted", tid)));
-	}
+		import std.datetime : Clock;
 
-	private void createImportableTask(ImportableTaskSpec spec)
-	{
-		auto tid = createTask("", spec.projectPath, spec.agentName);
-		auto td = &tasks[tid];
-		td.status = TaskStatus.importable;
-		td.agentSessionId = spec.sessionId;
-		td.title = spec.title;
-		td.lastActive = spec.lastActive;
+		if (scanGeneration < importableScanGeneration_)
+			return null;
+
+		ImportableTaskSpec[] accepted;
+		HistoryAccess[] acceptedAccess;
+		foreach (ref spec; desired)
 		{
-			Watermark wm;
-			auto importTa = tryAgentForTask(tid);
-			if (importTa)
-			{
-				auto jp = importTa.historyPath(spec.sessionId, spec.projectPath);
-				wm = watermarkFromPath(jp);
-			}
-			td.history.reset(wm);
+			auto resolution = resolveImportableScanRecord(spec.scanRecord, spec.projectPath);
+			if (resolution.kind != TaskHistoryResolutionKind.access)
+				continue;
+			accepted ~= spec;
+			acceptedAccess ~= resolution.requireAccess();
 		}
-		persistence.setStatus(tid, "importable");
-		persistence.setAgentSessionId(tid, spec.sessionId);
-		persistence.setTitle(tid, spec.title);
-		persistence.setLastActive(tid, spec.lastActive);
 
-		clientHub.broadcast(toJson(TaskCreatedMessage("task_created", tid, "", spec.projectPath, 0, "")));
-		broadcastTaskUpdate(tid);
+		int[] existing;
+		foreach (tid, ref td; tasks)
+			if (td.status == TaskStatus.importable)
+				existing ~= tid;
+
+		TaskData[int] stagedTasks;
+		ImportableScanRecord[int] stagedRecords;
+		int[] created;
+		foreach (tid; existing)
+			persistence.deleteTask(tid);
+		foreach (i, ref spec; accepted)
+		{
+			auto tid = persistence.createTask("", spec.projectPath, spec.agentName);
+			auto access = acceptedAccess[i];
+			enforce(exists(access.path) && isFile(access.path),
+				"Validated importable history locator disappeared before reconciliation");
+			auto td = TaskData(tid, "", spec.projectPath);
+			td.status = TaskStatus.importable;
+			td.agentName = spec.agentName;
+			td.agentSessionId = spec.scanRecord.key.sessionId;
+			td.title = spec.title;
+			td.createdAt = Clock.currStdTime;
+			td.lastActive = spec.lastActive;
+			td.history.reset(watermarkFromPath(access.path));
+			td.processQueue = new StateQueue!ProcessState(
+				makeProcessQueueSF(tid),
+				ProcessState.Dead,
+			);
+			td.archiveQueue = new StateQueue!ArchiveState(
+				makeArchiveQueueSF(tid),
+				ArchiveState.Unarchived,
+			);
+			persistence.setStatus(tid, "importable");
+			persistence.setAgentSessionId(tid, td.agentSessionId);
+			persistence.setTitle(tid, td.title);
+			persistence.setLastActive(tid, td.lastActive);
+			stagedTasks[tid] = move(td);
+			stagedRecords[tid] = spec.scanRecord;
+			created ~= tid;
+		}
+
+		return () {
+			enforce(scanGeneration >= importableScanGeneration_,
+				"A stale discovery generation cannot replace importable session records");
+			foreach (tid; existing)
+				tasks.remove(tid);
+			foreach (tid, ref td; stagedTasks)
+				tasks[tid] = move(td);
+			importableScanGeneration_ = scanGeneration;
+			importableScanRecords_ = move(stagedRecords);
+			foreach (tid; existing)
+				clientHub.broadcast(toJson(TaskDeletedMessage("task_deleted", tid)));
+			foreach (tid; created)
+			{
+				auto td = tid in tasks;
+				assert(td !is null,
+					"Committed importable task is missing before its broadcast");
+				clientHub.broadcast(toJson(TaskCreatedMessage("task_created", tid, "",
+					(*td).projectPath, 0, "")));
+				broadcastTaskUpdate(tid);
+			}
+		};
 	}
 
 	private void broadcastDiscoveryWorkspaces(WorkspaceInfo[] workspaces)
@@ -2259,6 +2331,125 @@ class App
 			ArchiveState.Unarchived,
 		);
 		return tid;
+	}
+
+	private TaskHistoryResolution resolveTaskHistory(int tid)
+	{
+		auto td = tid in tasks;
+		assert(td !is null, format!"History requested for missing task %d"(tid));
+		if (td.status != TaskStatus.importable)
+			return taskSessionRunner.resolveTaskHistory(tid);
+		auto record = tid in importableScanRecords_;
+		if (record is null || (*record).scanGeneration != importableScanGeneration_)
+			return TaskHistoryResolution.unavailable(UnavailableHistory(
+				UnavailableHistoryKind.context, td.agentName, td.agentSessionId,
+				"The importable session offer is no longer part of the current scan",
+				NativeHistoryRule.init, NativeHistoryProfile.init));
+		return resolveImportableScanRecord(*record, td.projectPath);
+	}
+
+	private TaskHistoryResolution resolveImportableScanRecord(
+		const ref ImportableScanRecord record, string projectPath)
+	{
+		if (projectPath.length == 0)
+			return TaskHistoryResolution.unavailable(UnavailableHistory(
+				UnavailableHistoryKind.context, record.agentName, record.key.sessionId,
+				"The importable session offer has no project path",
+				NativeHistoryRule.init, NativeHistoryProfile.init));
+		string failure = "No current configured profile produces this importable session";
+		foreach (ref context; record.producingContexts)
+		{
+			auto agent = tryCreateConfiguredAppAgent(context.agentName);
+			if (agent is null)
+				continue;
+			ResolvedNativeHistoryContext resolved;
+			try
+				resolved = resolveNativeHistoryContext(config, agent, context);
+			catch (Exception e)
+			{
+				failure = e.msg;
+				continue;
+			}
+			if (resolved.profile.driver != record.key.driver
+				|| resolved.profile.root != record.key.profileRoot)
+				continue;
+			if (!exists(record.discovered.exactHistoryPath)
+				|| !isFile(record.discovered.exactHistoryPath))
+				return TaskHistoryResolution.unavailable(UnavailableHistory(
+					UnavailableHistoryKind.profilePath, record.agentName,
+					record.key.sessionId,
+					"The importable session locator is unavailable", resolved.rule,
+					resolved.profile));
+			try
+			{
+				auto file = File(record.discovered.exactHistoryPath, "r");
+			}
+			catch (Exception e)
+				return TaskHistoryResolution.unavailable(UnavailableHistory(
+					UnavailableHistoryKind.profilePath, record.agentName,
+					record.key.sessionId, e.msg, resolved.rule, resolved.profile));
+			return TaskHistoryResolution.access(HistoryAccess(resolved.agent,
+				resolved.profile, record.key.sessionId, projectPath,
+				record.discovered.exactHistoryPath));
+		}
+		return TaskHistoryResolution.unavailable(UnavailableHistory(
+			UnavailableHistoryKind.context, record.agentName, record.key.sessionId,
+			failure, NativeHistoryRule.init, NativeHistoryProfile.init));
+	}
+
+	private LiveHistoryWatchResolution resolveLiveHistoryWatch(int tid)
+	{
+		return taskSessionRunner.resolveLiveHistoryWatch(tid);
+	}
+
+	private void reportUnavailableHistory(int tid,
+		const ref TaskHistoryResolution resolution)
+	{
+		assert(resolution.kind == TaskHistoryResolutionKind.unavailable,
+			"Only unavailable history resolutions may be reported");
+		auto td = tid in tasks;
+		assert(td !is null, "Unavailable history report requires an existing task");
+		auto unavailable = resolution.requireUnavailable();
+		string body;
+		if (unavailable.kind == UnavailableHistoryKind.profilePath)
+		{
+			body = "No history for session " ~ unavailable.sessionId ~ " under "
+				~ unavailable.profile.root ~ " (agent '" ~ unavailable.agentName
+				~ "').\n\nCheck " ~ unavailable.rule.profileEnvName
+				~ " and the configured profile location, then reload the task.";
+		}
+		else
+			body = unavailable.detail;
+		td.history.reset(Watermark.unreadable());
+		td.history.load((ulong) => LoadedHistory.init);
+		historyPipeline.appendTaskDiagnostic(tid, "Failed to load session history", body);
+		emitTaskReload(tid, "history_unavailable");
+	}
+
+	private HistoryForkDestination prepareHistoryForkDestination(int sourceTid)
+	{
+		import std.exception : enforce;
+		import std.uuid : randomUUID;
+
+		auto td = sourceTid in tasks;
+		assert(td !is null, "History fork destination requires an existing source task");
+		auto source = resolveTaskHistory(sourceTid);
+		enforce(source.kind == TaskHistoryResolutionKind.access,
+			"History fork destination requires readable source history");
+		auto sourceAccess = source.requireAccess();
+		auto agent = tryAgentForTask(sourceTid);
+		enforce(agent !is null, "History fork destination requires a configured agent");
+		enforce(agent.driver == sourceAccess.agent.driver,
+			"Generic history forks cannot convert between native history drivers");
+		auto typeDef = taskTypeCatalog.getTaskTypesForProject(td.projectPath)
+			.byName(td.taskType);
+		auto context = ConfiguredNativeHistoryContext(td.agentName, td.workspace,
+			td.repoPath, typeDef !is null && typeDef.read_only);
+		auto resolved = resolveNativeHistoryContext(config, agent, context);
+		auto sessionId = randomUUID().toString();
+		return HistoryForkDestination(sessionId,
+			agent.createHistoryForkDestination(sessionId,
+				taskPathResolver.effectiveCwd(td), resolved.profile));
 	}
 
 	/// Return the Agent instance for a task's agent name, creating it on demand.
@@ -2578,35 +2769,48 @@ class App
 		derivedTextJobs.cancelBackgroundWork(tid);
 	}
 
-	private void resetHistoryWatermarkAfterExit(int tid)
+	/// Returns true when the reset already emitted a task reload (unavailable
+	/// history), so the caller must not emit a redundant one.
+	private bool resetHistoryWatermarkAfterExit(int tid)
 	{
-		resetHistoryWatermark(tid, true);
+		return resetHistoryWatermark(tid, true);
 	}
 
-	private void resetHistoryWatermarkOnly(int tid)
+	private bool resetHistoryWatermarkOnly(int tid)
 	{
-		resetHistoryWatermark(tid, false);
+		return resetHistoryWatermark(tid, false);
 	}
 
-	private void resetHistoryWatermark(int tid, bool unsubscribeSubscribers)
+	private bool resetHistoryWatermark(int tid, bool unsubscribeSubscribers)
 	{
 		if (tid !in tasks)
-			return;
+			return false;
 		jsonlTracker.invalidateLineage(tid);
 		tasks[tid].clearSubmissionCorrelationState();
-		auto ta = tryAgentForTask(tid);
+		bool reloadEmitted;
 		{
 			Watermark wm;
-			if (ta && tasks[tid].agentSessionId.length > 0)
+			auto resolution = resolveTaskHistory(tid);
+			if (resolution.kind == TaskHistoryResolutionKind.access)
 			{
-				auto jp = ta.historyPath(tasks[tid].agentSessionId,
-					taskPathResolver.effectiveCwd(&tasks[tid]));
-				wm = watermarkFromPath(jp);
+				wm = watermarkFromPath(resolution.requireAccess().path);
+				tasks[tid].history.reset(wm);
 			}
-			tasks[tid].history.reset(wm);
+			else if (resolution.kind == TaskHistoryResolutionKind.unavailable)
+			{
+				reportUnavailableHistory(tid, resolution);
+				reloadEmitted = true;
+			}
+			else
+			{
+				if (resolution.kind == TaskHistoryResolutionKind.orphanAgent)
+					wm = Watermark.unreadable();
+				tasks[tid].history.reset(wm);
+			}
 		}
 		if (unsubscribeSubscribers)
 			clientHub.unsubscribeAll(tid);
+		return reloadEmitted;
 	}
 
 	private void requestMissingOutputs(int tid, string missing)
@@ -2932,19 +3136,6 @@ class App
 		return changed;
 	}
 
-	/// Try to extract agent session ID from an output line using the Agent interface.
-	private void tryExtractAgentSessionId(int tid, string rawLine)
-	{
-		auto sessionId = agentForTask(tid).parseSessionId(rawLine);
-		if (sessionId.length > 0)
-		{
-			tasks[tid].agentSessionId = sessionId;
-			persistence.setAgentSessionId(tid, sessionId);
-			if (!shuttingDown)
-				jsonlTracker.startJsonlWatch(tid);
-		}
-	}
-
 	private void broadcastTitleUpdate(int tid, string title)
 	{
 		import ae.utils.json : toJson;
@@ -2958,16 +3149,119 @@ class App
 			SuggestionsUpdateMessage("suggestions_update", tid, suggestions)).representation));
 	}
 
-	private void handlePromoteTaskMsg(WsMessage json)
+	private void handlePromoteTaskMsg(WebSocketAdapter ws, WsMessage json)
 	{
 		auto tid = json.tid;
+		auto rejectPromotion = (string message) {
+			ws.send(Data(toJson(ErrorMessage("error", message, tid)).representation));
+		};
 		if (tid < 0 || tid !in tasks)
 			return;
 		auto td = &tasks[tid];
 		if (td.status != "importable")
 			return;
-		transitionTask(tid, TaskStatus.importable, TaskStatus.completed,
-			TaskNotificationChange.preserve);
+		auto record = tid in importableScanRecords_;
+		if (record is null || (*record).scanGeneration != importableScanGeneration_)
+		{
+			rejectPromotion("This importable session offer is no longer current");
+			return;
+		}
+		if (td.agentSessionId != (*record).key.sessionId)
+		{
+			rejectPromotion("This importable session offer no longer matches its session ID");
+			return;
+		}
+		if (json.workspace.length == 0
+			|| !workspaceHasProjectPath(json.workspace, td.projectPath))
+		{
+			rejectPromotion("Select a configured workspace containing this project before importing");
+			return;
+		}
+		auto selectedAgent = tryCreateConfiguredAppAgent((*record).agentName);
+		if (selectedAgent is null)
+		{
+			rejectPromotion("The agent configured for this imported session is unavailable");
+			return;
+		}
+		ResolvedNativeHistoryContext selectedContext;
+		try
+		{
+			auto context = ConfiguredNativeHistoryContext((*record).agentName,
+				json.workspace, td.repoPath, false);
+			selectedContext = resolveNativeHistoryContext(config, selectedAgent, context);
+		}
+		catch (Exception e)
+		{
+			rejectPromotion(e.msg);
+			return;
+		}
+		if (selectedContext.profile.driver != (*record).key.driver
+			|| selectedContext.profile.root != (*record).key.profileRoot)
+		{
+			rejectPromotion("Cannot import session " ~ (*record).key.sessionId
+				~ " into workspace '" ~ json.workspace ~ "': it resolves to "
+				~ selectedContext.profile.root ~ " but the scanned session belongs to "
+				~ (*record).key.profileRoot);
+			return;
+		}
+		string selectedHistoryPath;
+		try
+		{
+			selectedHistoryPath = selectedContext.agent.historyPath(
+				(*record).key.sessionId, taskPathResolver.effectiveCwd(td),
+				selectedContext.profile);
+		}
+		catch (Exception e)
+		{
+			rejectPromotion(e.msg);
+			return;
+		}
+		if (selectedHistoryPath != (*record).discovered.exactHistoryPath)
+		{
+			rejectPromotion("Cannot import session " ~ (*record).key.sessionId
+				~ " into workspace '" ~ json.workspace ~ "': the derived locator under "
+				~ selectedContext.profile.root ~ " differs from the scanned locator under "
+				~ (*record).key.profileRoot);
+			return;
+		}
+		bool producingContextCurrent;
+		foreach (ref context; (*record).producingContexts)
+		{
+			auto configured = tryCreateConfiguredAppAgent(context.agentName);
+			if (configured is null)
+				continue;
+			try
+			{
+				auto resolved = resolveNativeHistoryContext(config, configured, context);
+				if (resolved.profile.driver == (*record).key.driver
+					&& resolved.profile.root == (*record).key.profileRoot)
+				{
+					producingContextCurrent = true;
+					break;
+				}
+			}
+			catch (Exception)
+			{
+			}
+		}
+		if (!producingContextCurrent)
+		{
+			rejectPromotion("This importable session offer is no longer produced by current configuration");
+			return;
+		}
+		auto history = resolveImportableScanRecord(*record, td.projectPath);
+		if (history.kind != TaskHistoryResolutionKind.access)
+		{
+			rejectPromotion("The imported session history is no longer available");
+			return;
+		}
+		persistence.promoteImportableTask(tid, json.workspace);
+		enforce(persistence.db.db.changes == 1,
+			"Importable task promotion must update exactly one task row");
+		td.workspace = json.workspace;
+		td.status = TaskStatus.completed;
+		importableScanRecords_.remove(tid);
+		broadcastTaskUpdate(tid);
 	}
 
 	private void onConfigChanged()
@@ -3041,7 +3335,7 @@ class App
 	{
 		discoveryService.discoverAllWorkspaces(config);
 		clientHub.broadcast(buildWorkspacesList(discoveryService.workspacesInfo));
-		discoveryService.enumerateSessions(config, agentsByName);
+		discoveryService.enumerateSessions();
 	}
 
 	/// Read a prompt template file from the prompt search path and substitute variables.
@@ -3086,6 +3380,24 @@ class App
 	private AgentSession sessionForTask(int tid)
 	{
 		return taskSessionRunner.sessionForTask(tid);
+	}
+
+	private CodexForkSourceState codexForkSourceState(int tid)
+	{
+		auto codex = cast(CodexSession) sessionForTask(tid);
+		if (codex !is null)
+			return codex.canRollbackThread
+				? CodexForkSourceState.liveReady
+				: CodexForkSourceState.liveBusy;
+		if (taskSessionRunner.forkSourceOperationInProgress(tid))
+			return CodexForkSourceState.liveBusy;
+		return CodexForkSourceState.dead;
+	}
+
+	private auto historyOperationsForTask(int tid)
+	{
+		return selectHistoryOperations(agentForTask(tid).driver,
+			codexForkSourceState(tid));
 	}
 
 	private bool taskAlive(int tid)
@@ -3388,6 +3700,8 @@ version (unittest) private final class GatedSubmissionSession : AgentSession
 	ContentBlock[][] contents;
 	size_t sendCalls;
 	private void delegate(TranslatedEvent) outputHandler_;
+	private void delegate(string) nativeSessionStartedHandler_;
+	private string nativeSessionId_;
 
 	Promise!AgentSubmissionReceipt sendMessage(const(ContentBlock)[] content,
 		string correlationId = null, bool isContextBootstrap = false)
@@ -3436,6 +3750,13 @@ version (unittest) private final class GatedSubmissionSession : AgentSession
 		emitNativeUserEcho(text, correlations[index]);
 	}
 
+	void emitNativeSessionStarted(string sessionId)
+	{
+		nativeSessionId_ = sessionId;
+		if (nativeSessionStartedHandler_ !is null)
+			nativeSessionStartedHandler_(sessionId);
+	}
+
 	void invalidatePendingSubmittedMessages() {}
 	@property bool supportsImages() const { return false; }
 	void interrupt() {}
@@ -3444,6 +3765,12 @@ version (unittest) private final class GatedSubmissionSession : AgentSession
 	void closeStdin() {}
 	void killAfterTimeout(Duration timeout) {}
 	@property bool canStopAfterCloseStdin() const { return true; }
+	@property void onNativeSessionStarted(void delegate(string) dg)
+	{
+		nativeSessionStartedHandler_ = dg;
+		if (nativeSessionId_.length > 0 && dg !is null)
+			dg(nativeSessionId_);
+	}
 	@property void onOutput(void delegate(TranslatedEvent) dg) { outputHandler_ = dg; }
 	@property void onStderr(void delegate(string line) dg) {}
 	@property void onExit(void delegate(int status) dg) {}
@@ -3456,6 +3783,9 @@ version (unittest) private final class GatedSubmissionRunner : TaskSessionRunner
 	private bool deferSessionUntilAlive_;
 	private bool[int] launched_;
 	void delegate(int) onLaunch;
+	/// When set, replaces the default `noSession()` resolution — used by
+	/// tests that need `resolveTaskHistory` to resolve some other kind.
+	TaskHistoryResolution delegate(int tid) resolveTaskHistoryOverride;
 
 	this(AgentSession session, bool deferSessionUntilAlive = false)
 	{
@@ -3469,6 +3799,13 @@ version (unittest) private final class GatedSubmissionRunner : TaskSessionRunner
 		if (deferSessionUntilAlive_ && tid !in launched_)
 			return null;
 		return session_;
+	}
+
+	override TaskHistoryResolution resolveTaskHistory(int tid)
+	{
+		return resolveTaskHistoryOverride is null
+			? TaskHistoryResolution.noSession()
+			: resolveTaskHistoryOverride(tid);
 	}
 
 	override Promise!ProcessState delegate(ProcessState) makeProcessQueueSF(int tid)
@@ -3564,10 +3901,12 @@ version (unittest) private final class GatedSubmissionFixture
 			(ProcessState state) { return resolve(state); },
 			ProcessState.Alive,
 		);
-		app.jsonlTracker.getTask = (int lookupTid) {
-			auto task = lookupTid in app.tasks;
-			return task is null ? null : task;
-		};
+			app.jsonlTracker.getTask = (int lookupTid) {
+				auto task = lookupTid in app.tasks;
+				return task is null ? null : task;
+			};
+			app.jsonlTracker.resolveTaskHistory = (int lookupTid) =>
+				TaskHistoryResolution.noSession();
 		app.archiveManager = new ArchiveManager(ArchiveManagerHost(
 			tryGetTask: (int lookupTid, out ArchiveTaskSnapshot snapshot) {
 				auto task = lookupTid in app.tasks;
@@ -3661,6 +4000,8 @@ unittest
 		auto task = lookupTid in app.tasks;
 		return task is null ? null : task;
 	};
+	app.jsonlTracker.resolveTaskHistory = (int lookupTid) =>
+		TaskHistoryResolution.noSession();
 
 	size_t userEventBroadcasts;
 	app.historyPipeline = new HistoryEventPipeline(HistoryEventPipelineHost(
@@ -4876,4 +5217,132 @@ unittest
 
 	app.reportMcpToolDescriptionLimit(projectPath, taskType, []);
 	assert((noticeId in app.activeNotices) is null);
+}
+
+// Regression for review 34528 Issue A: when the resolution is `unavailable`
+// under both the live binding (B, from taskSessionRunner.resolveTaskHistory)
+// and current config (C, re-resolved by resetHistoryWatermark) — the
+// ordinary single-profile case where B == C — both post-exit reset entry
+// points (resetHistoryWatermarkAfterExit and resetHistoryWatermarkOnly) must
+// end with exactly one unavailable-history report/broadcast, regardless of
+// whether history was already loaded live before exit; ensureHistoryLoadedForExit
+// and finalReconcileJsonlIfPresent must both stay silent. Which of onExit's
+// three branches selects which entry point is covered by e2e, not here.
+unittest
+{
+	App buildFixture(string dbPath, out int tid, out int* reloadCount,
+		out SubmissionCaptureWebSocket socket)
+	{
+		if (exists(dbPath))
+			remove(dbPath);
+		auto app = new App();
+		app.persistence = Persistence(dbPath);
+		tid = app.persistence.createTask();
+		app.tasks[tid] = TaskData(tid, "local", "/tmp/cydo-app-exit-unavailable");
+		app.tasks[tid].taskType = "test";
+		app.tasks[tid].status = TaskStatus.active;
+
+		auto unavailable = TaskHistoryResolution.unavailable(UnavailableHistory(
+			UnavailableHistoryKind.context, "claude", "session-1",
+			"The derived history file does not exist"));
+		auto runner = new GatedSubmissionRunner(new GatedSubmissionSession);
+		runner.resolveTaskHistoryOverride = (int) => unavailable;
+		app.taskSessionRunner = runner;
+
+		// `App.start()` (not `App`'s default constructor) is what wires
+		// historyPipeline/jsonlTracker/derivedTextJobs in production; this
+		// fixture wires the same collaborators by hand, using the App's own
+		// private resolveTaskHistory/reportUnavailableHistory so the exit
+		// path under test exercises the real reporting logic.
+		app.historyPipeline = new HistoryEventPipeline(HistoryEventPipelineHost(
+			getTask: (int lookupTid) {
+				auto task = lookupTid in app.tasks;
+				return task is null ? null : task;
+			},
+			resolveTaskHistory: &app.resolveTaskHistory,
+			reportUnavailableHistory: &app.reportUnavailableHistory,
+			makeTaskDiagnosticEventJson: &app.makeTaskDiagnosticEventJson,
+		));
+		app.jsonlTracker.getTask = (int lookupTid) {
+			auto task = lookupTid in app.tasks;
+			return task is null ? null : task;
+		};
+		app.jsonlTracker.resolveTaskHistory = &app.resolveTaskHistory;
+		app.derivedTextJobs = new DerivedTextJobs(DerivedTextJobsHost(
+			getTask: (int lookupTid) {
+				auto task = lookupTid in app.tasks;
+				return task is null ? null : task;
+			},
+		));
+
+		reloadCount = new int;
+		// Capture the pointer by value, not the `out` parameter itself: the
+		// closure outlives this call frame, so closing over `reloadCount`
+		// directly would leave it pointing at a dangling slot in the caller.
+		auto reloadCountRef = reloadCount;
+		socket = new SubmissionCaptureWebSocket((string payload) {
+			if (payload.canFind(`"type":"task_reload"`))
+				(*reloadCountRef)++;
+		});
+		app.clientHub.add(socket);
+		return app;
+	}
+
+	// Sub-case A: history was never loaded live (the common case — nobody
+	// was viewing the task). ensureHistoryLoadedForExit performs the
+	// resolution itself and must not report it.
+	void checkNeverLoaded(bool delegate(App, int) reset, string dbSuffix)
+	{
+		auto dbPath = buildPath(tempDir(), "cydo-app-exit-unavailable-" ~ dbSuffix ~ "-never-loaded.sqlite");
+		scope(exit) if (exists(dbPath)) remove(dbPath);
+		int tid;
+		int* reloadCount;
+		SubmissionCaptureWebSocket socket;
+		auto app = buildFixture(dbPath, tid, reloadCount, socket);
+		scope(exit) app.clientHub.remove(socket);
+
+		assert(!app.tasks[tid].history.isLoaded);
+		auto historyResolution = app.historyPipeline.ensureHistoryLoadedForExit(tid);
+		assert(app.tasks[tid].history.isLoaded);
+		app.jsonlTracker.finalReconcileJsonlIfPresent(tid, historyResolution);
+		assert(*reloadCount == 0, "pre-boundary exit-path load/reconcile must not report");
+
+		auto reloadEmitted = reset(app, tid);
+		assert(reloadEmitted);
+		assert(*reloadCount == 1, "post-exit reset must report exactly once: " ~ dbSuffix);
+	}
+
+	// Sub-case B: history was already loaded live before onExit ran (a
+	// client was subscribed), so ensureHistoryLoadedForExit short-circuits.
+	// finalReconcileJsonlIfPresent must self-resolve without reporting.
+	void checkAlreadyLoaded(bool delegate(App, int) reset, string dbSuffix)
+	{
+		auto dbPath = buildPath(tempDir(), "cydo-app-exit-unavailable-" ~ dbSuffix ~ "-already-loaded.sqlite");
+		scope(exit) if (exists(dbPath)) remove(dbPath);
+		int tid;
+		int* reloadCount;
+		SubmissionCaptureWebSocket socket;
+		auto app = buildFixture(dbPath, tid, reloadCount, socket);
+		scope(exit) app.clientHub.remove(socket);
+		app.tasks[tid].history.reset(Watermark.unreadable());
+		app.tasks[tid].history.load((ulong) => LoadedHistory.init);
+		assert(app.tasks[tid].history.isLoaded);
+
+		auto historyResolution = app.historyPipeline.ensureHistoryLoadedForExit(tid);
+		assert(historyResolution.isNull, "already-loaded history must short-circuit");
+		app.jsonlTracker.finalReconcileJsonlIfPresent(tid, historyResolution);
+		assert(*reloadCount == 0, "pre-boundary exit-path load/reconcile must not report");
+
+		auto reloadEmitted = reset(app, tid);
+		assert(reloadEmitted);
+		assert(*reloadCount == 1, "post-exit reset must report exactly once: " ~ dbSuffix);
+	}
+
+	// resetHistoryWatermarkAfterExit — the default onExit branch.
+	checkNeverLoaded((App app, int tid) => app.resetHistoryWatermarkAfterExit(tid), "after-exit");
+	checkAlreadyLoaded((App app, int tid) => app.resetHistoryWatermarkAfterExit(tid), "after-exit");
+	// resetHistoryWatermarkOnly — shared by the missingExecutableLaunchFailure
+	// and undoStopInProgress onExit branches.
+	checkNeverLoaded((App app, int tid) => app.resetHistoryWatermarkOnly(tid), "only");
+	checkAlreadyLoaded((App app, int tid) => app.resetHistoryWatermarkOnly(tid), "only");
 }

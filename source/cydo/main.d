@@ -1,5 +1,7 @@
 module cydo.main;
 
+import core.lifetime : move;
+
 import std.file : exists, isFile, thisExePath;
 import std.format : format;
 import std.logger : tracef, infof, warningf, errorf, fatalf;
@@ -533,7 +535,35 @@ static:
 
 		// Export task data as JSON
 		auto config = loadRuntimeConfig();
-		auto jsonData = exportTaskData(persistence, taskRows, config, typeInfo);
+		auto allRows = persistence.loadTasks();
+		TaskData[int] allTasks;
+		foreach (ref row; allRows)
+		{
+			auto task = TaskData(row.tid, row.workspace, row.projectPath);
+			task.agentName = row.agentName;
+			task.agentSessionId = row.agentSessionId;
+			task.worktreeTid = row.worktreeTid;
+			allTasks[row.tid] = move(task);
+		}
+		import cydo.workflow.workspace.task_path_resolver : TaskPathResolver,
+			TaskPathResolverHost;
+		auto taskDirTemplate = config.task_dir.length > 0
+			? config.task_dir : defaultTaskDirTemplate;
+		auto taskPathResolver = new TaskPathResolver(TaskPathResolverHost(
+			getTask: (int tid) => tid in allTasks ? &allTasks[tid] : null,
+			workspaces: () => config.workspaces,
+			taskDirTemplate: () => taskDirTemplate,
+		));
+		string jsonData;
+		try
+			jsonData = exportTaskData(taskRows, config, &allTasks, taskPathResolver,
+				typeInfo);
+		catch (Exception e)
+		{
+			stderr.writeln("Error: ", e.msg);
+			import core.stdc.stdlib : exit;
+			exit(1);
+		}
 
 		// Inject data and write output
 		auto html = buildExportHtml(templatePath, jsonData);

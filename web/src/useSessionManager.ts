@@ -2001,15 +2001,7 @@ export function useTaskManager(
   const promote = useCallback((tid: number) => {
     const t = findByTid(tid);
     if (!t || t.status !== "importable") return;
-    connRef.current?.promoteTask(tid);
-    // Optimistic update
-    const updated: TaskState = { ...t, status: "completed", resumable: true };
-    liveStates.set(t.uuid, updated);
-    setTasks((prev) => {
-      const next = new Map(prev);
-      next.set(t.uuid, updated);
-      return next;
-    });
+    connRef.current?.promoteTask(tid, activeWorkspaceRef.current ?? "");
   }, []);
 
   const setArchived = useCallback((tid: number, archived: boolean) => {

@@ -2,18 +2,23 @@ module cydo.workflow.history.jsonl_tracker;
 
 import std.stdio : File;
 import std.string : representation;
+import std.typecons : Nullable;
 
 import ae.net.http.websocket : WebSocketAdapter;
 import ae.sys.data : Data;
 import ae.sys.inotify : INotify;
 import ae.sys.timing : setTimeout, TimerTask;
 
-import cydo.agent.contract : Agent, PersistedHistoryBoundary, PersistedHistoryBoundaryKind;
+import cydo.agent.contract : Agent, PersistedHistoryBoundary,
+	PersistedHistoryBoundaryKind;
 import cydo.protocol : HistoryBoundary, HistoryBoundaryKind;
 import cydo.runtime.config : AgentDriver;
 import cydo.foundation.platform.inotify : RefCountedINotify;
 import cydo.domain.tasks.model : TaskData, Watermark,
 	extractEventFromEnvelope;
+import cydo.workflow.history.native_history : LiveHistoryContext,
+	LiveHistoryWatchResolution, LiveHistoryWatchResolutionKind, TaskHistoryResolution,
+	TaskHistoryResolutionKind;
 
 struct JsonlTracker
 {
@@ -31,10 +36,10 @@ struct JsonlTracker
 		PersistedBoundaryCandidate[][PersistedHistoryBoundaryKind] persistedByKind;
 		ubyte[] partialLine;
 	}
-	Agent delegate(int tid) getAgent;
 	TaskData* delegate(int tid) getTask;
 	ulong delegate(int tid) historyGeneration;
-	string delegate(int tid) getEffectiveCwd;
+	TaskHistoryResolution delegate(int tid) resolveTaskHistory;
+	LiveHistoryWatchResolution delegate(int tid) resolveLiveHistoryWatch;
 	void delegate(int tid, string msg) sendToSubscribed;
 	void delegate(int tid, size_t seq, HistoryBoundary boundary, bool publish, ulong generation) onBoundaryResolved;
 	void delegate(int tid) onLineageInvalidated;
@@ -48,6 +53,7 @@ struct JsonlTracker
 	private RefCountedINotify.Handle[int] jsonlWatches;
 	private size_t[int] jsonlReadPos;
 	private string[int] jsonlPaths;
+	private LiveHistoryContext[int] liveContexts;
 	private int[int] jsonlLineCount;
 	private BoundaryReconcileState[int] boundaryState;
 	private ulong[int] lineageGeneration;
@@ -55,6 +61,33 @@ struct JsonlTracker
 	// Snapshot of JSONL content taken just before broadcast, used for undo
 	// when the agent compacts the file (e.g. Codex auto-compaction).
 	private string[int] undoJsonl;
+
+	private LiveHistoryContext requireLiveContext(int tid)
+	{
+		auto context = tid in liveContexts;
+		assert(context !is null,
+			"JSONL history operation requires an attached live history context");
+		return *context;
+	}
+
+	private void attachLiveContext(int tid, LiveHistoryContext context)
+	{
+		liveContexts[tid] = context;
+	}
+
+	private void scheduleWatchRetry(int tid)
+	{
+		import core.time : seconds;
+
+		if (tid in jsonlRetryTimers)
+			return;
+		auto generation = lineageGeneration.get(tid, 0);
+		jsonlRetryTimers[tid] = setTimeout({
+			jsonlRetryTimers.remove(tid);
+			if (lineageGeneration.get(tid, 0) == generation)
+				startJsonlWatch(tid);
+		}, 2.seconds);
+	}
 
 	void noteLiveBoundaryCandidate(int tid, size_t seq, string event,
 		string raw = null, int sourceLine = 0, bool isContextBootstrap = false)
@@ -75,7 +108,7 @@ struct JsonlTracker
 		else return;
 		if (tid !in boundaryState)
 			boundaryState[tid] = BoundaryReconcileState.init;
-		if (getAgent(tid).driver == AgentDriver.codex && isContextBootstrap
+		if (requireLiveContext(tid).agent.driver == AgentDriver.codex && isContextBootstrap
 			&& kind == PersistedHistoryBoundaryKind.user)
 			return;
 		auto identity = p.uuid.length > 0 ? p.uuid : p.item_id;
@@ -134,7 +167,7 @@ struct JsonlTracker
 						continue;
 					auto nativeRecord = !persisted.boundary.anchor.startsWith("enqueue-");
 					if ((nativeRecord && persisted.boundary.anchor.startsWith("line:"))
-						|| (nativeRecord && getAgent(tid).driver == AgentDriver.claude
+						|| (nativeRecord && requireLiveContext(tid).agent.driver == AgentDriver.claude
 							&& kind == PersistedHistoryBoundaryKind.user)
 						|| (kind == PersistedHistoryBoundaryKind.agent_turn
 							&& live.identity.length == 0))
@@ -175,58 +208,77 @@ struct JsonlTracker
 		stopJsonlWatch(tid);
 	}
 
-	void finalReconcileJsonlIfPresent(int tid)
+	/// `knownResolution`, when present, is the resolution ensureHistoryLoadedForExit
+	/// already resolved immediately before this call while loading the task's
+	/// history for the first time; it is reused here instead of re-resolving.
+	/// This is exclusively an exit-path call (task_runner.d's onExit is its
+	/// only production caller): the post-exit config-only reset that follows
+	/// it is the sole owner of the unavailable-history diagnostic, so neither
+	/// this branch nor the fresh self-resolve branch below ever reports.
+	void finalReconcileJsonlIfPresent(int tid,
+		Nullable!TaskHistoryResolution knownResolution = Nullable!TaskHistoryResolution.init)
 	{
 		auto td = getTask(tid);
 		assert(td !is null && td.history.isLoaded,
 			"final JSONL reconciliation requires a loaded current task history");
+		TaskHistoryResolution resolution;
+		if (knownResolution.isNull)
+		{
+			resolution = resolveTaskHistory(tid);
+			final switch (resolution.kind)
+			{
+			case TaskHistoryResolutionKind.noSession:
+			case TaskHistoryResolutionKind.orphanAgent:
+			case TaskHistoryResolutionKind.unavailable:
+				return;
+			case TaskHistoryResolutionKind.access:
+				break;
+			}
+		}
+		else
+		{
+			resolution = knownResolution.get;
+			if (resolution.kind != TaskHistoryResolutionKind.access)
+				return;
+		}
+		auto access = resolution.requireAccess();
 		auto path = tid in jsonlPaths;
 		if (path is null)
 		{
-			if (td.agentSessionId.length == 0) return;
-			auto resolved = getAgent(tid).historyPath(td.agentSessionId, getEffectiveCwd(tid));
-			import std.file : exists;
-			if (resolved.length == 0 || !exists(resolved)) return;
-			attachAndCatchUp(tid, resolved, false);
+			attachAndCatchUp(tid, access.path, false);
 			return;
 		}
+		assert(*path == access.path,
+			"Final JSONL reconciliation path does not match resolved history access");
 		attachAndCatchUp(tid, *path, false);
 	}
 
 	/// Start watching the JSONL file (or directory if file doesn't exist yet).
 	void startJsonlWatch(int tid)
 	{
-		import std.file : exists, mkdirRecurse;
+		import std.file : exists;
 		import std.path : baseName, dirName;
 		import std.logger : tracef;
 
-		auto td = getTask(tid);
-		if (td is null)
-			return;
 		if (tid in jsonlWatches)
 			return;
-		if (td.agentSessionId.length == 0)
-			return;
-
-		auto jsonlPath = getAgent(tid).historyPath(td.agentSessionId, getEffectiveCwd(tid));
-		tracef("[jsonl] startJsonlWatch tid=%d sessionId=%s jsonlPath=%s exists=%s",
-			tid, td.agentSessionId, jsonlPath, jsonlPath.length > 0 && exists(jsonlPath));
-		if (jsonlPath.length == 0)
+		auto resolution = resolveLiveHistoryWatch(tid);
+		final switch (resolution.kind)
 		{
-			// File not discoverable yet (e.g. Codex — JSONL created asynchronously).
-			// Schedule a retry so the watch gets established once the file appears.
-			import core.time : seconds;
-			if (tid !in jsonlRetryTimers)
-			{
-				auto generation = lineageGeneration.get(tid, 0);
-				jsonlRetryTimers[tid] = setTimeout({
-					jsonlRetryTimers.remove(tid);
-					if (lineageGeneration.get(tid, 0) == generation)
-						startJsonlWatch(tid);
-				}, 2.seconds);
-			}
+		case LiveHistoryWatchResolutionKind.noLiveBinding:
 			return;
+		case LiveHistoryWatchResolutionKind.awaitingPath:
+			attachLiveContext(tid, resolution.requireContext());
+			scheduleWatchRetry(tid);
+			return;
+		case LiveHistoryWatchResolutionKind.target:
+			break;
 		}
+		auto target = resolution.requireTarget();
+		attachLiveContext(tid, target.context);
+		auto jsonlPath = target.path;
+		tracef("[jsonl] startJsonlWatch tid=%d sessionId=%s jsonlPath=%s exists=%s",
+			tid, target.context.sessionId, jsonlPath, exists(jsonlPath));
 
 		if (auto t = tid in jsonlRetryTimers)
 		{
@@ -243,7 +295,11 @@ struct JsonlTracker
 			// File doesn't exist yet — watch directory for its creation.
 			auto dirPath = dirName(jsonlPath);
 			auto fileName = baseName(jsonlPath);
-			mkdirRecurse(dirPath);
+			if (!exists(dirPath))
+			{
+				scheduleWatchRetry(tid);
+				return;
+			}
 			auto generation = lineageGeneration.get(tid, 0);
 			jsonlWatches[tid] = rcINotify.add(dirPath, INotify.Mask.create,
 				(in char[] name, INotify.Mask mask, uint cookie)
@@ -345,7 +401,8 @@ struct JsonlTracker
 		boundaryState[tid].partialLine = cast(ubyte[]) newContent[completeBytes .. $].dup;
 
 		auto lineOffset = jsonlLineCount.get(tid, 0);
-		auto boundaries = getAgent(tid).extractPersistedHistoryBoundaries(completeContent, lineOffset);
+		auto context = requireLiveContext(tid);
+		auto boundaries = context.agent.extractPersistedHistoryBoundaries(completeContent, lineOffset);
 		tracef("[jsonl] processNewJsonlContent tid=%d path=%s newBytes=%d boundaries=%d", tid, jsonlPath, got.length, boundaries.length);
 
 		import std.string : lineSplitter;
@@ -377,7 +434,7 @@ struct JsonlTracker
 			if (tid !in boundaryState)
 				boundaryState[tid] = BoundaryReconcileState.init;
 			auto task = getTask(tid);
-			if (boundaryHasCheckpoint(getAgent(tid).driver, boundary.kind))
+			if (boundaryHasCheckpoint(context.agent.driver, boundary.kind))
 				boundary.checkpointUuid = task.checkpointUuidForAnchor(boundary.anchor);
 			boundaryState[tid].persistedByKind[boundary.kind] ~= PersistedBoundaryCandidate(boundary,
 				cast(size_t) boundary.sourceLine, true, historyGeneration(tid));
@@ -410,6 +467,7 @@ struct JsonlTracker
 		}
 		jsonlReadPos.remove(tid);
 		jsonlPaths.remove(tid);
+		liveContexts.remove(tid);
 		jsonlLineCount.remove(tid);
 		boundaryState.remove(tid);
 		// Do NOT remove undoJsonl here: for agents that auto-restart (e.g. Codex
@@ -431,14 +489,20 @@ struct JsonlTracker
 		import std.file : exists, readText;
 		import std.logger : tracef;
 
-		auto td = getTask(tid);
-		if (td is null || td.agentSessionId.length == 0)
+		auto resolution = resolveTaskHistory(tid);
+		final switch (resolution.kind)
+		{
+		case TaskHistoryResolutionKind.noSession:
+		case TaskHistoryResolutionKind.orphanAgent:
+		case TaskHistoryResolutionKind.unavailable:
 			return;
-		auto jsonlPath = getAgent(tid).historyPath(td.agentSessionId, getEffectiveCwd(tid));
-		if (jsonlPath.length == 0 || !exists(jsonlPath))
-			return;
-		undoJsonl[tid] = readText(jsonlPath);
-		tracef("[jsonl] captureUndoSnapshot tid=%d path=%s bytes=%d", tid, jsonlPath, undoJsonl[tid].length);
+		case TaskHistoryResolutionKind.access:
+			break;
+		}
+		auto access = resolution.requireAccess();
+		undoJsonl[tid] = readText(access.path);
+		tracef("[jsonl] captureUndoSnapshot tid=%d path=%s bytes=%d", tid,
+			access.path, undoJsonl[tid].length);
 	}
 
 
@@ -452,6 +516,16 @@ struct JsonlTracker
 				? HistoryBoundaryKind.user : HistoryBoundaryKind.agent_turn,
 			boundary.checkpointUuid), publish, generation);
 	}
+}
+
+version (unittest)
+private void setTestLiveContext(ref JsonlTracker tracker, int tid,
+	Agent agent)
+{
+	import cydo.runtime.launch.types : NativeHistoryProfile;
+
+	tracker.liveContexts[tid] = LiveHistoryContext(agent,
+		NativeHistoryProfile(agent.driver, "/tmp"), "session", "/tmp");
 }
 
 unittest
@@ -494,7 +568,7 @@ unittest
 	import cydo.agent.drivers.codex : CodexAgent;
 	import std.conv : to;
 	JsonlTracker tracker;
-	tracker.getAgent = (int) => cast(Agent) new CodexAgent();
+	setTestLiveContext(tracker, 1, new CodexAgent());
 	tracker.historyGeneration = (int) => 0;
 	string[] resolved;
 	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
@@ -516,7 +590,7 @@ unittest
 	import cydo.agent.drivers.codex : CodexAgent;
 	import std.conv : to;
 	JsonlTracker tracker;
-	tracker.getAgent = (int) => cast(Agent) new CodexAgent();
+	setTestLiveContext(tracker, 1, new CodexAgent());
 	tracker.historyGeneration = (int) => 0;
 	string[] resolved;
 	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
@@ -539,7 +613,7 @@ unittest
 	import cydo.agent.drivers.claude : ClaudeCodeAgent;
 	import std.conv : to;
 	JsonlTracker tracker;
-	tracker.getAgent = (int) => cast(Agent) new ClaudeCodeAgent();
+	setTestLiveContext(tracker, 1, new ClaudeCodeAgent());
 	tracker.historyGeneration = (int) => 0;
 	string[] resolved;
 	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
@@ -565,7 +639,7 @@ unittest
 	task.history.reset(Watermark.none());
 	JsonlTracker tracker;
 	tracker.getTask = (int) => &task;
-	tracker.getAgent = (int) => cast(Agent) new CodexAgent();
+	setTestLiveContext(tracker, 1, new CodexAgent());
 	tracker.historyGeneration = (int) => task.history.generation;
 	string[] resolved;
 	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary b, bool, ulong) { resolved ~= b.anchor; };
@@ -575,6 +649,7 @@ unittest
 	tracker.attachAndCatchUp(1, path, false);
 	assert(resolved == ["line:2"]);
 	tracker.stopJsonlWatch(1);
+	setTestLiveContext(tracker, 1, new CodexAgent());
 	tracker.attachAndCatchUp(1, path, false);
 	assert(tracker.jsonlReadPos[1] > 0);
 	assert(resolved == ["line:2"]);
@@ -588,6 +663,7 @@ unittest
 	JsonlTracker tracker;
 	tracker.getTask = (int) => &task;
 	tracker.historyGeneration = (int) => task.history.generation;
+	tracker.resolveTaskHistory = (int) => TaskHistoryResolution.noSession();
 	tracker.finalReconcileJsonlIfPresent(1);
 	assert(1 !in tracker.jsonlPaths);
 }
@@ -597,6 +673,8 @@ unittest
 	import std.file : getSize, readText, remove, write;
 	import std.conv : to;
 	import cydo.agent.drivers.codex : CodexAgent;
+	import cydo.runtime.launch.types : NativeHistoryProfile;
+	import cydo.workflow.history.native_history : HistoryAccess;
 	import ae.utils.json : JSONFragment, toJson;
 	import cydo.protocol : TaskEventEnvelope;
 	auto path = "/tmp/cydo-jsonl-tracker-final-flush.jsonl";
@@ -606,11 +684,14 @@ unittest
 	task.history.reset(Watermark.none());
 	task.history.appendLive(Data(toJson(TaskEventEnvelope(1, 1,
 		JSONFragment(`{"type":"item/started","item_type":"user_message"}`))).representation), null);
+	auto agent = new CodexAgent();
 	JsonlTracker tracker;
 	tracker.getTask = (int) => &task;
-	tracker.getAgent = (int) => cast(Agent) new CodexAgent();
-	tracker.getEffectiveCwd = (int) => "";
+	setTestLiveContext(tracker, 1, agent);
 	tracker.historyGeneration = (int) => task.history.generation;
+	tracker.resolveTaskHistory = (int) => TaskHistoryResolution.access(
+		HistoryAccess(agent, NativeHistoryProfile(agent.driver, "/tmp"), "session",
+			"/tmp", path));
 	string[] resolved;
 	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
 		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
@@ -627,6 +708,123 @@ unittest
 	tracker.finalReconcileJsonlIfPresent(1);
 	assert(resolved == ["line:2:0"]);
 	remove(path);
+}
+
+// Regression for the onExit sequence in task_runner.d: ensureHistoryLoadedForExit
+// followed immediately by finalReconcileJsonlIfPresent(tid, itsReturnValue),
+// for a task whose history was never loaded during its live session and
+// whose native JSONL is unavailable at exit, must never report — that is the
+// exclusive job of the post-exit config-only reset that runs after this pair
+// (App.resetHistoryWatermark), which is the sole owner of the diagnostic for
+// the exit sequence.
+unittest
+{
+	import cydo.domain.storage.persistence : LoadedHistory;
+	import cydo.workflow.history.native_history : UnavailableHistory, UnavailableHistoryKind;
+	import cydo.workflow.history.pipeline : HistoryEventPipeline, HistoryEventPipelineHost;
+
+	TaskData task = TaskData(1, "", "");
+
+	auto unavailable = TaskHistoryResolution.unavailable(UnavailableHistory(
+		UnavailableHistoryKind.context, "claude", "session-1",
+		"The derived history file does not exist"));
+
+	int reportCount;
+	void reportUnavailableHistory(int tid, const ref TaskHistoryResolution resolution)
+	{
+		reportCount++;
+		task.history.reset(Watermark.unreadable());
+		task.history.load((ulong) => LoadedHistory.init);
+	}
+
+	auto pipeline = new HistoryEventPipeline(HistoryEventPipelineHost(
+		getTask: (int) => &task,
+		resolveTaskHistory: (int) => unavailable,
+		reportUnavailableHistory: &reportUnavailableHistory,
+	));
+
+	JsonlTracker tracker;
+	tracker.getTask = (int) => &task;
+	tracker.resolveTaskHistory = (int) => unavailable;
+
+	assert(!task.history.isLoaded);
+	auto historyResolution = pipeline.ensureHistoryLoadedForExit(1);
+	assert(task.history.isLoaded);
+	assert(reportCount == 0, "ensureHistoryLoadedForExit must not report; the "
+		~ "post-exit reset owns the diagnostic");
+
+	// Mirrors task_runner.d's onExit: finalReconcileJsonlIfPresent receives
+	// the resolution ensureHistoryLoadedForExit just resolved, and must not
+	// report it either.
+	tracker.finalReconcileJsonlIfPresent(1, historyResolution);
+	assert(reportCount == 0, "finalReconcileJsonlIfPresent must not report a "
+		~ "resolution reused from ensureHistoryLoadedForExit");
+}
+
+// Positive-contract counterpart to the exit-path regression above:
+// ensureHistoryLoaded (the reporting variant, used outside the exit sequence
+// by handleRequestHistory and the edit-message flows) must still report an
+// unavailable resolution exactly once, since it is the sole reporter for
+// those callers.
+unittest
+{
+	import cydo.workflow.history.native_history : UnavailableHistory, UnavailableHistoryKind;
+	import cydo.workflow.history.pipeline : HistoryEventPipeline, HistoryEventPipelineHost;
+
+	TaskData task = TaskData(1, "", "");
+
+	auto unavailable = TaskHistoryResolution.unavailable(UnavailableHistory(
+		UnavailableHistoryKind.context, "claude", "session-1",
+		"The derived history file does not exist"));
+
+	int reportCount;
+	void reportUnavailableHistory(int tid, const ref TaskHistoryResolution resolution)
+	{
+		reportCount++;
+	}
+
+	auto pipeline = new HistoryEventPipeline(HistoryEventPipelineHost(
+		getTask: (int) => &task,
+		resolveTaskHistory: (int) => unavailable,
+		reportUnavailableHistory: &reportUnavailableHistory,
+	));
+
+	assert(!task.history.isLoaded);
+	auto historyResolution = pipeline.ensureHistoryLoaded(1);
+	assert(task.history.isLoaded);
+	assert(reportCount == 1, "ensureHistoryLoaded should report exactly once");
+	assert(!historyResolution.isNull);
+	assert(historyResolution.get.kind == TaskHistoryResolutionKind.unavailable);
+}
+
+// A task whose history was already loaded before onExit runs (ensureHistoryLoadedForExit
+// short-circuits, returning no resolution) must still have finalReconcileJsonlIfPresent
+// resolve fresh, but — being exit-path exclusive — must not report it either;
+// JsonlTracker has no reportUnavailableHistory delegate at all, so a report
+// here would be a null-delegate crash rather than a silently swallowed call.
+unittest
+{
+	import cydo.domain.storage.persistence : LoadedHistory;
+	import cydo.workflow.history.native_history : UnavailableHistory, UnavailableHistoryKind;
+
+	TaskData task = TaskData(1, "", "");
+	task.history.reset(Watermark.unreadable());
+	task.history.load((ulong) => LoadedHistory.init);
+	assert(task.history.isLoaded);
+
+	auto unavailable = TaskHistoryResolution.unavailable(UnavailableHistory(
+		UnavailableHistoryKind.context, "claude", "session-1",
+		"The derived history file does not exist"));
+
+	JsonlTracker tracker;
+	tracker.getTask = (int) => &task;
+	tracker.resolveTaskHistory = (int) => unavailable;
+
+	auto generationBefore = task.history.generation;
+	tracker.finalReconcileJsonlIfPresent(1);
+	assert(task.history.isLoaded);
+	assert(task.history.generation == generationBefore,
+		"the unavailable arm must leave history untouched");
 }
 
 unittest
@@ -705,7 +903,7 @@ unittest
 	import cydo.agent.drivers.claude : ClaudeCodeAgent;
 	string[] resolved;
 	JsonlTracker tracker;
-	tracker.getAgent = (int) => cast(Agent) new ClaudeCodeAgent();
+	setTestLiveContext(tracker, 1, new ClaudeCodeAgent());
 	tracker.historyGeneration = (int) => 0;
 	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
 		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);
@@ -715,11 +913,13 @@ unittest
 		`{"type":"item/started","item_type":"user_message","uuid":"u"}`);
 	assert(tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user].length == 1);
 	tracker.invalidateLineage(1);
+	setTestLiveContext(tracker, 1, new ClaudeCodeAgent());
 	tracker.historyGeneration = (int) => 0;
 	tracker.noteLiveBoundaryCandidate(1, 7,
 		`{"type":"item/started","item_type":"user_message","uuid":"u","meta":null}`);
 	assert(tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user].length == 1);
 	tracker.invalidateLineage(1);
+	setTestLiveContext(tracker, 1, new ClaudeCodeAgent());
 	tracker.historyGeneration = (int) => 0;
 
 	// Live callback first: the canonical persisted identity resolves the queued live event.
@@ -733,6 +933,7 @@ unittest
 	assert(tracker.boundaryState[1].persistedByKind[PersistedHistoryBoundaryKind.user].length == 0);
 
 	// Persisted callback first: noteLiveBoundaryCandidate drains the matching canonical queue.
+	setTestLiveContext(tracker, 2, new ClaudeCodeAgent());
 	tracker.boundaryState[2] = JsonlTracker.BoundaryReconcileState.init;
 	tracker.boundaryState[2].persistedByKind[PersistedHistoryBoundaryKind.agent_turn] ~=
 		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("turn", PersistedHistoryBoundaryKind.agent_turn, null), 1, true, 0);
@@ -742,6 +943,7 @@ unittest
 	assert(tracker.boundaryState[2].persistedByKind[PersistedHistoryBoundaryKind.agent_turn].length == 0);
 
 	// Line anchors have no shared identity and drain FIFO in either callback order.
+	setTestLiveContext(tracker, 3, new ClaudeCodeAgent());
 	tracker.boundaryState[3] = JsonlTracker.BoundaryReconcileState.init;
 	tracker.boundaryState[3].persistedByKind[PersistedHistoryBoundaryKind.user] ~=
 		JsonlTracker.PersistedBoundaryCandidate(PersistedHistoryBoundary("line:10", PersistedHistoryBoundaryKind.user, null), 10, false, 0);
@@ -751,6 +953,7 @@ unittest
 
 	// Claude assistant message_stop has no UUID in its live turn/stop event;
 	// its persisted assistant UUID must therefore resolve FIFO, unlike users.
+	setTestLiveContext(tracker, 4, new ClaudeCodeAgent());
 	tracker.boundaryState[4] = JsonlTracker.BoundaryReconcileState.init;
 	tracker.boundaryState[4].liveByKind[PersistedHistoryBoundaryKind.agent_turn] ~=
 		JsonlTracker.LiveBoundaryCandidate(10, PersistedHistoryBoundaryKind.agent_turn, "", 0);
@@ -759,6 +962,7 @@ unittest
 	tracker.drainLiveBoundaries(4, PersistedHistoryBoundaryKind.agent_turn);
 	assert(resolved[$ - 1] == "assistant:10");
 
+	setTestLiveContext(tracker, 5, new ClaudeCodeAgent());
 	tracker.boundaryState[5] = JsonlTracker.BoundaryReconcileState.init;
 	tracker.boundaryState[5].liveByKind[PersistedHistoryBoundaryKind.user] ~=
 		JsonlTracker.LiveBoundaryCandidate(11, PersistedHistoryBoundaryKind.user, "user-a", 0);
@@ -833,8 +1037,8 @@ unittest
 unittest
 {
 	import std.conv : to;
-	import std.file : remove, write;
 	import cydo.agent.drivers.codex : CodexAgent;
+	import std.file : remove, write;
 
 	// A notification may arrive after stdout supplied the live candidate but
 	// before the writer has finished its JSONL line.  The completed line must
@@ -847,7 +1051,7 @@ unittest
 	TaskData task = TaskData(1, "", "");
 	task.history.reset(Watermark.none());
 	JsonlTracker tracker;
-	tracker.getAgent = (int) => cast(Agent) new CodexAgent();
+	setTestLiveContext(tracker, 1, new CodexAgent());
 	tracker.getTask = (int) => &task;
 	tracker.historyGeneration = (int) => task.history.generation;
 	string[] resolved;
@@ -870,10 +1074,12 @@ unittest
 unittest
 {
 	import std.conv : to;
+	import cydo.agent.drivers.codex : CodexAgent;
 
 	// When both queues already contain consecutive compatible boundaries, one
 	// reconciliation pass preserves their full FIFO order.
 	JsonlTracker tracker;
+	setTestLiveContext(tracker, 1, new CodexAgent());
 	tracker.historyGeneration = (int) => 0;
 	string[] resolved;
 	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {

@@ -6,6 +6,7 @@ import cydo.runtime.config : AgentDriver;
 
 enum HistoryOperation { fork, undo }
 enum HistoryOperationMechanism { none, jsonl, codex_native }
+enum CodexForkSourceState { dead, liveReady, liveBusy }
 
 struct HistoryOperationKinds
 {
@@ -19,17 +20,37 @@ struct HistoryOperations
 	HistoryOperationKinds undo;
 }
 
-HistoryOperations selectHistoryOperations(AgentDriver driver, bool alive,
-	bool canRollbackThread)
+HistoryOperations selectHistoryOperations(AgentDriver driver,
+	CodexForkSourceState codexForkSource)
 {
 	HistoryOperations result;
-	auto native = alive && driver == AgentDriver.codex && canRollbackThread;
-	result.fork.user = native ? HistoryOperationMechanism.codex_native : HistoryOperationMechanism.jsonl;
-	result.fork.agent_turn = native ? HistoryOperationMechanism.codex_native : HistoryOperationMechanism.jsonl;
-	result.undo.user = native
-		? HistoryOperationMechanism.codex_native : HistoryOperationMechanism.jsonl;
-	if (!native)
+	if (driver != AgentDriver.codex)
+	{
+		result.fork.user = HistoryOperationMechanism.jsonl;
+		result.fork.agent_turn = HistoryOperationMechanism.jsonl;
+		result.undo.user = HistoryOperationMechanism.jsonl;
 		result.undo.agent_turn = HistoryOperationMechanism.jsonl;
+		return result;
+	}
+
+	final switch (codexForkSource)
+	{
+	case CodexForkSourceState.dead:
+		result.fork.user = HistoryOperationMechanism.codex_native;
+		result.fork.agent_turn = HistoryOperationMechanism.codex_native;
+		result.undo.user = HistoryOperationMechanism.jsonl;
+		result.undo.agent_turn = HistoryOperationMechanism.jsonl;
+		break;
+	case CodexForkSourceState.liveReady:
+		result.fork.user = HistoryOperationMechanism.codex_native;
+		result.fork.agent_turn = HistoryOperationMechanism.codex_native;
+		result.undo.user = HistoryOperationMechanism.codex_native;
+		break;
+	case CodexForkSourceState.liveBusy:
+		result.undo.user = HistoryOperationMechanism.jsonl;
+		result.undo.agent_turn = HistoryOperationMechanism.jsonl;
+		break;
+	}
 	return result;
 }
 
@@ -50,16 +71,28 @@ bool allowsFileRevert(const HistoryBoundary boundary)
 unittest
 {
 	import cydo.protocol : HistoryBoundary;
-	auto offline = selectHistoryOperations(AgentDriver.codex, false, false);
-	assert(offline.fork.user == HistoryOperationMechanism.jsonl);
-	assert(offline.fork.agent_turn == HistoryOperationMechanism.jsonl);
+	auto offline = selectHistoryOperations(AgentDriver.codex,
+		CodexForkSourceState.dead);
+	assert(offline.fork.user == HistoryOperationMechanism.codex_native);
+	assert(offline.fork.agent_turn == HistoryOperationMechanism.codex_native);
 	assert(offline.undo.user == HistoryOperationMechanism.jsonl);
 	assert(offline.undo.agent_turn == HistoryOperationMechanism.jsonl);
-	auto native = selectHistoryOperations(AgentDriver.codex, true, true);
+	auto native = selectHistoryOperations(AgentDriver.codex,
+		CodexForkSourceState.liveReady);
 	assert(native.fork.user == HistoryOperationMechanism.codex_native);
 	assert(native.fork.agent_turn == HistoryOperationMechanism.codex_native);
 	assert(native.undo.user == HistoryOperationMechanism.codex_native);
 	assert(native.undo.agent_turn == HistoryOperationMechanism.none);
+	auto busy = selectHistoryOperations(AgentDriver.codex,
+		CodexForkSourceState.liveBusy);
+	assert(busy.fork.user == HistoryOperationMechanism.none);
+	assert(busy.fork.agent_turn == HistoryOperationMechanism.none);
+	assert(busy.undo.user == HistoryOperationMechanism.jsonl);
+	assert(busy.undo.agent_turn == HistoryOperationMechanism.jsonl);
+	auto claude = selectHistoryOperations(AgentDriver.claude,
+		CodexForkSourceState.dead);
+	assert(claude.fork.user == HistoryOperationMechanism.jsonl);
+	assert(claude.undo.agent_turn == HistoryOperationMechanism.jsonl);
 	auto boundary = HistoryBoundary("a", HistoryBoundaryKind.agent_turn, "");
 	assert(allowsOperation(boundary, offline, HistoryOperation.undo));
 	assert(!allowsOperation(boundary, native, HistoryOperation.undo));

@@ -411,3 +411,164 @@ test("import replay drops durable session/status rows but keeps compact boundary
     rmSync(workDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Split-root import preview/adoption test.
+//
+// Proves discovery is exact-rooted, not resolved via any bare-session-ID
+// fallback: a poisoned same-session-ID sibling written under a different,
+// unconfigured root (mirroring the backend-parent-profile-A vs.
+// configured-profile-B split used by AC21/AC22/AC23 elsewhere in this unit)
+// must never surface in the importable preview. It also proves workspace
+// adoption is only durable after the server confirms it: reconfiguring the
+// agent's profile root live (B -> C, with no re-scan — config reload only
+// re-derives the workspace list, never re-enumerates native sessions) makes
+// the server reject "Import Session" as a root mismatch, and the item must
+// remain importable rather than silently promoting client-side.
+// ---------------------------------------------------------------------------
+
+function writeSplitRootConfig(
+  configPath: string,
+  profileRoot: string,
+  displayName: string,
+): void {
+  writeTestConfig(
+    configPath,
+    `default_agent: work-claude
+agents:
+  work-claude:
+    driver: claude
+    display_name: ${displayName}
+    sandbox:
+      env:
+        CLAUDE_CONFIG_DIR: ${profileRoot}
+workspaces:
+  testws:
+    root: /tmp/cydo-test-workspace
+`,
+  );
+}
+
+function writeNativeClaudeSession(
+  root: string,
+  projectPath: string,
+  sessionId: string,
+  marker: string,
+): void {
+  const mangledPath = projectPath.replace(/\//g, "-");
+  const dir = `${root}/projects/${mangledPath}`;
+  mkdirSync(dir, { recursive: true });
+  const jsonlContent =
+    [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: sessionId,
+        model: "claude-3-5-sonnet-20241022",
+        cwd: projectPath,
+      }),
+      JSON.stringify({
+        type: "user",
+        message: { content: marker },
+      }),
+    ].join("\n") + "\n";
+  writeFileSync(`${dir}/${sessionId}.jsonl`, jsonlContent);
+}
+
+test(
+  "importable preview is exact-rooted and a stale-root promote is rejected without promoting",
+  { tag: "@claude-only" },
+  async ({ page }) => {
+    const { workDir, workerHome } = createWorkDir("split-root");
+    const projectPath = "/tmp/cydo-test-workspace";
+    const sessionId = "22223333-4444-5555-6666-777788889999";
+    const realMarker = "split-root-real-import-marker";
+    const poisonMarker = "split-root-a-poison-import-marker";
+
+    // profileB is the currently-configured work-claude root; profileA is the
+    // backend's own parent CLAUDE_CONFIG_DIR (unconfigured for work-claude,
+    // never scanned); profileC is the root work-claude is reconfigured to
+    // live, after the one and only scan already happened against B.
+    const profileB = `${workDir}/profile-b`;
+    const profileA = `${workerHome}/.claude`;
+    const profileC = `${workDir}/profile-c`;
+
+    writeNativeClaudeSession(profileB, projectPath, sessionId, realMarker);
+    writeNativeClaudeSession(profileA, projectPath, sessionId, poisonMarker);
+
+    const configPath = `${workerHome}/.config/cydo/config.yaml`;
+    writeSplitRootConfig(configPath, profileB, "Profile B");
+
+    const proc = spawnBackend(workDir, workerHome);
+    try {
+      await waitForBackend(proc);
+      await page.goto(BACKEND_URL + "/");
+
+      const realLabel = page.locator(
+        ".project-card-sessions .sidebar-item .sidebar-label",
+        { hasText: realMarker },
+      );
+      await expect(realLabel).toBeVisible({ timeout: 15_000 });
+      await expect(
+        page.locator(".sidebar-item .sidebar-label", {
+          hasText: poisonMarker,
+        }),
+      ).toHaveCount(0);
+
+      await realLabel.click();
+      await expect(page).toHaveURL(/\/task\//, { timeout: 5_000 });
+      await expect(
+        page.locator(".message.user-message", { hasText: realMarker }),
+      ).toBeVisible({ timeout: 15_000 });
+      await expect(
+        page.locator(".message.user-message", { hasText: poisonMarker }),
+      ).toHaveCount(0);
+
+      const importBtn = page.locator(".btn-resume", {
+        hasText: "Import Session",
+      });
+      await expect(importBtn).toBeVisible({ timeout: 5_000 });
+      const taskUrl = page.url();
+
+      // Reconfigure work-claude live, from B to C, with no backend restart.
+      writeSplitRootConfig(configPath, profileC, "Profile C");
+
+      // Observe the config-reload acknowledgement via a fresh draft's
+      // picker on the project card (mirrors the AC21/AC23 reconfiguration-
+      // ack pattern), before returning to the still-importable task.
+      await page.goto(BACKEND_URL + "/");
+      await page
+        .locator(".project-card", { hasText: "cydo-test-workspace" })
+        .locator('button[title="New task"]')
+        .click();
+      await expect(
+        page.locator('.agent-picker option[value="work-claude"]'),
+      ).toHaveText("Profile C", { timeout: 20_000 });
+
+      await page.goto(taskUrl);
+      await expect(importBtn).toBeVisible({ timeout: 10_000 });
+      await importBtn.click();
+
+      const errorDialog = page.locator(".command-error-dialog");
+      await expect(errorDialog).toBeVisible({ timeout: 10_000 });
+      await expect(errorDialog.locator(".command-error-message")).toHaveText(
+        `Cannot import session ${sessionId} into workspace 'testws': ` +
+          `it resolves to ${profileC} but the scanned session belongs to ${profileB}`,
+      );
+      await errorDialog.getByRole("button", { name: "Dismiss" }).click();
+      await expect(errorDialog).not.toBeVisible();
+
+      // The rejected promotion left the task importable, not silently
+      // promoted client-side.
+      await expect(importBtn).toBeVisible({ timeout: 5_000 });
+      await expect(
+        page.locator(".sidebar-item.sidebar-archive-node", {
+          hasText: /Import/,
+        }),
+      ).toBeVisible();
+    } finally {
+      await killBackend(proc);
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  },
+);

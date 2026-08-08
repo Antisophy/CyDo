@@ -2,9 +2,11 @@ module cydo.agent.drivers.codex;
 
 import core.time : Duration, msecs, seconds;
 
+import std.algorithm : startsWith;
 import std.conv : to;
+import std.exception : enforce;
 import std.logger : errorf, tracef, warningf;
-import std.path : buildPath, dirName;
+import std.path : buildPath, dirName, isAbsolute;
 
 import ae.sys.data : Data;
 import ae.sys.timing : setTimeout, TimerTask;
@@ -35,7 +37,8 @@ import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.runtime.config : AgentDriver, ModelSpec, ModelSpecFields;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
-import cydo.runtime.launch.types : NativeHistoryRule, ProcessLaunch;
+import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule,
+	ProcessLaunch;
 import cydo.runtime.launch.sandbox : cleanup, cydoBinaryDir, cydoBinaryPath, effectiveEnvValue,
 	executableMountPaths, resolveExecutablePath;
 import launchSandbox = cydo.runtime.launch.sandbox;
@@ -45,16 +48,156 @@ import cydo.foundation.text.title : truncateTitle;
 // CodexAgent — Agent descriptor for OpenAI Codex CLI.
 // ---------------------------------------------------------------------------
 
+private struct CodexHistoryKey
+{
+	string root;
+	string sessionId;
+}
+
+private struct CodexLiveHistoryPath
+{
+	CodexSession owner;
+	string path;
+}
+
+final class CodexForkPathLease
+{
+private:
+	CodexSession owner_;
+	CodexHistoryKey key_;
+	string path_;
+	bool released_;
+
+public:
+	this(CodexSession owner, CodexHistoryKey key, string path)
+	{
+		owner_ = owner;
+		key_ = key;
+		path_ = path;
+	}
+
+	@property string path()
+	{
+		enforce(!released_, "Codex fork history path lease was released");
+		return path_;
+	}
+
+	void release()
+	{
+		if (released_)
+			return;
+		owner_.releaseForkPath(this);
+	}
+}
+
+struct ThreadForkOutcome
+{
+	bool ok;
+	string threadId;
+	CodexForkPathLease historyLease;
+	string rawResultJson;
+	string error;
+}
+
+/// A real, private source-thread owner used only to issue a native fork after
+/// the normal task session has been stopped. It is route-ready only after the
+/// app server has registered the exact resumed thread route.
+final class CodexForkSourceOwner
+{
+private:
+	CodexSession session_;
+	string sourceThreadId_;
+	Promise!CodexSession routeReady_;
+	bool routeReadySettled_;
+	bool closing_;
+	bool closed_;
+	void delegate() closedHandler_;
+
+public:
+	this(CodexSession session, string sourceThreadId)
+	{
+		enforce(session !is null,
+			"Codex fork source owner requires a Codex session");
+		enforce(sourceThreadId.length > 0,
+			"Codex fork source owner requires a source thread ID");
+		session_ = session;
+		sourceThreadId_ = sourceThreadId;
+		routeReady_ = new Promise!CodexSession;
+		session_.onRouteReady = {
+			if (routeReadySettled_)
+				return;
+			try
+			{
+				enforce(session_.alive,
+					"Codex fork source owner exited before its route was ready");
+				enforce(session_.currentThreadId == sourceThreadId_,
+					"Codex fork source owner resumed a different thread");
+				routeReadySettled_ = true;
+				routeReady_.fulfill(session_);
+			}
+			catch (Exception e)
+			{
+				routeReadySettled_ = true;
+				routeReady_.reject(e);
+				closeStdin();
+			}
+		};
+		session_.onExit = (int) {
+			if (!routeReadySettled_)
+			{
+				routeReadySettled_ = true;
+				routeReady_.reject(new Exception(
+					"Codex fork source owner exited before its route was ready"));
+			}
+			notifyClosed();
+		};
+	}
+
+	@property Promise!CodexSession routeReady() { return routeReady_; }
+
+	void closeStdin()
+	{
+		if (closed_ || closing_)
+			return;
+		closing_ = true;
+		if (!routeReadySettled_)
+		{
+			routeReadySettled_ = true;
+			routeReady_.reject(new Exception(
+				"Codex fork source owner closed before its route was ready"));
+		}
+		session_.closeStdin();
+		if (!session_.alive)
+			notifyClosed();
+	}
+
+	@property void onClosed(void delegate() handler)
+	{
+		closedHandler_ = handler;
+		if (closed_ && closedHandler_)
+			closedHandler_();
+	}
+
+private:
+	void notifyClosed()
+	{
+		if (closed_)
+			return;
+		closed_ = true;
+		if (closedHandler_)
+			closedHandler_();
+	}
+}
+
+private enum RouteOwnerKind { task, forkOperation }
+
 class CodexAgent : Agent
 {
 	private AppServerProcess[string] serverPool; // keyed by workspace+sandbox signature
 	private AppServerStartupGate[string] appServerStartupGates;
 	private ModelSpec[string] modelAliasOverrides;
 	private string lastMcpConfigPath_;
-	// sessionId → rollout JSONL path. Populated lazily by populateSessionIndex
-	// (called from historyPath on first use and from enumerateAllSessions).
-	private string[string] sessionIdToPath_;
-	private bool sessionIndexBuilt_;
+	private CodexLiveHistoryPath[CodexHistoryKey] liveHistoryPaths_;
 	// History replay state: tracks whether task_started has been seen in the current replay.
 	private bool histSeenTaskStarted_;
 
@@ -134,8 +277,67 @@ class CodexAgent : Agent
 	{
 		auto workspace = config.workspace.length > 0 ? config.workspace : "default";
 		auto server = getOrCreateServer(serverPoolKey(workspace, launch), launch);
-		auto session = new CodexSession(server, tid, config);
-		server.registerSessionByTid(tid, session.asRouteTarget());
+		auto session = makeSession(server, tid, config, RouteOwnerKind.task);
+		beginSession(server, session, tid, resumeSessionId, launch, config);
+		return session;
+	}
+
+	/// Resume a stopped source thread into a private owner used exclusively by
+	/// one native fork. The caller owns closeStdin after the fork continuation.
+	package(cydo) CodexForkSourceOwner openForkSourceOwner(int sourceTid,
+		string sourceThreadId, ProcessLaunch launch, SessionConfig config)
+	{
+		enforce(sourceTid >= 0,
+			"Codex fork source owner requires a task ID");
+		enforce(sourceThreadId.length > 0,
+			"Codex fork source owner requires a source thread ID");
+		enforce(launch.nativeHistoryProfile.driver == driver,
+			"Codex fork source owner requires a Codex launch profile");
+		auto workspace = config.workspace.length > 0 ? config.workspace : "default";
+		auto server = getOrCreateServer(serverPoolKey(workspace, launch), launch);
+		auto routeTid = server.reserveOperationRouteTid();
+		CodexSession session;
+		CodexForkSourceOwner owner;
+		try
+		{
+			session = makeSession(server, routeTid, config,
+				RouteOwnerKind.forkOperation);
+			owner = new CodexForkSourceOwner(session, sourceThreadId);
+			beginSession(server, session, sourceTid, sourceThreadId, launch, config);
+			return owner;
+		}
+		catch (Exception e)
+		{
+			if (owner !is null)
+				owner.closeStdin();
+			else if (session !is null)
+				session.closeStdin();
+			else
+				server.cancelOperationRouteReservation(routeTid);
+			throw e;
+		}
+	}
+
+	private CodexSession makeSession(AppServerProcess server, int routeTid,
+		SessionConfig config, RouteOwnerKind ownerKind)
+	{
+		auto session = new CodexSession(server, routeTid, config,
+			&releaseLiveSessionPaths);
+		final switch (ownerKind)
+		{
+		case RouteOwnerKind.task:
+			server.registerSessionByTid(routeTid, session.asRouteTarget());
+			break;
+		case RouteOwnerKind.forkOperation:
+			server.registerOperationSessionByTid(routeTid, session.asRouteTarget());
+			break;
+		}
+		return session;
+	}
+
+	private void beginSession(AppServerProcess server, CodexSession session,
+		int mcpTid, string resumeSessionId, ProcessLaunch launch, SessionConfig config)
+	{
 
 		auto model = config.model.length > 0 ? config.model : "codex-mini-latest";
 		auto workDir = launch.workDir.length > 0
@@ -144,7 +346,7 @@ class CodexAgent : Agent
 		auto devInstructions = buildDeveloperInstructions();
 
 		// Build config override (reasoning summary + MCP tools).
-		auto configOverride = buildConfigOverride(tid, config);
+		auto configOverride = buildConfigOverride(mcpTid, config);
 
 		server.onReady(() {
 			void startFreshThread()
@@ -161,18 +363,23 @@ class CodexAgent : Agent
 				server.sendRequest("thread/start",
 					toJson(tsp)
 				).then((JsonRpcResponse resp) {
-					ThreadStartResult result;
 					try
-						result = resp.getResult!ThreadStartResult();
+					{
+						auto result = resp.getResult!ThreadStartResult();
+						enforce(result.thread.id.length > 0,
+							"thread/start returned an empty thread id");
+						if (result.thread.path.length > 0)
+							registerLiveSessionPath(session, launch.nativeHistoryProfile,
+								result.thread.id, result.thread.path);
+						session.onThreadStarted(result, null, model, workDir,
+							resp.result.toJson());
+					}
 					catch (Exception e)
 					{
 						warningf("thread/start error: %s", e.msg);
 						session.onThreadStartFailed(e);
 						return;
 					}
-					registerSessionPath(result.thread.id, result.thread.path);
-					session.onThreadStarted(result, null, model, workDir,
-						resp.result.toJson());
 				}, (Exception e) {
 					session.onThreadStartFailed(e);
 				});
@@ -196,37 +403,25 @@ class CodexAgent : Agent
 				server.sendRequest("thread/resume",
 					toJson(trp)
 				).then((JsonRpcResponse resp) {
-					ThreadStartResult result;
 					try
-						result = resp.getResult!ThreadStartResult();
+					{
+						auto result = resp.getResult!ThreadStartResult();
+						enforce(result.thread.id.length > 0,
+							"thread/resume returned an empty thread id");
+						enforce(result.thread.id == resumeSessionId,
+							"thread/resume returned a different thread id");
+						if (result.thread.path.length > 0)
+							registerLiveSessionPath(session, launch.nativeHistoryProfile,
+								result.thread.id, result.thread.path);
+						session.onThreadStarted(result, resumeSessionId, model, workDir,
+							resp.result.toJson());
+					}
 					catch (Exception e)
 					{
 						warningf("thread/resume error: %s", e.msg);
-						if (session.outputHandler_)
-						{
-							ProcessStderrEvent ev;
-							ev.text = "thread/resume error: " ~ e.msg;
-							session.outputHandler_(TranslatedEvent(toJson(ev), null));
-						}
 						session.onThreadStartFailed(e);
 						return;
 					}
-					if (result.thread.id.length == 0)
-					{
-						warningf("thread/resume returned empty thread id");
-						if (session.outputHandler_)
-						{
-							ProcessStderrEvent ev;
-							ev.text = "thread/resume returned empty thread id";
-							session.outputHandler_(TranslatedEvent(toJson(ev), null));
-						}
-						session.onThreadStartFailed(new Exception(
-							"thread/resume returned empty thread id"));
-						return;
-					}
-					registerSessionPath(result.thread.id, result.thread.path);
-					session.onThreadStarted(result, resumeSessionId, model, workDir,
-						resp.result.toJson());
 				}, (Exception e) {
 					session.onThreadStartFailed(e);
 				});
@@ -234,29 +429,34 @@ class CodexAgent : Agent
 			else
 				startFreshThread();
 		});
-
-		return session;
 	}
 
-	Promise!ThreadForkOutcome forkSession(int tid, string sourceThreadId,
-		ProcessLaunch launch, SessionConfig config = SessionConfig.init,
-		string sourcePath = null)
+	Promise!ThreadForkOutcome forkSession(CodexSession forkOwner, int childTid,
+		string sourceThreadId, string forkSourcePath, ProcessLaunch childLaunch,
+		SessionConfig childConfig)
 	{
+		enforce(forkOwner !is null && forkOwner.alive,
+			"Codex native fork requires a live parent session");
+		enforce(forkOwner.currentThreadId == sourceThreadId,
+			"Codex native fork source does not match its parent session");
+		enforce(childLaunch.nativeHistoryProfile.driver == driver,
+			"Codex native fork child launch does not carry a Codex profile");
+		enforce(forkSourcePath.length > 0 && isAbsolute(forkSourcePath),
+			"Codex native fork requires an absolute captured source path");
 		auto outcome = new Promise!ThreadForkOutcome;
-		auto workspace = config.workspace.length > 0 ? config.workspace : "default";
-		auto server = getOrCreateServer(serverPoolKey(workspace, launch), launch);
-		auto model = config.model.length > 0 ? config.model : "codex-mini-latest";
-		auto workDir = launch.workDir.length > 0
-			? launch.workDir
-			: (config.workDir.length > 0 ? config.workDir : ".");
+		auto workspace = childConfig.workspace.length > 0 ? childConfig.workspace : "default";
+		auto server = forkOwner.server;
+		auto model = childConfig.model.length > 0 ? childConfig.model : "codex-mini-latest";
+		auto workDir = childLaunch.workDir.length > 0
+			? childLaunch.workDir
+			: (childConfig.workDir.length > 0 ? childConfig.workDir : ".");
 		auto devInstructions = buildDeveloperInstructions();
-		auto configOverride = buildConfigOverride(tid, config);
+		auto configOverride = buildConfigOverride(childTid, childConfig);
 
 		server.onReady(() {
 			ThreadForkParams tfp;
 			tfp.threadId = sourceThreadId;
-			if (sourcePath.length > 0)
-				tfp.path = sourcePath;
+			tfp.path = forkSourcePath;
 			tfp.model = model;
 			tfp.cwd = workDir;
 			tfp.approvalPolicy = "never";
@@ -272,18 +472,36 @@ class CodexAgent : Agent
 						result = resp.getResult!ThreadStartResult();
 					catch (Exception e)
 					{
-						outcome.fulfill(ThreadForkOutcome(false, "", "", e.msg));
+						outcome.fulfill(ThreadForkOutcome(false, "", null, "", e.msg));
 						return;
 					}
 					if (result.thread.id.length == 0)
 					{
-						outcome.fulfill(ThreadForkOutcome(false, "", resp.result.toJson(),
+						outcome.fulfill(ThreadForkOutcome(false, "", null, resp.result.toJson(),
 							"thread/fork returned empty thread id"));
 						return;
 					}
-					outcome.fulfill(ThreadForkOutcome(true, result.thread.id,
+					if (!forkOwner.alive)
+					{
+						outcome.fulfill(ThreadForkOutcome(false, "", null,
+							resp.result.toJson(), "Codex fork parent exited"));
+						return;
+					}
+					CodexForkPathLease lease;
+					try
+						lease = forkOwner.registerForkPath(childLaunch.nativeHistoryProfile,
+							result.thread.id, result.thread.path);
+					catch (Exception e)
+					{
+						outcome.fulfill(ThreadForkOutcome(false, "", null,
+							resp.result.toJson(), e.msg));
+						return;
+					}
+					outcome.fulfill(ThreadForkOutcome(true, result.thread.id, lease,
 						resp.result.toJson(), ""));
-				});
+				}, (Exception e) {
+					outcome.fulfill(ThreadForkOutcome(false, "", null, "", e.msg));
+				}).ignoreResult();
 		});
 
 		return outcome;
@@ -292,8 +510,10 @@ class CodexAgent : Agent
 	/// Roll back `numTurns` turns from the end of the given thread.
 	/// The session must be alive and idle (no turn in progress).
 	Promise!ThreadRollbackOutcome rollbackThread(string threadId, uint numTurns,
-		ProcessLaunch launch, string workspace = "")
+		string capturedHistoryPath, ProcessLaunch launch, string workspace)
 	{
+		enforce(capturedHistoryPath.length > 0 && isAbsolute(capturedHistoryPath),
+			"Codex rollback requires an absolute captured history path");
 		auto outcome = new Promise!ThreadRollbackOutcome;
 		auto ws = workspace.length > 0 ? workspace : "default";
 		auto server = getOrCreateServer(serverPoolKey(ws, launch), launch);
@@ -301,19 +521,17 @@ class CodexAgent : Agent
 		server.onReady(() {
 			import std.file : exists, getSize;
 			size_t rollbackStart;
-			auto initialPath = historyPath(threadId, workspace);
-			if (initialPath.length > 0 && exists(initialPath))
-				rollbackStart = getSize(initialPath);
+			if (exists(capturedHistoryPath))
+				rollbackStart = getSize(capturedHistoryPath);
 
 			void waitForRollbackMarker(uint attemptsRemaining)
 			{
 				import std.file : exists, readText;
 				import std.string : lineSplitter;
 
-				auto path = historyPath(threadId, workspace);
-				if (path.length > 0 && exists(path))
+				if (exists(capturedHistoryPath))
 				{
-					auto content = readText(path);
+					auto content = readText(capturedHistoryPath);
 					if (content.length < rollbackStart)
 						rollbackStart = 0;
 					foreach (line; content[rollbackStart .. $].lineSplitter)
@@ -461,36 +679,6 @@ class CodexAgent : Agent
 			server.shutdown();
 	}
 
-	string parseSessionId(string line)
-	{
-		import std.algorithm : canFind;
-		// CodexSession emits agnostic events; look for session/init.
-		if (!line.canFind(`"session/init"`))
-			return null;
-
-		@JSONPartial
-		static struct InitProbe
-		{
-			string type;
-			string session_id;
-		}
-
-		try
-		{
-			auto probe = jsonParse!InitProbe(line);
-			if (probe.type == "session/init" && probe.session_id.length > 0)
-				return probe.session_id;
-
-			warningf("Unexpected session/init event: %s", line);
-			return null;
-		}
-		catch (Exception e)
-		{
-			warningf("Error parsing session id: %s", e.msg);
-			return null;
-		}
-	}
-
 	string extractResultText(string line)
 	{
 		import std.algorithm : canFind;
@@ -600,76 +788,114 @@ class CodexAgent : Agent
 		assert(agent.resolveModelSpec("").model == "");
 	}
 
-	string historyPath(string sessionId, string projectPath)
+	string historyPath(string sessionId, string effectiveCwd,
+		const ref NativeHistoryProfile profile)
 	{
-		if (sessionId.length == 0)
-			return null;
-		if (auto p = sessionId in sessionIdToPath_)
-			return *p;
-		// Codex stores sessions at ~/.codex/sessions/YYYY/MM/DD/rollout-*-<threadId>.jsonl
-		// with an unknown timestamp prefix, so we maintain an in-memory index built
-		// by a single recursive scan rather than scanning per call (O(tasks × N) at
-		// startup otherwise).
-		if (!sessionIndexBuilt_)
-			populateSessionIndex(null);
-		if (auto p = sessionId in sessionIdToPath_)
-			return *p;
-		// Miss after initial build — could be a session created after the scan
-		// (e.g. a fresh fork). Rebuild once and retry. Repeated lookups for the
-		// same missing session will still rescan, but that path is exercised only
-		// by runtime callers, not the M-task startup loop.
-		populateSessionIndex(null);
-		if (auto p = sessionId in sessionIdToPath_)
-			return *p;
+		enforce(sessionId.length > 0,
+			"Codex history path requires a session ID");
+		foreach (ref session; scanSessions(profile))
+			if (session.sessionId == sessionId)
+				return session.exactHistoryPath;
 		return null;
 	}
 
-	private void registerSessionPath(string sessionId, string path)
+	string createHistoryForkDestination(string sessionId, string effectiveCwd,
+		const ref NativeHistoryProfile profile)
 	{
-		if (sessionId.length == 0 || path.length == 0)
-			return;
-		sessionIdToPath_[sessionId] = path;
+		enforce(false,
+			"Codex generic history forks must use the native thread RPC path");
+		assert(false);
 	}
 
-	private void populateSessionIndex(DiscoveredSession[]* outDiscovered)
+	package(cydo) string liveSessionPath(CodexSession owner,
+		const ref NativeHistoryProfile profile, string sessionId)
+	{
+		validateProfile(profile);
+		enforce(owner !is null,
+			"Codex live history lookup requires an owner");
+		auto entry = CodexHistoryKey(profile.root, sessionId) in liveHistoryPaths_;
+		if (entry is null)
+			return null;
+		enforce((*entry).owner is owner,
+			"Codex live history path belongs to a different session owner");
+		return (*entry).path;
+	}
+
+	private void registerLiveSessionPath(CodexSession owner,
+		const ref NativeHistoryProfile profile, string sessionId, string path)
+	{
+		validateProfile(profile);
+		enforce(owner !is null,
+			"Codex live history registration requires an owner");
+		enforce(sessionId.length > 0,
+			"Codex live history registration requires a session ID");
+		validateProfilePath(profile, path);
+		auto key = CodexHistoryKey(profile.root, sessionId);
+		if (auto existing = key in liveHistoryPaths_)
+			enforce((*existing).owner is owner,
+				"Codex live history path is already owned by another session");
+		liveHistoryPaths_[key] = CodexLiveHistoryPath(owner, path);
+	}
+
+	private void releaseLiveSessionPaths(CodexSession owner)
+	{
+		CodexHistoryKey[] keys;
+		foreach (key, value; liveHistoryPaths_)
+			if (value.owner is owner)
+				keys ~= key;
+		foreach (key; keys)
+			liveHistoryPaths_.remove(key);
+	}
+
+	private void validateProfile(const ref NativeHistoryProfile profile)
+	{
+		enforce(profile.driver == driver,
+			"Codex history profile driver does not match Codex");
+		enforce(profile.root.length > 0 && isAbsolute(profile.root),
+			"Codex history profile requires an absolute root");
+	}
+
+	private static void validateProfilePath(const ref NativeHistoryProfile profile,
+		string path)
+	{
+		import std.path : buildPath;
+
+		auto sessionsRoot = buildPath(profile.root, "sessions");
+		enforce(path.length > 0 && isAbsolute(path)
+			&& (path == sessionsRoot || path.startsWith(sessionsRoot ~ "/")),
+			"Codex thread path is not inside the supplied profile sessions directory");
+	}
+
+	private DiscoveredSession[] scanSessions(const ref NativeHistoryProfile profile)
 	{
 		import std.file : DirEntry, dirEntries, exists, SpanMode;
 		import std.path : baseName, buildPath;
-		import std.process : environment;
 		import std.regex : ctRegex, matchFirst;
 
-		auto home = environment.get("HOME", "/tmp");
-		auto codexHome = environment.get("CODEX_HOME", buildPath(home, ".codex"));
-		auto sessionsDir = buildPath(codexHome, "sessions");
-
-		sessionIdToPath_ = null;
-		sessionIndexBuilt_ = true;
+		validateProfile(profile);
+		auto sessionsDir = buildPath(profile.root, "sessions");
 		if (!exists(sessionsDir))
-			return;
+			return [];
 
-		// Codex rollout filenames: rollout-<YYYY>-<MM>-<DD>T<HH>-<MM>-<SS>-<UUID>.jsonl
-		// The UUID (8-4-4-4-12 hex) is the session id; it matches parseSessionId.
 		enum uuidRx = ctRegex!`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`;
-		try
+		bool[string] seen;
+		DiscoveredSession[] result;
+		foreach (DirEntry entry; dirEntries(sessionsDir, "*.jsonl", SpanMode.depth))
 		{
-			foreach (DirEntry entry; dirEntries(sessionsDir, "*.jsonl", SpanMode.depth))
-			{
-				auto base = baseName(entry.name, ".jsonl");
-				auto m = base.matchFirst(uuidRx);
-				auto sessionId = m.empty ? base : m.hit;
-				sessionIdToPath_[sessionId] = entry.name;
-				if (outDiscovered !is null)
-				{
-					DiscoveredSession ds;
-					ds.sessionId = sessionId;
-					ds.mtime = entry.timeLastModified.stdTime;
-					ds.projectPath = "";
-					*outDiscovered ~= ds;
-				}
-			}
+			auto base = baseName(entry.name, ".jsonl");
+			auto match = base.matchFirst(uuidRx);
+			auto sessionId = match.empty ? base : match.hit;
+			enforce(sessionId !in seen,
+				"Codex profile contains duplicate rollout histories for session " ~ sessionId);
+			seen[sessionId] = true;
+			DiscoveredSession session;
+			session.sessionId = sessionId;
+			session.mtime = entry.timeLastModified.stdTime;
+			session.projectPath = "";
+			session.exactHistoryPath = entry.name;
+			result ~= session;
 		}
-		catch (Exception e)
-		{ tracef("populateSessionIndex(codex): error scanning %s: %s", sessionsDir, e.msg); }
+		return result;
 	}
 
 	TranslatedEvent[] translateHistoryLine(string line, int lineNum)
@@ -784,7 +1010,7 @@ class CodexAgent : Agent
 	@property bool supportsDeveloperPrompt() { return false; }
 
 	RewindResult rewindFiles(string sessionId, string afterUuid, string cwd,
-		ProcessLaunch launch = ProcessLaunch.init)
+		ProcessLaunch launch)
 	{
 		return RewindResult(false, "File revert is not supported for Codex sessions");
 	}
@@ -792,26 +1018,23 @@ class CodexAgent : Agent
 	/// Currently unused — no callers in the codebase. Implement if a caller is added.
 	string extractUserText(string line) { return ""; }
 
-	DiscoveredSession[] enumerateAllSessions()
+	DiscoveredSession[] enumerateAllSessions(const ref NativeHistoryProfile profile)
 	{
-		DiscoveredSession[] result;
-		populateSessionIndex(&result);
-		return result;
+		return scanSessions(profile);
 	}
 
-	SessionMeta readSessionMeta(string sessionId)
+	SessionMeta readSessionMeta(const ref DiscoveredSession session)
 	{
 		import std.algorithm : canFind;
 		import std.stdio : File;
-		auto pathp = sessionId in sessionIdToPath_;
-		if (pathp is null)
+		if (session.exactHistoryPath.length == 0)
 			return SessionMeta.init;
 
 		SessionMeta meta;
 		try
 		{
 			int lineCount = 0;
-			auto f = File(*pathp, "r");
+			auto f = File(session.exactHistoryPath, "r");
 			foreach (line; f.byLine)
 			{
 				if (lineCount++ > 50)
@@ -872,11 +1095,12 @@ class CodexAgent : Agent
 			}
 		}
 		catch (Exception e)
-		{ tracef("readSessionMeta(codex, %s): error: %s", sessionId, e.msg); }
+		{ tracef("readSessionMeta(codex, %s): error: %s", session.sessionId, e.msg); }
 		return meta;
 	}
 
-	string matchProject(string sessionId, const string[] knownProjectPaths) { return ""; }
+	string matchProject(const ref DiscoveredSession session,
+		const string[] knownProjectPaths) { return ""; }
 
 	private string prepareIsolatedOneShotHome(ProcessLaunch launch)
 	{
@@ -1308,6 +1532,141 @@ unittest
 
 unittest
 {
+	import cydo.agent.drivers.codex.process : makeTestAppServerProcess;
+
+	auto connection = new TestCodexConnection;
+	auto server = makeTestAppServerProcess(connection);
+	auto session = new CodexSession(server, 1, SessionConfig.init);
+	string[] order;
+	session.onRouteReady = {
+		assert(server.hasThreadRouteForTest("codex-native-id"));
+		order ~= "route";
+	};
+	session.onNativeSessionStarted = (string sessionId) {
+		order ~= "native:" ~ sessionId;
+	};
+	session.onOutput = (TranslatedEvent event) { order ~= "output"; };
+	ThreadStartResult started;
+	started.thread.id = "codex-native-id";
+	session.onThreadStarted(started, null, "test-model", "/test/workdir",
+		`{"thread":{"id":"codex-native-id"}}`);
+	assert(order.length >= 3
+		&& order[0] == "native:codex-native-id"
+		&& order[1] == "route"
+		&& order[2] == "output",
+		"Codex must register its route before publishing route readiness");
+
+	auto lateConnection = new TestCodexConnection;
+	auto lateServer = makeTestAppServerProcess(lateConnection);
+	auto lateSession = new CodexSession(lateServer, 2, SessionConfig.init);
+	ThreadStartResult lateStarted;
+	lateStarted.thread.id = "codex-late-id";
+	lateSession.onThreadStarted(lateStarted, "codex-late-id", "test-model",
+		"/test/workdir", `{"thread":{"id":"codex-late-id"}}`);
+	string delivered;
+	lateSession.onNativeSessionStarted = (string sessionId) { delivered = sessionId; };
+	assert(delivered == "codex-late-id");
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import cydo.agent.drivers.codex.process : makeTestAppServerProcess;
+
+	void drainNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager, "nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	JsonRpcResponse threadResponse(string threadId, string threadPath)
+	{
+		ThreadStartResult result;
+		result.thread.id = threadId;
+		result.thread.path = threadPath;
+		JsonRpcResponse response;
+		response.result = SO.from(result);
+		return response;
+	}
+
+	auto connection = new TestCodexConnection;
+	auto server = makeTestAppServerProcess(connection);
+	auto agent = new CodexAgent;
+	ProcessLaunch sourceLaunch;
+	sourceLaunch.executablePath = "unused-test-codex";
+	sourceLaunch.workDir = "/test/source-workdir";
+	sourceLaunch.nativeHistoryProfile = NativeHistoryProfile(AgentDriver.codex,
+		"/test/source-profile");
+	SessionConfig sourceConfig;
+	sourceConfig.workspace = "operation-owner";
+	sourceConfig.model = "test-model";
+	agent.serverPool[agent.serverPoolKey(sourceConfig.workspace, sourceLaunch)] = server;
+
+	auto operation = agent.openForkSourceOwner(71, "source-thread", sourceLaunch,
+		sourceConfig);
+	CodexSession owner;
+	bool ownerReady;
+	operation.routeReady.then((CodexSession value) {
+		owner = value;
+		ownerReady = true;
+	}, (Exception e) {
+		assert(false, e.msg);
+	}).ignoreResult();
+
+	auto resumeRequest = connection.takeRequest("thread/resume");
+	auto resumeParams = jsonParse!ThreadResumeParams(toJson(resumeRequest.params));
+	assert(resumeParams.threadId == "source-thread"
+		&& resumeParams.cwd == "/test/source-workdir");
+	connection.respond(resumeRequest, threadResponse("source-thread",
+		"/test/source-profile/sessions/2026/08/source-thread.jsonl"));
+	drainNextTicks();
+	assert(ownerReady && owner !is null && owner.alive);
+	assert(server.hasThreadRouteForTest("source-thread"));
+
+	ProcessLaunch childLaunch;
+	childLaunch.workDir = "/test/child-workdir";
+	childLaunch.nativeHistoryProfile = NativeHistoryProfile(AgentDriver.codex,
+		"/test/child-profile");
+	SessionConfig childConfig;
+	childConfig.workspace = sourceConfig.workspace;
+	childConfig.model = "test-model";
+	auto fork = agent.forkSession(owner, 72, "source-thread",
+		"/test/source-profile/sessions/fork-source.jsonl", childLaunch, childConfig);
+	auto forkRequest = connection.takeRequest("thread/fork");
+	auto forkParams = jsonParse!ThreadForkParams(toJson(forkRequest.params));
+	assert(forkParams.threadId == "source-thread"
+		&& forkParams.path == "/test/source-profile/sessions/fork-source.jsonl");
+
+	ThreadForkOutcome outcome;
+	bool forkSettled;
+	fork.then((ThreadForkOutcome value) {
+		outcome = value;
+		forkSettled = true;
+	}, (Exception e) {
+		assert(false, e.msg);
+	}).ignoreResult();
+	connection.respond(forkRequest, threadResponse("child-thread",
+		"/test/child-profile/sessions/2026/08/child-thread.jsonl"));
+	drainNextTicks();
+	assert(forkSettled && outcome.ok && outcome.threadId == "child-thread"
+		&& outcome.historyLease.path
+			== "/test/child-profile/sessions/2026/08/child-thread.jsonl");
+	outcome.historyLease.release();
+
+	operation.closeStdin();
+	assert(!owner.alive);
+	assert(!server.hasThreadRouteForTest("source-thread"));
+}
+
+unittest
+{
 	import ae.net.asockets : socketManager;
 	import std.algorithm : canFind;
 	import std.file : SpanMode, dirEntries, exists, mkdirRecurse, rmdirRecurse, tempDir, write;
@@ -1665,8 +2024,14 @@ private class AppServerStartupLease
 class CodexSession : AgentSession
 {
 	private AppServerProcess server;
+	private void delegate(CodexSession owner) releaseLivePaths_;
 	private int tid;
 	private string threadId;
+	private string nativeSessionId_;
+	private void delegate(string sessionId) nativeSessionStartedHandler_;
+	private bool routeReady_;
+	private void delegate() routeReadyHandler_;
+	private CodexForkPathLease[CodexHistoryKey] forkPaths_;
 	private string activeTurnId_;
 	private string model;
 	private string workDir;
@@ -1724,12 +2089,82 @@ class CodexSession : AgentSession
 	package void delegate(string line) stderrHandler_;
 	private void delegate(int status) exitHandler_;
 
-	this(AppServerProcess server, int tid, SessionConfig config)
+	this(AppServerProcess server, int tid, SessionConfig config,
+		void delegate(CodexSession owner) releaseLivePaths = null)
 	{
 		this.server = server;
 		this.tid = tid;
 		this.alive_ = true;
 		this.agentName_ = config.agentName;
+		this.releaseLivePaths_ = releaseLivePaths;
+	}
+
+	package @property string currentThreadId() { return threadId; }
+
+	package void notifyNativeSessionStarted(string id)
+	{
+		if (nativeSessionId_ !is null)
+		{
+			enforce(nativeSessionId_ == id,
+				"Codex session reported conflicting native session IDs");
+			return;
+		}
+		nativeSessionId_ = id;
+		if (nativeSessionStartedHandler_)
+			nativeSessionStartedHandler_(id);
+	}
+
+	package void notifyRouteReady()
+	{
+		enforce(threadId.length > 0,
+			"Codex route readiness requires a thread ID");
+		routeReady_ = true;
+		if (routeReadyHandler_)
+			routeReadyHandler_();
+	}
+
+	package CodexForkPathLease registerForkPath(
+		const ref NativeHistoryProfile profile, string childSessionId, string childPath)
+	{
+		enforce(profile.driver == AgentDriver.codex,
+			"Codex fork path requires a Codex child profile");
+		enforce(childSessionId.length > 0,
+			"Codex fork path requires a child session ID");
+		auto sessionsRoot = buildPath(profile.root, "sessions");
+		enforce(childPath.length > 0 && isAbsolute(childPath)
+			&& (childPath == sessionsRoot || childPath.startsWith(sessionsRoot ~ "/")),
+			"Codex fork path is not inside the child profile sessions directory");
+		auto key = CodexHistoryKey(profile.root, childSessionId);
+		enforce(key !in forkPaths_,
+			"Codex fork path lease already exists for the child session");
+		auto lease = new CodexForkPathLease(this, key, childPath);
+		forkPaths_[key] = lease;
+		return lease;
+	}
+
+	private void releaseForkPath(CodexForkPathLease lease)
+	{
+		if (lease is null || lease.released_)
+			return;
+		auto current = lease.key_ in forkPaths_;
+		if (current !is null && *current is lease)
+			forkPaths_.remove(lease.key_);
+		lease.released_ = true;
+	}
+
+	private void releaseAllForkPaths()
+	{
+		auto leases = forkPaths_.values;
+		forkPaths_ = null;
+		foreach (lease; leases)
+			lease.released_ = true;
+	}
+
+	private void releaseNativeHistoryPaths()
+	{
+		releaseAllForkPaths();
+		if (releaseLivePaths_)
+			releaseLivePaths_(this);
 	}
 
 	package CodexSessionRouteTarget asRouteTarget()
@@ -1781,6 +2216,8 @@ class CodexSession : AgentSession
 
 		sessionId = threadId;
 		server.registerSession(threadId, asRouteTarget());
+		notifyNativeSessionStarted(threadId);
+		notifyRouteReady();
 
 		// Emit synthetic session/init with raw RPC response as _raw.
 		import cydo.protocol : SessionInitEvent, SessionMetadataEvent;
@@ -2050,6 +2487,7 @@ class CodexSession : AgentSession
 	package void onServerExit(int status)
 	{
 		rejectUnsettledMessages(new Exception("Codex app-server exited before accepting message submission"));
+		releaseNativeHistoryPaths();
 		if (!alive_)
 			return; // Already stopped; avoid double-invocation of exitHandler_.
 		alive_ = false;
@@ -2131,6 +2569,7 @@ class CodexSession : AgentSession
 	{
 		rejectUnsettledMessages(new Exception(
 			"Codex session closed before accepting message submission"));
+		releaseNativeHistoryPaths();
 		if (!alive_)
 			return;
 		if (threadId.length > 0)
@@ -2149,6 +2588,19 @@ class CodexSession : AgentSession
 	@property bool canStopAfterCloseStdin() const
 	{
 		return true;
+	}
+
+	@property void onNativeSessionStarted(void delegate(string sessionId) callback)
+	{
+		nativeSessionStartedHandler_ = callback;
+		if (nativeSessionId_ !is null && nativeSessionStartedHandler_)
+			nativeSessionStartedHandler_(nativeSessionId_);
+	}
+	package @property void onRouteReady(void delegate() callback)
+	{
+		routeReadyHandler_ = callback;
+		if (routeReady_ && routeReadyHandler_)
+			routeReadyHandler_();
 	}
 
 	@property void onOutput(void delegate(TranslatedEvent) dg) { outputHandler_ = dg; }

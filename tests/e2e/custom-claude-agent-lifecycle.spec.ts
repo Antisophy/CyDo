@@ -1,3 +1,19 @@
+import { test as base } from "@playwright/test";
+import { spawn, execFileSync, spawnSync } from "child_process";
+import type { ChildProcess } from "child_process";
+import {
+  mkdirSync,
+  symlinkSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  existsSync,
+  rmSync,
+  renameSync,
+  unlinkSync,
+} from "fs";
+import { join, dirname, relative, basename } from "path";
+
 import { writeTestConfig } from "./test-config";
 
 import {
@@ -6,9 +22,11 @@ import {
   enterSession,
   sendMessage,
   killSession,
+  endSession,
   responseTimeout,
   assistantText,
   lastAssistantText,
+  killBackend,
 } from "./fixtures";
 import type { Page } from "./fixtures";
 
@@ -203,5 +221,712 @@ test(
     await expect(editTool.locator(".tool-view-file")).toBeVisible({
       timeout: 5_000,
     });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// AC21/AC22 real-Claude profile-lifecycle regression tests.
+//
+// These tests separate the backend's parent CLAUDE_CONFIG_DIR (profile A,
+// which agent sandbox env normally inherits) from the configured work-claude
+// agent's CLAUDE_CONFIG_DIR (profile B, later reconfigured or renamed to C).
+// A same-session-ID poison file planted under A (and, for AC22, a stale B)
+// makes any accidental fallback to the backend's parent environment or a
+// stale root visible, without CyDo ever persisting or exposing the native
+// locator itself — every assertion below reads the real Claude CLI's own
+// JSONL files or a stopped-backend SQLite snapshot directly.
+// ---------------------------------------------------------------------------
+
+type ProfiledClaudeBackend = {
+  baseURL: string;
+  workDir: string;
+  workerHome: string;
+  configPath: string;
+  backendProfileA: string;
+  profileB: string;
+  profileC: string;
+  stop: () => Promise<void>;
+  start: () => Promise<void>;
+  restart: () => Promise<void>;
+};
+
+const PROFILE_WORK_DIR = "/tmp/cydo-real-claude-profile-lifecycle";
+const PROFILE_BASE_URL = "http://localhost:3940";
+
+function initClaudeProfileDir(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "settings.json"),
+    JSON.stringify({
+      hasCompletedOnboarding: true,
+      theme: "dark",
+      skipDangerousModePermissionPrompt: true,
+      autoUpdates: false,
+    }),
+  );
+}
+
+/** Write a complete work-claude config pointed at the given profile root. */
+function writeProfileConfig(
+  configPath: string,
+  profileRoot: string,
+  displayName: string,
+): void {
+  writeTestConfig(
+    configPath,
+    `default_agent: work-claude
+agents:
+  work-claude:
+    driver: claude
+    display_name: ${displayName}
+    sandbox:
+      env:
+        CLAUDE_CONFIG_DIR: ${profileRoot}
+workspaces:
+  local:
+    root: /tmp/cydo-test-workspace
+`,
+  );
+}
+
+function spawnProfiledBackend(
+  workDir: string,
+  workerHome: string,
+  backendProfileA: string,
+): ChildProcess {
+  return spawn(process.env.CYDO_BIN!, [], {
+    detached: true,
+    cwd: workDir,
+    env: {
+      ...process.env,
+      HOME: workerHome,
+      CLAUDE_CONFIG_DIR: backendProfileA,
+      XDG_DATA_HOME: `${workDir}/data`,
+    },
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+}
+
+async function waitForProfiledBackend(
+  baseURL: string,
+  proc: ChildProcess,
+  timeoutMs = 30_000,
+): Promise<void> {
+  const processExited = new Promise<never>((_, reject) => {
+    if (proc.exitCode !== null) {
+      reject(
+        new Error(`Backend process already exited with code ${proc.exitCode}`),
+      );
+      return;
+    }
+    proc.on("exit", (code, signal) => {
+      reject(
+        new Error(
+          `Backend process exited with code ${code}` +
+            `${signal ? ` (signal ${signal})` : ""} before becoming ready`,
+        ),
+      );
+    });
+  });
+
+  const polling = (async () => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(baseURL);
+        if (res.ok || res.status < 500) return;
+      } catch {
+        // not ready yet
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    throw new Error(`Backend at ${baseURL} did not start in time`);
+  })();
+
+  await Promise.race([polling, processExited]);
+}
+
+/**
+ * Local restartable backend fixture with a separate backend-parent profile
+ * (A) and configured agent profile (B/C). Overrides baseURL so page.goto("/")
+ * targets this backend instead of fixtures.ts's fixed /tmp/cydo-backend.
+ */
+const profiledTest = base.extend<{ profileBackend: ProfiledClaudeBackend }>({
+  profileBackend: async ({}, use) => {
+    const workDir = PROFILE_WORK_DIR;
+    const workerHome = `${workDir}/home`;
+    const backendProfileA = `${workDir}/profile-a`;
+    const profileB = `${workDir}/profile-b`;
+    const profileC = `${workDir}/profile-c`;
+    const configPath = `${workerHome}/.config/cydo/config.yaml`;
+
+    rmSync(workDir, { recursive: true, force: true });
+    mkdirSync(`${workDir}/data`, { recursive: true });
+    symlinkSync("/tmp/cydo-test-workspace/defs", `${workDir}/defs`);
+    mkdirSync(`${workerHome}/.config/cydo`, { recursive: true });
+
+    initClaudeProfileDir(backendProfileA);
+    initClaudeProfileDir(profileB);
+    writeProfileConfig(configPath, profileB, "Profile B");
+
+    let proc = spawnProfiledBackend(workDir, workerHome, backendProfileA);
+    try {
+      await waitForProfiledBackend(PROFILE_BASE_URL, proc);
+    } catch (e) {
+      try {
+        process.kill(-proc.pid!, "SIGTERM");
+      } catch {
+        // already gone
+      }
+      throw e;
+    }
+
+    let running = true;
+    const stop = async () => {
+      if (!running) return;
+      await killBackend(proc);
+      running = false;
+    };
+    const start = async () => {
+      proc = spawnProfiledBackend(workDir, workerHome, backendProfileA);
+      await waitForProfiledBackend(PROFILE_BASE_URL, proc);
+      running = true;
+    };
+    const restart = async () => {
+      await stop();
+      await start();
+    };
+
+    await use({
+      baseURL: PROFILE_BASE_URL,
+      workDir,
+      workerHome,
+      configPath,
+      backendProfileA,
+      profileB,
+      profileC,
+      stop,
+      start,
+      restart,
+    });
+
+    if (running) await killBackend(proc);
+  },
+  baseURL: async ({ profileBackend }, use) => {
+    await use(profileBackend.baseURL);
+  },
+});
+
+/** Poll root/projects for exactly one real CLI JSONL containing marker. */
+async function findNativeJsonlContaining(
+  root: string,
+  marker: string,
+): Promise<string> {
+  const projectsDir = join(root, "projects");
+  let found: string | undefined;
+  await expect
+    .poll(
+      () => {
+        if (!existsSync(projectsDir)) return 0;
+        const matches: string[] = [];
+        for (const entry of readdirSync(projectsDir, {
+          recursive: true,
+        }) as string[]) {
+          if (!entry.endsWith(".jsonl")) continue;
+          const full = join(projectsDir, entry);
+          try {
+            if (readFileSync(full, "utf8").includes(marker)) matches.push(full);
+          } catch {
+            // file may be mid-write; retry on next poll
+          }
+        }
+        found = matches.length === 1 ? matches[0] : undefined;
+        return matches.length;
+      },
+      { timeout: 20_000 },
+    )
+    .toBe(1);
+  return found!;
+}
+
+function relativeNativePath(root: string, realFile: string): string {
+  const rel = relative(root, realFile);
+  expect(rel.startsWith("projects/")).toBe(true);
+  return rel;
+}
+
+/** Create a valid two-line native Claude session at the given relative location. */
+function writeSameIdPoison(
+  root: string,
+  relativePath: string,
+  sessionId: string,
+  cwd: string,
+  marker: string,
+): void {
+  const fullPath = join(root, relativePath);
+  mkdirSync(dirname(fullPath), { recursive: true });
+  const content =
+    [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: sessionId,
+        model: "claude-3-5-sonnet-20241022",
+        cwd,
+      }),
+      JSON.stringify({
+        type: "user",
+        message: { content: marker },
+      }),
+    ].join("\n") + "\n";
+  writeFileSync(fullPath, content);
+}
+
+function treeContains(root: string, marker: string): boolean {
+  const projectsDir = join(root, "projects");
+  if (!existsSync(projectsDir)) return false;
+  for (const entry of readdirSync(projectsDir, {
+    recursive: true,
+  }) as string[]) {
+    if (!entry.endsWith(".jsonl")) continue;
+    try {
+      if (readFileSync(join(projectsDir, entry), "utf8").includes(marker))
+        return true;
+    } catch {
+      // ignore transient read races
+    }
+  }
+  return false;
+}
+
+function readFileOrEmpty(path: string): string {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+async function activeTaskTid(page: Page): Promise<string> {
+  const row = page.locator(".sidebar-item.active");
+  await expect(row).toBeVisible({ timeout: 5_000 });
+  const tid = await row.getAttribute("data-tid");
+  expect(tid).toBeTruthy();
+  return tid!;
+}
+
+async function openTaskByTid(
+  page: Page,
+  tid: string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  const row = page.locator(`.sidebar-item[data-tid="${tid}"]`);
+  await expect(row).toBeVisible({ timeout: timeoutMs });
+  await row.click();
+  await expect(row).toHaveClass(/active/, { timeout: timeoutMs });
+}
+
+profiledTest(
+  "real Claude configured profile B survives End, navigation, reload, restart, and resume",
+  { tag: "@claude-only" },
+  async ({ page, profileBackend }) => {
+    const marker1 = "ac21-b-original-marker";
+    const marker2 = "ac21-b-second-marker";
+    const poisonMarker = "ac21-a-poison-marker";
+    const cwd = "/tmp/cydo-test-workspace";
+
+    await enterSession(page);
+    await sendMessage(page, `reply with "${marker1}"`);
+    await expect(assistantText(page, marker1)).toBeVisible({ timeout: 60_000 });
+
+    const tid = await activeTaskTid(page);
+    const taskUrl = page.url();
+
+    const realFile = await findNativeJsonlContaining(
+      profileBackend.profileB,
+      marker1,
+    );
+    const relPath = relativeNativePath(profileBackend.profileB, realFile);
+    const sessionId = basename(realFile, ".jsonl");
+    expect(treeContains(profileBackend.backendProfileA, marker1)).toBe(false);
+
+    // Adversarial same-ID poison under the backend's parent profile (A):
+    // a fallback to A would surface this rather than B's real content.
+    writeSameIdPoison(
+      profileBackend.backendProfileA,
+      relPath,
+      sessionId,
+      cwd,
+      poisonMarker,
+    );
+
+    await endSession(page);
+    await expect(assistantText(page, marker1)).toBeVisible({ timeout: 15_000 });
+    await expect(
+      page.locator(".message.user-message", { hasText: poisonMarker }),
+    ).toHaveCount(0);
+    expect(readFileOrEmpty(realFile)).toContain(marker1);
+
+    // Navigate away and back through normal browser navigation.
+    await page.goto("/");
+    await page.goto(taskUrl);
+    await openTaskByTid(page, tid);
+    await expect(assistantText(page, marker1)).toBeVisible({ timeout: 15_000 });
+    await expect(
+      page.locator(".message.user-message", { hasText: poisonMarker }),
+    ).toHaveCount(0);
+
+    // Reload the browser — cold load from B's real JSONL.
+    await page.reload();
+    await openTaskByTid(page, tid);
+    await expect(assistantText(page, marker1)).toBeVisible({ timeout: 15_000 });
+    await expect(
+      page.locator(".message.user-message", { hasText: poisonMarker }),
+    ).toHaveCount(0);
+
+    // Restart the backend: DB/config/B persist; the unrelated parent A remains.
+    await profileBackend.restart();
+    await page.goto(taskUrl);
+    await openTaskByTid(page, tid);
+    await expect(assistantText(page, marker1)).toBeVisible({ timeout: 15_000 });
+    await expect(
+      page.locator(".message.user-message", { hasText: poisonMarker }),
+    ).toHaveCount(0);
+
+    // Resume, append a second marker, End again.
+    await page.locator(".btn-banner-resume").click();
+    await expect(page.locator(".btn-banner-stop")).toBeVisible({
+      timeout: 15_000,
+    });
+    await sendMessage(page, `reply with "${marker2}"`);
+    await expect(assistantText(page, marker2)).toBeVisible({ timeout: 60_000 });
+    await endSession(page);
+
+    await expect
+      .poll(() => readFileOrEmpty(realFile), { timeout: 20_000 })
+      .toContain(marker2);
+    const finalContent = readFileOrEmpty(realFile);
+    expect(finalContent).toContain(marker1);
+    expect(finalContent).not.toContain(poisonMarker);
+    expect(
+      readFileOrEmpty(join(profileBackend.backendProfileA, relPath)),
+    ).not.toContain(marker2);
+  },
+);
+
+profiledTest(
+  "real Claude retains live profile B but uses current profile C after End",
+  { tag: "@claude-only" },
+  async ({ page, profileBackend }) => {
+    const liveMarker = "ac21-live-b-marker";
+    const poisonMarker = "ac21-a-poison-marker-live";
+    const cwd = "/tmp/cydo-test-workspace";
+
+    await enterSession(page);
+    await sendMessage(page, `reply with "${liveMarker}"`);
+    await expect(assistantText(page, liveMarker)).toBeVisible({
+      timeout: 60_000,
+    });
+
+    const tid = await activeTaskTid(page);
+
+    const realFile = await findNativeJsonlContaining(
+      profileBackend.profileB,
+      liveMarker,
+    );
+    const relPath = relativeNativePath(profileBackend.profileB, realFile);
+    const sessionId = basename(realFile, ".jsonl");
+
+    writeSameIdPoison(
+      profileBackend.backendProfileA,
+      relPath,
+      sessionId,
+      cwd,
+      poisonMarker,
+    );
+    initClaudeProfileDir(profileBackend.profileC);
+
+    // Reconfigure the (still-live) work-claude agent from B to C.
+    writeProfileConfig(
+      profileBackend.configPath,
+      profileBackend.profileC,
+      "Profile C",
+    );
+
+    // Observe the config-reload acknowledgement via a fresh draft's picker.
+    await enterSession(page);
+    await expect(
+      page.locator('.agent-picker option[value="work-claude"]'),
+    ).toHaveText("Profile C", { timeout: 20_000 });
+
+    // Return to the still-live original task.
+    await openTaskByTid(page, tid);
+    await expect(assistantText(page, liveMarker)).toBeVisible({
+      timeout: 15_000,
+    });
+
+    await endSession(page);
+
+    // Scoped to :visible: app.tsx keeps every "everLoaded" task's SessionView
+    // mounted (display: none when inactive) rather than unmounting, so an
+    // unscoped selector could match a hidden pane's diagnostic if another
+    // task's diagnostic is ever present in the DOM.
+    const diagnostics = page.locator(
+      ".diagnostic-message.diagnostic-error:visible",
+    );
+    await expect(diagnostics).toHaveCount(1, { timeout: 15_000 });
+    const diagText = await diagnostics.first().innerText();
+    expect(diagText).toContain("Failed to load session history");
+    expect(diagText).toContain(sessionId);
+    expect(diagText).toContain(profileBackend.profileC);
+    expect(diagText).toContain("work-claude");
+    expect(diagText).toContain("CLAUDE_CONFIG_DIR");
+    expect(diagText).not.toContain(profileBackend.backendProfileA);
+    expect(diagText).not.toContain(profileBackend.profileB);
+
+    await expect(
+      page.locator('[data-testid="assistant-text"]', { hasText: liveMarker }),
+    ).toHaveCount(0);
+    await expect(
+      page.locator(".message.user-message", { hasText: poisonMarker }),
+    ).toHaveCount(0);
+
+    // Independent filesystem proof: B still has the live marker, C has nothing.
+    expect(readFileOrEmpty(realFile)).toContain(liveMarker);
+    expect(treeContains(profileBackend.profileC, liveMarker)).toBe(false);
+  },
+);
+
+profiledTest(
+  "real Claude profile rename from B to C preserves task history and discovery ownership",
+  { tag: "@claude-only" },
+  async ({ page, profileBackend }) => {
+    const beforeMarker = "ac22-before-rename";
+    const afterMarker = "ac22-after-rename";
+    const aPoisonMarker = "ac22-a-poison-marker";
+    const bPoisonMarker = "ac22-b-poison-marker";
+    const sentinelMarker = "ac22-c-discovery-sentinel";
+    const cwd = "/tmp/cydo-test-workspace";
+
+    await enterSession(page);
+    await sendMessage(page, `reply with "${beforeMarker}"`);
+    await expect(assistantText(page, beforeMarker)).toBeVisible({
+      timeout: 60_000,
+    });
+
+    const tid = await activeTaskTid(page);
+    const taskUrl = page.url();
+
+    const realFile = await findNativeJsonlContaining(
+      profileBackend.profileB,
+      beforeMarker,
+    );
+    const relPath = relativeNativePath(profileBackend.profileB, realFile);
+    const sessionId = basename(realFile, ".jsonl");
+
+    await endSession(page);
+    await profileBackend.stop();
+
+    const dbPath = `${profileBackend.workDir}/data/cydo/cydo.db`;
+    const beforeRow = execFileSync(
+      "sqlite3",
+      [
+        dbPath,
+        `SELECT tid, agent_session_id, agent_type, workspace, project_path FROM tasks WHERE tid = ${tid};`,
+      ],
+      { encoding: "utf8" },
+    ).trim();
+    const [rowTid, rowSessionId, rowAgentType, rowWorkspace, rowProjectPath] =
+      beforeRow.split("|");
+    expect(rowTid).toBe(tid);
+    expect(rowSessionId).toBe(sessionId);
+    expect(rowAgentType).toBe("work-claude");
+    expect(rowWorkspace).toBe("local");
+    expect(rowProjectPath).toBe(cwd);
+
+    const schemaOut = execFileSync(
+      "sqlite3",
+      [dbPath, "PRAGMA table_info(tasks);"],
+      { encoding: "utf8" },
+    );
+    const columnNames = schemaOut
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => line.split("|")[1]);
+    expect(columnNames).not.toContain("profile_root");
+    expect(columnNames).not.toContain("native_history_root");
+    expect(columnNames).not.toContain("native_history_path");
+    expect(columnNames).toContain("project_path");
+
+    // Rename B → C while the backend is stopped, then recreate poisoned B/A
+    // siblings at the same relative location with the same session ID.
+    renameSync(profileBackend.profileB, profileBackend.profileC);
+    initClaudeProfileDir(profileBackend.profileB);
+    writeSameIdPoison(
+      profileBackend.profileB,
+      relPath,
+      sessionId,
+      cwd,
+      bPoisonMarker,
+    );
+    writeSameIdPoison(
+      profileBackend.backendProfileA,
+      relPath,
+      sessionId,
+      cwd,
+      aPoisonMarker,
+    );
+
+    // A separate, differently-ID'd, C-only session: the discovery
+    // scan-completion sentinel.
+    const sentinelId = "22222222-3333-4444-5555-666666666666";
+    const sentinelRelPath = join(dirname(relPath), `${sentinelId}.jsonl`);
+    writeSameIdPoison(
+      profileBackend.profileC,
+      sentinelRelPath,
+      sentinelId,
+      cwd,
+      sentinelMarker,
+    );
+
+    // Only the configured agent's CLAUDE_CONFIG_DIR changes, B → C.
+    writeProfileConfig(
+      profileBackend.configPath,
+      profileBackend.profileC,
+      "Profile B",
+    );
+
+    await profileBackend.start();
+
+    await page.goto(taskUrl);
+    await openTaskByTid(page, tid);
+    await expect(assistantText(page, beforeMarker)).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect(
+      page.locator(".message.user-message", { hasText: aPoisonMarker }),
+    ).toHaveCount(0);
+    await expect(
+      page.locator(".message.user-message", { hasText: bPoisonMarker }),
+    ).toHaveCount(0);
+
+    await page.locator(".btn-banner-resume").click();
+    await expect(page.locator(".btn-banner-stop")).toBeVisible({
+      timeout: 15_000,
+    });
+    await sendMessage(page, `reply with "${afterMarker}"`);
+    await expect(assistantText(page, afterMarker)).toBeVisible({
+      timeout: 60_000,
+    });
+    await endSession(page);
+
+    const cFile = join(profileBackend.profileC, relPath);
+    await expect
+      .poll(() => readFileOrEmpty(cFile), { timeout: 20_000 })
+      .toContain(afterMarker);
+    const finalCContent = readFileOrEmpty(cFile);
+    expect(finalCContent).toContain(beforeMarker);
+    expect(finalCContent).not.toContain(aPoisonMarker);
+    expect(finalCContent).not.toContain(bPoisonMarker);
+
+    const aPoisonFile = join(profileBackend.backendProfileA, relPath);
+    const bPoisonFile = join(profileBackend.profileB, relPath);
+    expect(readFileOrEmpty(aPoisonFile)).not.toContain(afterMarker);
+    expect(readFileOrEmpty(bPoisonFile)).not.toContain(afterMarker);
+
+    // Export: the parent CLAUDE_CONFIG_DIR is A, but the current config
+    // overrides work-claude to C — export must re-derive C, not A/B.
+    const outputPath = "/tmp/cydo-ac22-rename-export.html";
+    try {
+      const result = spawnSync(
+        process.env.CYDO_BIN!,
+        ["export-html", tid, "--output", outputPath],
+        {
+          env: {
+            ...process.env,
+            HOME: profileBackend.workerHome,
+            CLAUDE_CONFIG_DIR: profileBackend.backendProfileA,
+            XDG_DATA_HOME: `${profileBackend.workDir}/data`,
+          },
+          encoding: "utf8",
+        },
+      );
+      if (result.status !== 0) {
+        throw new Error(
+          `cydo export-html failed (status ${result.status}):\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+        );
+      }
+      const html = readFileSync(outputPath, "utf8");
+      const match = html.match(
+        /<script id="cydo-export-data" type="application\/json">([\s\S]*?)<\/script>/,
+      );
+      expect(match).toBeTruthy();
+      const exportedText = match![1];
+      expect(exportedText).toContain(beforeMarker);
+      expect(exportedText).toContain(afterMarker);
+      expect(exportedText).not.toContain(aPoisonMarker);
+      expect(exportedText).not.toContain(bPoisonMarker);
+    } finally {
+      try {
+        unlinkSync(outputPath);
+      } catch {
+        // file may not exist if export failed
+      }
+    }
+
+    // Discovery ownership: refresh, then confirm only the C-only sentinel
+    // is offered — the unchanged task must own (claude, C, sessionId).
+    await page.goto("/");
+    const refreshBtn = page.locator('button[title="Refresh project list"]');
+    await refreshBtn.click();
+    await expect(refreshBtn).toBeDisabled({ timeout: 5_000 });
+    await expect(refreshBtn).toBeEnabled({ timeout: 30_000 });
+
+    await page.goto(taskUrl);
+    const importNode = page.locator(".sidebar-item.sidebar-archive-node", {
+      hasText: /Import \(1\)/,
+    });
+    await expect(importNode).toBeVisible({ timeout: 15_000 });
+    await importNode.click();
+
+    const sentinelEntry = page.locator(".sidebar-item .sidebar-label", {
+      hasText: sentinelMarker,
+    });
+    await expect(sentinelEntry).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.locator(".sidebar-item .sidebar-label", { hasText: aPoisonMarker }),
+    ).not.toBeVisible();
+    await expect(
+      page.locator(".sidebar-item .sidebar-label", { hasText: bPoisonMarker }),
+    ).not.toBeVisible();
+
+    // The original task remains a normal resumable task, not importable.
+    await openTaskByTid(page, tid);
+    await expect(page.locator(".btn-banner-resume")).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(
+      page.locator(".btn-resume", { hasText: "Import Session" }),
+    ).not.toBeVisible();
+    await expect(assistantText(page, beforeMarker)).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect(assistantText(page, afterMarker)).toBeVisible({
+      timeout: 15_000,
+    });
+
+    // Stop again and compare the logical row exactly against the pre-rename
+    // snapshot — no task-row native locator was ever written.
+    await profileBackend.stop();
+    const afterRow = execFileSync(
+      "sqlite3",
+      [
+        dbPath,
+        `SELECT tid, agent_session_id, agent_type, workspace, project_path FROM tasks WHERE tid = ${tid};`,
+      ],
+      { encoding: "utf8" },
+    ).trim();
+    expect(afterRow).toBe(beforeRow);
   },
 );

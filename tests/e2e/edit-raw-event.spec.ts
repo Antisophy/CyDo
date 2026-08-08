@@ -298,6 +298,8 @@ test("clearing raw JSON deletes the source line instead of writing null", async 
   await page.locator(".raw-edit-textarea").fill("");
   await page.locator(".edit-actions .btn-primary").click();
 
+  await expect(page.locator(".source-view")).toBeHidden({ timeout: 15_000 });
+
   await expect(lastAssistantText(page, "Done.")).not.toBeVisible({
     timeout: 15_000,
   });

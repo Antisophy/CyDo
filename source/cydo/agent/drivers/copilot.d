@@ -3,6 +3,7 @@ module cydo.agent.drivers.copilot;
 import core.time : Duration;
 
 import std.conv : to;
+import std.exception : enforce;
 import std.format : format;
 import std.path : buildPath, dirName, expandTilde;
 import ae.utils.json : JSONFragment, JSONOptional, JSONPartial, jsonParse, toJson;
@@ -55,9 +56,6 @@ class CopilotAgent : Agent
 	private string lastMcpConfigPath_;
 	// Tool dispatch callback — set externally (e.g., by App) before creating sessions.
 	package(cydo) ToolDispatchFn toolDispatch_;
-	// Background thread: sessionId → session directory path (populated by enumerateAllSessions)
-	private string[string] sessionIdToDirPath_;
-
 	void configureSandbox(ref SandboxPaths paths, ref string[string] env)
 	{
 		import std.process : environment;
@@ -145,29 +143,6 @@ class CopilotAgent : Agent
 			workDir, launch.cmdPrefix, toolDispatch_, config);
 	}
 
-	string parseSessionId(string line)
-	{
-		import std.algorithm : canFind;
-		if (!line.canFind(`"session/init"`))
-			return null;
-
-		@JSONPartial
-		static struct InitProbe
-		{
-			string type;
-			string session_id;
-		}
-
-		try
-		{
-			auto probe = jsonParse!InitProbe(line);
-			if (probe.type == "session/init" && probe.session_id.length > 0)
-				return probe.session_id;
-		}
-		catch (Exception) {}
-		return null;
-	}
-
 	string extractResultText(string line)
 	{
 		import std.algorithm : canFind;
@@ -212,19 +187,17 @@ class CopilotAgent : Agent
 
 	string extractUserText(string line) { return ""; }
 
-	DiscoveredSession[] enumerateAllSessions()
+	DiscoveredSession[] enumerateAllSessions(const ref NativeHistoryProfile profile)
 	{
 		import std.file : DirEntry, dirEntries, exists, SpanMode;
 		import std.path : baseName, buildPath;
-		import std.process : environment;
 
-		auto home = environment.get("HOME", "/tmp");
-		auto copilotHome = environment.get("COPILOT_HOME", buildPath(home, ".copilot"));
-		auto sessionStateDir = buildPath(copilotHome, "session-state");
+		enforce(profile.driver == driver,
+			"Copilot history profile driver does not match Copilot");
+		auto sessionStateDir = buildPath(profile.root, "session-state");
 		if (!exists(sessionStateDir))
 			return [];
 
-		sessionIdToDirPath_ = null;
 		DiscoveredSession[] result;
 		try
 		{
@@ -236,12 +209,12 @@ class CopilotAgent : Agent
 				if (!exists(eventsFile))
 					continue;
 				auto sessionId = baseName(dirEntry.name);
-				sessionIdToDirPath_[sessionId] = dirEntry.name;
 				DiscoveredSession ds;
 				ds.sessionId = sessionId;
 				import std.file : timeLastModified;
 				ds.mtime = timeLastModified(eventsFile).stdTime;
 				ds.projectPath = ""; // not derivable
+				ds.exactHistoryPath = eventsFile;
 				result ~= ds;
 			}
 		}
@@ -253,21 +226,18 @@ class CopilotAgent : Agent
 		return result;
 	}
 
-	SessionMeta readSessionMeta(string sessionId)
+	SessionMeta readSessionMeta(const ref DiscoveredSession session)
 	{
 		import std.algorithm : canFind;
-		import std.path : buildPath;
 		import std.stdio : File;
-		auto pathp = sessionId in sessionIdToDirPath_;
-		if (pathp is null)
+		if (session.exactHistoryPath.length == 0)
 			return SessionMeta.init;
 
-		auto eventsFile = buildPath(*pathp, "events.jsonl");
 		SessionMeta meta;
 		try
 		{
 			int lineCount = 0;
-			auto f = File(eventsFile, "r");
+			auto f = File(session.exactHistoryPath, "r");
 			foreach (line; f.byLine)
 			{
 				if (lineCount++ > 50)
@@ -311,12 +281,13 @@ class CopilotAgent : Agent
 		catch (Exception e)
 		{
 			import std.logger : tracef;
-			tracef("readSessionMeta(copilot, %s): error: %s", sessionId, e.msg);
+			tracef("readSessionMeta(copilot, %s): error: %s", session.sessionId, e.msg);
 		}
 		return meta;
 	}
 
-	string matchProject(string sessionId, const string[] knownProjectPaths) { return ""; }
+	string matchProject(const ref DiscoveredSession session,
+		const string[] knownProjectPaths) { return ""; }
 
 	void setModelAliases(ModelSpec[string] aliases)
 	{
@@ -380,14 +351,20 @@ class CopilotAgent : Agent
 
 	// ---- History / fork ----
 
-	string historyPath(string sessionId, string projectPath)
+	string historyPath(string sessionId, string effectiveCwd,
+		const ref NativeHistoryProfile profile)
 	{
-		import std.process : environment;
-		if (sessionId.length == 0)
-			return "";
-		auto home = environment.get("HOME", "/tmp");
-		auto copilotHome = environment.get("COPILOT_HOME", buildPath(home, ".copilot"));
-		return buildPath(copilotHome, "session-state", sessionId, "events.jsonl");
+		enforce(profile.driver == driver,
+			"Copilot history profile driver does not match Copilot");
+		enforce(sessionId.length > 0,
+			"Copilot history path requires a session ID");
+		return buildPath(profile.root, "session-state", sessionId, "events.jsonl");
+	}
+
+	string createHistoryForkDestination(string sessionId, string effectiveCwd,
+		const ref NativeHistoryProfile profile)
+	{
+		return historyPath(sessionId, effectiveCwd, profile);
 	}
 
 	void resetHistoryReplay() {} // no state to reset for Copilot
@@ -677,7 +654,7 @@ class CopilotAgent : Agent
 	@property bool supportsDeveloperPrompt() { return true; }
 
 	RewindResult rewindFiles(string sessionId, string afterUuid, string cwd,
-		ProcessLaunch launch = ProcessLaunch.init)
+		ProcessLaunch launch)
 	{
 		return RewindResult(false, "File revert is not supported for Copilot sessions");
 	}
@@ -1019,6 +996,8 @@ class CopilotSession : AgentSession, SdkSessionHandler
 	private bool sessionReady_; // true after session.create/resume response
 	private string agentName_;
 	private string copilotVersion_;
+	private void delegate(string sessionId) nativeSessionStartedHandler_;
+	private bool nativeSessionStartedNotified_;
 
 	// Each message owns its settlement while it waits for readiness, a turn,
 	// or the correlated session.send response.
@@ -1095,6 +1074,7 @@ class CopilotSession : AgentSession, SdkSessionHandler
 		hadItemsSinceLastStop_ = false;
 
 		// Emit synthetic session/init.
+		notifyNativeSessionStarted();
 		SessionInitEvent initEv;
 		initEv.session_id      = sessionId;
 		initEv.model           = model;
@@ -1336,6 +1316,25 @@ class CopilotSession : AgentSession, SdkSessionHandler
 	@property bool canStopAfterCloseStdin() const
 	{
 		return false;
+	}
+
+	@property void onNativeSessionStarted(void delegate(string sessionId) callback)
+	{
+		nativeSessionStartedHandler_ = callback;
+		if (nativeSessionStartedHandler_ && sessionId.length > 0)
+		{
+			nativeSessionStartedNotified_ = true;
+			nativeSessionStartedHandler_(sessionId);
+		}
+	}
+
+	private void notifyNativeSessionStarted()
+	{
+		if (nativeSessionStartedNotified_)
+			return;
+		nativeSessionStartedNotified_ = true;
+		if (nativeSessionStartedHandler_)
+			nativeSessionStartedHandler_(sessionId);
 	}
 
 	@property void onOutput(void delegate(TranslatedEvent) dg) { outputHandler_ = dg; }
@@ -3154,6 +3153,29 @@ private struct CopilotMcpConfigServer
 
 private struct CopilotMcpConfigServers { CopilotMcpConfigServer cydo; }
 private struct CopilotMcpConfig { CopilotMcpConfigServers mcpServers; }
+
+unittest
+{
+	auto session = new CopilotSession(null, 1, "client-generated-id",
+		"test-model", "/test/workdir");
+	string[] order;
+	session.onOutput = (TranslatedEvent event) { order ~= "output"; };
+	session.onNativeSessionStarted = (string sessionId) {
+		order ~= "native:" ~ sessionId;
+	};
+	assert(order == ["native:client-generated-id"]);
+
+	session.onSessionStarted("test-model", "/test/workdir");
+	assert(order == ["native:client-generated-id", "output"],
+		"Copilot must publish its native ID once before synthetic session/init");
+
+	auto lateSession = new CopilotSession(null, 2, "late-id", "test-model",
+		"/test/workdir");
+	lateSession.onSessionStarted("test-model", "/test/workdir");
+	string delivered;
+	lateSession.onNativeSessionStarted = (string sessionId) { delivered = sessionId; };
+	assert(delivered == "late-id");
+}
 
 /// Generate a temporary MCP config file for Copilot's --additional-mcp-config flag.
 string generateCopilotMcpConfig(int tid, const ref NativeHistoryProfile profile,

@@ -56,6 +56,9 @@ interface AgentSession
 	/// Force-kill the agent if it has not exited within `timeout` (SIGTERM, then SIGKILL after 2s).
 	void killAfterTimeout(Duration timeout);
 
+	/// Callback: called once the native agent session ID is known.
+	@property void onNativeSessionStarted(void delegate(string sessionId) callback);
+
 	/// Callback: called for each translated event from the agent.
 	@property void onOutput(void delegate(TranslatedEvent) dg);
 

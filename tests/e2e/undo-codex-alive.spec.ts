@@ -1,3 +1,17 @@
+import { test as base } from "@playwright/test";
+import { spawn } from "child_process";
+import type { ChildProcess } from "child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
+import { basename, dirname, join, relative } from "path";
+import { writeTestConfig } from "./test-config";
 import {
   test,
   expect,
@@ -5,11 +19,12 @@ import {
   sendMessage,
   assistantText,
   killSession,
+  killBackend,
+  responseTimeout,
   visibleHistory,
   installCydoE2eBridge,
   undoThroughBridge,
 } from "./fixtures";
-import { readFileSync } from "fs";
 import type { Page } from "@playwright/test";
 
 async function activeTid(page: Page): Promise<number> {
@@ -655,5 +670,414 @@ test(
       secondUndoPreview: "3 messages will be removed.",
       retainedContext: "context-check-passed",
     });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// AC23 real-Codex undo/rollback split-CODEX_HOME regression test.
+//
+// Mirrors codex-fork.spec.ts's AC23 fork-lifecycle test and
+// custom-claude-agent-lifecycle.spec.ts's AC21 profile-lifecycle test: a
+// live task's own native rollback (Codex's thread/rollback, recorded as a
+// `thread_rolled_back` marker appended to the session's own rollout JSONL —
+// Codex's rollback is append-only/marker-based, never a truncation of the
+// file) must land in the launch profile (B) the task actually ran under,
+// even after the agent is reconfigured live to a different profile (C), and
+// must never touch a same-session-ID sibling poisoned under the backend's
+// own parent profile (A) or under C. Codex's native rollback requires a live
+// app-server connection, so unlike AC21/AC23's cold-diagnostic checks this
+// is a live-only proof (there is no cold native-rollback path to exercise).
+// ---------------------------------------------------------------------------
+
+type ProfiledCodexBackend = {
+  baseURL: string;
+  workDir: string;
+  workerHome: string;
+  configPath: string;
+  backendProfileA: string;
+  profileB: string;
+  profileC: string;
+};
+
+const CODEX_UNDO_PROFILE_WORK_DIR = "/tmp/cydo-codex-undo-profile-lifecycle";
+const CODEX_UNDO_PROFILE_BASE_URL = "http://localhost:3940";
+
+/** Minimal CODEX_HOME: config.toml pointed at the mock API, no session state. */
+function initCodexProfileDir(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  mkdirSync(join(dir, "shell_snapshots"), { recursive: true });
+  writeFileSync(
+    join(dir, "config.toml"),
+    `model = "codex-mini-latest"
+model_provider = "cydo-mock"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[model_providers.cydo-mock]
+name = "CyDo mock OpenAI"
+base_url = "http://127.0.0.1:9000/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+`,
+  );
+}
+
+/** Write a complete work-codex config pointed at the given CODEX_HOME. */
+function writeCodexProfileConfig(
+  configPath: string,
+  profileRoot: string,
+  displayName: string,
+): void {
+  writeTestConfig(
+    configPath,
+    `default_agent: work-codex
+agents:
+  work-codex:
+    driver: codex
+    display_name: ${displayName}
+    sandbox:
+      env:
+        CODEX_HOME: ${profileRoot}
+workspaces:
+  local:
+    root: /tmp/cydo-test-workspace
+`,
+  );
+}
+
+function spawnCodexProfiledBackend(
+  workDir: string,
+  workerHome: string,
+  backendProfileA: string,
+): ChildProcess {
+  return spawn(process.env.CYDO_BIN!, [], {
+    detached: true,
+    cwd: workDir,
+    env: {
+      ...process.env,
+      HOME: workerHome,
+      CODEX_HOME: backendProfileA,
+      XDG_DATA_HOME: `${workDir}/data`,
+    },
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+}
+
+async function waitForCodexProfiledBackend(
+  baseURL: string,
+  proc: ChildProcess,
+  timeoutMs = 30_000,
+): Promise<void> {
+  const processExited = new Promise<never>((_, reject) => {
+    if (proc.exitCode !== null) {
+      reject(
+        new Error(`Backend process already exited with code ${proc.exitCode}`),
+      );
+      return;
+    }
+    proc.on("exit", (code, signal) => {
+      reject(
+        new Error(
+          `Backend process exited with code ${code}` +
+            `${signal ? ` (signal ${signal})` : ""} before becoming ready`,
+        ),
+      );
+    });
+  });
+
+  const polling = (async () => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch(baseURL);
+        if (res.ok || res.status < 500) return;
+      } catch {
+        // not ready yet
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    throw new Error(`Backend at ${baseURL} did not start in time`);
+  })();
+
+  await Promise.race([polling, processExited]);
+}
+
+/**
+ * Local restartable backend fixture with a separate backend-parent profile
+ * (A) and configured agent profile (B/C), overriding baseURL so
+ * page.goto("/") targets this backend instead of fixtures.ts's fixed
+ * /tmp/cydo-backend. Uses its own work dir, distinct from codex-fork.spec.ts's
+ * CODEX_PROFILE_WORK_DIR, so the two specs' fixtures never collide.
+ */
+const codexProfileTest = base.extend<{ profileBackend: ProfiledCodexBackend }>({
+  profileBackend: async ({}, use, testInfo) => {
+    test.skip(testInfo.project.name !== "codex", "codex-only regression");
+
+    const workDir = CODEX_UNDO_PROFILE_WORK_DIR;
+    const workerHome = `${workDir}/home`;
+    const backendProfileA = `${workDir}/profile-a`;
+    const profileB = `${workDir}/profile-b`;
+    const profileC = `${workDir}/profile-c`;
+    const configPath = `${workerHome}/.config/cydo/config.yaml`;
+
+    rmSync(workDir, { recursive: true, force: true });
+    mkdirSync(`${workDir}/data`, { recursive: true });
+    symlinkSync("/tmp/cydo-test-workspace/defs", `${workDir}/defs`);
+    mkdirSync(`${workerHome}/.config/cydo`, { recursive: true });
+
+    initCodexProfileDir(backendProfileA);
+    initCodexProfileDir(profileB);
+    writeCodexProfileConfig(configPath, profileB, "Profile B");
+
+    const proc = spawnCodexProfiledBackend(
+      workDir,
+      workerHome,
+      backendProfileA,
+    );
+    try {
+      await waitForCodexProfiledBackend(CODEX_UNDO_PROFILE_BASE_URL, proc);
+    } catch (e) {
+      try {
+        process.kill(-proc.pid!, "SIGTERM");
+      } catch {
+        // already gone
+      }
+      throw e;
+    }
+
+    await use({
+      baseURL: CODEX_UNDO_PROFILE_BASE_URL,
+      workDir,
+      workerHome,
+      configPath,
+      backendProfileA,
+      profileB,
+      profileC,
+    });
+
+    await killBackend(proc);
+  },
+  baseURL: async ({ profileBackend }, use) => {
+    await use(profileBackend.baseURL);
+  },
+});
+
+function listRolloutFiles(sessionsDir: string): string[] {
+  if (!existsSync(sessionsDir)) return [];
+  const matches: string[] = [];
+  for (const entry of readdirSync(sessionsDir, {
+    recursive: true,
+  }) as string[]) {
+    if (!entry.endsWith(".jsonl")) continue;
+    if (!basename(entry).startsWith("rollout-")) continue;
+    matches.push(join(sessionsDir, entry));
+  }
+  return matches;
+}
+
+/** Poll root/sessions for exactly one real Codex rollout JSONL containing marker. */
+async function findRolloutJsonlContaining(
+  root: string,
+  marker: string,
+): Promise<string> {
+  const sessionsDir = join(root, "sessions");
+  let found: string | undefined;
+  await expect
+    .poll(
+      () => {
+        const matches: string[] = [];
+        for (const full of listRolloutFiles(sessionsDir)) {
+          try {
+            if (readFileSync(full, "utf8").includes(marker)) matches.push(full);
+          } catch {
+            // file may be mid-write; retry on next poll
+          }
+        }
+        found = matches.length === 1 ? matches[0] : undefined;
+        return matches.length;
+      },
+      { timeout: 20_000 },
+    )
+    .toBe(1);
+  return found!;
+}
+
+function relativeRolloutPath(root: string, realFile: string): string {
+  const rel = relative(root, realFile);
+  expect(rel.startsWith("sessions/")).toBe(true);
+  return rel;
+}
+
+function sessionIdFromRollout(path: string): string {
+  const firstLine = readFileSync(path, "utf8").split("\n")[0];
+  const parsed = JSON.parse(firstLine);
+  expect(parsed.type).toBe("session_meta");
+  expect(typeof parsed.payload?.id).toBe("string");
+  return parsed.payload.id as string;
+}
+
+/** Create a valid two-line rollout at the given relative location, same session ID. */
+function writeSameIdRolloutPoison(
+  root: string,
+  relativePath: string,
+  sessionId: string,
+  cwd: string,
+  marker: string,
+): void {
+  const fullPath = join(root, relativePath);
+  mkdirSync(dirname(fullPath), { recursive: true });
+  const content =
+    [
+      JSON.stringify({
+        type: "session_meta",
+        payload: { id: sessionId, cwd, cli_version: "0.0.0-poison" },
+      }),
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: marker }],
+        },
+      }),
+    ].join("\n") + "\n";
+  writeFileSync(fullPath, content);
+}
+
+async function openTaskByTid(
+  page: Page,
+  tid: string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  const row = page.locator(`.sidebar-item[data-tid="${tid}"]`);
+  await expect(row).toBeVisible({ timeout: timeoutMs });
+  await row.click();
+  await expect(row).toHaveClass(/active/, { timeout: timeoutMs });
+}
+
+codexProfileTest(
+  "codex live rollback lands in the launch profile B rollout, never in an A/C same-ID poison sibling",
+  { tag: "@codex-only" },
+  async ({ page, profileBackend }) => {
+    const marker1 = "split-undo-one";
+    const marker2 = "split-undo-two";
+    const marker3 = "split-undo-three";
+    const followup = "split-undo-followup";
+    const cwd = "/tmp/cydo-test-workspace";
+    const timeout = responseTimeout("codex");
+
+    await enterSession(page);
+
+    for (const marker of [marker1, marker2, marker3]) {
+      await sendMessage(page, `Please reply with "${marker}"`);
+      await expect(assistantText(page, marker)).toBeVisible({ timeout });
+    }
+
+    const tid = String(await activeTid(page));
+    const taskUrl = page.url();
+
+    // The task's own rollout lands under B, never A or C.
+    const realRollout = await findRolloutJsonlContaining(
+      profileBackend.profileB,
+      marker3,
+    );
+    const relPath = relativeRolloutPath(profileBackend.profileB, realRollout);
+    const sessionId = sessionIdFromRollout(realRollout);
+    expect(readFileSync(realRollout, "utf8")).not.toContain(
+      "thread_rolled_back",
+    );
+
+    // Adversarial same-session-ID poison siblings under the backend's own
+    // parent profile (A) and under the root work-codex is about to be
+    // reconfigured to (C): a rollback that fell back to reading or writing
+    // either would surface (or be recorded against) this content instead of
+    // B's own.
+    writeSameIdRolloutPoison(
+      profileBackend.backendProfileA,
+      relPath,
+      sessionId,
+      cwd,
+      "split-undo-a-poison-marker",
+    );
+    const poisonAContent = readFileSync(
+      join(profileBackend.backendProfileA, relPath),
+      "utf8",
+    );
+    initCodexProfileDir(profileBackend.profileC);
+    writeSameIdRolloutPoison(
+      profileBackend.profileC,
+      relPath,
+      sessionId,
+      cwd,
+      "split-undo-c-poison-marker",
+    );
+    const poisonCContent = readFileSync(
+      join(profileBackend.profileC, relPath),
+      "utf8",
+    );
+
+    // Reconfigure work-codex live, from B to C, with no backend restart —
+    // the task is still alive and bound to its own already-launched B
+    // process throughout. Confirm the reload actually landed via a fresh
+    // draft's picker before returning to the live task, rather than a fixed
+    // sleep — the exact-message assertions below have zero tolerance for a
+    // race-induced wrong branch.
+    writeCodexProfileConfig(
+      profileBackend.configPath,
+      profileBackend.profileC,
+      "Profile C",
+    );
+    await enterSession(page);
+    await expect(
+      page.locator('.agent-picker option[value="work-codex"]'),
+    ).toHaveText("Profile C", { timeout: 20_000 });
+
+    await page.goto(taskUrl);
+    await openTaskByTid(page, tid);
+    await expect(assistantText(page, marker3)).toBeVisible({ timeout: 15_000 });
+
+    await undoUserMessage(page, `Please reply with "${marker3}"`);
+    await expect(assistantText(page, marker3)).toHaveCount(0, {
+      timeout: 15_000,
+    });
+    await expect(assistantText(page, marker2)).toBeVisible();
+    await expect(assistantText(page, marker1)).toBeVisible();
+
+    // The rollback landed in B's own rollout file as a native
+    // thread_rolled_back marker (append-only — Codex's rollback never
+    // truncates the file, it appends an event marker that CyDo's own replay
+    // logic skips past)...
+    await expect
+      .poll(() => readFileSync(realRollout, "utf8"), { timeout: 15_000 })
+      .toContain("thread_rolled_back");
+
+    // ...and never touched either poison sibling.
+    expect(
+      readFileSync(join(profileBackend.backendProfileA, relPath), "utf8"),
+    ).toBe(poisonAContent);
+    expect(
+      readFileSync(join(profileBackend.profileC, relPath), "utf8"),
+    ).toBe(poisonCContent);
+
+    // Session is still alive and fully functional after the rollback, and
+    // its follow-up turn lands in the very same B rollout file, not a new
+    // one under B, A, or C.
+    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled({
+      timeout: 15_000,
+    });
+    await sendMessage(page, `Please reply with "${followup}"`);
+    await expect(assistantText(page, followup)).toBeVisible({ timeout });
+    const followupRollout = await findRolloutJsonlContaining(
+      profileBackend.profileB,
+      followup,
+    );
+    expect(followupRollout).toBe(realRollout);
+    expect(
+      readFileSync(join(profileBackend.backendProfileA, relPath), "utf8"),
+    ).toBe(poisonAContent);
+    expect(
+      readFileSync(join(profileBackend.profileC, relPath), "utf8"),
+    ).toBe(poisonCContent);
   },
 );

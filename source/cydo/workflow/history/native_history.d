@@ -1,6 +1,9 @@
 module cydo.workflow.history.native_history;
 
 import std.exception : enforce;
+import std.file : exists, isFile;
+import std.path : isAbsolute;
+import std.stdio : File;
 
 import cydo.agent.contract : Agent;
 import cydo.agent.resolver : resolveConfiguredAgent;
@@ -25,6 +28,245 @@ struct ResolvedNativeHistoryContext
 	ResolvedSandbox sandbox;
 	NativeHistoryRule rule;
 	NativeHistoryProfile profile;
+}
+
+enum TaskHistoryResolutionKind
+{
+	noSession,
+	access,
+	orphanAgent,
+	unavailable,
+}
+
+struct HistoryAccess
+{
+	Agent agent;
+	NativeHistoryProfile profile;
+	string sessionId;
+	string effectiveCwd;
+	string path;
+}
+
+enum UnavailableHistoryKind
+{
+	context,
+	profilePath,
+}
+
+struct UnavailableHistory
+{
+	UnavailableHistoryKind kind;
+	string agentName;
+	string sessionId;
+	string detail;
+	NativeHistoryRule rule;
+	NativeHistoryProfile profile;
+}
+
+struct TaskHistoryResolution
+{
+private:
+	TaskHistoryResolutionKind kind_;
+	HistoryAccess access_;
+	UnavailableHistory unavailable_;
+	string orphanAgentName_;
+	string orphanSessionId_;
+
+public:
+	@property TaskHistoryResolutionKind kind() const { return kind_; }
+
+	static TaskHistoryResolution noSession()
+	{
+		TaskHistoryResolution result;
+		result.kind_ = TaskHistoryResolutionKind.noSession;
+		return result;
+	}
+
+	static TaskHistoryResolution access(HistoryAccess value)
+	{
+		validateHistoryAccess(value);
+		TaskHistoryResolution result;
+		result.kind_ = TaskHistoryResolutionKind.access;
+		result.access_ = value;
+		return result;
+	}
+
+	static TaskHistoryResolution orphanAgent(string agentName, string sessionId)
+	{
+		enforce(agentName.length > 0,
+			"Orphaned history resolution requires an agent name");
+		enforce(sessionId.length > 0,
+			"Orphaned history resolution requires a session ID");
+		TaskHistoryResolution result;
+		result.kind_ = TaskHistoryResolutionKind.orphanAgent;
+		result.orphanAgentName_ = agentName;
+		result.orphanSessionId_ = sessionId;
+		return result;
+	}
+
+	static TaskHistoryResolution unavailable(UnavailableHistory value)
+	{
+		enforce(value.agentName.length > 0,
+			"Unavailable history resolution requires an agent name");
+		enforce(value.sessionId.length > 0,
+			"Unavailable history resolution requires a session ID");
+		enforce(value.detail.length > 0,
+			"Unavailable history resolution requires diagnostic detail");
+		if (value.kind == UnavailableHistoryKind.profilePath)
+		{
+			enforce(value.rule.profileEnvName.length > 0,
+				"Profile-path history resolution requires a profile rule");
+			enforce(value.profile.root.length > 0 && isAbsolute(value.profile.root),
+				"Profile-path history resolution requires an absolute profile root");
+			enforce(value.rule.driver == value.profile.driver,
+				"Profile-path history rule and profile drivers must match");
+		}
+		TaskHistoryResolution result;
+		result.kind_ = TaskHistoryResolutionKind.unavailable;
+		result.unavailable_ = value;
+		return result;
+	}
+
+	HistoryAccess requireAccess() const
+	{
+		enforce(kind_ == TaskHistoryResolutionKind.access,
+			"History resolution does not contain readable history access");
+		return cast(HistoryAccess) access_;
+	}
+
+	UnavailableHistory requireUnavailable() const
+	{
+		enforce(kind_ == TaskHistoryResolutionKind.unavailable,
+			"History resolution does not contain unavailable-history detail");
+		return cast(UnavailableHistory) unavailable_;
+	}
+
+	string requireOrphanAgentName() const
+	{
+		enforce(kind_ == TaskHistoryResolutionKind.orphanAgent,
+			"History resolution does not contain an orphaned agent");
+		return orphanAgentName_;
+	}
+
+	string requireOrphanSessionId() const
+	{
+		enforce(kind_ == TaskHistoryResolutionKind.orphanAgent,
+			"History resolution does not contain an orphaned session ID");
+		return orphanSessionId_;
+	}
+}
+
+struct LiveHistoryContext
+{
+	Agent agent;
+	NativeHistoryProfile profile;
+	string sessionId;
+	string effectiveCwd;
+}
+
+enum LiveHistoryWatchResolutionKind
+{
+	noLiveBinding,
+	awaitingPath,
+	target,
+}
+
+struct LiveHistoryWatchTarget
+{
+	LiveHistoryContext context;
+	string path;
+}
+
+struct LiveHistoryWatchResolution
+{
+private:
+	LiveHistoryWatchResolutionKind kind_;
+	LiveHistoryContext context_;
+	LiveHistoryWatchTarget target_;
+
+public:
+	@property LiveHistoryWatchResolutionKind kind() const { return kind_; }
+
+	static LiveHistoryWatchResolution noLiveBinding()
+	{
+		LiveHistoryWatchResolution result;
+		result.kind_ = LiveHistoryWatchResolutionKind.noLiveBinding;
+		return result;
+	}
+
+	static LiveHistoryWatchResolution awaitingPath(LiveHistoryContext context)
+	{
+		validateLiveHistoryContext(context);
+		LiveHistoryWatchResolution result;
+		result.kind_ = LiveHistoryWatchResolutionKind.awaitingPath;
+		result.context_ = context;
+		return result;
+	}
+
+	static LiveHistoryWatchResolution target(LiveHistoryWatchTarget value)
+	{
+		validateLiveHistoryContext(value.context);
+		enforce(value.path.length > 0 && isAbsolute(value.path),
+			"Live history watch target must be an absolute path");
+		LiveHistoryWatchResolution result;
+		result.kind_ = LiveHistoryWatchResolutionKind.target;
+		result.context_ = value.context;
+		result.target_ = value;
+		return result;
+	}
+
+	LiveHistoryContext requireContext() const
+	{
+		enforce(kind_ == LiveHistoryWatchResolutionKind.awaitingPath
+			|| kind_ == LiveHistoryWatchResolutionKind.target,
+			"Live history watch resolution does not contain a context");
+		return cast(LiveHistoryContext) context_;
+	}
+
+	LiveHistoryWatchTarget requireTarget() const
+	{
+		enforce(kind_ == LiveHistoryWatchResolutionKind.target,
+			"Live history watch resolution does not contain a target");
+		return cast(LiveHistoryWatchTarget) target_;
+	}
+}
+
+private void validateLiveHistoryContext(ref LiveHistoryContext value)
+{
+	enforce(value.agent !is null,
+		"Live history context requires an Agent");
+	enforce(value.profile.driver == value.agent.driver,
+		"Live history context Agent and profile drivers must match");
+	enforce(value.profile.root.length > 0 && isAbsolute(value.profile.root),
+		"Live history context requires an absolute profile root");
+	enforce(value.sessionId.length > 0,
+		"Live history context requires a session ID");
+	enforce(value.effectiveCwd.length > 0,
+		"Live history context requires an effective CWD");
+}
+
+private bool isReadableRegularFile(string path)
+{
+	if (!exists(path) || !isFile(path))
+		return false;
+	try
+	{
+		auto file = File(path, "r");
+		return true;
+	}
+	catch (Exception)
+		return false;
+}
+
+private void validateHistoryAccess(ref HistoryAccess value)
+{
+	auto context = LiveHistoryContext(value.agent, value.profile, value.sessionId,
+		value.effectiveCwd);
+	validateLiveHistoryContext(context);
+	enforce(value.path.length > 0 && isAbsolute(value.path),
+		"History access requires an absolute path");
+	enforce(isReadableRegularFile(value.path),
+		"History access requires an existing readable regular file");
 }
 
 ResolvedNativeHistoryContext resolveNativeHistoryContext(

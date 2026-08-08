@@ -1,5 +1,7 @@
 module cydo.workflow.exporter.html;
 
+import std.conv : to;
+
 import ae.utils.json : JSONFragment, toJson;
 
 import cydo.agent.contract : Agent;
@@ -7,8 +9,11 @@ import cydo.agent.resolver : tryCreateConfiguredAgent;
 import cydo.runtime.config : AgentDriver, CydoConfig;
 import cydo.protocol : TaskEventSeqEnvelope, TranslatedEvent;
 import cydo.domain.storage.persistence : Persistence;
-import cydo.domain.tasks.model : TypeInfoEntry;
+import cydo.domain.tasks.model : TaskData, TypeInfoEntry;
 import cydo.workflow.history.jsonl_store : loadTaskHistory;
+import cydo.workflow.history.native_history : ConfiguredNativeHistoryContext,
+	resolveNativeHistoryContext;
+import cydo.workflow.workspace.task_path_resolver : TaskPathResolver;
 
 /// Recursively collect all tasks reachable from rootTids via parent_tid.
 /// Returns the deduplicated set (roots + all descendants).
@@ -56,8 +61,9 @@ Persistence.TaskRow[] collectTaskTree(ref Persistence persistence, int[] rootTid
 
 /// Serialize task metadata and event history as the export JSON blob.
 /// Format: {"tasks": [...], "events": {"<tid>": [TaskEventSeqEnvelope, ...]}, "typeInfo": [...]}
-string exportTaskData(ref Persistence persistence, Persistence.TaskRow[] taskRows,
-	ref CydoConfig config, TypeInfoEntry[] typeInfo = null)
+string exportTaskData(Persistence.TaskRow[] taskRows, ref CydoConfig config,
+	TaskData[int]* allTasks, TaskPathResolver taskPathResolver,
+	TypeInfoEntry[] typeInfo = null)
 {
 	import std.format : format;
 
@@ -116,11 +122,31 @@ string exportTaskData(ref Persistence persistence, Persistence.TaskRow[] taskRow
 
 		auto agent = getAgent(t.agentName);
 		if (agent is null)
-			continue;
-
-		auto jsonlPath = agent.historyPath(t.agentSessionId, t.projectPath);
-		if (jsonlPath.length == 0)
-			continue;
+			throw new Exception("Cannot export task " ~ t.tid.to!string
+				~ ": configured agent '" ~ t.agentName ~ "' is unavailable");
+		auto td = t.tid in *allTasks;
+		if (td is null)
+			throw new Exception("Cannot export task " ~ t.tid.to!string
+				~ ": task context is unavailable");
+		auto context = ConfiguredNativeHistoryContext(t.agentName, t.workspace,
+			(*td).repoPath, false);
+		auto resolved = resolveNativeHistoryContext(config, agent, context);
+		auto jsonlPath = agent.historyPath(t.agentSessionId,
+			taskPathResolver.effectiveCwd(td), resolved.profile);
+		import std.file : exists, isFile;
+		import std.path : isAbsolute;
+		import std.stdio : File;
+		if (jsonlPath.length == 0 || !isAbsolute(jsonlPath) || !exists(jsonlPath)
+			|| !isFile(jsonlPath))
+			throw new Exception("Cannot export task " ~ t.tid.to!string
+				~ ": session history is unavailable");
+		try
+		{
+			auto file = File(jsonlPath, "r");
+		}
+		catch (Exception)
+			throw new Exception("Cannot export task " ~ t.tid.to!string
+				~ ": session history is unreadable");
 
 		// Pre-compute rollback skip lines for Codex
 		bool[int] rollbackSkipLines;

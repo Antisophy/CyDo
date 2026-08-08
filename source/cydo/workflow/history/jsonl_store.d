@@ -10,6 +10,7 @@ import ae.utils.json : JSONFragment, toJson;
 
 import cydo.protocol : TaskEventEnvelope, TranslatedEvent;
 import cydo.domain.storage.persistence : LoadedHistory, Persistence, createForkTask, noSourceLine;
+import cydo.workflow.history.native_history : HistoryAccess;
 
 /// Load task history from a JSONL file.
 /// Returns events wrapped in file-event envelopes paired with raw source lines.
@@ -58,52 +59,47 @@ struct ForkResult
 {
 	int tid = -1;
 	string agentSessionId;
+	string destinationPath;
+}
+
+struct HistoryForkDestination
+{
+	string sessionId;
+	string path;
 }
 
 /// Fork a task by truncating its JSONL after the given fork ID.
-/// Creates a new JSONL file with a fresh session ID and a corresponding DB row.
-/// historyPathFn computes the JSONL file path for a given session ID.
+/// Creates a new JSONL file at an explicit target and a corresponding DB row.
 /// rewriteSessionIdFn rewrites session ID references in each JSONL line.
 /// matchFn checks whether a JSONL line (at 1-based lineNum) matches the fork ID.
-ForkResult forkTask(ref Persistence persistence, int sourceTid, string sourceSessionId, string afterForkId,
-	string projectPath, string workspace, string title, string delegate(string sessionId) historyPathFn,
+ForkResult forkTask(ref Persistence persistence, int sourceTid,
+	const ref HistoryAccess source, string afterForkId, string projectPath,
+	string workspace, string title, const ref HistoryForkDestination destination,
 	string delegate(string line, string oldId, string newId) rewriteSessionIdFn,
-bool delegate(string line, int lineNum, string forkId) matchFn,
+	bool delegate(string line, int lineNum, string forkId) matchFn,
 	string description = "", string taskType = "", string agentName = "claude")
 {
 	import std.file : exists, mkdirRecurse, readText, write;
+	import std.path : dirName, isAbsolute;
 	import std.string : lineSplitter;
 
-	auto sourcePath = historyPathFn(sourceSessionId);
-	if (sourcePath.length == 0 || !exists(sourcePath))
-		return ForkResult.init;
-
-	auto newSessionId = generateUUID();
-	auto destPath = historyPathFn(newSessionId);
-
-	// For agents where historyPath uses glob (e.g. Codex), the new file
-	// doesn't exist yet so the glob returns "".  Derive the destination
-	// path from the source path by replacing the session ID in the filename.
-	if (destPath.length == 0)
-	{
-		import std.path : buildPath, dirName, baseName;
-		import std.string : replace;
-		auto sourceFile = baseName(sourcePath);
-		auto destFile = sourceFile.replace(sourceSessionId, newSessionId);
-		destPath = buildPath(dirName(sourcePath), destFile);
-	}
+	assert(exists(source.path), "Fork source history file must exist");
+	assert(destination.sessionId.length > 0 && destination.path.length > 0
+		&& isAbsolute(destination.path),
+		"History fork destination must provide an absolute path and session ID");
 
 	// Read source, rewrite sessionId, truncate after target line
 	string output;
 	bool found = false;
 	int lineNum = 0;
-	foreach (line; readText(sourcePath).lineSplitter)
+	foreach (line; readText(source.path).lineSplitter)
 	{
 		lineNum++;
 		if (line.length == 0)
 			continue;
 
-		auto rewritten = rewriteSessionIdFn(line, sourceSessionId, newSessionId);
+		auto rewritten = rewriteSessionIdFn(line, source.sessionId,
+			destination.sessionId);
 		output ~= rewritten ~ "\n";
 
 		if (matchFn(line, lineNum, afterForkId))
@@ -119,16 +115,16 @@ bool delegate(string line, int lineNum, string forkId) matchFn,
 	// Ensure the destination directory exists (e.g. copilot creates per-session
 	// subdirectories: COPILOT_HOME/session-state/{newSessionId}/events.jsonl).
 	{
-		import std.path : dirName;
-		auto destDir = dirName(destPath);
+		auto destDir = dirName(destination.path);
 		if (destDir.length > 0)
 			mkdirRecurse(destDir);
 	}
-	write(destPath, output);
+	write(destination.path, output);
 
 	// Create DB entry with the new agent session ID
-	return ForkResult(createForkTask(persistence, sourceTid, newSessionId, projectPath,
-		workspace, title, description, taskType, agentName), newSessionId);
+	return ForkResult(createForkTask(persistence, sourceTid, destination.sessionId,
+		projectPath, workspace, title, description, taskType, agentName),
+		destination.sessionId, destination.path);
 }
 
 /// Edit a message in a JSONL file by replacing its content.
@@ -228,6 +224,60 @@ unittest
 	assert(readText(jsonlPath) == [`{"a":1}`, `{"y":2}`, `{"c":3}`, ""].join("\n"));
 
 	assert(spliceJsonlByLine(jsonlPath, 99, [`{"ignored":true}`]) == false);
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, write, readText;
+	import std.path : buildPath;
+	import std.string : replace;
+	import cydo.agent.contract : Agent;
+	import cydo.agent.drivers.claude : ClaudeCodeAgent;
+	import cydo.runtime.launch.types : NativeHistoryProfile;
+
+	auto root = buildPath("/tmp", "cydo-explicit-history-fork");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope(exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto dbPath = buildPath(root, "cydo.db");
+	mkdirRecurse(root);
+	auto persistence = Persistence(dbPath);
+	auto sourceTid = persistence.createTask("", "/tmp/fork-project", "claude");
+	Agent agent = new ClaudeCodeAgent();
+	auto profile = NativeHistoryProfile(agent.driver, buildPath(root, "profile"));
+	auto sourcePath = buildPath(profile.root, "projects", "-tmp-fork-project",
+		"source-session.jsonl");
+	mkdirRecurse(buildPath(profile.root, "projects", "-tmp-fork-project"));
+	write(sourcePath, "source-session first\nsource-session second\n");
+	auto source = HistoryAccess(agent, profile, "source-session", "/tmp/fork-project",
+		sourcePath);
+	auto destination = HistoryForkDestination("child-session",
+		buildPath(root, "explicit", "nested", "child.jsonl"));
+
+	string rewrite(string line, string oldId, string newId)
+	{
+		return line.replace(oldId, newId);
+	}
+
+	bool match(string line, int lineNum, string anchor)
+	{
+		return anchor == "first" && lineNum == 1;
+	}
+
+	assert(forkTask(persistence, sourceTid, source, "missing", "/tmp/fork-project",
+		"", "parent", destination, &rewrite, &match).tid < 0);
+	assert(!exists(destination.path),
+		"a missing anchor must not create the explicit child destination");
+
+	auto result = forkTask(persistence, sourceTid, source, "first", "/tmp/fork-project",
+		"", "parent", destination, &rewrite, &match);
+	assert(result.tid > 0);
+	assert(result.agentSessionId == destination.sessionId);
+	assert(result.destinationPath == destination.path);
+	assert(readText(destination.path) == "child-session first\n");
 }
 
 bool writeJsonlPrefix(string sourcePath, string destPath, string afterForkId,

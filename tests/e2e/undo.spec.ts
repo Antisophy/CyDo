@@ -11,6 +11,24 @@ test("undo moves user message text to input box", async ({
   page,
   agentType,
 }) => {
+  const taskCreatedEvents: Array<{
+    tid: number;
+    parent_tid?: number;
+    relation_type?: string;
+  }> = [];
+  if (agentType === "codex") {
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", (event) => {
+        try {
+          const frame = JSON.parse(event.payload.toString());
+          if (frame?.type === "task_created") taskCreatedEvents.push(frame);
+        } catch {
+          // Ignore non-JSON frames.
+        }
+      });
+    });
+  }
+
   await enterSession(page);
 
   await sendMessage(page, 'Please reply with "reply-one"');
@@ -101,6 +119,27 @@ test("undo moves user message text to input box", async ({
     'Please reply with "reply-three"\n\nPlease reply with "reply-four"\n\nPlease reply with "reply-five"',
     { timeout: 15_000 },
   );
+
+  if (agentType === "codex") {
+    await expect(async () => {
+      expect(
+        taskCreatedEvents.find(
+          (event) => event.relation_type === "undo-backup",
+        ),
+      ).toBeTruthy();
+    }).toPass({ timeout: 15_000 });
+
+    const backupTid = taskCreatedEvents.find(
+      (event) => event.relation_type === "undo-backup",
+    )!.tid;
+    await page.reload();
+    const backup = page.locator(`.sidebar-item[data-tid="${backupTid}"]`);
+    await expect(backup).toBeVisible({ timeout: 15_000 });
+    await backup.click();
+    await expect(assistantText(page, "reply-five")).toBeVisible({
+      timeout: 15_000,
+    });
+  }
 });
 
 test(

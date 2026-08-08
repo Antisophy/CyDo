@@ -6,7 +6,8 @@ import cydo.protocol : TranslatedEvent;
 import cydo.agent.session : AgentSession;
 import cydo.runtime.config : AgentDriver, ModelSpec;
 import cydo.runtime.launch.sandbox_paths : SandboxPaths;
-import cydo.runtime.launch.types : NativeHistoryRule, ProcessLaunch;
+import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule,
+	ProcessLaunch;
 
 /// Per-session configuration passed to createSession.
 struct SessionConfig
@@ -39,6 +40,7 @@ struct DiscoveredSession
 	string sessionId;   /// Opaque agent-meaningful identifier (UUID, path-based ID, etc.)
 	long mtime;         /// Modification time (SysTime.stdTime) — for cache invalidation
 	string projectPath; /// Project path if cheaply derivable from directory structure (empty otherwise)
+	string exactHistoryPath; /// Transient absolute locator from this discovery scan
 }
 
 /// Metadata extracted by reading session content.
@@ -97,11 +99,6 @@ interface Agent
 	AgentSession createSession(int tid, string resumeSessionId, ProcessLaunch launch,
 		SessionConfig config = SessionConfig.init);
 
-	/// Try to extract the agent session ID from an output line.
-	/// Returns the session ID string if found, null otherwise.
-	/// Called for each line of agent output until the session ID is discovered.
-	string parseSessionId(string line);
-
 	/// Extract the canonical result text from an agent output line.
 	/// Returns empty string if the line is not a result event.
 	string extractResultText(string line);
@@ -119,9 +116,14 @@ interface Agent
 	/// label resolves to itself unless overridden.
 	ModelSpec resolveModelSpec(string modelClass);
 
-	/// Compute the path to the agent's history file for a given session ID.
-	/// projectPath is the project's absolute path; empty means use cwd.
-	string historyPath(string sessionId, string projectPath);
+	/// Compute the path to the agent's history file in an exact configured profile.
+	string historyPath(string sessionId, string effectiveCwd,
+		const ref NativeHistoryProfile profile);
+
+	/// Compute the deterministic destination for a generic JSONL history fork.
+	/// Codex native forks obtain their path from the thread RPC instead.
+	string createHistoryForkDestination(string sessionId, string effectiveCwd,
+		const ref NativeHistoryProfile profile);
 
 	/// Reset internal history-replay state (e.g. task_started sentinel).
 	/// Called before each loadTaskHistory loop so re-loads start clean.
@@ -183,8 +185,8 @@ interface Agent
 
 	/// Revert files to the state after a given message UUID.
 	/// Only called when supportsFileRevert is true.
-	RewindResult rewindFiles(string sessionId, string afterUuid, string cwd,
-		ProcessLaunch launch = ProcessLaunch.init);
+	RewindResult rewindFiles(string sessionId, string afterUuid, string effectiveCwd,
+		ProcessLaunch launch);
 
 	/// Extract user message text from a raw event line.
 	string extractUserText(string line);
@@ -192,17 +194,18 @@ interface Agent
 	/// Enumerate all persisted sessions for this agent type.
 	/// Returns lightweight info from directory scanning / DB query only — no content reads.
 	/// Must be safe to call from a background thread (no shared mutable state).
-	DiscoveredSession[] enumerateAllSessions();
+	DiscoveredSession[] enumerateAllSessions(const ref NativeHistoryProfile profile);
 
 	/// Extract metadata (title, project path) from a session's persisted content.
 	/// The agent reads only as much as needed (e.g., first few lines via byLine).
 	/// Must be safe to call from a background thread (pure I/O, no shared mutable state).
-	SessionMeta readSessionMeta(string sessionId);
+	SessionMeta readSessionMeta(const ref DiscoveredSession session);
 
 	/// Cheaply match a session to a project path using directory structure only — no file reads.
 	/// Returns the matching project path, or "" if not determinable without reading content.
 	/// Must be safe to call from a background thread (no shared mutable state).
-	string matchProject(string sessionId, const string[] knownProjectPaths);
+	string matchProject(const ref DiscoveredSession session,
+		const string[] knownProjectPaths);
 
 	/// Run a one-shot LLM completion using the supplied process launch context.
 	OneShotHandle completeOneShot(string prompt, string modelClass,

@@ -231,8 +231,8 @@ export class Connection {
     this.send(JSON.stringify({ type: "resume", tid }));
   }
 
-  promoteTask(tid: number) {
-    this.send(JSON.stringify({ type: "promote_task", tid }));
+  promoteTask(tid: number, workspace: string) {
+    this.send(JSON.stringify({ type: "promote_task", tid, workspace }));
   }
 
   createTask(

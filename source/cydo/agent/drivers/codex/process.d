@@ -2,6 +2,8 @@ module cydo.agent.drivers.codex.process;
 
 import core.time : seconds;
 
+import std.exception : enforce;
+
 import ae.net.jsonrpc.binding : JsonRpcDispatcher, jsonRpcDispatcher;
 import ae.net.jsonrpc.codec : JsonRpcCodec;
 import ae.utils.json : JSONFragment, jsonParse, toJson;
@@ -36,6 +38,10 @@ class AppServerProcess
 	private CodexSessionRouteTarget[string] sessions;
 	// Task ID → session (populated at session creation, before thread/start)
 	private CodexSessionRouteTarget[int] sessionsByTid;
+	// A stopped-source fork owns a real private CodexSession while it resumes
+	// the source thread. Its route identity must never overlap a logical task.
+	private bool[int] operationRouteReservations_;
+	private int nextOperationRouteTid_ = int.min;
 
 	// Actions queued until server reaches ready state.
 	private void delegate()[] readyQueue;
@@ -133,26 +139,66 @@ class AppServerProcess
 
 	void registerSession(string threadId, CodexSessionRouteTarget session)
 	{
+		enforce(threadId.length > 0, "Codex thread route requires a thread ID");
+		enforce(threadId !in sessions,
+			"Codex thread route is already registered");
 		sessions[threadId] = session;
 	}
 
 	void unregisterSession(string threadId)
 	{
 		sessions.remove(threadId);
-		if (sessions.length == 0 && sessionsByTid.length == 0)
-			shutdown();
+		shutdownIfUnrouted();
 	}
 
 	void registerSessionByTid(int tid, CodexSessionRouteTarget session)
 	{
+		enforce(tid !in operationRouteReservations_,
+			"Codex task route conflicts with an operation reservation");
+		enforce(tid !in sessionsByTid,
+			"Codex task route is already registered");
 		sessionsByTid[tid] = session;
+	}
+
+	package int reserveOperationRouteTid()
+	{
+		for (;;)
+		{
+			enforce(nextOperationRouteTid_ < -1,
+				"Codex operation route ID space is exhausted");
+			auto routeTid = nextOperationRouteTid_++;
+			if (routeTid in sessionsByTid || routeTid in operationRouteReservations_)
+				continue;
+			operationRouteReservations_[routeTid] = true;
+			return routeTid;
+		}
+	}
+
+	package void registerOperationSessionByTid(int routeTid,
+		CodexSessionRouteTarget session)
+	{
+		enforce(routeTid in operationRouteReservations_,
+			"Codex operation route was not reserved");
+		enforce(routeTid !in sessionsByTid,
+			"Codex operation route is already registered");
+		sessionsByTid[routeTid] = session;
+	}
+
+	package void cancelOperationRouteReservation(int routeTid)
+	{
+		enforce(routeTid in operationRouteReservations_,
+			"Codex operation route was not reserved");
+		enforce(routeTid !in sessionsByTid,
+			"Codex operation route must unregister before cancellation");
+		operationRouteReservations_.remove(routeTid);
+		shutdownIfUnrouted();
 	}
 
 	void unregisterSessionByTid(int tid)
 	{
 		sessionsByTid.remove(tid);
-		if (sessions.length == 0 && sessionsByTid.length == 0)
-			shutdown();
+		operationRouteReservations_.remove(tid);
+		shutdownIfUnrouted();
 	}
 
 	/// Queue an action for when the server is ready. Runs immediately if
@@ -309,6 +355,18 @@ class AppServerProcess
 	private CodexSessionRouteTarget[] allSessions()
 	{
 		return sessionsByTid.values;
+	}
+
+	private void shutdownIfUnrouted()
+	{
+		if (sessions.length == 0 && sessionsByTid.length == 0
+			&& operationRouteReservations_.length == 0)
+			shutdown();
+	}
+
+	version (unittest) package bool hasThreadRouteForTest(string threadId)
+	{
+		return (threadId in sessions) !is null;
 	}
 }
 

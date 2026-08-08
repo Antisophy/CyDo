@@ -122,6 +122,18 @@ struct Persistence
 			"ALTER TABLE tasks ADD COLUMN needs_attention INTEGER NOT NULL DEFAULT 0;",
 			// Migration 20: immutable task-local commit collection boundary
 			"ALTER TABLE tasks ADD COLUMN task_start_head TEXT NOT NULL DEFAULT '';",
+			// Migration 21: cache native session metadata by its exact profile namespace.
+			"DROP TABLE session_meta_cache;" ~
+			"CREATE TABLE session_meta_cache (" ~
+			"    driver TEXT NOT NULL," ~
+			"    profile_root TEXT NOT NULL," ~
+			"    session_id TEXT NOT NULL," ~
+			"    mtime INTEGER NOT NULL," ~
+			"    project_path TEXT NOT NULL DEFAULT ''," ~
+			"    title TEXT NOT NULL DEFAULT ''," ~
+			"    has_messages INTEGER NOT NULL DEFAULT 1," ~
+			"    PRIMARY KEY (driver, profile_root, session_id)" ~
+			");",
 		]);
 
 		// In CI, disable durability to speed up tests. This trades crash-safety
@@ -205,6 +217,12 @@ struct Persistence
 	void setStatus(int tid, string status)
 	{
 		db.stmt!"UPDATE tasks SET status = ? WHERE tid = ?".exec(status, tid);
+	}
+
+	void promoteImportableTask(int tid, string workspace)
+	{
+		db.stmt!"UPDATE tasks SET workspace = ?, status = 'completed' WHERE tid = ? AND status = 'importable'"
+			.exec(workspace, tid);
 	}
 
 	void setTaskType(int tid, string taskType)
@@ -313,19 +331,20 @@ struct Persistence
 		struct CachePathRow
 		{
 			string driverName;
+			string profileRoot;
 			string sessionId;
 			string projectPath;
 		}
 		CachePathRow[] cacheRows;
-		foreach (string driverName, string sessionId, string projectPath;
-			db.stmt!"SELECT agent_type, session_id, project_path FROM session_meta_cache".iterate())
-			cacheRows ~= CachePathRow(driverName, sessionId, projectPath);
+		foreach (string driverName, string profileRoot, string sessionId, string projectPath;
+			db.stmt!"SELECT driver, profile_root, session_id, project_path FROM session_meta_cache".iterate())
+			cacheRows ~= CachePathRow(driverName, profileRoot, sessionId, projectPath);
 		foreach (row; cacheRows)
 		{
 			auto normalized = normalize(row.projectPath);
 			if (normalized != row.projectPath)
-				db.stmt!"UPDATE session_meta_cache SET project_path = ? WHERE agent_type = ? AND session_id = ?"
-					.exec(normalized, row.driverName, row.sessionId);
+				db.stmt!"UPDATE session_meta_cache SET project_path = ? WHERE driver = ? AND profile_root = ? AND session_id = ?"
+					.exec(normalized, row.driverName, row.profileRoot, row.sessionId);
 		}
 	}
 
@@ -363,6 +382,7 @@ struct Persistence
 	struct CacheRow
 	{
 		string driverName;
+		string profileRoot;
 		string sessionId;
 		long mtime;
 		string projectPath;
@@ -373,26 +393,35 @@ struct Persistence
 	CacheRow[] loadSessionMetaCache()
 	{
 		CacheRow[] result;
-		foreach (string driverName, string sessionId, long mtime, string projectPath, string title, int hasMessages;
-			db.stmt!"SELECT agent_type, session_id, mtime, project_path, title, has_messages FROM session_meta_cache".iterate())
+		foreach (string driverName, string profileRoot, string sessionId, long mtime, string projectPath, string title, int hasMessages;
+			db.stmt!"SELECT driver, profile_root, session_id, mtime, project_path, title, has_messages FROM session_meta_cache".iterate())
 		{
-			// session_meta_cache.agent_type is a legacy column name; it stores the driver name.
-			result ~= CacheRow(driverName, sessionId, mtime, projectPath, title, hasMessages != 0);
+			result ~= CacheRow(driverName, profileRoot, sessionId, mtime, projectPath,
+				title, hasMessages != 0);
 		}
 		return result;
 	}
 
-	void upsertSessionMetaCache(string driverName, string sessionId, long mtime,
-		string projectPath, string title, bool hasMessages)
+	void upsertSessionMetaCache(string driverName, string profileRoot,
+		string sessionId, long mtime, string projectPath, string title,
+		bool hasMessages)
 	{
-		db.stmt!"INSERT OR REPLACE INTO session_meta_cache (agent_type, session_id, mtime, project_path, title, has_messages) VALUES (?, ?, ?, ?, ?, ?)"
-			.exec(driverName, sessionId, mtime, projectPath, title, hasMessages ? 1 : 0);
+		db.stmt!"INSERT OR REPLACE INTO session_meta_cache (driver, profile_root, session_id, mtime, project_path, title, has_messages) VALUES (?, ?, ?, ?, ?, ?, ?)"
+			.exec(driverName, profileRoot, sessionId, mtime, projectPath, title,
+				hasMessages ? 1 : 0);
 	}
 
-	void deleteSessionMetaCacheEntry(string driverName, string sessionId)
+	void deleteSessionMetaCacheEntry(string driverName, string profileRoot,
+		string sessionId)
 	{
-		db.stmt!"DELETE FROM session_meta_cache WHERE agent_type = ? AND session_id = ?"
-			.exec(driverName, sessionId);
+		db.stmt!"DELETE FROM session_meta_cache WHERE driver = ? AND profile_root = ? AND session_id = ?"
+			.exec(driverName, profileRoot, sessionId);
+	}
+
+	void deleteSessionMetaCacheGroup(string driverName, string profileRoot)
+	{
+		db.stmt!"DELETE FROM session_meta_cache WHERE driver = ? AND profile_root = ?"
+			.exec(driverName, profileRoot);
 	}
 }
 
@@ -424,9 +453,12 @@ unittest
 	auto forkTid = createForkTask(persistence, firstTid, "fork-session",
 		canonicalProjectPath(project), "", "parent");
 	auto fileTid = persistence.createTask("", regularFile);
-	persistence.upsertSessionMetaCache("claude", "symlink-session", 1, projectLink, "", true);
-	persistence.upsertSessionMetaCache("claude", "missing-session", 1, missing, "", true);
-	persistence.upsertSessionMetaCache("claude", "file-session", 1, regularFile, "", true);
+	persistence.upsertSessionMetaCache("claude", "/profiles/one", "symlink-session", 1,
+		projectLink, "", true);
+	persistence.upsertSessionMetaCache("claude", "/profiles/one", "missing-session", 1,
+		missing, "", true);
+	persistence.upsertSessionMetaCache("claude", "/profiles/one", "file-session", 1,
+		regularFile, "", true);
 
 	persistence.normalizeProjectPaths(&bestEffortProjectPathIdentity);
 	auto canonical = canonicalProjectPath(project);
@@ -532,4 +564,112 @@ unittest
 
 	assert(rows.length == 1);
 	assert(rows[0].taskStartHead == "");
+}
+
+unittest
+{
+	import std.file : exists, remove, tempDir;
+	import std.path : buildPath;
+
+	auto dbPath = buildPath(tempDir(), "cydo-profile-cache-migration.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+
+	{
+		auto legacy = Database(dbPath);
+		legacy.db.exec("CREATE TABLE tasks (" ~
+			"tid INTEGER PRIMARY KEY AUTOINCREMENT, agent_session_id TEXT, " ~
+			"description TEXT NOT NULL DEFAULT '', task_type TEXT NOT NULL DEFAULT 'blank', " ~
+			"parent_tid INTEGER, relation_type TEXT NOT NULL DEFAULT '', " ~
+			"workspace TEXT NOT NULL DEFAULT '', project_path TEXT NOT NULL DEFAULT '', " ~
+			"title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', " ~
+			"worktree_path TEXT NOT NULL DEFAULT '', has_worktree INTEGER NOT NULL DEFAULT 0, " ~
+			"agent_type TEXT NOT NULL DEFAULT 'claude', archived INTEGER NOT NULL DEFAULT 0, " ~
+			"draft TEXT NOT NULL DEFAULT '', result_text TEXT DEFAULT '', created_at INTEGER, " ~
+			"last_active INTEGER, worktree_tid INTEGER NOT NULL DEFAULT 0, " ~
+			"entry_point TEXT NOT NULL DEFAULT '', needs_attention INTEGER NOT NULL DEFAULT 0, " ~
+			"task_start_head TEXT NOT NULL DEFAULT '');"
+		);
+		legacy.db.exec("CREATE TABLE session_meta_cache (" ~
+			"agent_type TEXT NOT NULL, session_id TEXT NOT NULL, mtime INTEGER NOT NULL, " ~
+			"project_path TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', " ~
+			"has_messages INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (agent_type, session_id));"
+		);
+		legacy.db.exec("INSERT INTO tasks (tid, workspace, project_path, status) " ~
+			"VALUES (1, 'existing-workspace', 'project', 'completed');"
+		);
+		legacy.db.exec("INSERT INTO session_meta_cache " ~
+			"(agent_type, session_id, mtime, project_path, title, has_messages) " ~
+			"VALUES ('claude', 'ambiguous-id', 1, 'project', 'old cache row', 1);"
+		);
+		legacy.db.exec("PRAGMA user_version = 21;");
+	}
+
+	auto persistence = Persistence(dbPath);
+	int userVersion;
+	foreach (int value; persistence.db.stmt!"PRAGMA user_version".iterate())
+		userVersion = value;
+	assert(userVersion == 22);
+
+	auto rows = persistence.loadTasks();
+	assert(rows.length == 1);
+	assert(rows[0].workspace == "existing-workspace");
+	assert(rows[0].projectPath == "project");
+	assert(rows[0].status == "completed");
+	assert(persistence.loadSessionMetaCache().length == 0,
+		"ambiguous pre-profile cache rows must be discarded");
+
+	string[] taskColumns;
+	foreach (int index, string name;
+		persistence.db.stmt!"PRAGMA table_info(tasks)".iterate())
+		taskColumns ~= name;
+	assert(taskColumns == [
+		"tid", "agent_session_id", "description", "task_type", "parent_tid",
+		"relation_type", "workspace", "project_path", "title", "status",
+		"worktree_path", "has_worktree", "agent_type", "archived", "draft",
+		"result_text", "created_at", "last_active", "worktree_tid", "entry_point",
+		"needs_attention", "task_start_head",
+	]);
+
+	persistence.upsertSessionMetaCache("claude", "/profiles/one", "same-id", 1,
+		"project-one", "one", true);
+	persistence.upsertSessionMetaCache("claude", "/profiles/two", "same-id", 2,
+		"project-two", "two", true);
+	persistence.upsertSessionMetaCache("codex", "/profiles/one", "same-id", 3,
+		"project-three", "three", true);
+	assert(persistence.loadSessionMetaCache().length == 3);
+	persistence.deleteSessionMetaCacheEntry("claude", "/profiles/one", "same-id");
+	auto cacheRows = persistence.loadSessionMetaCache();
+	assert(cacheRows.length == 2);
+	bool hasClaudeProfileTwo;
+	bool hasCodexProfileOne;
+	foreach (row; cacheRows)
+	{
+		hasClaudeProfileTwo |= row.driverName == "claude" && row.profileRoot == "/profiles/two";
+		hasCodexProfileOne |= row.driverName == "codex" && row.profileRoot == "/profiles/one";
+	}
+	assert(hasClaudeProfileTwo && hasCodexProfileOne);
+	persistence.deleteSessionMetaCacheGroup("claude", "/profiles/two");
+	cacheRows = persistence.loadSessionMetaCache();
+	assert(cacheRows.length == 1);
+	assert(cacheRows[0].driverName == "codex" && cacheRows[0].profileRoot == "/profiles/one");
+
+	auto importableTid = persistence.createTask("", "project");
+	persistence.setStatus(importableTid, "importable");
+	persistence.promoteImportableTask(importableTid, "selected-workspace");
+	auto pendingTid = persistence.createTask("old-workspace", "project");
+	persistence.promoteImportableTask(pendingTid, "new-workspace");
+	rows = persistence.loadTasks();
+	bool promoted;
+	bool pendingUnchanged;
+	foreach (row; rows)
+	{
+		if (row.tid == importableTid)
+			promoted = row.workspace == "selected-workspace" && row.status == "completed";
+		if (row.tid == pendingTid)
+			pendingUnchanged = row.workspace == "old-workspace" && row.status == "pending";
+	}
+	assert(promoted);
+	assert(pendingUnchanged);
 }

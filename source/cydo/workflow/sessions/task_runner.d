@@ -2,10 +2,12 @@ module cydo.workflow.sessions.task_runner;
 
 import core.time : seconds;
 
-import std.file : mkdirRecurse;
+import std.file : exists, isFile, mkdirRecurse;
 import std.exception : enforce;
-import std.path : buildPath, dirName;
+import std.path : buildPath, dirName, isAbsolute;
+import std.stdio : File;
 import std.logger : infof, tracef, warningf;
+import std.typecons : Nullable;
 
 import ae.utils.json : JSONOptional, JSONPartial, jsonParse, toJson;
 import ae.utils.promise : Promise, reject, resolve;
@@ -19,10 +21,15 @@ import cydo.protocol : ItemDeltaEvent, ItemStartedEvent, ProcessExitEvent,
 import cydo.runtime.config : AgentDriver, CydoConfig, PathMode, SandboxConfig;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
-import cydo.runtime.launch.types : AgentSandboxConfig, ProcessLaunch;
+import cydo.runtime.launch.types : AgentSandboxConfig, NativeHistoryProfile,
+	NativeHistoryRule, ProcessLaunch;
 import launchSandbox = cydo.runtime.launch.sandbox;
 import cydo.workflow.history.native_history : ConfiguredNativeHistoryContext,
-	resolveNativeHistoryContext;
+	HistoryAccess, LiveHistoryContext, LiveHistoryWatchResolution,
+	LiveHistoryWatchResolutionKind, LiveHistoryWatchTarget,
+	ResolvedNativeHistoryContext, TaskHistoryResolution, TaskHistoryResolutionKind, UnavailableHistory,
+	UnavailableHistoryKind, resolveNativeHistoryContext;
+import cydo.agent.drivers.codex : CodexAgent, CodexForkSourceOwner, CodexSession;
 import cydo.domain.tasks.model : ProcessState, TaskData, TaskStatus,
 	WaitingTaskDependencyState;
 import cydo.domain.tasks.lifecycle : TaskNotificationChange;
@@ -164,6 +171,7 @@ struct TaskSessionRunnerHost
 	string delegate() mcpSocketPath;
 	Agent delegate(int tid) agentForTask;
 	Agent delegate(int tid) tryAgentForTask;
+	void delegate(int tid, string agentSessionId) setAgentSessionId;
 	void delegate(int tid) clearLastActive;
 	void delegate(int tid, TranslatedEvent ev) broadcastTask;
 	string delegate(int tid, string subject, string body) appendTaskDiagnostic;
@@ -186,8 +194,10 @@ struct TaskSessionRunnerHost
 	void delegate(int tid) failPendingPermissionPromptOnExit;
 	void delegate(int tid) failPendingAskRouteOnExit;
 	void delegate(int tid) cancelExitBackgroundWork;
-	void delegate(int tid) resetHistoryWatermarkOnly;
-	void delegate(int tid) resetHistoryWatermarkAfterExit;
+	/// Returns true when the reset already emitted a task reload (unavailable
+	/// history), so the caller must not emit a redundant one.
+	bool delegate(int tid) resetHistoryWatermarkOnly;
+	bool delegate(int tid) resetHistoryWatermarkAfterExit; /// ditto
 	void delegate(int tid) unsubscribeTaskHistorySubscribers;
 	void delegate(int tid) touchAndPersistLastActive;
 	int delegate(int tid) findAliveAncestor;
@@ -202,8 +212,16 @@ struct TaskSessionRunnerHost
 	void delegate(int tid) spawnOnYieldContinuation;
 	void delegate(int tid) emitTaskReload;
 	void delegate(int tid) startJsonlWatch;
-	void delegate(int tid) ensureHistoryLoaded;
-	void delegate(int tid) finalReconcileJsonlIfPresent;
+	/// Returns the resolution used, or null when history was already loaded
+	/// (no resolution was performed). Never reports an unavailable
+	/// resolution: the post-exit reset that runs later in onExit is the sole
+	/// owner of that diagnostic.
+	Nullable!TaskHistoryResolution delegate(int tid) ensureHistoryLoadedForExit;
+	/// `resolution` is what the immediately preceding ensureHistoryLoadedForExit
+	/// call returned; passing it through avoids re-resolving the same B
+	/// resolution. Never reports, for the same reason.
+	void delegate(int tid, Nullable!TaskHistoryResolution resolution)
+		finalReconcileJsonlIfPresent;
 	void delegate(int tid) stopJsonlWatch;
 	void delegate(int tid) broadcastHistoryOperations;
 	Promise!void delegate(int tid) sendSystemRestartNudge;
@@ -214,10 +232,86 @@ struct TaskSessionRunnerHost
 	TaskTypeCatalog taskTypeCatalog;
 }
 
+private struct LiveHistoryBinding
+{
+	AgentSession owner;
+	Agent agent;
+	NativeHistoryProfile profile;
+	string sessionId;
+	string effectiveCwd;
+}
+
+private enum LaunchOwnership { task, operation }
+
+/// Owns the current-profile launch and private real CodexSession used to
+/// resume a stopped source thread solely for one native fork. It is never a
+/// normal task session or a live-history binding.
+final class CodexForkSourceOperation
+{
+private:
+	CodexForkSourceOwner owner_;
+	ProcessLaunch launch_;
+	bool released_;
+	void delegate() releasedHandler_;
+
+public:
+	this(ProcessLaunch launch)
+	{
+		launch_ = launch;
+	}
+
+	void attachOwner(CodexForkSourceOwner owner)
+	{
+		enforce(owner_ is null,
+			"Codex fork source operation already has an owner");
+		enforce(owner !is null,
+			"Codex fork source operation requires an owner");
+		owner_ = owner;
+		owner_.onClosed = &release;
+	}
+
+	@property Promise!CodexSession routeReady()
+	{
+		enforce(owner_ !is null,
+			"Codex fork source operation has no owner yet");
+		return owner_.routeReady;
+	}
+
+	void activate(void delegate() releasedHandler)
+	{
+		enforce(releasedHandler_ is null,
+			"Codex fork source operation was activated more than once");
+		releasedHandler_ = releasedHandler;
+	}
+
+	void closeStdin()
+	{
+		if (released_)
+			return;
+		if (owner_ !is null)
+			owner_.closeStdin();
+		else
+			release();
+	}
+
+private:
+	void release()
+	{
+		if (released_)
+			return;
+		released_ = true;
+		launchSandbox.cleanup(launch_.sandbox);
+		if (releasedHandler_)
+			releasedHandler_();
+	}
+}
+
 class TaskSessionRunner
 {
 	private TaskSessionRunnerHost host_;
 	private AgentSession[int] sessions_;
+	private LiveHistoryBinding[int] liveHistoryBindings_;
+	private CodexForkSourceOperation[int] forkSourceOperations_;
 
 	this(TaskSessionRunnerHost host)
 	{
@@ -237,6 +331,61 @@ class TaskSessionRunner
 		return session !is null && session.alive;
 	}
 
+	bool forkSourceOperationInProgress(int tid)
+	{
+		return (tid in forkSourceOperations_) !is null;
+	}
+
+	CodexForkSourceOperation openCodexForkSourceOperation(int tid,
+		const ref HistoryAccess source)
+	{
+		auto td = requireTask(tid,
+			"Codex fork source operation requires an existing task");
+		auto sourceAgent = cast(Agent) source.agent;
+		auto codex = cast(CodexAgent) sourceAgent;
+		enforce(codex !is null && source.profile.driver == AgentDriver.codex,
+			"Codex fork source operation requires Codex history access");
+		enforce(source.sessionId == td.agentSessionId,
+			"Codex fork source operation must use the task's exact session ID");
+		auto configuredAgent = host_.tryAgentForTask(tid);
+		enforce(configuredAgent !is null && configuredAgent is sourceAgent,
+			"Codex fork source operation must use the task's configured Agent");
+		enforce(sessionForTask(tid) is null,
+			"Codex fork source operation cannot retain a task session");
+		enforce(tid !in forkSourceOperations_,
+			"Codex fork source operation is already active for this task");
+
+		auto typeDef = currentTaskTypeDef(td);
+		TaskSessionLaunch launch;
+		CodexForkSourceOperation operation;
+		try
+		{
+			launch = prepareOperationSessionLaunch(tid, sourceAgent, typeDef);
+			enforce(launch.processLaunch.nativeHistoryProfile.driver == source.profile.driver
+				&& launch.processLaunch.nativeHistoryProfile.root == source.profile.root,
+				"Codex fork source operation launch must use the captured source profile");
+			operation = new CodexForkSourceOperation(launch.processLaunch);
+			forkSourceOperations_[tid] = operation;
+			operation.activate(() {
+				auto mapped = tid in forkSourceOperations_;
+				if (mapped !is null && *mapped is operation)
+					forkSourceOperations_.remove(tid);
+			});
+			auto owner = codex.openForkSourceOwner(tid, source.sessionId,
+				launch.processLaunch, launch.sessionConfig);
+			operation.attachOwner(owner);
+			return operation;
+		}
+		catch (Exception e)
+		{
+			if (operation !is null)
+				operation.closeStdin();
+			else if (launch.processLaunch.nativeHistoryProfile.root.length > 0)
+				launchSandbox.cleanup(launch.processLaunch.sandbox);
+			throw e;
+		}
+	}
+
 	bool taskCanStop(int tid, bool stdinClosed)
 	{
 		auto session = sessionForTask(tid);
@@ -245,8 +394,136 @@ class TaskSessionRunner
 			&& (!stdinClosed || session.canStopAfterCloseStdin);
 	}
 
+	TaskHistoryResolution resolveTaskHistory(int tid)
+	{
+		auto td = requireTask(tid,
+			"Task history resolution requires an existing task");
+		if (td.agentSessionId.length == 0)
+			return TaskHistoryResolution.noSession();
+
+		if (auto binding = tid in liveHistoryBindings_)
+		{
+			auto owner = tid in sessions_;
+			enforce(owner !is null && *owner is (*binding).owner,
+				"Live history binding does not match the mapped session owner");
+			return resolveHistoryAccess((*binding).agent, (*binding).profile,
+				(*binding).sessionId, (*binding).effectiveCwd, td.agentName,
+				(*binding).agent.nativeHistoryRule);
+		}
+
+		auto agent = host_.tryAgentForTask(tid);
+		if (agent is null)
+			return TaskHistoryResolution.orphanAgent(td.agentName, td.agentSessionId);
+
+		ResolvedNativeHistoryContext resolved;
+		try
+		{
+			auto typeDef = currentTaskTypeDef(td);
+			auto context = ConfiguredNativeHistoryContext(td.agentName, td.workspace,
+				td.repoPath, typeDef !is null && typeDef.read_only);
+			resolved = resolveNativeHistoryContext(*host_.currentConfig(), agent, context);
+		}
+		catch (Exception e)
+		{
+			return TaskHistoryResolution.unavailable(UnavailableHistory(
+				UnavailableHistoryKind.context, td.agentName, td.agentSessionId,
+				e.msg, NativeHistoryRule.init, NativeHistoryProfile.init));
+		}
+		auto cwd = host_.effectiveCwd(td);
+		return resolveHistoryAccess(resolved.agent, resolved.profile,
+			td.agentSessionId, cwd, td.agentName, resolved.rule);
+	}
+
+	LiveHistoryWatchResolution resolveLiveHistoryWatch(int tid)
+	{
+		auto binding = tid in liveHistoryBindings_;
+		if (binding is null)
+			return LiveHistoryWatchResolution.noLiveBinding();
+		auto owner = tid in sessions_;
+		enforce(owner !is null && *owner is (*binding).owner,
+			"Live history watch binding does not match the mapped session owner");
+		auto context = LiveHistoryContext((*binding).agent, (*binding).profile,
+			(*binding).sessionId, (*binding).effectiveCwd);
+		if (auto codex = cast(CodexAgent) (*binding).agent)
+		{
+			auto codexOwner = cast(CodexSession) (*binding).owner;
+			enforce(codexOwner !is null,
+				"Codex live history binding must be owned by a Codex session");
+			auto path = codex.liveSessionPath(codexOwner, (*binding).profile,
+				(*binding).sessionId);
+			if (path.length == 0)
+				return LiveHistoryWatchResolution.awaitingPath(context);
+			return LiveHistoryWatchResolution.target(LiveHistoryWatchTarget(context, path));
+		}
+		auto path = (*binding).agent.historyPath((*binding).sessionId,
+			(*binding).effectiveCwd, (*binding).profile);
+		return LiveHistoryWatchResolution.target(LiveHistoryWatchTarget(context, path));
+	}
+
+	ProcessLaunch requireLiveHistoryLaunch(int tid, const ref HistoryAccess access)
+	{
+		auto td = requireTask(tid,
+			"Live history launch requires an existing task");
+		auto binding = tid in liveHistoryBindings_;
+		enforce(binding !is null,
+			"Live history launch requires a live history binding");
+		auto owner = tid in sessions_;
+		enforce(owner !is null && *owner is (*binding).owner,
+			"Live history launch binding does not match the mapped session owner");
+		enforce(access.agent is (*binding).agent
+			&& access.profile.driver == (*binding).profile.driver
+			&& access.profile.root == (*binding).profile.root
+			&& access.sessionId == (*binding).sessionId
+			&& access.effectiveCwd == (*binding).effectiveCwd,
+			"Live history access does not match its live binding");
+		enforce(td.launch.nativeHistoryProfile.driver == (*binding).profile.driver
+			&& td.launch.nativeHistoryProfile.root == (*binding).profile.root,
+			"Live history launch does not match its binding profile");
+		return td.launch;
+	}
+
+private:
+	TaskHistoryResolution resolveHistoryAccess(Agent agent,
+		const ref NativeHistoryProfile profile, string sessionId, string effectiveCwd,
+		string agentName, NativeHistoryRule rule)
+	{
+		auto path = agent.historyPath(sessionId, effectiveCwd, profile);
+		if (path.length == 0 || !isAbsolute(path))
+			return TaskHistoryResolution.unavailable(UnavailableHistory(
+				UnavailableHistoryKind.profilePath, agentName, sessionId,
+				"The derived history path is unavailable", rule, profile));
+		if (!exists(path))
+			return TaskHistoryResolution.unavailable(UnavailableHistory(
+				UnavailableHistoryKind.profilePath, agentName, sessionId,
+				"The derived history file does not exist", rule, profile));
+		if (!isFile(path))
+			return TaskHistoryResolution.unavailable(UnavailableHistory(
+				UnavailableHistoryKind.profilePath, agentName, sessionId,
+				"The derived history path is not a regular file", rule, profile));
+		try
+		{
+			auto file = File(path, "r");
+		}
+		catch (Exception e)
+		{
+			return TaskHistoryResolution.unavailable(UnavailableHistory(
+				UnavailableHistoryKind.profilePath, agentName, sessionId, e.msg,
+				rule, profile));
+		}
+		return TaskHistoryResolution.access(HistoryAccess(agent, profile, sessionId,
+			effectiveCwd, path));
+	}
+
+public:
+
 	void shutdownSessions()
 	{
+		CodexForkSourceOperation[] operationSnapshot;
+		foreach (operation; forkSourceOperations_)
+			operationSnapshot ~= operation;
+		foreach (operation; operationSnapshot)
+			operation.closeStdin();
+
 		AgentSession[] snapshot;
 		foreach (session; sessions_)
 			snapshot ~= session;
@@ -278,6 +555,8 @@ class TaskSessionRunner
 
 	void stopTask(int tid)
 	{
+		if (auto operation = tid in forkSourceOperations_)
+			(*operation).closeStdin();
 		if (auto session = sessionForTask(tid))
 			session.stop();
 	}
@@ -285,8 +564,27 @@ class TaskSessionRunner
 	TaskSessionLaunch prepareTaskSessionLaunch(int tid, Agent taskAgent,
 		TaskTypeDef* typeDef)
 	{
+		return buildTaskSessionLaunch(tid, taskAgent, typeDef,
+			LaunchOwnership.task);
+	}
+
+	/// Build a current-config launch for a one-shot operation without assigning
+	/// it to TaskData.launch. The operation caller owns sandbox cleanup.
+	TaskSessionLaunch prepareOperationSessionLaunch(int tid, Agent taskAgent,
+		TaskTypeDef* typeDef)
+	{
+		return buildTaskSessionLaunch(tid, taskAgent, typeDef,
+			LaunchOwnership.operation);
+	}
+
+	private TaskSessionLaunch buildTaskSessionLaunch(int tid, Agent taskAgent,
+		TaskTypeDef* typeDef, LaunchOwnership ownership)
+	{
 		auto td = requireTask(tid,
 			"Task must exist before preparing session launch");
+		if (ownership == LaunchOwnership.operation)
+			enforce(td.launch.nativeHistoryProfile.root.length == 0,
+				"Operation launch requires TaskData.launch to have been cleared");
 
 		SessionConfig sessionConfig;
 		auto taskTypes = host_.taskTypeCatalog.getTaskTypesForProject(td.projectPath);
@@ -423,9 +721,11 @@ class TaskSessionRunner
 		}
 
 		sandbox.sharedTmpPath = host_.resolveSharedTmpPath(tid);
-		td.launch = launchSandbox.prepareProcessLaunch(sandbox,
+		auto processLaunch = launchSandbox.prepareProcessLaunch(sandbox,
 			nativeHistoryContext.rule, nativeHistoryContext.profile, chdir,
 			taskAgent.executableName(sandbox.env));
+		if (ownership == LaunchOwnership.task)
+			td.launch = processLaunch;
 
 		sessionConfig.workspace = td.workspace;
 		sessionConfig.workDir = chdir !is null ? chdir : "";
@@ -458,7 +758,7 @@ class TaskSessionRunner
 				td.taskType, options: renderedToolOptions));
 		sessionConfig.agentName = td.agentName;
 
-		return TaskSessionLaunch(td.launch, sessionConfig);
+		return TaskSessionLaunch(processLaunch, sessionConfig);
 	}
 
 	void spawnTaskSession(int tid)
@@ -475,25 +775,57 @@ class TaskSessionRunner
 
 		auto taskAgent = host_.agentForTask(tid);
 		auto typeDef = currentTaskTypeDef(td);
+		auto taskEffectiveCwd = host_.effectiveCwd(td);
 		auto launch = prepareTaskSessionLaunch(tid, taskAgent, typeDef);
 		td = requireTask(tid, "Task disappeared before session creation");
 		auto session = taskAgent.createSession(tid, td.agentSessionId,
 			launch.processLaunch, launch.sessionConfig);
 		sessions_[tid] = session;
 		host_.clearLastActive(tid);
+		session.onNativeSessionStarted = (string sessionId) {
+			enforce(sessionId.length > 0,
+				"Native session lifecycle callback returned an empty session ID");
+			auto current = host_.getTask(tid);
+			if (current is null)
+				return;
+			auto mapped = tid in sessions_;
+			enforce(mapped !is null && *mapped is session,
+				"Native session lifecycle callback does not own the mapped session");
+			if (current.agentSessionId.length > 0)
+				enforce(current.agentSessionId == sessionId,
+					"Resumed native session ID does not match the persisted task ID");
+			else
+			{
+				current.agentSessionId = sessionId;
+				host_.setAgentSessionId(tid, sessionId);
+			}
+			enforce(launch.processLaunch.nativeHistoryProfile.driver == taskAgent.driver,
+				"Native session launch profile does not match the launch Agent");
+			liveHistoryBindings_[tid] = LiveHistoryBinding(session, taskAgent,
+				launch.processLaunch.nativeHistoryProfile, sessionId, taskEffectiveCwd);
+			if (!host_.shuttingDown())
+				host_.startJsonlWatch(tid);
+		};
 
 		if (taskAgent.lastMcpConfigPath.length > 0)
 			td.launch.sandbox.tempFiles ~= taskAgent.lastMcpConfigPath;
 
-		if (td.agentSessionId.length > 0)
-			host_.startJsonlWatch(tid);
-
 		session.onOutput = (TranslatedEvent ev) {
+			auto stored = tid in sessions_;
+			if (stored is null || *stored !is session)
+				return;
+			if (host_.shuttingDown())
+				return;
 			host_.broadcastTask(tid, ev);
 
 			auto current = host_.getTask(tid);
 			if (current is null)
+			{
+				host_.stopJsonlWatch(tid);
+				liveHistoryBindings_.remove(tid);
+				sessions_.remove(tid);
 				return;
+			}
 
 			if (isAssistantTurnWork(ev))
 			{
@@ -512,7 +844,12 @@ class TaskSessionRunner
 
 			current = host_.getTask(tid);
 			if (current is null)
+			{
+				host_.stopJsonlWatch(tid);
+				liveHistoryBindings_.remove(tid);
+				sessions_.remove(tid);
 				return;
+			}
 
 			current.isProcessing = false;
 			current.hadTurnResult = true;
@@ -525,7 +862,12 @@ class TaskSessionRunner
 
 			current = host_.getTask(tid);
 			if (current is null)
+			{
+				host_.stopJsonlWatch(tid);
+				liveHistoryBindings_.remove(tid);
+				sessions_.remove(tid);
 				return;
+			}
 
 			current.resultText = taskAgent.extractResultText(ev.translated);
 			current.lastTurnFailed = isErrorTurnResult(ev.translated);
@@ -606,6 +948,11 @@ class TaskSessionRunner
 		string lastStderr;
 
 		session.onStderr = (string line) {
+			auto stored = tid in sessions_;
+			if (stored is null || *stored !is session)
+				return;
+			if (host_.shuttingDown())
+				return;
 			ProcessStderrEvent ev;
 			ev.text = line;
 			host_.broadcastTask(tid, TranslatedEvent(toJson(ev), null));
@@ -616,9 +963,22 @@ class TaskSessionRunner
 			auto stored = tid in sessions_;
 			if (stored is null || *stored !is session)
 				return;
-			sessions_.remove(tid);
+			if (auto binding = tid in liveHistoryBindings_)
+				enforce((*binding).owner is session,
+					"Exiting session does not own its live history binding");
 			if (host_.shuttingDown())
+			{
+				host_.stopJsonlWatch(tid);
+				liveHistoryBindings_.remove(tid);
+				sessions_.remove(tid);
+				auto shutdownTask = host_.getTask(tid);
+				if (shutdownTask !is null)
+				{
+					cleanupTaskLaunch(shutdownTask);
+					shutdownTask.launch = ProcessLaunch.init;
+				}
 				return;
+			}
 
 			host_.touchAndPersistLastActive(tid);
 
@@ -627,7 +987,12 @@ class TaskSessionRunner
 
 			auto current = host_.getTask(tid);
 			if (current is null)
+			{
+				host_.stopJsonlWatch(tid);
+				liveHistoryBindings_.remove(tid);
+				sessions_.remove(tid);
 				return;
+			}
 
 			ProcessExitEvent ev;
 			ev.code = exitCode;
@@ -645,16 +1010,27 @@ class TaskSessionRunner
 
 			current = host_.getTask(tid);
 			if (current is null)
+			{
+				host_.stopJsonlWatch(tid);
+				liveHistoryBindings_.remove(tid);
+				sessions_.remove(tid);
 				return;
+			}
 
 			current.isProcessing = false;
 			current.stdinClosed = false;
 			if (exitCode != 0 && current.status != TaskStatus.completed)
 				current.error = lastStderr;
-			cleanupTaskLaunch(current);
-			host_.ensureHistoryLoaded(tid);
-			host_.finalReconcileJsonlIfPresent(tid);
+			auto historyResolution = host_.ensureHistoryLoadedForExit(tid);
+			host_.finalReconcileJsonlIfPresent(tid, historyResolution);
 			host_.stopJsonlWatch(tid);
+			liveHistoryBindings_.remove(tid);
+			sessions_.remove(tid);
+			current = host_.getTask(tid);
+			if (current is null)
+				return;
+			cleanupTaskLaunch(current);
+			current.launch = ProcessLaunch.init;
 
 			host_.failPendingAskUserQuestionOnExit(tid);
 			host_.failPendingPermissionPromptOnExit(tid);
@@ -665,9 +1041,10 @@ class TaskSessionRunner
 			bool missingExecutableLaunchFailure = exitCode != 0
 				&& !current.hadTurnResult
 				&& isMissingExecutableMessage(current.error);
+			bool reloadEmitted;
 			if (missingExecutableLaunchFailure)
 			{
-				host_.resetHistoryWatermarkOnly(tid);
+				reloadEmitted = host_.resetHistoryWatermarkOnly(tid);
 				auto translated = host_.appendTaskDiagnostic(
 					tid, "Failed to resume session",
 					buildLaunchFailureBody(tid, current.error));
@@ -675,9 +1052,9 @@ class TaskSessionRunner
 				host_.unsubscribeTaskHistorySubscribers(tid);
 			}
 			else if (current.undoStopInProgress)
-				host_.resetHistoryWatermarkOnly(tid);
+				reloadEmitted = host_.resetHistoryWatermarkOnly(tid);
 			else
-				host_.resetHistoryWatermarkAfterExit(tid);
+				reloadEmitted = host_.resetHistoryWatermarkAfterExit(tid);
 
 			current = host_.getTask(tid);
 			if (current is null)
@@ -794,7 +1171,8 @@ class TaskSessionRunner
 				observeWaitingParentDeliveryAttempt(tid,
 					host_.deliverWaitingParentResultsIfReady(tid));
 
-			host_.emitTaskReload(tid);
+			if (!reloadEmitted)
+				host_.emitTaskReload(tid);
 
 			current = host_.getTask(tid);
 			if (current is null)
@@ -833,6 +1211,9 @@ class TaskSessionRunner
 		{
 			if (host_.shuttingDown())
 				return reject!ProcessState(new Exception("Shutting down"));
+			if (tid in forkSourceOperations_)
+				return reject!ProcessState(new Exception(
+					"Codex fork source operation is in progress"));
 			try
 				spawnTaskSession(tid);
 			catch (Exception e)
@@ -1393,6 +1774,30 @@ version (unittest) private TaskSessionRunner gitMetadataTestRunner(
 	));
 }
 
+unittest
+{
+	withGitMetadataLaunchFixture("cydo-task-runner-operation-launch",
+		(GitMetadataLaunchFixture fixture) {
+			auto catalog = gitMetadataTaskCatalog(fixture,
+				"task_types:\n"
+				~ "  operation:\n"
+				~ "    model_class: large\n");
+			TaskData[int] tasks;
+			tasks[1] = TaskData(1, "local", fixture.linkedCheckout);
+			tasks[1].taskType = "operation";
+			tasks[1].agentName = "claude";
+			auto runner = gitMetadataTestRunner(&tasks, catalog, fixture,
+				unrestrictedLaunchTestSandbox(), "", fixture.linkedCheckout);
+			auto typeDef = catalog.getTaskTypesForProject(fixture.linkedCheckout)
+				.byName("operation");
+			auto launch = runner.prepareOperationSessionLaunch(1,
+				new LinkedWorktreeSandboxTestAgent(), typeDef);
+			assert(tasks[1].launch.nativeHistoryProfile.root.length == 0);
+			assert(launch.processLaunch.nativeHistoryProfile.root.length > 0);
+			launchSandbox.cleanup(launch.processLaunch.sandbox);
+		});
+}
+
 version (unittest) private void assertRunnerMcpConfigCleanup(
 	string fixtureName, string agentName, string executableEnvName, Agent agent)
 {
@@ -1450,25 +1855,29 @@ version (unittest) private void assertRunnerMcpConfigCleanup(
 				reportMcpToolDescriptionLimit: (string projectPath, string taskType,
 					ToolDescriptionViolation[] violations) {},
 				resolveSharedTmpPath: (int tid) => "",
-				mcpSocketPath: () => mcpSocket,
-				agentForTask: (int tid) => agent,
-				tryAgentForTask: (int tid) => agent,
-				clearLastActive: (int tid) {},
+					mcpSocketPath: () => mcpSocket,
+					agentForTask: (int tid) => agent,
+					tryAgentForTask: (int tid) => agent,
+					setAgentSessionId: (int tid, string sessionId) {
+						tasks[tid].agentSessionId = sessionId;
+					},
+					clearLastActive: (int tid) {},
 				broadcastTask: (int tid, TranslatedEvent event) {},
 				publishTaskSnapshot: (int tid) {},
 				hasPendingSubTask: (int tid) => false,
 				hasTaskDependency: (int tid) => false,
 				hasPendingChildQuestion: (int tid) => false,
 				touchAndPersistLastActive: (int tid) {},
-				ensureHistoryLoaded: (int tid) {},
-				finalReconcileJsonlIfPresent: (int tid) {},
-				stopJsonlWatch: (int tid) {},
+					ensureHistoryLoadedForExit: (int tid) => Nullable!TaskHistoryResolution.init,
+					finalReconcileJsonlIfPresent: (int tid, Nullable!TaskHistoryResolution) {},
+					startJsonlWatch: (int tid) {},
+					stopJsonlWatch: (int tid) {},
 				failPendingAskUserQuestionOnExit: (int tid) {},
 				failPendingPermissionPromptOnExit: (int tid) {},
 				failPendingAskRouteOnExit: (int tid) {},
 				drainIdleCallbacksOnExit: (int tid) {},
 				cancelExitBackgroundWork: (int tid) {},
-				resetHistoryWatermarkAfterExit: (int tid) {},
+				resetHistoryWatermarkAfterExit: (int tid) => false,
 				parentTaskForChild: (int childTid) => 0,
 				deliverWaitingParentResultsIfReady: (int tid) => resolve(),
 				persistResultText: (int tid, string resultText) {},

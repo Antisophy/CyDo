@@ -110,6 +110,7 @@ test("tool result with Bash output renders correctly", async ({
 
 test("fork stays focused on forked session", async ({ page, agentType }) => {
   const frames: any[] = [];
+  let postReloadFrameStart = 0;
   page.on("websocket", (ws) => {
     ws.on("framereceived", (event) => {
       try {
@@ -134,6 +135,7 @@ test("fork stays focused on forked session", async ({ page, agentType }) => {
   if (agentType === "codex" || agentType === "copilot") {
     // Codex/Copilot: kill and reload so JSONL is finalized and fork buttons appear
     await killSession(page, agentType);
+    postReloadFrameStart = frames.length;
     await page.reload();
     await expect(assistantText(page, "fork-source")).toBeVisible({
       timeout: responseTimeout(agentType),
@@ -176,10 +178,11 @@ test("fork stays focused on forked session", async ({ page, agentType }) => {
     );
     expect(targetReplacements).toHaveLength(1);
     expect(
-      frames.some(
+      frames.slice(postReloadFrameStart).some(
         (frame) =>
           frame?.type === "history_operations" &&
-          frame?.history_operations?.fork?.user === "jsonl",
+          frame?.history_operations?.fork?.user ===
+            (agentType === "codex" ? "codex_native" : "jsonl"),
       ),
     ).toBe(true);
   }).toPass({ timeout: 15_000 });

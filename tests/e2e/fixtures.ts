@@ -62,6 +62,13 @@ export async function killSession(page: Page, agentType: AgentType) {
   await expect(page.locator(".btn-banner-archive")).toBeVisible({ timeout });
 }
 
+/** Gracefully end the active session (closes stdin) and wait for it to archive. */
+export async function endSession(page: Page) {
+  await page.locator(".btn-banner-end").click();
+  const timeout = 30_000;
+  await expect(page.locator(".btn-banner-archive")).toBeVisible({ timeout });
+}
+
 /** Return an appropriate response timeout for the given agent. */
 export function responseTimeout(agentType: AgentType): number {
   return agentType === "codex" ? 90_000 : 60_000;
