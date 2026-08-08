@@ -7,7 +7,7 @@ import std.typecons : Nullable;
 
 import cydo.agent.resolver : effectiveDefaultAgentName, isConfiguredAgentName;
 import cydo.agent.drivers.registry : agentRegistry;
-import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, loadConfig, reloadConfig;
+import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, effectiveDriver, loadConfig, reloadConfig;
 
 void resolveConfig(ref CydoConfig config)
 {
@@ -16,11 +16,11 @@ void resolveConfig(ref CydoConfig config)
 	{
 		if (!ac.driver.set)
 		{
-			try
-				ac.driver = SetInfo!AgentDriver(to!AgentDriver(name), true);
-			catch (Exception e)
+			auto driver = effectiveDriver(name, ac);
+			if (driver.isNull)
 				throw new Exception(
 					"agents['" ~ name ~ "']: driver field is required (not a known driver name)");
+			ac.driver = SetInfo!AgentDriver(driver.get, true);
 		}
 	}
 
@@ -161,4 +161,29 @@ unittest
 	}
 	catch (Exception e)
 		assert(e.msg == "Multiple Claude-configured agents exist; set default_agent explicitly");
+}
+
+// 27. End-to-end: parse → resolveConfig → createAgentByDriver → setModelAliases →
+// resolveModelSpec, for both a configured and an unconfigured model_class.
+unittest
+{
+	import configy.read : parseConfigString;
+	import cydo.agent.resolver : createAgentByDriver, resolveConfiguredAgent;
+
+	auto yaml = "workspaces:\n  local:\n    root: /tmp\n"
+		~ "agents:\n  claude:\n    model_aliases:\n      large:\n        model: custom-model\n        effort: high\n";
+	auto config = parseConfigString!CydoConfig(yaml, "/dev/null");
+	resolveConfig(config);
+
+	auto resolved = resolveConfiguredAgent(config, "claude");
+	auto agent = createAgentByDriver(resolved.driver);
+	agent.setModelAliases(resolved.config.model_aliases);
+
+	auto configured = agent.resolveModelSpec("large");
+	assert(configured.model == "custom-model");
+	assert(configured.effort == "high");
+
+	auto unconfigured = agent.resolveModelSpec("medium");
+	assert(unconfigured.model == "sonnet");
+	assert(unconfigured.effort == "");
 }
