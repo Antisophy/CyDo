@@ -17,7 +17,7 @@ import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary,
 import cydo.protocol;
 import cydo.agent.process : AgentProcess, FramingMode;
 import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
-import cydo.runtime.config : AgentDriver;
+import cydo.runtime.config : AgentDriver, ModelSpec, ModelSpecFields;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
 import cydo.runtime.launch.types : ProcessLaunch, ResolvedSandbox;
@@ -74,7 +74,7 @@ class ClaudeCodeAgent : Agent
 		return effectiveEnvValue(env, "CYDO_CLAUDE_BIN", "claude");
 	}
 
-	private string[string] modelAliasOverrides;
+	private ModelSpec[string] modelAliasOverrides;
 	private string lastMcpConfigPath_;
 	// Background thread: sessionId → file path (populated by enumerateAllSessions)
 	private string[string] sessionIdToPath_;
@@ -321,22 +321,64 @@ class ClaudeCodeAgent : Agent
 		return "";
 	}
 
-	void setModelAliases(string[string] aliases)
+	void setModelAliases(ModelSpec[string] aliases)
 	{
 		modelAliasOverrides = aliases;
 	}
 
-	string resolveModelAlias(string modelClass)
+	private static string defaultModelForClass(string modelClass)
 	{
-		if (auto p = modelClass in modelAliasOverrides)
-			return *p;
 		switch (modelClass)
 		{
 			case "small":  return "haiku";
 			case "medium": return "sonnet";
 			case "large":  return "opus";
-			default:       return "sonnet";
+			default:       return modelClass; // open-ended labels pass through
 		}
+	}
+
+	ModelSpec resolveModelSpec(string modelClass)
+	{
+		ModelSpec spec;
+		if (auto p = modelClass in modelAliasOverrides)
+			spec = *p;
+		if (spec.model.length == 0)
+			spec.model = defaultModelForClass(modelClass);
+		return spec;
+	}
+
+	unittest
+	{
+		auto agent = new ClaudeCodeAgent();
+
+		// 14. with no overrides, hardcoded defaults and empty effort
+		assert(agent.resolveModelSpec("small") == ModelSpec(ModelSpecFields("haiku")));
+		assert(agent.resolveModelSpec("medium") == ModelSpec(ModelSpecFields("sonnet")));
+		assert(agent.resolveModelSpec("large") == ModelSpec(ModelSpecFields("opus")));
+
+		// 15. an override replaces the default model
+		agent.setModelAliases(["large": ModelSpec(ModelSpecFields("custom-model"))]);
+		assert(agent.resolveModelSpec("large").model == "custom-model");
+
+		// 16. an effort-only override keeps the driver's default model
+		agent.setModelAliases(["large": ModelSpec(ModelSpecFields("", "high"))]);
+		auto effortOnly = agent.resolveModelSpec("large");
+		assert(effortOnly.model == "opus");
+		assert(effortOnly.effort == "high");
+
+		// 17. an unknown class passes through, and can still be overridden
+		agent.setModelAliases(null);
+		auto passthrough = agent.resolveModelSpec("best");
+		assert(passthrough.model == "best");
+		assert(passthrough.effort == "");
+		agent.setModelAliases(["best": ModelSpec(ModelSpecFields("opus", "max"))]);
+		auto customClass = agent.resolveModelSpec("best");
+		assert(customClass.model == "opus");
+		assert(customClass.effort == "max");
+
+		// 18. the empty-class edge stays inert
+		agent.setModelAliases(null);
+		assert(agent.resolveModelSpec("").model == "");
 	}
 
 	string historyPath(string sessionId, string projectPath)
@@ -556,7 +598,7 @@ class ClaudeCodeAgent : Agent
 	}
 
 	private static string[] buildOneShotArgs(string claudeBin, string prompt,
-		string model, ProcessLaunch launch)
+		string model, string effort, ProcessLaunch launch)
 	{
 		string[] args = [
 			claudeBin,
@@ -570,6 +612,10 @@ class ClaudeCodeAgent : Agent
 		// uses its own configured default
 		if (model.length > 0)
 			args ~= ["--model", model];
+		// an empty effort means no explicit effort; omit the flag so claude
+		// uses its own configured default
+		if (effort.length > 0)
+			args ~= ["--effort", effort];
 		if (launch.cmdPrefix !is null)
 			args = launch.cmdPrefix ~ args;
 		return args;
@@ -582,12 +628,20 @@ class ClaudeCodeAgent : Agent
 		ProcessLaunch launch; // .init: no cmdPrefix
 
 		// an empty alias omits --model entirely
-		assert(!buildOneShotArgs("claude", "hi", "", launch).canFind("--model"));
+		assert(!buildOneShotArgs("claude", "hi", "", "", launch).canFind("--model"));
 
 		// a resolved model is passed through as `--model <x>`
-		auto withModel = buildOneShotArgs("claude", "hi", "opus", launch);
+		auto withModel = buildOneShotArgs("claude", "hi", "opus", "", launch);
 		auto i = withModel.countUntil("--model");
 		assert(i >= 0 && withModel[i + 1] == "opus");
+
+		// an empty effort omits --effort entirely
+		assert(!buildOneShotArgs("claude", "hi", "opus", "", launch).canFind("--effort"));
+
+		// a resolved effort is passed through as `--effort <x>`
+		auto withEffort = buildOneShotArgs("claude", "hi", "opus", "xhigh", launch);
+		auto j = withEffort.countUntil("--effort");
+		assert(j >= 0 && withEffort[j + 1] == "xhigh");
 	}
 
 	OneShotHandle completeOneShot(string prompt, string modelClass,
@@ -608,8 +662,8 @@ class ClaudeCodeAgent : Agent
 			"HOME": environment.get("HOME", ""),
 		];
 
-		auto model = resolveModelAlias(modelClass);
-		auto args = buildOneShotArgs(claudeBin, prompt, model, launch);
+		auto spec = resolveModelSpec(modelClass);
+		auto args = buildOneShotArgs(claudeBin, prompt, spec.model, spec.effort, launch);
 
 		auto procEnv = launch.cmdPrefix is null ? env : null;
 
@@ -829,6 +883,10 @@ class ClaudeCodeSession : AgentSession
 		if (config.model.length > 0)
 			claudeArgs ~= ["--model", config.model];
 
+		// Passed through verbatim; `claude` owns the accepted value set.
+		if (config.effort.length > 0)
+			claudeArgs ~= ["--effort", config.effort];
+
 		if (config.appendSystemPrompt.length > 0)
 			claudeArgs ~= ["--append-system-prompt", config.appendSystemPrompt];
 
@@ -855,16 +913,21 @@ class ClaudeCodeSession : AgentSession
 	{
 		import std.algorithm : canFind, countUntil;
 
-		SessionConfig config; // .init: no model, no cmdPrefix
+		SessionConfig config; // .init: no model, no effort, no cmdPrefix
 		auto args = buildSessionArgs("claude", null, null, null, config);
 		assert(!args.canFind("--model"));
+		assert(!args.canFind("--effort"));
 
-		auto withModel = config;
-		withModel.model = "opus";
-		auto modelArgs = buildSessionArgs("claude", null, null, null, withModel);
-		auto i = modelArgs.countUntil("--model");
-		assert(i >= 0 && modelArgs[i + 1] == "opus");
+		auto withBoth = config;
+		withBoth.model = "opus";
+		withBoth.effort = "xhigh";
+		auto bothArgs = buildSessionArgs("claude", null, null, null, withBoth);
+		auto modelIdx = bothArgs.countUntil("--model");
+		assert(modelIdx >= 0 && bothArgs[modelIdx + 1] == "opus");
+		auto effortIdx = bothArgs.countUntil("--effort");
+		assert(effortIdx >= 0 && bothArgs[effortIdx + 1] == "xhigh");
 
+		// pinning the Step 1 extraction's ordering: cmdPrefix comes first
 		auto withPrefix = buildSessionArgs("claude", null, ["prefix"], null, config);
 		assert(withPrefix[0] == "prefix");
 	}

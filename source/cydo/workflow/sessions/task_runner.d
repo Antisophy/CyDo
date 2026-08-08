@@ -297,7 +297,9 @@ class TaskSessionRunner
 		sessionConfig.handoffs = formatCompactHandoffToolSummary(taskTypes, td.taskType);
 		if (typeDef !is null)
 		{
-			sessionConfig.model = taskAgent.resolveModelAlias(typeDef.model_class);
+			auto spec = taskAgent.resolveModelSpec(typeDef.model_class);
+			sessionConfig.model = spec.model;
+			sessionConfig.effort = spec.effort;
 			if (taskAgent.supportsDeveloperPrompt)
 				sessionConfig.appendSystemPrompt = loadTaskTypeSystemPrompt(*typeDef, taskTypes,
 					td.taskType,

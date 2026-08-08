@@ -32,7 +32,7 @@ public import cydo.agent.drivers.codex.rpc;
 import cydo.protocol : ContentBlock, ProcessStderrEvent, SessionCompactedEvent,
 	TranslatedEvent, extrasToFragment;
 import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
-import cydo.runtime.config : AgentDriver;
+import cydo.runtime.config : AgentDriver, ModelSpec, ModelSpecFields;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
 import cydo.runtime.launch.types : ProcessLaunch;
@@ -49,7 +49,7 @@ class CodexAgent : Agent
 {
 	private AppServerProcess[string] serverPool; // keyed by workspace+sandbox signature
 	private AppServerStartupGate[string] appServerStartupGates;
-	private string[string] modelAliasOverrides;
+	private ModelSpec[string] modelAliasOverrides;
 	private string lastMcpConfigPath_;
 	// sessionId → rollout JSONL path. Populated lazily by populateSessionIndex
 	// (called from historyPath on first use and from enumerateAllSessions).
@@ -147,9 +147,7 @@ class CodexAgent : Agent
 		auto devInstructions = buildDeveloperInstructions();
 
 		// Build config override (reasoning summary + MCP tools).
-		auto configOverride = buildConfigOverride(tid,
-			config.creatableTaskTypes, config.switchModes, config.handoffs,
-			config.includeTools, config.mcpSocketPath);
+		auto configOverride = buildConfigOverride(tid, config);
 
 		server.onReady(() {
 			void startFreshThread()
@@ -193,6 +191,9 @@ class CodexAgent : Agent
 				trp.sandbox = "danger-full-access";
 				if (devInstructions.length > 0)
 					trp.developerInstructions = devInstructions;
+				// Spike finding (.cydo/tasks/34497/output.md): if the pooled
+				// app-server still holds this thread open, a changed effort here
+				// is silently ignored — the thread keeps its original effort.
 				trp.config = JSONFragment(configOverride);
 
 				server.sendRequest("thread/resume",
@@ -252,9 +253,7 @@ class CodexAgent : Agent
 			? launch.workDir
 			: (config.workDir.length > 0 ? config.workDir : ".");
 		auto devInstructions = buildDeveloperInstructions();
-		auto configOverride = buildConfigOverride(tid,
-			config.creatableTaskTypes, config.switchModes, config.handoffs,
-			config.includeTools, config.mcpSocketPath);
+		auto configOverride = buildConfigOverride(tid, config);
 
 		server.onReady(() {
 			ThreadForkParams tfp;
@@ -544,22 +543,64 @@ class CodexAgent : Agent
 		return "";
 	}
 
-	void setModelAliases(string[string] aliases)
+	void setModelAliases(ModelSpec[string] aliases)
 	{
 		modelAliasOverrides = aliases;
 	}
 
-	string resolveModelAlias(string modelClass)
+	private static string defaultModelForClass(string modelClass)
 	{
-		if (auto p = modelClass in modelAliasOverrides)
-			return *p;
 		switch (modelClass)
 		{
 			case "small":  return "gpt-5.6-luna";
 			case "medium": return "gpt-5.6-terra";
 			case "large":  return "gpt-5.6-sol";
-			default:       return "gpt-5.6-luna";
+			default:       return modelClass; // open-ended labels pass through
 		}
+	}
+
+	ModelSpec resolveModelSpec(string modelClass)
+	{
+		ModelSpec spec;
+		if (auto p = modelClass in modelAliasOverrides)
+			spec = *p;
+		if (spec.model.length == 0)
+			spec.model = defaultModelForClass(modelClass);
+		return spec;
+	}
+
+	unittest
+	{
+		auto agent = new CodexAgent();
+
+		// 14. with no overrides, hardcoded defaults and empty effort
+		assert(agent.resolveModelSpec("small") == ModelSpec(ModelSpecFields("gpt-5.6-luna")));
+		assert(agent.resolveModelSpec("medium") == ModelSpec(ModelSpecFields("gpt-5.6-terra")));
+		assert(agent.resolveModelSpec("large") == ModelSpec(ModelSpecFields("gpt-5.6-sol")));
+
+		// 15. an override replaces the default model
+		agent.setModelAliases(["large": ModelSpec(ModelSpecFields("custom-model"))]);
+		assert(agent.resolveModelSpec("large").model == "custom-model");
+
+		// 16. an effort-only override keeps the driver's default model
+		agent.setModelAliases(["large": ModelSpec(ModelSpecFields("", "high"))]);
+		auto effortOnly = agent.resolveModelSpec("large");
+		assert(effortOnly.model == "gpt-5.6-sol");
+		assert(effortOnly.effort == "high");
+
+		// 17. an unknown class passes through, and can still be overridden
+		agent.setModelAliases(null);
+		auto passthrough = agent.resolveModelSpec("best");
+		assert(passthrough.model == "best");
+		assert(passthrough.effort == "");
+		agent.setModelAliases(["best": ModelSpec(ModelSpecFields("opus", "max"))]);
+		auto customClass = agent.resolveModelSpec("best");
+		assert(customClass.model == "opus");
+		assert(customClass.effort == "max");
+
+		// 18. the empty-class edge stays inert
+		agent.setModelAliases(null);
+		assert(agent.resolveModelSpec("").model == "");
 	}
 
 	string historyPath(string sessionId, string projectPath)
@@ -868,6 +909,41 @@ class CodexAgent : Agent
 		return oneShotHome;
 	}
 
+	private static string[] buildOneShotArgs(string executablePath, string prompt,
+		string model, string effort, string[] cmdPrefix)
+	{
+		string[] codexArgs = [
+			executablePath,
+			"exec",
+			"--ephemeral",
+			"--skip-git-repo-check",
+			"-m", model,
+		];
+		// The TOML quotes are deliberate: `-c` parses the value as TOML and only
+		// falls back to a raw string literal on parse failure, so quoting makes
+		// the intent explicit.
+		if (effort.length > 0)
+			codexArgs ~= ["-c", `model_reasoning_effort="` ~ effort ~ `"`];
+		codexArgs ~= prompt;
+		return cmdPrefix !is null ? cmdPrefix ~ codexArgs : codexArgs;
+	}
+
+	unittest
+	{
+		import std.algorithm : canFind, countUntil;
+
+		// 24. -c is immediately followed by model_reasoning_effort="high" when
+		// effort is set; absent when it is not. prompt stays the final positional.
+		auto withEffort = buildOneShotArgs("codex", "hi", "gpt-5.6-sol", "high", null);
+		auto i = withEffort.countUntil("-c");
+		assert(i >= 0 && withEffort[i + 1] == `model_reasoning_effort="high"`);
+		assert(withEffort[$ - 1] == "hi");
+
+		auto withoutEffort = buildOneShotArgs("codex", "hi", "gpt-5.6-sol", "", null);
+		assert(!withoutEffort.canFind("-c"));
+		assert(withoutEffort[$ - 1] == "hi");
+	}
+
 	OneShotHandle completeOneShot(string prompt, string modelClass,
 		ProcessLaunch launch = ProcessLaunch.init)
 	{
@@ -879,19 +955,12 @@ class CodexAgent : Agent
 		auto oneShotLaunch = launchSandbox.withProcessLaunchEnv(launch, "CODEX_HOME",
 			oneShotHome);
 
-		string[] codexArgs = [
-			oneShotLaunch.executablePath.length > 0
-				? oneShotLaunch.executablePath
-				: executableName(oneShotLaunch.sandbox.env),
-			"exec",
-			"--ephemeral",
-			"--skip-git-repo-check",
-			"-m", resolveModelAlias(modelClass),
-			prompt,
-		];
-		auto args = oneShotLaunch.cmdPrefix !is null
-			? oneShotLaunch.cmdPrefix ~ codexArgs
-			: codexArgs;
+		auto spec = resolveModelSpec(modelClass);
+		auto executablePath = oneShotLaunch.executablePath.length > 0
+			? oneShotLaunch.executablePath
+			: executableName(oneShotLaunch.sandbox.env);
+		auto args = buildOneShotArgs(executablePath, prompt, spec.model, spec.effort,
+			oneShotLaunch.cmdPrefix);
 
 		AgentProcess proc;
 		try
@@ -2208,22 +2277,26 @@ private:
 /// Build a JSON config override object passed as the "config" field in
 /// thread/start params. Includes reasoning summary and, when available,
 /// MCP server config for CyDo tools.
-string buildConfigOverride(int tid, string creatableTaskTypes,
-	string switchModes, string handoffs, string[] includeTools, string mcpSocketPath)
+string buildConfigOverride(int tid, SessionConfig config)
 {
 	import std.array : join;
 	import std.process : environment;
 
-	JSONFragment[string] config;
+	JSONFragment[string] overrides;
 
 	// Always request reasoning summaries from the model.
-	config["model_reasoning_summary"] = JSONFragment(`"auto"`);
+	overrides["model_reasoning_summary"] = JSONFragment(`"auto"`);
+
+	// Verified against codex v0.147.0 (.cydo/tasks/34497/output.md): an unknown
+	// config key here is silently ignored, so this key string is load-bearing.
+	if (config.effort.length > 0)
+		overrides["model_reasoning_effort"] = JSONFragment(toJson(config.effort));
 
 	// Disable Codex's built-in multi-agent collaboration feature. CyDo agents must
 	// delegate only via mcp__cydo__Task, never Codex's own spawn_agent/team tools.
 	// Turning the feature off removes both the collaboration tools and the injected
 	// "team of agents" framing in one shot.
-	config["features.multi_agent"] = JSONFragment("false");
+	overrides["features.multi_agent"] = JSONFragment("false");
 
 	// Force CyDo's MCP tools to be exposed as top-level DIRECT model tools rather
 	// than nested inside Codex's code-mode `exec` sandbox. In code mode the exec
@@ -2233,14 +2306,14 @@ string buildConfigOverride(int tid, string creatableTaskTypes,
 	// direct-call path awaits the full MCP result with no yield timer.
 	// Note: features.code_mode=false is insufficient — model tool_mode metadata
 	// ("code_mode_only") overrides the feature flag; this per-namespace knob wins.
-	config["features.code_mode.direct_only_tool_namespaces"] = JSONFragment(`["mcp__cydo"]`);
+	overrides["features.code_mode.direct_only_tool_namespaces"] = JSONFragment(`["mcp__cydo"]`);
 
 	// If CYDO_CODEX_COMPACT_LIMIT is set (test-only), override compaction threshold.
 	auto compactLimit = environment.get("CYDO_CODEX_COMPACT_LIMIT", "");
 	if (compactLimit.length > 0)
 	{
-		config["model_auto_compact_token_limit"] = JSONFragment(compactLimit);
-		config["model_context_window"] = JSONFragment(compactLimit);
+		overrides["model_auto_compact_token_limit"] = JSONFragment(compactLimit);
+		overrides["model_context_window"] = JSONFragment(compactLimit);
 	}
 
 	auto cydoBin = cydoBinaryPath;
@@ -2248,11 +2321,11 @@ string buildConfigOverride(int tid, string creatableTaskTypes,
 	{
 		string[string] env;
 		env["CYDO_TID"] = to!string(tid);
-		env["CYDO_SOCKET"] = mcpSocketPath;
-		env["CYDO_CREATABLE_TYPES"] = creatableTaskTypes;
-		env["CYDO_SWITCHMODES"] = switchModes;
-		env["CYDO_HANDOFFS"] = handoffs;
-		env["CYDO_INCLUDE_TOOLS"] = includeTools is null ? "" : includeTools.join(",");
+		env["CYDO_SOCKET"] = config.mcpSocketPath;
+		env["CYDO_CREATABLE_TYPES"] = config.creatableTaskTypes;
+		env["CYDO_SWITCHMODES"] = config.switchModes;
+		env["CYDO_HANDOFFS"] = config.handoffs;
+		env["CYDO_INCLUDE_TOOLS"] = config.includeTools is null ? "" : config.includeTools.join(",");
 
 		auto toolTimeout = environment.get("CYDO_TEST_CODEX_MCP_TOOL_TIMEOUT_SEC", "");
 		auto serverConfig = McpServerConfig(
@@ -2262,10 +2335,10 @@ string buildConfigOverride(int tid, string creatableTaskTypes,
 			toolTimeout.length > 0 ? to!uint(toolTimeout) : 100000000,
 		);
 
-		config["mcp_servers.cydo"] = JSONFragment(toJson(serverConfig));
+		overrides["mcp_servers.cydo"] = JSONFragment(toJson(serverConfig));
 	}
 
-	return toJson(config);
+	return toJson(overrides);
 }
 
 unittest
@@ -2365,11 +2438,21 @@ unittest
 {
 	import std.string : indexOf;
 
-	auto config = buildConfigOverride(1, "", "", "", null, "");
-	assert(config.indexOf(`"features.multi_agent":false`) >= 0,
-		"Codex config must disable the built-in multi-agent feature; actual=" ~ config);
-	assert(config.indexOf(`"features.code_mode.direct_only_tool_namespaces":["mcp__cydo"]`) >= 0,
-		"Codex config must expose CyDo MCP tools as direct calls; actual=" ~ config);
+	SessionConfig noEffort;
+	auto overrides = buildConfigOverride(1, noEffort);
+	assert(overrides.indexOf(`"features.multi_agent":false`) >= 0,
+		"Codex config must disable the built-in multi-agent feature; actual=" ~ overrides);
+	assert(overrides.indexOf(`"features.code_mode.direct_only_tool_namespaces":["mcp__cydo"]`) >= 0,
+		"Codex config must expose CyDo MCP tools as direct calls; actual=" ~ overrides);
+	assert(overrides.indexOf(`"model_reasoning_effort"`) < 0,
+		"empty effort must not add the key at all; actual=" ~ overrides);
+
+	// 22. a non-empty effort adds the model_reasoning_effort key verbatim
+	SessionConfig withEffort;
+	withEffort.effort = "high";
+	auto overridesWithEffort = buildConfigOverride(1, withEffort);
+	assert(overridesWithEffort.indexOf(`"model_reasoning_effort":"high"`) >= 0,
+		"Codex config must carry model_reasoning_effort; actual=" ~ overridesWithEffort);
 }
 
 /// Extract display-level command input from a live Codex commandExecution item.
@@ -3002,6 +3085,30 @@ unittest
 
 	exerciseThreadSetupFailure(null, "thread/start");
 	exerciseThreadSetupFailure("resume-thread", "thread/resume");
+
+	// 23. SessionConfig.effort flows into the thread/start config override.
+	{
+		import std.algorithm : canFind;
+
+		auto connection = new TestCodexConnection;
+		auto server = makeTestAppServerProcess(connection);
+		auto agent = new CodexAgent;
+		ProcessLaunch launch;
+		launch.executablePath = "unused-test-codex";
+		launch.workDir = "/test/workdir";
+		SessionConfig config;
+		config.workspace = "effort-test";
+		config.model = "test-model";
+		config.effort = "high";
+		agent.serverPool[agent.serverPoolKey(config.workspace, launch)] = server;
+
+		auto session = cast(CodexSession) agent.createSession(32, null, launch, config);
+		assert(session !is null);
+		auto setupRequest = connection.takeRequest("thread/start");
+		auto params = jsonParse!ThreadStartParams(toJson(setupRequest.params));
+		assert(params.model == "test-model");
+		assert(params.config.json.canFind(`"model_reasoning_effort":"high"`));
+	}
 
 	{
 		auto connection = new TestCodexConnection;

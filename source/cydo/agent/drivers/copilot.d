@@ -28,7 +28,7 @@ import cydo.protocol : ContentBlock, ItemCompletedEvent, ItemDeltaEvent,
 	ProcessStderrEvent, SessionInitEvent, TranslatedEvent, TurnResultEvent,
 	TurnStopEvent, UsageInfo;
 import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
-import cydo.runtime.config : AgentDriver;
+import cydo.runtime.config : AgentDriver, ModelSpec, ModelSpecFields;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
 import cydo.runtime.launch.types : ProcessLaunch;
@@ -47,7 +47,7 @@ alias ToolDispatchFn = Promise!McpResult delegate(string tool, string tid, JSONF
 
 class CopilotAgent : Agent
 {
-	private string[string] modelAliasOverrides;
+	private ModelSpec[string] modelAliasOverrides;
 	// Shared SDK process for one-shot requests.
 	package SdkProcess sharedSdkServer_;
 	package string sharedWorkDir_;
@@ -108,7 +108,7 @@ class CopilotAgent : Agent
 	AgentSession createSession(int tid, string resumeSessionId, ProcessLaunch launch,
 		SessionConfig config = SessionConfig.init)
 	{
-		auto model = config.model.length > 0 ? resolveModelAlias(config.model) : "";
+		auto model = config.model;
 		auto workDir = launch.workDir.length > 0
 			? launch.workDir
 			: (config.workDir.length > 0 ? config.workDir : ".");
@@ -320,15 +320,13 @@ class CopilotAgent : Agent
 
 	string matchProject(string sessionId, const string[] knownProjectPaths) { return ""; }
 
-	void setModelAliases(string[string] aliases)
+	void setModelAliases(ModelSpec[string] aliases)
 	{
 		modelAliasOverrides = aliases;
 	}
 
-	string resolveModelAlias(string modelClass)
+	private static string defaultModelForClass(string modelClass)
 	{
-		if (auto p = modelClass in modelAliasOverrides)
-			return *p;
 		switch (modelClass)
 		{
 			case "small":  return "claude-haiku-4.5";
@@ -336,6 +334,50 @@ class CopilotAgent : Agent
 			case "large":  return "claude-opus-4.6";
 			default:       return modelClass; // pass through unknown aliases
 		}
+	}
+
+	ModelSpec resolveModelSpec(string modelClass)
+	{
+		ModelSpec spec;
+		if (auto p = modelClass in modelAliasOverrides)
+			spec = *p;
+		if (spec.model.length == 0)
+			spec.model = defaultModelForClass(modelClass);
+		return spec;
+	}
+
+	unittest
+	{
+		auto agent = new CopilotAgent();
+
+		// 14. with no overrides, hardcoded defaults and empty effort
+		assert(agent.resolveModelSpec("small") == ModelSpec(ModelSpecFields("claude-haiku-4.5")));
+		assert(agent.resolveModelSpec("medium") == ModelSpec(ModelSpecFields("claude-sonnet-4.6")));
+		assert(agent.resolveModelSpec("large") == ModelSpec(ModelSpecFields("claude-opus-4.6")));
+
+		// 15. an override replaces the default model
+		agent.setModelAliases(["large": ModelSpec(ModelSpecFields("custom-model"))]);
+		assert(agent.resolveModelSpec("large").model == "custom-model");
+
+		// 16. an effort-only override keeps the driver's default model
+		agent.setModelAliases(["large": ModelSpec(ModelSpecFields("", "high"))]);
+		auto effortOnly = agent.resolveModelSpec("large");
+		assert(effortOnly.model == "claude-opus-4.6");
+		assert(effortOnly.effort == "high");
+
+		// 17. an unknown class passes through, and can still be overridden
+		agent.setModelAliases(null);
+		auto passthrough = agent.resolveModelSpec("best");
+		assert(passthrough.model == "best");
+		assert(passthrough.effort == "");
+		agent.setModelAliases(["best": ModelSpec(ModelSpecFields("opus", "max"))]);
+		auto customClass = agent.resolveModelSpec("best");
+		assert(customClass.model == "opus");
+		assert(customClass.effort == "max");
+
+		// 18. the empty-class edge stays inert
+		agent.setModelAliases(null);
+		assert(agent.resolveModelSpec("").model == "");
 	}
 
 	// ---- History / fork ----
@@ -648,7 +690,7 @@ class CopilotAgent : Agent
 		auto p = new Promise!string;
 		auto session = new OneShotCopilotSession(p);
 
-		auto model = modelClass.length > 0 ? resolveModelAlias(modelClass) : "";
+		auto model = resolveModelSpec(modelClass).model;
 		auto cwd = launch.workDir.length > 0 ? launch.workDir
 			: (sharedWorkDir_.length > 0 ? sharedWorkDir_ : ".");
 

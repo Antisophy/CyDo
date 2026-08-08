@@ -4,7 +4,7 @@ import ae.utils.promise : Promise;
 
 import cydo.protocol : TranslatedEvent;
 import cydo.agent.session : AgentSession;
-import cydo.runtime.config : AgentDriver;
+import cydo.runtime.config : AgentDriver, ModelSpec;
 import cydo.runtime.launch.sandbox_paths : SandboxPaths;
 import cydo.runtime.launch.types : ProcessLaunch;
 
@@ -12,6 +12,7 @@ import cydo.runtime.launch.types : ProcessLaunch;
 struct SessionConfig
 {
 	string model;              /// CLI model alias (e.g., "haiku", "sonnet", "opus"); null = default
+	string effort;             /// Reasoning/thinking effort; empty = the driver's default
 	string appendSystemPrompt; /// Appended to the default system prompt; null = none
 	string creatableTaskTypes; /// Pre-formatted description of available task types for MCP tool
 	string switchModes;        /// Pre-formatted description of available SwitchMode continuations
@@ -107,12 +108,13 @@ interface Agent
 	string extractAssistantText(string line);
 
 	/// Set config-driven model alias overrides.
-	/// These take precedence over hardcoded defaults in resolveModelAlias.
-	void setModelAliases(string[string] aliases);
+	/// These take precedence over the hardcoded defaults in resolveModelSpec.
+	void setModelAliases(ModelSpec[string] aliases);
 
-	/// Map abstract model class ("small", "medium", "large") to
-	/// agent-specific model name/alias.
-	string resolveModelAlias(string modelClass);
+	/// Map a model class label to the driver-specific model name and launch
+	/// parameters. "small"/"medium"/"large" have per-driver defaults; any other
+	/// label resolves to itself unless overridden.
+	ModelSpec resolveModelSpec(string modelClass);
 
 	/// Compute the path to the agent's history file for a given session ID.
 	/// projectPath is the project's absolute path; empty means use cwd.

@@ -1,7 +1,9 @@
 module cydo.runtime.config;
 
-import configy.attributes : Key, Optional, SetInfo;
+import configy.attributes : ConfigParser, Key, Optional, SetInfo;
 import configy.read : parseConfigFileSimple;
+
+import dyaml.node : NodeID;
 
 import std.typecons : Nullable;
 
@@ -25,11 +27,62 @@ struct SandboxConfig
 
 enum AgentDriver { claude, codex, copilot }
 
+/// Whether a driver has any mechanism for the `effort` launch parameter.
+/// The *values* are not validated — they pass through to the CLI, which owns
+/// the value space.
+bool driverSupportsEffort(AgentDriver driver)
+{
+	final switch (driver)
+	{
+		case AgentDriver.claude:  return true;   // `--effort <value>`
+		case AgentDriver.codex:   return true;   // `model_reasoning_effort` config key
+		case AgentDriver.copilot: return false;  // no reasoning-effort knob
+	}
+}
+
+/// The driver an agent entry resolves to: its explicit `driver:` field, or the
+/// map key when that names a driver. Null when neither applies — `resolveConfig`
+/// turns that into the "driver field is required" error.
+Nullable!AgentDriver effectiveDriver(string name, const ref AgentConfig ac)
+{
+	import std.conv : to;
+	if (ac.driver.set)
+		return Nullable!AgentDriver(ac.driver.value);
+	try
+		return Nullable!AgentDriver(to!AgentDriver(name));
+	catch (Exception)
+		return Nullable!AgentDriver.init;
+}
+
+/// Fields of a `model_aliases` entry's mapping form.
+struct ModelSpecFields
+{
+	@Optional string model;   /// Driver-specific model name; empty = the driver's class default
+	@Optional string effort;  /// Reasoning/thinking effort; empty = the driver's default
+}
+
+/// A `model_aliases` target: either a bare model name or a mapping.
+struct ModelSpec
+{
+	ModelSpecFields fields;
+	alias fields this;
+
+	static ModelSpec fromYAML(scope ConfigParser!ModelSpec parser)
+	{
+		if (parser.node.nodeID == NodeID.mapping)
+			return ModelSpec(parser.parseAs!ModelSpecFields);
+		if (parser.node.nodeID != NodeID.scalar)
+			throw new Exception(
+				"expected a model name or a mapping with `model:`/`effort:`");
+		return ModelSpec(ModelSpecFields(parser.node.as!string));
+	}
+}
+
 struct AgentConfig
 {
 	@Optional SetInfo!AgentDriver driver;
 	@Optional SandboxConfig sandbox;
-	@Optional string[string] model_aliases;
+	@Optional ModelSpec[string] model_aliases;
 	@Optional string display_name;
 }
 
@@ -62,6 +115,25 @@ struct CydoConfig
 	@Optional bool dev_mode;
 	@Optional string log_level = "info";
 	@Optional string system_keyword = "SYSTEM";
+
+	/// Called by configy during parsing (configy/read.d:650), so a semantic
+	/// error surfaces on the same path as a YAML syntax error.
+	void validate() const
+	{
+		import std.format : format;
+		foreach (name, ref ac; agents)
+		{
+			auto driver = effectiveDriver(name, ac);
+			// An unresolvable driver is resolveConfig's error to report.
+			if (driver.isNull || driverSupportsEffort(driver.get))
+				continue;
+			foreach (modelClass, ref spec; ac.model_aliases)
+				if (spec.effort.length > 0)
+					throw new Exception(format(
+						"agents['%s'].model_aliases['%s']: the %s driver does not support `effort`",
+						name, modelClass, driver.get));
+		}
+	}
 }
 
 string configPath()
@@ -122,6 +194,8 @@ private void normalizeWorkspacePaths(ref CydoConfig config)
 version (unittest)
 {
 	import ae.sys.file : realPath;
+	import configy.read : parseConfigString;
+	import std.algorithm : canFind;
 	import std.exception : assertThrown;
 	import std.file : exists, mkdirRecurse, rmdirRecurse, symlink, write;
 	import std.path : buildPath, buildNormalizedPath;
@@ -163,5 +237,159 @@ version (unittest)
 		CydoConfig invalid;
 		invalid.workspaces = [WorkspaceConfig("file", regularFile)];
 		assertThrown!Exception(applyPostLoadFixups(invalid));
+	}
+
+	private enum workspacesYAML = "workspaces:\n  local:\n    root: /tmp\n";
+
+	// 1. A scalar entry parses to model == the scalar, effort == "".
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-claude:\n    driver: claude\n"
+			~ "    model_aliases:\n      small: haiku\n";
+		auto config = parseConfigString!CydoConfig(yaml, "/dev/null");
+		auto spec = config.agents["my-claude"].model_aliases["small"];
+		assert(spec.model == "haiku");
+		assert(spec.effort == "");
+	}
+
+	// 2. A mapping entry with both keys parses both.
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-claude:\n    driver: claude\n"
+			~ "    model_aliases:\n      large:\n        model: opus\n        effort: high\n";
+		auto config = parseConfigString!CydoConfig(yaml, "/dev/null");
+		auto spec = config.agents["my-claude"].model_aliases["large"];
+		assert(spec.model == "opus");
+		assert(spec.effort == "high");
+	}
+
+	// 3. A mapping entry with only effort: keeps model empty ("keep the class default").
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-claude:\n    driver: claude\n"
+			~ "    model_aliases:\n      large:\n        effort: high\n";
+		auto config = parseConfigString!CydoConfig(yaml, "/dev/null");
+		auto spec = config.agents["my-claude"].model_aliases["large"];
+		assert(spec.model == "");
+		assert(spec.effort == "high");
+	}
+
+	// 4. A mapping entry with only model: leaves effort empty.
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-claude:\n    driver: claude\n"
+			~ "    model_aliases:\n      large:\n        model: opus\n";
+		auto config = parseConfigString!CydoConfig(yaml, "/dev/null");
+		auto spec = config.agents["my-claude"].model_aliases["large"];
+		assert(spec.model == "opus");
+		assert(spec.effort == "");
+	}
+
+	// 5. Scalar and mapping entries coexist in the same model_aliases map.
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-claude:\n    driver: claude\n"
+			~ "    model_aliases:\n      small: haiku\n      large:\n        model: opus\n        effort: high\n";
+		auto config = parseConfigString!CydoConfig(yaml, "/dev/null");
+		auto aliases = config.agents["my-claude"].model_aliases;
+		assert(aliases["small"].model == "haiku");
+		assert(aliases["large"].model == "opus");
+		assert(aliases["large"].effort == "high");
+	}
+
+	// 6. A sequence value throws, mentioning the config path and the expected shape.
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-claude:\n    driver: claude\n"
+			~ "    model_aliases:\n      large: [a, b]\n";
+		try
+		{
+			parseConfigString!CydoConfig(yaml, "/dev/null");
+			assert(false, "expected a ConfigException");
+		}
+		catch (Exception e)
+		{
+			assert(e.toString().canFind("agents[my-claude].model_aliases[large]"));
+			assert(e.toString().canFind("expected a model name or a mapping"));
+		}
+	}
+
+	// 7. An unknown key inside the mapping form throws (configy's strict mode).
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-claude:\n    driver: claude\n"
+			~ "    model_aliases:\n      large:\n        modle: opus\n";
+		assertThrown!Exception(parseConfigString!CydoConfig(yaml, "/dev/null"));
+	}
+
+	// 8. effort on an agent with an explicit `driver: copilot` throws.
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-copilot:\n    driver: copilot\n"
+			~ "    model_aliases:\n      large:\n        effort: high\n";
+		try
+		{
+			parseConfigString!CydoConfig(yaml, "/dev/null");
+			assert(false, "expected a ConfigException");
+		}
+		catch (Exception e)
+		{
+			assert(e.toString().canFind("my-copilot"));
+			assert(e.toString().canFind("large"));
+			assert(e.toString().canFind("copilot"));
+		}
+	}
+
+	// 9. effort on a key-inferred copilot agent throws the same message.
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  copilot:\n"
+			~ "    model_aliases:\n      large:\n        effort: high\n";
+		try
+		{
+			parseConfigString!CydoConfig(yaml, "/dev/null");
+			assert(false, "expected a ConfigException");
+		}
+		catch (Exception e)
+		{
+			assert(e.toString().canFind("copilot"));
+			assert(e.toString().canFind("large"));
+		}
+	}
+
+	// 10. effort on a claude agent and on a codex agent parses without throwing.
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-claude:\n    driver: claude\n"
+			~ "    model_aliases:\n      large:\n        effort: high\n"
+			~ "  my-codex:\n    driver: codex\n"
+			~ "    model_aliases:\n      large:\n        effort: high\n";
+		parseConfigString!CydoConfig(yaml, "/dev/null");
+	}
+
+	// 11. An arbitrary, unrecognised effort value on claude parses without throwing.
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-claude:\n    driver: claude\n"
+			~ "    model_aliases:\n      large:\n        effort: some-future-level\n";
+		parseConfigString!CydoConfig(yaml, "/dev/null");
+	}
+
+	// 12. A model-only alias on a copilot agent parses without throwing.
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  my-copilot:\n    driver: copilot\n"
+			~ "    model_aliases:\n      small: gpt-4.1\n      large:\n        model: gpt-4.1\n";
+		parseConfigString!CydoConfig(yaml, "/dev/null");
+	}
+
+	// 13. An agent whose key is not a driver name and has no driver: field, with
+	// effort set, parses without throwing from validate() — resolveConfig
+	// reports the "driver field is required" error, not validate().
+	unittest
+	{
+		auto yaml = workspacesYAML ~ "agents:\n  custom:\n"
+			~ "    model_aliases:\n      large:\n        effort: high\n";
+		parseConfigString!CydoConfig(yaml, "/dev/null");
 	}
 }
