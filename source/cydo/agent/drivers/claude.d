@@ -796,13 +796,11 @@ class ClaudeCodeSession : AgentSession
 	private string executablePath_;
 	private string agentName_;
 
-	this(string executablePath, string resumeSessionId = null, string[] cmdPrefix = null,
-		string mcpConfigPath = null, SessionConfig config = SessionConfig.init)
+	private static string[] buildSessionArgs(string executablePath, string resumeSessionId,
+		string[] cmdPrefix, string mcpConfigPath, SessionConfig config)
 	{
-		executablePath_ = executablePath;
-		agentName_ = config.agentName;
 		string[] claudeArgs = [
-			executablePath_.length > 0 ? executablePath_ : "claude",
+			executablePath.length > 0 ? executablePath : "claude",
 			"-p",
 			"--input-format", "stream-json",
 			"--output-format", "stream-json",
@@ -850,6 +848,35 @@ class ClaudeCodeSession : AgentSession
 		else
 			args = claudeArgs;
 
+		return args;
+	}
+
+	unittest
+	{
+		import std.algorithm : canFind, countUntil;
+
+		SessionConfig config; // .init: no model, no cmdPrefix
+		auto args = buildSessionArgs("claude", null, null, null, config);
+		assert(!args.canFind("--model"));
+
+		auto withModel = config;
+		withModel.model = "opus";
+		auto modelArgs = buildSessionArgs("claude", null, null, null, withModel);
+		auto i = modelArgs.countUntil("--model");
+		assert(i >= 0 && modelArgs[i + 1] == "opus");
+
+		auto withPrefix = buildSessionArgs("claude", null, ["prefix"], null, config);
+		assert(withPrefix[0] == "prefix");
+	}
+
+	this(string executablePath, string resumeSessionId = null, string[] cmdPrefix = null,
+		string mcpConfigPath = null, SessionConfig config = SessionConfig.init)
+	{
+		executablePath_ = executablePath;
+		agentName_ = config.agentName;
+
+		auto args = buildSessionArgs(executablePath, resumeSessionId, cmdPrefix,
+			mcpConfigPath, config);
 		process = new AgentProcess(args, logName: "claude");
 
 		process.onStdoutLine = (string line) {
