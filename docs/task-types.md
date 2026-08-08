@@ -15,8 +15,8 @@ agent_description: string             # LLM-visible; explains when to use this t
 prompt_template: string | path        # template used to wrap the task description in the rendered task prompt
 system_prompt_template: string | path # optional startup system/developer prompt for agents that support it
 model_class: string                   # open-ended label; small/medium/large have per-driver defaults,
-                                       # any other label resolves to itself unless mapped in the
-                                       # agent's model_aliases (see README.md)
+                                      # any other label resolves to itself unless mapped in the
+                                      # agent's model_aliases (see README.md)
 read_only: bool                   # sandbox mounts project dir as ro (default false)
 output_type: [commit | worktree | report]  # what the task produces (empty = no output)
 allow_native_subagents: bool  # use Claude's built-in Task tool instead of CyDo's (default false)

@@ -319,7 +319,16 @@ version (unittest)
 	{
 		auto yaml = workspacesYAML ~ "agents:\n  my-claude:\n    driver: claude\n"
 			~ "    model_aliases:\n      large:\n        modle: opus\n";
-		assertThrown!Exception(parseConfigString!CydoConfig(yaml, "/dev/null"));
+		try
+		{
+			parseConfigString!CydoConfig(yaml, "/dev/null");
+			assert(false, "expected a ConfigException");
+		}
+		catch (Exception e)
+		{
+			assert(e.toString().canFind("agents[my-claude].model_aliases[large]"));
+			assert(e.toString().canFind("modle"));
+		}
 	}
 
 	// 8. effort on an agent with an explicit `driver: copilot` throws.
@@ -337,6 +346,7 @@ version (unittest)
 			assert(e.toString().canFind("my-copilot"));
 			assert(e.toString().canFind("large"));
 			assert(e.toString().canFind("copilot"));
+			assert(e.toString().canFind("does not support"));
 		}
 	}
 
@@ -354,6 +364,7 @@ version (unittest)
 		{
 			assert(e.toString().canFind("copilot"));
 			assert(e.toString().canFind("large"));
+			assert(e.toString().canFind("does not support"));
 		}
 	}
 
