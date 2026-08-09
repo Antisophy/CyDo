@@ -65,6 +65,23 @@ struct PersistedHistoryBoundary {
 	int sourceLine;
 }
 
+/// Pure result of a driver repairing its persisted interrupted-tool-call
+/// records. `removedInterruptionUuid` names the exact native user record that
+/// was removed; it remains null unless that record was structurally proven.
+/// The on-disk helper exposes this identity to callers only after it writes
+/// `lines` successfully.
+class InterruptedToolCallRepair
+{
+	string[] lines;
+	string removedInterruptionUuid;
+
+	this(string[] lines, string removedInterruptionUuid = null)
+	{
+		this.lines = lines;
+		this.removedInterruptionUuid = removedInterruptionUuid;
+	}
+}
+
 /// Describes an agent type: its sandbox requirements, git identity,
 /// and how to create sessions. Separates agent metadata from
 /// the runtime AgentSession interface.
@@ -148,6 +165,17 @@ interface Agent
 
 	/// Extract persisted history boundaries with explicit kinds.
 	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0);
+
+	/// Repair a persisted session file after CyDo deliberately interrupted an
+	/// in-flight MCP tool call, which the harness records as a rejection or
+	/// abort. `lines` is the whole session file split into lines; `toolName` is
+	/// CyDo's canonical MCP tool name; `resultText` is the result CyDo intended
+	/// to deliver. Returns repaired lines, or null if the expected shape is not
+	/// present. Pure and non-throwing: an unrecognised shape returns null.
+	/// A matching repair may omit removedInterruptionUuid when it rewrites only
+	/// the tool result and finds no structurally linked interruption record.
+	InterruptedToolCallRepair repairInterruptedToolCall(string[] lines, string toolName,
+		string resultText);
 
 	/// Check whether a raw JSONL line (at 1-based lineNum) matches a fork ID.
 	/// Used by truncation/fork logic to find the cut point.

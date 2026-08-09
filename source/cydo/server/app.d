@@ -3098,7 +3098,18 @@ class App
 	/// task_reload is a hard history-lineage boundary on the wire: clients are
 	/// unsubscribed before it is sent, must discard pre-reload live assumptions,
 	/// and must call request_history to subscribe to the new replayed lineage.
-	private void emitTaskReload(int tid, string reason = "")
+	private void emitTaskReload(int tid)
+	{
+		emitTaskReload(tid, "", null);
+	}
+
+	private void emitTaskReload(int tid, string reason)
+	{
+		emitTaskReload(tid, reason, null);
+	}
+
+	private void emitTaskReload(int tid, string reason,
+		string excludedUserUuid)
 	{
 		import ae.utils.json : toJson;
 
@@ -3108,7 +3119,8 @@ class App
 		tasks[tid].clearSubmissionCorrelationState();
 		clientHub.unsubscribeAll(tid);
 		derivedTextJobs.invalidateSuggestions(tid);
-		clientHub.broadcast(toJson(TaskReloadMessage("task_reload", tid, reason)));
+		clientHub.broadcast(toJson(TaskReloadMessage("task_reload", tid, reason,
+			excludedUserUuid)));
 	}
 
 	private string makeTaskDiagnosticEventJson(string subject, string body)

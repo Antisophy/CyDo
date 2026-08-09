@@ -23,7 +23,9 @@ import cydo.agent.sdk : SdkProcess, SdkSessionHandler,
 	SdkToolCallRequest, SdkToolCallResult, SdkToolResult,
 	SdkEvent, EmptyResult;
 version (unittest) import cydo.agent.sdk : makeTestSdkProcess;
-import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary, PersistedHistoryBoundaryKind, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
+import cydo.agent.contract : Agent, DiscoveredSession, InterruptedToolCallRepair,
+	PersistedHistoryBoundary, PersistedHistoryBoundaryKind, OneShotHandle,
+	RewindResult, SessionConfig, SessionMeta;
 import cydo.protocol : ContentBlock, ItemCompletedEvent, ItemDeltaEvent,
 	ItemResultEvent, ItemStartedEvent, makeUnrecognizedEvent, ProcessExitEvent,
 	ProcessStderrEvent, SessionInitEvent, TranslatedEvent, TurnResultEvent,
@@ -626,6 +628,15 @@ class CopilotAgent : Agent
 		return ids;
 	}
 
+	InterruptedToolCallRepair repairInterruptedToolCall(string[] lines, string toolName,
+		string resultText)
+	{
+		// Native SDK tool dispatch (at handleToolCall/toolDispatch_) never reaches
+		// transport.d's interrupted MCP path; continuation e2e coverage pins its
+		// already-successful tool.execution_complete record instead.
+		return null;
+	}
+
 	bool forkIdMatchesLine(string line, int lineNum, string forkId)
 	{
 		@JSONPartial
@@ -725,6 +736,13 @@ class CopilotAgent : Agent
 
 		return OneShotHandle(p, null);
 	}
+}
+
+unittest
+{
+	auto agent = new CopilotAgent;
+	assert(agent.repairInterruptedToolCall([`{"type":"tool.execution_complete"}`],
+		"mcp__cydo__SwitchMode", "RESULT") is null);
 }
 
 unittest

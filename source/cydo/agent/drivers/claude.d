@@ -5,6 +5,7 @@ import core.time : Duration, seconds;
 import std.conv : to;
 import std.exception : enforce;
 import std.format : format;
+import std.json : JSONType, JSONValue, parseJSON;
 import std.path : dirName, expandTilde;
 import std.logger : errorf, tracef, warningf;
 import std.math : isNaN;
@@ -14,7 +15,9 @@ import ae.utils.json : JSONExtras, JSONFragment, JSONName, JSONOptional, JSONPar
 import ae.utils.promise : Promise, reject, resolve;
 import ae.utils.time.types : AbsTime;
 
-import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary, PersistedHistoryBoundaryKind, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
+import cydo.agent.contract : Agent, DiscoveredSession, InterruptedToolCallRepair,
+	PersistedHistoryBoundary, PersistedHistoryBoundaryKind, OneShotHandle,
+	RewindResult, SessionConfig, SessionMeta;
 import cydo.protocol;
 import cydo.agent.process : AgentProcess, FramingMode;
 import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
@@ -469,6 +472,12 @@ class ClaudeCodeAgent : Agent
 		return ids;
 	}
 
+	InterruptedToolCallRepair repairInterruptedToolCall(string[] lines, string toolName,
+		string resultText)
+	{
+		return repairInterruptedToolCallImpl(lines, toolName, resultText);
+	}
+
 	bool forkIdMatchesLine(string line, int lineNum, string forkId)
 	{
 		import std.algorithm : canFind, startsWith;
@@ -688,6 +697,229 @@ class ClaudeCodeAgent : Agent
 
 		return OneShotHandle(promise, &cancel);
 	}
+}
+
+private bool interruptedToolCallHasKey(ref JSONValue value, string key)
+{
+	return value.type == JSONType.object && key in value.object;
+}
+
+private string interruptedToolCallStringAt(ref JSONValue value, string key)
+{
+	if (!interruptedToolCallHasKey(value, key))
+		return null;
+	auto field = value.object[key];
+	return field.type == JSONType.string ? field.str : null;
+}
+
+/// Repair the Claude JSONL records emitted after CyDo interrupts a successful
+/// continuation MCP call. Returns null when the expected call/result pair is
+/// not present, leaving the caller's file untouched.
+InterruptedToolCallRepair repairInterruptedToolCallImpl(string[] lines, string toolName,
+	string resultText)
+{
+	string toolUseId;
+	foreach (line; lines)
+	{
+		JSONValue record;
+		try
+			record = parseJSON(line);
+		catch (Exception)
+			continue;
+		if (interruptedToolCallStringAt(record, "type") != "assistant"
+			|| !interruptedToolCallHasKey(record, "message"))
+			continue;
+
+		auto message = record.object["message"];
+		if (!interruptedToolCallHasKey(message, "content")
+			|| message.object["content"].type != JSONType.array)
+			continue;
+		foreach (block_; message.object["content"].array)
+		{
+			auto block = block_;
+			if (interruptedToolCallStringAt(block, "type") == "tool_use"
+				&& interruptedToolCallStringAt(block, "name") == toolName)
+				toolUseId = interruptedToolCallStringAt(block, "id");
+		}
+	}
+	if (toolUseId.length == 0)
+		return null;
+
+	string resultUuid;
+	bool rewroteResult;
+	string[] rewritten;
+	foreach (line; lines)
+	{
+		JSONValue record;
+		try
+			record = parseJSON(line);
+		catch (Exception)
+		{
+			rewritten ~= line;
+			continue;
+		}
+
+		if (!rewroteResult && interruptedToolCallStringAt(record, "type") == "user"
+			&& interruptedToolCallHasKey(record, "message"))
+		{
+			auto message = record.object["message"];
+			if (interruptedToolCallHasKey(message, "content")
+				&& message.object["content"].type == JSONType.array
+				&& message.object["content"].array.length > 0)
+			{
+				auto content = message.object["content"];
+				auto block = content.array[0];
+				if (interruptedToolCallStringAt(block, "type") == "tool_result"
+					&& interruptedToolCallStringAt(block, "tool_use_id") == toolUseId)
+				{
+					block.object["content"] = JSONValue(resultText);
+					block.object.remove("is_error");
+					content.array[0] = block;
+					message.object["content"] = content;
+					record.object["message"] = message;
+					record.object["toolUseResult"] = JSONValue(resultText);
+					record.object.remove("toolDenialKind");
+					resultUuid = interruptedToolCallStringAt(record, "uuid");
+					rewritten ~= record.toString();
+					rewroteResult = true;
+					continue;
+				}
+			}
+		}
+		rewritten ~= line;
+	}
+	if (!rewroteResult || resultUuid.length == 0)
+		return null;
+
+	string interruptionUuid;
+	string[] withoutInterruption;
+	foreach (line; rewritten)
+	{
+		JSONValue record;
+		try
+			record = parseJSON(line);
+		catch (Exception)
+		{
+			withoutInterruption ~= line;
+			continue;
+		}
+
+		if (interruptionUuid.length == 0
+			&& interruptedToolCallStringAt(record, "type") == "user"
+			&& interruptedToolCallStringAt(record, "parentUuid") == resultUuid
+			&& interruptedToolCallHasKey(record, "message"))
+		{
+			auto message = record.object["message"];
+			if (interruptedToolCallHasKey(message, "content")
+				&& message.object["content"].type == JSONType.array
+				&& message.object["content"].array.length == 1)
+			{
+				auto block = message.object["content"].array[0];
+				auto text = interruptedToolCallStringAt(block, "text");
+				if (interruptedToolCallStringAt(block, "type") == "text"
+					&& (text == "[Request interrupted by user for tool use]"
+						|| text == "[Request interrupted by user]"))
+				{
+					interruptionUuid = interruptedToolCallStringAt(record, "uuid");
+					if (interruptionUuid.length > 0)
+						continue;
+				}
+			}
+		}
+		withoutInterruption ~= line;
+	}
+	if (interruptionUuid.length == 0)
+		return new InterruptedToolCallRepair(withoutInterruption);
+
+	string[] repaired;
+	foreach (line; withoutInterruption)
+	{
+		JSONValue record;
+		try
+			record = parseJSON(line);
+		catch (Exception)
+		{
+			repaired ~= line;
+			continue;
+		}
+
+		bool changed;
+		foreach (key; ["leafUuid", "parentUuid"])
+			if (interruptedToolCallStringAt(record, key) == interruptionUuid)
+			{
+				record.object[key] = JSONValue(resultUuid);
+				changed = true;
+			}
+		repaired ~= changed ? record.toString() : line;
+	}
+	return new InterruptedToolCallRepair(repaired, interruptionUuid);
+}
+
+unittest
+{
+	auto assistant = `{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_switch","name":"mcp__cydo__SwitchMode","input":{"continuation":"plan"}}]}}`;
+	auto rejected = `{"type":"user","uuid":"u1","parentUuid":"a1","message":{"role":"user","content":[{"type":"tool_result","content":"The user doesn't want to proceed with this tool use.","is_error":true,"tool_use_id":"toolu_switch"}]},"toolUseResult":"User rejected tool use","toolDenialKind":"user-rejected"}`;
+	auto interruption = `{"type":"user","uuid":"u2","parentUuid":"u1","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}`;
+	auto lastPrompt = `{"type":"last-prompt","leafUuid":"u2","sessionId":"session"}`;
+
+	auto repaired = repairInterruptedToolCallImpl(
+		[assistant, rejected, interruption, lastPrompt],
+		"mcp__cydo__SwitchMode", "RESULT");
+	assert(repaired !is null && repaired.lines.length == 3);
+	assert(repaired.removedInterruptionUuid == "u2");
+	auto result = parseJSON(repaired.lines[1]);
+	auto resultBlock = result["message"]["content"][0];
+	assert(resultBlock["content"].str == "RESULT");
+	assert("is_error" !in resultBlock.object);
+	assert(result["toolUseResult"].str == "RESULT");
+	assert("toolDenialKind" !in result.object);
+	assert(parseJSON(repaired.lines[2])["leafUuid"].str == "u1");
+
+	auto older = repairInterruptedToolCallImpl([
+		assistant, rejected,
+		`{"type":"user","uuid":"u2","parentUuid":"u1","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}`,
+		lastPrompt,
+	], "mcp__cydo__SwitchMode", "RESULT");
+	assert(older !is null && older.lines.length == 3);
+	assert(older.removedInterruptionUuid == "u2");
+	assert(parseJSON(older.lines[2])["leafUuid"].str == "u1");
+
+	auto noInterruption = repairInterruptedToolCallImpl([assistant, rejected],
+		"mcp__cydo__SwitchMode", "RESULT");
+	assert(noInterruption !is null && noInterruption.lines.length == 2);
+	assert(noInterruption.removedInterruptionUuid.length == 0);
+	assert(parseJSON(noInterruption.lines[1])["toolUseResult"].str == "RESULT");
+
+	auto oldAssistant = `{"type":"assistant","uuid":"old-a","message":{"content":[{"type":"tool_use","id":"old-call","name":"mcp__cydo__SwitchMode","input":{}}]}}`;
+	auto oldResult = `{"type":"user","uuid":"old-u","message":{"content":[{"type":"tool_result","content":"OLD","tool_use_id":"old-call"}]}}`;
+	auto multiple = repairInterruptedToolCallImpl(
+		[oldAssistant, oldResult, assistant, rejected, interruption, lastPrompt],
+		"mcp__cydo__SwitchMode", "RESULT");
+	assert(multiple !is null && multiple.lines[1] == oldResult);
+
+	auto mixedAssistant = `{"type":"assistant","uuid":"mixed-a","message":{"content":[{"type":"tool_use","id":"bash-call","name":"Bash","input":{}},{"type":"tool_use","id":"toolu_switch","name":"mcp__cydo__SwitchMode","input":{}}]}}`;
+	auto bashResult = `{"type":"user","uuid":"bash-u","message":{"content":[{"type":"tool_result","content":"BASH","tool_use_id":"bash-call"}]}}`;
+	auto unrelated = repairInterruptedToolCallImpl(
+		[mixedAssistant, bashResult, rejected, interruption, lastPrompt],
+		"mcp__cydo__SwitchMode", "RESULT");
+	assert(unrelated !is null && unrelated.lines[1] == bashResult);
+
+	auto handoffAssistant = `{"type":"assistant","uuid":"h-a","message":{"content":[{"type":"tool_use","id":"handoff-call","name":"mcp__cydo__Handoff","input":{}}]}}`;
+	auto handoffResult = `{"type":"user","uuid":"h-u","message":{"content":[{"type":"tool_result","content":"rejected","is_error":true,"tool_use_id":"handoff-call"}]},"toolDenialKind":"user-rejected"}`;
+	auto handoff = repairInterruptedToolCallImpl([handoffAssistant, handoffResult],
+		"mcp__cydo__Handoff", "HANDOFF RESULT");
+	assert(handoff !is null
+		&& parseJSON(handoff.lines[1])["toolUseResult"].str == "HANDOFF RESULT");
+	assert(handoff.removedInterruptionUuid.length == 0);
+	auto malformed = repairInterruptedToolCallImpl([assistant, rejected, "not json"],
+		"mcp__cydo__SwitchMode", "RESULT");
+	assert(malformed !is null && malformed.removedInterruptionUuid.length == 0);
+	assert(repairInterruptedToolCallImpl([assistant, rejected],
+		"mcp__cydo__Handoff", "RESULT") is null);
+	assert(repairInterruptedToolCallImpl([`{"type":"user"}`],
+		"mcp__cydo__SwitchMode", "RESULT") is null);
+	assert(repairInterruptedToolCallImpl([assistant],
+		"mcp__cydo__SwitchMode", "RESULT") is null);
 }
 
 unittest

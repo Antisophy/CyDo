@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { reduceMessage } from "./sessionReducer";
 import {
   beginTaskHistoryReplay,
+  excludeReloadDraftUuid,
   reconcileInputDraft,
   resetTaskForReload,
   resetTaskForHistoryReplay,
@@ -85,7 +86,7 @@ function makeRichState(): TaskState {
     historyTotal: 9,
     historyReceived: 5,
     pendingHistoryReplies: 2,
-    preReloadDrafts: ["draft A"],
+    preReloadDrafts: [{ text: "draft A" }],
     inputDraft: "draft B",
     error: "stderr line",
     undoPending: {
@@ -219,7 +220,10 @@ describe("history replay reset", () => {
       }),
     );
 
-    expect(preReloadDrafts).toEqual(["unreplayed input", "optimistic input"]);
+    expect(preReloadDrafts).toEqual([
+      { text: "unreplayed input" },
+      { text: "optimistic input" },
+    ]);
     expect(reset.messages).toEqual([before.messages[1]]);
     expect(
       replayed.messages.filter((message) => message.type === "diagnostic"),
@@ -236,6 +240,117 @@ describe("history replay reset", () => {
       },
     });
     expect(reconcileInputDraft(replayed)).toBe("unreplayed input");
+  });
+
+  it("excludes only the repaired native UUID from a fresh draft snapshot", () => {
+    const interruptionText = "[Request interrupted by user for tool use]";
+    const before = {
+      ...makeTaskState(1, true, true),
+      messages: [
+        {
+          id: "interruption",
+          type: "user" as const,
+          uuid: "removed-u2",
+          content: [{ type: "text" as const, text: interruptionText }],
+        },
+        {
+          id: "real-steer",
+          type: "user" as const,
+          uuid: "real-u3",
+          content: [{ type: "text" as const, text: interruptionText }],
+        },
+      ],
+    };
+
+    const preReloadDrafts = excludeReloadDraftUuid(
+      snapshotUserDrafts(before),
+      "removed-u2",
+    );
+
+    expect(preReloadDrafts).toEqual([
+      { text: interruptionText, nativeUuid: "real-u3" },
+    ]);
+    expect(
+      reconcileInputDraft({
+        ...before,
+        messages: [],
+        preReloadDrafts,
+      }),
+    ).toBe(interruptionText);
+  });
+
+  it("filters a repaired UUID from an already-open reload snapshot", () => {
+    const interruptionText = "[Request interrupted by user for tool use]";
+    const before = {
+      ...makeTaskState(1, true, true),
+      pendingHistoryReplies: 1,
+      preReloadDrafts: [
+        { text: interruptionText, nativeUuid: "removed-u2" },
+        { text: interruptionText, nativeUuid: "real-u3" },
+        { text: "browser draft" },
+      ],
+    };
+
+    const filtered = excludeReloadDraftUuid(
+      before.preReloadDrafts,
+      "removed-u2",
+    );
+    const reset = resetTaskForReload(before, filtered);
+
+    expect(reset.pendingHistoryReplies).toBe(1);
+    expect(reset.preReloadDrafts).toEqual([
+      { text: interruptionText, nativeUuid: "real-u3" },
+      { text: "browser draft" },
+    ]);
+  });
+
+  it("keeps text-multiset draft recovery unchanged without an excluded UUID", () => {
+    const duplicateText = "same user text";
+    const before = {
+      ...makeTaskState(1, true, true),
+      messages: [
+        {
+          id: "first-duplicate",
+          type: "user" as const,
+          uuid: "first-u1",
+          content: [{ type: "text" as const, text: duplicateText }],
+        },
+        {
+          id: "second-duplicate",
+          type: "user" as const,
+          uuid: "second-u2",
+          content: [{ type: "text" as const, text: duplicateText }],
+        },
+        {
+          id: "other",
+          type: "user" as const,
+          uuid: "other-u3",
+          content: [{ type: "text" as const, text: "other text" }],
+        },
+      ],
+    };
+
+    const preReloadDrafts = snapshotUserDrafts(before);
+    const replayed = {
+      ...before,
+      messages: [
+        {
+          id: "replayed-duplicate",
+          type: "user" as const,
+          uuid: "first-u1",
+          content: [{ type: "text" as const, text: duplicateText }],
+        },
+        {
+          id: "replayed-other",
+          type: "user" as const,
+          uuid: "other-u3",
+          content: [{ type: "text" as const, text: "other text" }],
+        },
+      ],
+      preReloadDrafts,
+    };
+
+    expect(reconcileInputDraft(replayed)).toBe(duplicateText);
   });
 
   it("keeps live events that arrive after reload before its replay starts", () => {
@@ -313,7 +428,7 @@ describe("history replay reset", () => {
 
   it("preserves stable server metadata when task reload clears task state", () => {
     const before = makeRichState();
-    const preReloadDrafts = ["draft captured before reload"];
+    const preReloadDrafts = [{ text: "draft captured before reload" }];
     const reset = resetTaskForReload(before, preReloadDrafts);
 
     expect(reset).toMatchObject({

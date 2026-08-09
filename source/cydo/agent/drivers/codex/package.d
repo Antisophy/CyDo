@@ -25,7 +25,9 @@ version (unittest) import ae.net.asockets : ConnectionState, DisconnectType,
 	IConnection;
 version (unittest) import ae.utils.jsonrpc : JsonRpcRequest;
 
-import cydo.agent.contract : Agent, DiscoveredSession, PersistedHistoryBoundary, OneShotHandle, RewindResult, SessionConfig, SessionMeta;
+import cydo.agent.contract : Agent, DiscoveredSession, InterruptedToolCallRepair,
+	PersistedHistoryBoundary, OneShotHandle, RewindResult, SessionConfig,
+	SessionMeta;
 import cydo.agent.process : AgentProcess, FramingMode;
 import cydo.agent.drivers.codex.app_server : CodexSessionRouteTarget;
 public import cydo.agent.drivers.codex.process : AppServerProcess;
@@ -980,6 +982,13 @@ class CodexAgent : Agent
 	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content, int lineOffset = 0)
 	{
 		return extractPersistedHistoryBoundariesImpl(content, lineOffset);
+	}
+
+	InterruptedToolCallRepair repairInterruptedToolCall(string[] lines, string toolName,
+		string resultText)
+	{
+		auto repaired = repairInterruptedToolCallImpl(lines, toolName, resultText);
+		return repaired is null ? null : new InterruptedToolCallRepair(repaired);
 	}
 
 	bool forkIdMatchesLine(string line, int lineNum, string forkId)

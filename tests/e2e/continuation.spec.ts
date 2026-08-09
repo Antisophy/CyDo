@@ -1,10 +1,244 @@
+import type { AgentType } from "./fixtures";
 import {
   test,
   expect,
   enterSession,
   sendMessage,
   assistantText,
+  currentTaskTid,
+  historyPathForTask,
+  readHistoryFile,
+  responseTimeout,
 } from "./fixtures";
+
+type JsonRecord = Record<string, unknown>;
+type ContinuationTool = "SwitchMode" | "Handoff";
+type ContinuationReload = {
+  tid: number;
+  hasExcludedUserUuid: boolean;
+  excludedUserUuid: unknown;
+};
+
+const rejectedContinuationHistoryFragments = [
+  "The user doesn't want to proceed with this tool use",
+  "[Request interrupted by user",
+  "aborted by user after",
+  "<turn_aborted>",
+  '"toolDenialKind"',
+];
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireJsonRecord(value: unknown, label: string): JsonRecord {
+  if (!isJsonRecord(value)) throw new Error(`${label} must be a JSON object`);
+  return value;
+}
+
+function requireJsonString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0)
+    throw new Error(`${label} must be a non-empty string`);
+  return value;
+}
+
+function parseHistoryJsonl(rawHistory: string): JsonRecord[] {
+  return rawHistory
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line, index) =>
+      requireJsonRecord(JSON.parse(line) as unknown, `JSONL line ${index + 1}`),
+    );
+}
+
+function exactlyOne<T>(items: T[], label: string): T {
+  expect(items, label).toHaveLength(1);
+  return items[0]!;
+}
+
+function continuationReloadFromFrame(
+  frame: JsonRecord,
+): ContinuationReload | undefined {
+  if (
+    frame.type !== "task_reload" ||
+    frame.reason !== "continuation" ||
+    typeof frame.tid !== "number"
+  ) {
+    return undefined;
+  }
+  return {
+    tid: frame.tid,
+    hasExcludedUserUuid: Object.hasOwn(frame, "excluded_user_uuid"),
+    excludedUserUuid: frame.excluded_user_uuid,
+  };
+}
+
+function assertAcceptedContinuationText(text: string, prefix: string) {
+  expect(text.startsWith(prefix), `Expected ${prefix} success text`).toBe(true);
+  expect(text).toContain("' accepted.");
+}
+
+function assertClaudeContinuationResult(
+  rows: JsonRecord[],
+  tool: ContinuationTool,
+  successPrefix: string,
+) {
+  const toolUses: JsonRecord[] = [];
+  for (const row of rows) {
+    if (row.type !== "assistant" || !isJsonRecord(row.message)) continue;
+    const content = row.message.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (
+        isJsonRecord(block) &&
+        block.type === "tool_use" &&
+        block.name === `mcp__cydo__${tool}`
+      ) {
+        toolUses.push(block);
+      }
+    }
+  }
+
+  const toolUse = exactlyOne(toolUses, `Expected one Claude ${tool} tool_use`);
+  const toolUseId = requireJsonString(toolUse.id, `Claude ${tool} tool_use id`);
+  const toolResults: JsonRecord[] = [];
+  for (const row of rows) {
+    if (row.type !== "user" || !isJsonRecord(row.message)) continue;
+    const content = row.message.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (
+        isJsonRecord(block) &&
+        block.type === "tool_result" &&
+        block.tool_use_id === toolUseId
+      ) {
+        toolResults.push(block);
+      }
+    }
+  }
+
+  const toolResult = exactlyOne(
+    toolResults,
+    `Expected one Claude ${tool} tool_result for ${toolUseId}`,
+  );
+  assertAcceptedContinuationText(
+    requireJsonString(toolResult.content, `Claude ${tool} tool result content`),
+    successPrefix,
+  );
+}
+
+function assertCodexContinuationResult(
+  rows: JsonRecord[],
+  tool: ContinuationTool,
+  successPrefix: string,
+) {
+  const calls = rows.filter(
+    (row) =>
+      row.type === "response_item" &&
+      isJsonRecord(row.payload) &&
+      row.payload.type === "function_call" &&
+      row.payload.name === tool &&
+      row.payload.namespace === "mcp__cydo",
+  );
+  const call = exactlyOne(calls, `Expected one Codex ${tool} function_call`);
+  const payload = requireJsonRecord(call.payload, `Codex ${tool} call payload`);
+  const callId = requireJsonString(payload.call_id, `Codex ${tool} call id`);
+  const outputs = rows.filter(
+    (row) =>
+      row.type === "response_item" &&
+      isJsonRecord(row.payload) &&
+      row.payload.type === "function_call_output" &&
+      row.payload.call_id === callId,
+  );
+  const output = exactlyOne(
+    outputs,
+    `Expected one Codex ${tool} function_call_output for ${callId}`,
+  );
+  const outputPayload = requireJsonRecord(
+    output.payload,
+    `Codex ${tool} output payload`,
+  );
+  assertAcceptedContinuationText(
+    requireJsonString(outputPayload.output, `Codex ${tool} output`),
+    successPrefix,
+  );
+}
+
+function assertCopilotContinuationResult(
+  rows: JsonRecord[],
+  tool: ContinuationTool,
+  successPrefix: string,
+) {
+  const starts = rows.filter(
+    (row) =>
+      row.type === "tool.execution_start" &&
+      isJsonRecord(row.data) &&
+      row.data.toolName === `cydo-${tool}`,
+  );
+  const start = exactlyOne(
+    starts,
+    `Expected one Copilot cydo-${tool} tool.execution_start`,
+  );
+  const startData = requireJsonRecord(start.data, `Copilot ${tool} start data`);
+  const toolCallId = requireJsonString(
+    startData.toolCallId,
+    `Copilot ${tool} tool call id`,
+  );
+  const completions = rows.filter(
+    (row) =>
+      row.type === "tool.execution_complete" &&
+      isJsonRecord(row.data) &&
+      row.data.toolCallId === toolCallId,
+  );
+  const completion = exactlyOne(
+    completions,
+    `Expected one Copilot ${tool} tool.execution_complete for ${toolCallId}`,
+  );
+  const completionData = requireJsonRecord(
+    completion.data,
+    `Copilot ${tool} completion data`,
+  );
+  expect(completionData.success).toBe(true);
+  const result = requireJsonRecord(
+    completionData.result,
+    `Copilot ${tool} completion result`,
+  );
+  const content = requireJsonString(
+    result.content,
+    `Copilot ${tool} completion result content`,
+  );
+  assertAcceptedContinuationText(content, successPrefix);
+  expect(
+    requireJsonString(
+      result.detailedContent,
+      `Copilot ${tool} completion result detailed content`,
+    ),
+  ).toBe(content);
+}
+
+function assertRepairedContinuationHistory(
+  agentType: AgentType,
+  rawHistory: string,
+  tool: ContinuationTool,
+) {
+  const rows = parseHistoryJsonl(rawHistory);
+  const successPrefix = tool === "SwitchMode" ? "Mode switch to '" : "Handoff to '";
+
+  if (agentType === "claude") {
+    assertClaudeContinuationResult(rows, tool, successPrefix);
+  } else if (agentType === "codex") {
+    assertCodexContinuationResult(rows, tool, successPrefix);
+  } else {
+    assertCopilotContinuationResult(rows, tool, successPrefix);
+    return;
+  }
+
+  for (const fragment of rejectedContinuationHistoryFragments) {
+    expect(rawHistory, `Unexpected stale continuation history: ${fragment}`).not.toContain(
+      fragment,
+    );
+  }
+}
 
 test("keep_context continuation injects prompt template", async ({
   page,
@@ -28,6 +262,24 @@ test("keep_context continuation injects prompt template", async ({
   await expect(
     assistantText(page, "SwitchMode to plan successful."),
   ).toBeVisible({ timeout: 30_000 });
+
+  assertRepairedContinuationHistory(
+    agentType,
+    readHistoryFile(historyPathForTask(currentTaskTid(page))),
+    "SwitchMode",
+  );
+
+  if (agentType !== "copilot") {
+    const rejectionNeedle =
+      agentType === "claude"
+        ? "The user doesn't want to proceed"
+        : "aborted by user after";
+    const encodedNeedle = Buffer.from(rejectionNeedle).toString("base64");
+    await sendMessage(page, `check context contains ${encodedNeedle}`);
+    await expect(assistantText(page, "context-check-failed")).toBeVisible({
+      timeout: responseTimeout(agentType),
+    });
+  }
 });
 
 test("keep_context SwitchMode preface uses continuation key", async ({
@@ -112,6 +364,44 @@ test("handoff continuation exit navigates to grandparent, not completed parent",
   page,
   agentType,
 }) => {
+  const taskCreatedEvents: Array<{
+    tid: number;
+    parent_tid: number;
+    relation_type?: string;
+  }> = [];
+  const liveInterruptionMarkers: Array<{ tid: number; uuid: string }> = [];
+  const continuationReloads: ContinuationReload[] = [];
+  page.on("websocket", (ws) => {
+    ws.on("framereceived", (event) => {
+      try {
+        const frame = JSON.parse(event.payload.toString()) as unknown;
+        if (!isJsonRecord(frame)) return;
+        if (
+          frame.type === "task_created" &&
+          typeof frame.tid === "number" &&
+          typeof frame.parent_tid === "number"
+        ) {
+          taskCreatedEvents.push({
+            tid: frame.tid,
+            parent_tid: frame.parent_tid,
+            relation_type:
+              typeof frame.relation_type === "string"
+                ? frame.relation_type
+                : undefined,
+          });
+        }
+        const interruptionUuid = interruptedClaudeUserUuid(frame);
+        if (interruptionUuid && typeof frame.tid === "number") {
+          liveInterruptionMarkers.push({ tid: frame.tid, uuid: interruptionUuid });
+        }
+        const continuationReload = continuationReloadFromFrame(frame);
+        if (continuationReload) continuationReloads.push(continuationReload);
+      } catch {
+        /* ignore non-JSON frames */
+      }
+    });
+  });
+
   // Create root task G and enter its session.
   await enterSession(page);
 
@@ -133,6 +423,18 @@ test("handoff continuation exit navigates to grandparent, not completed parent",
   );
   expect(tidG).toBeGreaterThan(0);
 
+  // task_created is broadcast before A receives the initial prompt that calls
+  // Handoff, so retain A's tid before navigation can move to its successor.
+  const handingOffTasks = () =>
+    taskCreatedEvents.filter(
+      (event) =>
+        event.relation_type === "subtask" && event.parent_tid === tidG,
+    );
+  await expect(async () => {
+    expect(handingOffTasks()).toHaveLength(1);
+  }).toPass({ timeout: 30_000 });
+  const handingOffTid = handingOffTasks()[0]!.tid;
+
   // Flow: A calls Handoff → A completes → continuation C created → C auto-focused
   //        → C responds → C exits → frontend should navigate to G (first alive ancestor)
   //
@@ -141,6 +443,34 @@ test("handoff continuation exit navigates to grandparent, not completed parent",
   await expect(page).toHaveURL(new RegExp(`/task/${tidG}$`), {
     timeout: 30_000,
   });
+
+  assertRepairedContinuationHistory(
+    agentType,
+    readHistoryFile(historyPathForTask(handingOffTid)),
+    "Handoff",
+  );
+
+  const sourceReload = exactlyOne(
+    continuationReloads.filter((reload) => reload.tid === handingOffTid),
+    "Expected one source-task continuation task_reload",
+  );
+  if (agentType === "claude") {
+    const markerUuid = exactlyOne(
+      [
+        ...new Set(
+          liveInterruptionMarkers
+            .filter((marker) => marker.tid === handingOffTid)
+            .map((marker) => marker.uuid),
+        ),
+      ],
+      "Expected one live Claude Handoff interruption marker UUID",
+    );
+    expect(sourceReload.hasExcludedUserUuid).toBe(true);
+    expect(sourceReload.excludedUserUuid).toBe(markerUuid);
+  } else {
+    expect(sourceReload.hasExcludedUserUuid).toBe(false);
+    expect(sourceReload.excludedUserUuid).toBeUndefined();
+  }
 });
 
 test("handoff replay rebuilds known system message metadata", async ({
@@ -381,6 +711,23 @@ test("on_yield does not fire on non-zero exit", { tag: "@no-codex" }, async ({ p
 });
 
 test("input box stays empty after mode switch", async ({ page, agentType }) => {
+  const liveInterruptionUuids: string[] = [];
+  const continuationReloads: ContinuationReload[] = [];
+  page.on("websocket", (ws) => {
+    ws.on("framereceived", (event) => {
+      try {
+        const frame = JSON.parse(event.payload.toString()) as unknown;
+        if (!isJsonRecord(frame)) return;
+        const interruptionUuid = interruptedClaudeUserUuid(frame);
+        if (interruptionUuid) liveInterruptionUuids.push(interruptionUuid);
+        const continuationReload = continuationReloadFromFrame(frame);
+        if (continuationReload) continuationReloads.push(continuationReload);
+      } catch {
+        /* ignore non-JSON frames */
+      }
+    });
+  });
+
   await enterSession(page);
 
   await sendMessage(page, "call switchmode plan");
@@ -394,4 +741,57 @@ test("input box stays empty after mode switch", async ({ page, agentType }) => {
   const input = page.locator(".input-textarea:visible").first();
   await expect(input).toBeEnabled({ timeout: 10_000 });
   await expect(input).toHaveValue("");
+
+  const continuationReload = exactlyOne(
+    continuationReloads,
+    "Expected one continuation task_reload",
+  );
+  if (agentType === "claude") {
+    const markerUuid = exactlyOne(
+      [...new Set(liveInterruptionUuids)],
+      "Expected one live Claude interruption marker UUID",
+    );
+    expect(continuationReload.hasExcludedUserUuid).toBe(true);
+    expect(
+      continuationReload.excludedUserUuid,
+      "The persisted repair UUID must equal the UUID emitted for the live marker",
+    ).toBe(markerUuid);
+  } else {
+    expect(continuationReload.hasExcludedUserUuid).toBe(false);
+    expect(continuationReload.excludedUserUuid).toBeUndefined();
+  }
+
+  await page.reload();
+  await expect(
+    page.locator(".result-divider.system-user-message", {
+      hasText: "Mode switch: plan",
+    }),
+  ).toBeVisible({ timeout: 30_000 });
+  const reloadedInput = page.locator(".input-textarea:visible").first();
+  await expect(reloadedInput).toBeEnabled({ timeout: 10_000 });
+  await expect(reloadedInput).toHaveValue("");
 });
+
+function interruptedClaudeUserUuid(frame: JsonRecord): string | undefined {
+  const event = frame.event;
+  if (
+    !isJsonRecord(event) ||
+    event.type !== "item/started" ||
+    event.item_type !== "user_message" ||
+    typeof event.uuid !== "string" ||
+    event.uuid.length === 0 ||
+    !Array.isArray(event.content)
+  ) {
+    return undefined;
+  }
+
+  return event.content.some(
+    (block) =>
+      isJsonRecord(block) &&
+      block.type === "text" &&
+      (block.text === "[Request interrupted by user for tool use]" ||
+        block.text === "[Request interrupted by user]"),
+  )
+    ? event.uuid
+    : undefined;
+}

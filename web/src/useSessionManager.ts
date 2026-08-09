@@ -33,6 +33,7 @@ import {
 import { outbox } from "./outbox";
 import {
   beginTaskHistoryReplay,
+  excludeReloadDraftUuid,
   reconcileInputDraft,
   resetTaskForReload,
   snapshotUserDrafts,
@@ -1594,20 +1595,25 @@ export function useTaskManager(
           requestedHistoryRef.current.delete(t.uuid);
 
           const isEdit = msg.reason === "edit";
+          const excludedNativeUuid =
+            msg.reason === "continuation" ? msg.excluded_user_uuid : undefined;
           // opensCycle: first reload of a new reconciliation cycle
           const opensCycle = t.pendingHistoryReplies === 0;
 
-          let nextDrafts: string[] | undefined;
+          let nextDrafts: TaskState["preReloadDrafts"];
           if (opensCycle) {
             if (isEdit) {
               nextDrafts = undefined;
             } else {
-              nextDrafts = snapshotUserDrafts(t);
+              nextDrafts = snapshotUserDrafts(t, excludedNativeUuid);
             }
           } else {
             // Intermediate reload within an open cycle — preserve the snapshot
             // captured at cycle start so the final diff still has it.
-            nextDrafts = t.preReloadDrafts;
+            nextDrafts = excludeReloadDraftUuid(
+              t.preReloadDrafts,
+              excludedNativeUuid,
+            );
           }
 
           const reset = resetTaskForReload(t, nextDrafts);

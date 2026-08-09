@@ -9,6 +9,7 @@ import ae.sys.data : Data;
 import ae.utils.json : JSONFragment, toJson;
 
 import cydo.protocol : TaskEventEnvelope, TranslatedEvent;
+import cydo.agent.contract : InterruptedToolCallRepair;
 import cydo.domain.storage.persistence : LoadedHistory, Persistence, createForkTask, noSourceLine;
 import cydo.workflow.history.native_history : HistoryAccess;
 
@@ -164,6 +165,94 @@ bool editJsonlMessage(string jsonlPath, string targetId,
 
 	write(jsonlPath, output);
 	return true;
+}
+
+/// Apply a driver's interrupted-tool-call repair to an on-disk session file.
+///
+/// This is deliberately best-effort: Claude 2.1.220 and Codex 0.144.1 own
+/// these third-party session formats, and their real behavior is pinned by the
+/// continuation e2e tests. A vendor-format change must not make process exit
+/// fail, but no-match and exception logging keeps that degradation visible.
+/// Returns the removed native interruption UUID only after the file was
+/// successfully rewritten. Every no-match or I/O failure returns null.
+string repairInterruptedToolCallFile(string jsonlPath,
+	InterruptedToolCallRepair delegate(string[] lines, string toolName,
+		string resultText) repairFn,
+	string toolName, string resultText)
+{
+	import std.array : array, join;
+	import std.file : exists, readText, write;
+	import std.logger : infof, warningf;
+	import std.string : lineSplitter;
+
+	try
+	{
+		if (jsonlPath.length == 0 || !exists(jsonlPath))
+			return null;
+
+		auto repaired = repairFn(readText(jsonlPath).lineSplitter.array,
+			toolName, resultText);
+		if (repaired is null)
+		{
+			infof("Interrupted tool-call repair did not match %s", jsonlPath);
+			return null;
+		}
+
+		write(jsonlPath, repaired.lines.join("\n") ~ "\n");
+		return repaired.removedInterruptionUuid.length > 0
+			? repaired.removedInterruptionUuid
+			: null;
+	}
+	catch (Exception e)
+	{
+		warningf("Interrupted tool-call repair failed for %s: %s", jsonlPath,
+			e.msg);
+		return null;
+	}
+}
+
+unittest
+{
+	import core.sys.posix.sys.stat : chmod;
+	import std.file : mkdirRecurse, readText, rmdirRecurse, write;
+	import std.path : buildPath;
+	import std.string : toStringz;
+
+	auto dir = buildPath("/tmp", "cydo-persist-interrupted-tool-call-repair");
+	mkdirRecurse(dir);
+	scope(exit) rmdirRecurse(dir);
+
+	auto jsonlPath = buildPath(dir, "events.jsonl");
+	write(jsonlPath, "not json\n");
+	InterruptedToolCallRepair delegate(string[], string, string) noRepair =
+		(string[] lines, string toolName, string resultText) { return null; };
+	assert(repairInterruptedToolCallFile(jsonlPath, noRepair,
+		"mcp__cydo__SwitchMode", "RESULT") is null);
+	assert(repairInterruptedToolCallFile(buildPath(dir, "missing.jsonl"), noRepair,
+		"mcp__cydo__SwitchMode", "RESULT") is null);
+
+	InterruptedToolCallRepair delegate(string[], string, string) rewriteWithoutMarker =
+		(string[] lines, string toolName, string resultText) {
+			return new InterruptedToolCallRepair(["rewritten"]);
+		};
+	assert(repairInterruptedToolCallFile(jsonlPath, rewriteWithoutMarker,
+		"mcp__cydo__SwitchMode", "RESULT") is null);
+	assert(readText(jsonlPath) == "rewritten\n");
+
+	InterruptedToolCallRepair delegate(string[], string, string) rewriteMarker =
+		(string[] lines, string toolName, string resultText) {
+			return new InterruptedToolCallRepair(["repaired"], "u2");
+		};
+	assert(repairInterruptedToolCallFile(jsonlPath, rewriteMarker,
+		"mcp__cydo__SwitchMode", "RESULT") == "u2");
+	assert(readText(jsonlPath) == "repaired\n");
+
+	auto readOnlyPath = buildPath(dir, "read-only.jsonl");
+	write(readOnlyPath, "before\n");
+	assert(chmod(readOnlyPath.toStringz, 256) == 0); // 0400
+	scope(exit) chmod(readOnlyPath.toStringz, 384); // 0600
+	assert(repairInterruptedToolCallFile(readOnlyPath, rewriteMarker,
+		"mcp__cydo__SwitchMode", "RESULT") is null);
 }
 
 /// Replace the JSONL line at 1-based lineNum with zero, one, or many lines.

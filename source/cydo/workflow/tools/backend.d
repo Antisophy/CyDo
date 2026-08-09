@@ -80,7 +80,7 @@ struct WorkflowToolsHost
 	Promise!void delegate(int tid, const(ContentBlock)[] content,
 		const(ContentBlock)[] broadcastContent, string cydoMeta,
 		string nonce) sendTaskMessage;
-	void delegate(int tid, string reason) emitTaskReload;
+	void delegate(int tid, string reason, string excludedUserUuid) emitTaskReload;
 	void delegate(int tid, string subject,
 		string body) appendTaskDiagnostic;
 	void delegate(int tid, string subject,
@@ -203,7 +203,7 @@ unittest
 		setupWorktreeForEdge: (int childTid, int parentTid, WorktreeMode mode) {},
 		ensureProcessQueueAlive: (int tid) => tid == 2 ? reject!void(new Exception("simulated child session startup failure")) : resolve(),
 		sendTaskMessage: (int tid, const(ContentBlock)[] content, const(ContentBlock)[] broadcastContent, string cydoMeta, string nonce) { assert(tid == 3); return resolve(); },
-		emitTaskReload: (int tid, string reason) {},
+		emitTaskReload: (int tid, string reason, string excludedUserUuid) {},
 		appendTaskDiagnostic: (int tid, string subject, string body) {},
 		taskAlive: (int tid) => false, tasksShareWorkspace: (int aTid, int bTid) => true,
 		taskWorkspaceLabel: (int tid) => "local", addIdleCallback: (int tid, void delegate() cb) {},
@@ -601,15 +601,16 @@ public:
 				true);
 		}
 
-		td.pendingContinuation = new PendingContinuation(
-			PendingContinuation.Kind.switchMode, continuation);
-		infof("SwitchMode: tid=%d continuation=%s (type %s → %s)",
-			tid, continuation, td.taskType, contDef.task_type);
-
-		return McpResult(
+		auto result = McpResult(
 			"Mode switch to '" ~ contDef.task_type
 			~ "' accepted. Yield your turn IMMEDIATELY — do not call any more tools or generate output. "
 			~ "You will receive new instructions when your session resumes.");
+		td.pendingContinuation = new PendingContinuation(
+			PendingContinuation.Kind.switchMode, continuation, null, result.text);
+		infof("SwitchMode: tid=%d continuation=%s (type %s → %s)",
+			tid, continuation, td.taskType, contDef.task_type);
+
+		return result;
 	}
 
 	McpResult handleHandoff(string callerTid, string continuation, string prompt)
@@ -662,15 +663,16 @@ public:
 				true);
 		}
 
-		td.pendingContinuation = new PendingContinuation(
-			PendingContinuation.Kind.handoff, continuation, prompt);
-		infof("Handoff: tid=%d continuation=%s (type %s → %s)",
-			tid, continuation, td.taskType, contDef.task_type);
-
-		return McpResult(
+		auto result = McpResult(
 			"Handoff to '" ~ contDef.task_type
 			~ "' accepted. Yield your turn IMMEDIATELY — do not call any more tools or generate output. "
 			~ "A new task will be created with your prompt. Your session is ending.");
+		td.pendingContinuation = new PendingContinuation(
+			PendingContinuation.Kind.handoff, continuation, prompt, result.text);
+		infof("Handoff: tid=%d continuation=%s (type %s → %s)",
+			tid, continuation, td.taskType, contDef.task_type);
+
+		return result;
 	}
 
 	Promise!McpResult handleAskUserQuestion(string callerTid,
@@ -1200,6 +1202,7 @@ public:
 			.byName(td.taskType);
 		auto contKey = td.pendingContinuation.key;
 		auto hPrompt = td.pendingContinuation.handoffPrompt;
+		auto repairedInterruptionUuid = td.pendingContinuation.repairedInterruptionUuid;
 		td.pendingContinuation = null;
 
 		if (typeDef is null)
@@ -1225,7 +1228,8 @@ public:
 			return;
 		}
 
-		executeContinuation(tid, *contDefP, hPrompt, contKey);
+		executeContinuation(tid, *contDefP, hPrompt, contKey,
+			repairedInterruptionUuid);
 	}
 
 	void spawnOnYieldContinuation(int tid)
@@ -1424,7 +1428,7 @@ private:
 	}
 
 	void executeContinuation(int tid, ContinuationDef contDef,
-		string handoffPrompt, string edgeName)
+		string handoffPrompt, string edgeName, string excludedUserUuid = null)
 	{
 		auto td = requireTask(tid,
 			"Continuation execution requires a live task");
@@ -1458,7 +1462,7 @@ private:
 					[TaskStatus.pending, TaskStatus.alive, TaskStatus.waiting,
 						TaskStatus.completed, TaskStatus.failed], TaskStatus.active,
 					TaskNotificationChange.preserve);
-			host_.emitTaskReload(tid, "continuation");
+			host_.emitTaskReload(tid, "continuation", excludedUserUuid);
 
 			auto renderedContinuationPrompt = renderContinuationPrompt(contDef,
 				"Continue from where you left off.",
@@ -1535,7 +1539,7 @@ private:
 				[TaskStatus.pending, TaskStatus.active, TaskStatus.alive,
 					TaskStatus.waiting, TaskStatus.failed], TaskStatus.completed,
 				TaskNotificationChange.preserve);
-			host_.emitTaskReload(tid, "continuation");
+			host_.emitTaskReload(tid, "continuation", excludedUserUuid);
 
 			auto successorPrompt = handoffPrompt.length > 0
 				? handoffPrompt
@@ -1771,7 +1775,7 @@ unittest
 				"startup failure should prevent sending the subtask prompt");
 			return resolve();
 		},
-		emitTaskReload: (int tid, string reason) {},
+		emitTaskReload: (int tid, string reason, string excludedUserUuid) {},
 		appendTaskDiagnostic: (int tid, string subject, string body) {},
 		taskAlive: (int tid) => false,
 		tasksShareWorkspace: (int aTid, int bTid) => true,
@@ -1938,6 +1942,9 @@ unittest
 		string sendFailure;
 		string[] diagnosticSubjects;
 		string[] diagnosticBodies;
+		int reloadTid = -1;
+		string reloadReason;
+		string reloadExcludedUserUuid;
 		Promise!void reactivationGate;
 
 		this()
@@ -2027,7 +2034,11 @@ unittest
 						return reject!void(new Exception(sendFailure));
 					return resolve();
 				},
-				emitTaskReload: (int tid, string reason) {},
+				emitTaskReload: (int tid, string reason, string excludedUserUuid) {
+					reloadTid = tid;
+					reloadReason = reason;
+					reloadExcludedUserUuid = excludedUserUuid;
+				},
 				appendTaskDiagnostic: (int tid, string subject, string body) {
 					diagnosticSubjects ~= subject;
 					diagnosticBodies ~= body;
@@ -2138,6 +2149,35 @@ unittest
 		assert(fixture.persistAddDependencyCalls == 0);
 		assert(fixture.persistRemoveDependencyCalls == 0);
 		assert(registry.exists(handle));
+	}
+
+	// The on-exit repair must persist exactly the result transport intended to
+	// deliver before it interrupted the continuation tool call.
+	{
+		auto fixture = new BatchInvariantFixture;
+		auto backend = fixture.makeBackend();
+		auto switchResult = backend.handleSwitchMode("1", "keep");
+		assert(!switchResult.isError);
+		assert(fixture.tasks[1].pendingContinuation !is null);
+		assert(fixture.tasks[1].pendingContinuation.resultText == switchResult.text);
+
+		fixture = new BatchInvariantFixture;
+		backend = fixture.makeBackend();
+		auto handoffResult = backend.handleHandoff("1", "continue", "prompt");
+		assert(!handoffResult.isError);
+		assert(fixture.tasks[1].pendingContinuation !is null);
+		assert(fixture.tasks[1].pendingContinuation.resultText == handoffResult.text);
+
+		fixture = new BatchInvariantFixture;
+		backend = fixture.makeBackend();
+		auto pending = new PendingContinuation(
+			PendingContinuation.Kind.switchMode, "keep");
+		pending.repairedInterruptionUuid = "u2";
+		fixture.tasks[1].pendingContinuation = pending;
+		backend.spawnContinuation(1);
+		assert(fixture.reloadTid == 1
+			&& fixture.reloadReason == "continuation"
+			&& fixture.reloadExcludedUserUuid == "u2");
 	}
 
 	// Initial child prompt failure is observed through the real send Promise,

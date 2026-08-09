@@ -513,6 +513,12 @@ struct PendingContinuation
 	Kind kind;
 	string key;           // continuation key (was pendingContinuation)
 	string handoffPrompt; // only set for Kind.handoff
+	/// Tool result CyDo intended to return before transport dropped it; consumed
+	/// by the on-exit persisted-history repair.
+	string resultText;
+	/// Native UUID of the structurally linked Claude interruption record removed
+	/// by the persisted repair, set only after the JSONL rewrite succeeds.
+	string repairedInterruptionUuid;
 }
 
 struct AcceptedNativeEcho
@@ -1100,6 +1106,20 @@ struct TaskReloadMessage
 	string type = "task_reload";
 	int tid;
 	string reason;
+	@JSONOptional string excluded_user_uuid;
+}
+
+unittest
+{
+	import ae.utils.json : toJson;
+	import std.string : indexOf;
+
+	auto withoutUuid = toJson(TaskReloadMessage("task_reload", 7,
+		"continuation", null));
+	assert(withoutUuid.indexOf(`"excluded_user_uuid"`) < 0);
+	auto withUuid = toJson(TaskReloadMessage("task_reload", 7,
+		"continuation", "u2"));
+	assert(withUuid.indexOf(`"excluded_user_uuid":"u2"`) >= 0);
 }
 
 struct TitleUpdateMessage

@@ -251,6 +251,8 @@ export interface TaskReloadMessage {
   type: "task_reload";
   tid: number;
   reason?: string;
+  /** Native user UUID deleted by a successful continuation-history repair. */
+  excluded_user_uuid?: string | null;
 }
 export interface FocusHintMessage {
   type: "focus_hint";

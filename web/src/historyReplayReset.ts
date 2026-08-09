@@ -1,12 +1,33 @@
-import type { TaskState } from "./types";
+import type { PreReloadDraft, TaskState } from "./types";
 import { canonicalUserTextFromDisplayMessage } from "./userText";
 
-export function snapshotUserDrafts(task: TaskState): string[] | undefined {
+/** Remove only a draft tied to the exact native user UUID removed from JSONL. */
+export function excludeReloadDraftUuid(
+  drafts: PreReloadDraft[] | undefined,
+  excludedNativeUuid: string | null | undefined,
+): PreReloadDraft[] | undefined {
+  if (!drafts || !excludedNativeUuid) return drafts;
+  const remaining = drafts.filter(
+    (draft) => draft.nativeUuid !== excludedNativeUuid,
+  );
+  return remaining.length > 0 ? remaining : undefined;
+}
+
+export function snapshotUserDrafts(
+  task: TaskState,
+  excludedNativeUuid?: string | null,
+): PreReloadDraft[] | undefined {
   const drafts = task.messages
     .filter((message) => message.type === "user")
-    .map((message) => canonicalUserTextFromDisplayMessage(message))
-    .filter((text) => text.length > 0);
-  return drafts.length > 0 ? drafts : undefined;
+    .map((message) => {
+      const text = canonicalUserTextFromDisplayMessage(message);
+      return message.uuid ? { text, nativeUuid: message.uuid } : { text };
+    })
+    .filter((draft) => draft.text.length > 0);
+  return excludeReloadDraftUuid(
+    drafts.length > 0 ? drafts : undefined,
+    excludedNativeUuid,
+  );
 }
 
 export function reconcileInputDraft(task: TaskState): string | undefined {
@@ -22,10 +43,10 @@ export function reconcileInputDraft(task: TaskState): string | undefined {
     finalCounts.set(text, (finalCounts.get(text) ?? 0) + 1);
   }
   const remaining: string[] = [];
-  for (const text of task.preReloadDrafts) {
-    const count = finalCounts.get(text) ?? 0;
-    if (count > 0) finalCounts.set(text, count - 1);
-    else remaining.push(text);
+  for (const draft of task.preReloadDrafts) {
+    const count = finalCounts.get(draft.text) ?? 0;
+    if (count > 0) finalCounts.set(draft.text, count - 1);
+    else remaining.push(draft.text);
   }
   return remaining.length > 0 ? remaining.join("\n\n") : undefined;
 }
@@ -116,7 +137,7 @@ export function resetTaskForHistoryReplay(
 
 export function resetTaskForReload(
   task: TaskState,
-  preReloadDrafts: string[] | undefined,
+  preReloadDrafts: PreReloadDraft[] | undefined,
 ): TaskState {
   return {
     ...resetTaskTimeline(task, {

@@ -2,13 +2,14 @@ module cydo.agent.drivers.codex.rollout;
 
 import std.conv : to;
 import std.algorithm : canFind;
+import std.json : JSONType, JSONValue, parseJSON;
 import std.logger : tracef;
 import std.typecons : Nullable;
 
 import ae.utils.json : JSONFragment, JSONOptional, JSONPartial, jsonParse, toJson;
 
 import cydo.agent.contract : PersistedHistoryBoundary, PersistedHistoryBoundaryKind;
-import cydo.protocol : ContentBlock, makeUnrecognizedEvent;
+import cydo.protocol : ContentBlock, decomposeToolName, makeUnrecognizedEvent;
 
 package enum ForkableMessageRole
 {
@@ -166,6 +167,210 @@ package PersistedHistoryBoundary[] extractPersistedHistoryBoundariesImpl(string 
 			probe.isUserMessage ? PersistedHistoryBoundaryKind.user : PersistedHistoryBoundaryKind.agent_turn, null);
 	}
 	return ids;
+}
+
+private bool interruptedToolCallHasKey(ref JSONValue value, string key)
+{
+	return value.type == JSONType.object && key in value.object;
+}
+
+private string interruptedToolCallStringAt(ref JSONValue value, string key)
+{
+	if (!interruptedToolCallHasKey(value, key))
+		return null;
+	auto field = value.object[key];
+	return field.type == JSONType.string ? field.str : null;
+}
+
+private string interruptedToolCallTurnId(ref JSONValue payload)
+{
+	if (!interruptedToolCallHasKey(payload,
+		"internal_chat_message_metadata_passthrough"))
+		return null;
+	auto metadata = payload.object["internal_chat_message_metadata_passthrough"];
+	return interruptedToolCallStringAt(metadata, "turn_id");
+}
+
+/// Repair a Codex rollout after CyDo interrupts a successful continuation MCP
+/// call. Returns null when the expected function-call/output pair is absent.
+package string[] repairInterruptedToolCallImpl(string[] lines, string toolName,
+	string resultText)
+{
+	string splitName;
+	string toolServer;
+	string toolSource;
+	decomposeToolName(toolName, splitName, toolServer, toolSource);
+	auto splitNamespace = toolSource ~ "__" ~ toolServer;
+
+	string callId;
+	string turnId;
+	foreach (line; lines)
+	{
+		JSONValue record;
+		try
+			record = parseJSON(line);
+		catch (Exception)
+			continue;
+		if (interruptedToolCallStringAt(record, "type") != "response_item"
+			|| !interruptedToolCallHasKey(record, "payload"))
+			continue;
+
+		auto payload = record.object["payload"];
+		if (interruptedToolCallStringAt(payload, "type") != "function_call")
+			continue;
+		auto name = interruptedToolCallStringAt(payload, "name");
+		if (name == toolName
+			|| (name == splitName
+				&& interruptedToolCallStringAt(payload, "namespace") == splitNamespace))
+		{
+			callId = interruptedToolCallStringAt(payload, "call_id");
+			turnId = interruptedToolCallTurnId(payload);
+		}
+	}
+	if (callId.length == 0)
+		return null;
+
+	bool rewroteOutput;
+	size_t outputIndex = size_t.max;
+	string[] repaired;
+	foreach (lineIndex, line; lines)
+	{
+		JSONValue record;
+		try
+			record = parseJSON(line);
+		catch (Exception)
+		{
+			repaired ~= line;
+			continue;
+		}
+		if (!interruptedToolCallHasKey(record, "payload"))
+		{
+			repaired ~= line;
+			continue;
+		}
+
+		auto type = interruptedToolCallStringAt(record, "type");
+		auto payload = record.object["payload"];
+		if (!rewroteOutput && type == "response_item"
+			&& interruptedToolCallStringAt(payload, "type") == "function_call_output"
+			&& interruptedToolCallStringAt(payload, "call_id") == callId)
+		{
+			payload.object["output"] = JSONValue(resultText);
+			record.object["payload"] = payload;
+			repaired ~= record.toString();
+			rewroteOutput = true;
+			outputIndex = lineIndex;
+			continue;
+		}
+
+		if (turnId.length > 0 && lineIndex > outputIndex
+			&& type == "response_item"
+			&& interruptedToolCallStringAt(payload, "type") == "message"
+			&& (interruptedToolCallStringAt(payload, "role") == "developer"
+				|| interruptedToolCallStringAt(payload, "role") == "user")
+			&& interruptedToolCallTurnId(payload) == turnId
+			&& interruptedToolCallHasKey(payload, "content")
+			&& payload.object["content"].type == JSONType.array
+			&& payload.object["content"].array.length == 1)
+		{
+			auto firstBlock = payload.object["content"].array[0];
+			if (interruptedToolCallStringAt(firstBlock, "type") == "input_text"
+				&& isCodexTurnAbortedUserText(
+					interruptedToolCallStringAt(firstBlock, "text")))
+				continue;
+		}
+
+		if (turnId.length > 0 && lineIndex > outputIndex && type == "event_msg"
+			&& interruptedToolCallStringAt(payload, "type") == "turn_aborted"
+			&& interruptedToolCallStringAt(payload, "turn_id") == turnId
+			&& interruptedToolCallStringAt(payload, "reason") == "interrupted")
+			continue;
+
+		repaired ~= line;
+	}
+	return rewroteOutput ? repaired : null;
+}
+
+unittest
+{
+	auto call = `{"type":"response_item","payload":{"type":"function_call","name":"SwitchMode","namespace":"mcp__cydo","arguments":"{\"continuation\":\"plan\"}","call_id":"call_switch","internal_chat_message_metadata_passthrough":{"turn_id":"turn_switch"}}}`;
+	auto output = `{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_switch","output":"aborted by user after 0.1s","internal_chat_message_metadata_passthrough":{"turn_id":"turn_switch"}}}`;
+	auto tokenCount = `{"type":"event_msg","payload":{"type":"token_count","info":{}}}`;
+	auto developerMarker = `{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<turn_aborted>\nThe previous turn was interrupted on purpose.\n</turn_aborted>"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn_switch"}}}`;
+	auto abortedEvent = `{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn_switch","reason":"interrupted"}}`;
+
+	auto repaired = repairInterruptedToolCallImpl(
+		[call, output, tokenCount, developerMarker, abortedEvent],
+		"mcp__cydo__SwitchMode", "RESULT");
+	assert(repaired !is null && repaired.length == 3);
+	assert(parseJSON(repaired[1])["payload"]["output"].str == "RESULT");
+	assert(repaired[2] == tokenCount);
+
+	auto flattened = repairInterruptedToolCallImpl([
+		`{"type":"response_item","payload":{"type":"function_call","name":"mcp__cydo__SwitchMode","call_id":"flat-call","internal_chat_message_metadata_passthrough":{"turn_id":"flat-turn"}}}`,
+		`{"type":"response_item","payload":{"type":"function_call_output","call_id":"flat-call","output":"aborted by user after 0.2s"}}`,
+	], "mcp__cydo__SwitchMode", "FLAT RESULT");
+	assert(flattened !is null
+		&& parseJSON(flattened[1])["payload"]["output"].str == "FLAT RESULT");
+
+	auto handoffCall = `{"type":"response_item","payload":{"type":"function_call","name":"Handoff","namespace":"mcp__cydo","call_id":"handoff-call","internal_chat_message_metadata_passthrough":{"turn_id":"handoff-turn"}}}`;
+	auto handoffOutput = `{"type":"response_item","payload":{"type":"function_call_output","call_id":"handoff-call","output":"aborted by user after 0.1s"}}`;
+	auto handoffMarker = `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"}],"internal_chat_message_metadata_passthrough":{"turn_id":"handoff-turn"}}}`;
+	auto handoffEvent = `{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"handoff-turn","reason":"interrupted"}}`;
+	auto handoff = repairInterruptedToolCallImpl(
+		[handoffCall, handoffOutput, handoffMarker, handoffEvent],
+		"mcp__cydo__Handoff", "HANDOFF RESULT");
+	assert(handoff !is null && handoff.length == 2
+		&& parseJSON(handoff[1])["payload"]["output"].str == "HANDOFF RESULT");
+
+	void assertContains(string[] records, string expected)
+	{
+		foreach (record; records)
+			if (record == expected)
+				return;
+		assert(false, "Expected retained record: " ~ expected);
+	}
+
+	auto preOutputMarker = `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\ninterrupted\n</turn_aborted>"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn_switch"}}}`;
+	auto openingOnly = `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\ninterrupted"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn_switch"}}}`;
+	auto trailingText = `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\ninterrupted\n</turn_aborted>\nordinary"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn_switch"}}}`;
+	auto wrongContentType = `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"text","text":"<turn_aborted>\ninterrupted\n</turn_aborted>"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn_switch"}}}`;
+	auto multipleContent = `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\ninterrupted\n</turn_aborted>"},{"type":"input_text","text":"extra"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn_switch"}}}`;
+	auto unacceptedRole = `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"<turn_aborted>\ninterrupted\n</turn_aborted>"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn_switch"}}}`;
+	auto differentTurn = `{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<turn_aborted>\ninterrupted\n</turn_aborted>"}],"internal_chat_message_metadata_passthrough":{"turn_id":"other-turn"}}}`;
+	auto lookalikes = [openingOnly, trailingText, wrongContentType, multipleContent,
+		unacceptedRole, differentTurn];
+	auto retained = repairInterruptedToolCallImpl(
+		[call, preOutputMarker, output] ~ lookalikes,
+		"mcp__cydo__SwitchMode", "RESULT");
+	assert(retained !is null && retained.length == 3 + lookalikes.length);
+	assert(retained[1] == preOutputMarker);
+	foreach (lookalike; lookalikes)
+		assertContains(retained, lookalike);
+
+	auto noMarkerEvent = repairInterruptedToolCallImpl([call, output, abortedEvent],
+		"mcp__cydo__SwitchMode", "RESULT");
+	assert(noMarkerEvent !is null && noMarkerEvent.length == 2);
+	auto preOutputEvent = `{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn_switch","reason":"interrupted"}}`;
+	auto otherTurnEvent = `{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"other-turn","reason":"interrupted"}}`;
+	auto otherReasonEvent = `{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn_switch","reason":"shutdown"}}`;
+	auto retainedEvents = repairInterruptedToolCallImpl(
+		[call, preOutputEvent, output, otherTurnEvent, otherReasonEvent],
+		"mcp__cydo__SwitchMode", "RESULT");
+	assert(retainedEvents !is null && retainedEvents.length == 5);
+	assertContains(retainedEvents, preOutputEvent);
+	assertContains(retainedEvents, otherTurnEvent);
+	assertContains(retainedEvents, otherReasonEvent);
+
+	auto malformed = repairInterruptedToolCallImpl([call, "not json", output],
+		"mcp__cydo__SwitchMode", "RESULT");
+	assert(malformed !is null && malformed.length == 3 && malformed[1] == "not json");
+	assert(repairInterruptedToolCallImpl([call, output],
+		"mcp__cydo__Handoff", "RESULT") is null);
+	assert(repairInterruptedToolCallImpl([`{"type":"event_msg","payload":{"type":"token_count"}}`],
+		"mcp__cydo__SwitchMode", "RESULT") is null);
+	assert(repairInterruptedToolCallImpl([call],
+		"mcp__cydo__SwitchMode", "RESULT") is null);
 }
 
 package bool isCodexContextOnlyUserText(string text)

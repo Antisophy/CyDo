@@ -30,13 +30,14 @@ import cydo.workflow.history.native_history : ConfiguredNativeHistoryContext,
 	ResolvedNativeHistoryContext, TaskHistoryResolution, TaskHistoryResolutionKind, UnavailableHistory,
 	UnavailableHistoryKind, resolveNativeHistoryContext;
 import cydo.agent.drivers.codex : CodexAgent, CodexForkSourceOwner, CodexSession;
-import cydo.domain.tasks.model : ProcessState, TaskData, TaskStatus,
+import cydo.domain.tasks.model : PendingContinuation, ProcessState, TaskData, TaskStatus,
 	WaitingTaskDependencyState;
 import cydo.domain.tasks.lifecycle : TaskNotificationChange;
 import cydo.domain.task_types.catalog : TaskTypeCatalog;
 import cydo.domain.task_types.definition : TaskTypeDef,
 	formatCompactCreatableTaskTypeToolSummary, formatCompactHandoffToolSummary,
 	isInteractive, formatCompactSwitchModeToolSummary, loadTaskTypeSystemPrompt, byName;
+import cydo.workflow.history.jsonl_store : repairInterruptedToolCallFile;
 
 version (unittest) import std.exception : assertThrown;
 version (unittest) import std.process : execute;
@@ -1024,6 +1025,7 @@ public:
 			auto historyResolution = host_.ensureHistoryLoadedForExit(tid);
 			host_.finalReconcileJsonlIfPresent(tid, historyResolution);
 			host_.stopJsonlWatch(tid);
+			repairInterruptedContinuationOnExit(tid, current, cleanExit);
 			liveHistoryBindings_.remove(tid);
 			sessions_.remove(tid);
 			current = host_.getTask(tid);
@@ -1390,6 +1392,37 @@ private:
 	bool taskHasOnYield(const TaskData* td)
 	{
 		return currentOnYieldDef(td) !is null;
+	}
+
+	private void repairInterruptedContinuationOnExit(int tid, TaskData* current,
+		bool cleanExit)
+	{
+		auto pc = current.pendingContinuation;
+		if (!cleanExit || pc is null || pc.resultText.length == 0)
+			return;
+
+		// Must run while the live binding still exists (before it is removed
+		// below): the repair needs the exact agent/profile/cwd this session
+		// was launched with, not a freshly re-resolved one.
+		auto binding = tid in liveHistoryBindings_;
+		if (binding is null || (*binding).sessionId.length == 0)
+			return;
+
+		string toolName;
+		final switch (pc.kind)
+		{
+		case PendingContinuation.Kind.switchMode:
+			toolName = "mcp__cydo__SwitchMode";
+			break;
+		case PendingContinuation.Kind.handoff:
+			toolName = "mcp__cydo__Handoff";
+			break;
+		}
+
+		pc.repairedInterruptionUuid = repairInterruptedToolCallFile(
+			(*binding).agent.historyPath((*binding).sessionId,
+				(*binding).effectiveCwd, (*binding).profile),
+			&(*binding).agent.repairInterruptedToolCall, toolName, pc.resultText);
 	}
 
 	void cleanupTaskLaunch(TaskData* td)

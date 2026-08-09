@@ -1,12 +1,16 @@
 import { test as isolatedTest } from "@playwright/test";
 import type { Locator } from "@playwright/test";
 import type { ChildProcess } from "child_process";
-import { execFileSync, spawn } from "child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
-import { join } from "path";
+import { spawn } from "child_process";
+import {
+  mkdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "fs";
 import { writeTestConfig } from "./test-config";
 
-import type { Page } from "./fixtures";
+import type { AgentType, Page } from "./fixtures";
 import {
   test,
   expect,
@@ -16,77 +20,12 @@ import {
   responseTimeout,
   assistantText,
   lastAssistantText,
+  currentTaskTid,
+  historyPathForTask,
+  readHistoryFile,
 } from "./fixtures";
 
-type AgentType = "claude" | "codex" | "copilot";
-
 const BACKEND_URL = "http://localhost:3940";
-
-function currentTaskTid(page: Page): number {
-  const match = page.url().match(/\/task\/(\d+)(?:$|[/?#])/);
-  if (!match) throw new Error(`Could not extract tid from URL: ${page.url()}`);
-  return Number(match[1]);
-}
-
-function lookupTaskSession(
-  tid: number,
-): { sessionId: string; projectPath: string; agentType: AgentType } {
-  const row = execFileSync(
-    "sqlite3",
-    [
-      "/tmp/cydo-backend/data/cydo/cydo.db",
-      `SELECT agent_session_id || '|' || project_path || '|' || agent_type FROM tasks WHERE tid = ${tid};`,
-    ],
-    { encoding: "utf8" },
-  ).trim();
-  if (row.length === 0) throw new Error(`No task row found for tid ${tid}`);
-  const [sessionId, projectPath, agentType] = row.split("|");
-  if (!sessionId || !projectPath || !agentType)
-    throw new Error(`Incomplete task row for tid ${tid}: ${row}`);
-  if (agentType !== "claude" && agentType !== "codex" && agentType !== "copilot")
-    throw new Error(`Unexpected agent type ${agentType}`);
-  return { sessionId, projectPath, agentType };
-}
-
-function findFileRecursive(root: string, predicate: (path: string) => boolean): string | null {
-  for (const entry of readdirSync(root)) {
-    const fullPath = join(root, entry);
-    const stat = statSync(fullPath);
-    if (stat.isDirectory()) {
-      const nested = findFileRecursive(fullPath, predicate);
-      if (nested) return nested;
-      continue;
-    }
-    if (predicate(fullPath)) return fullPath;
-  }
-  return null;
-}
-
-function historyPathForTask(tid: number): string {
-  const { sessionId, projectPath, agentType } = lookupTaskSession(tid);
-  switch (agentType) {
-    case "claude":
-      return `/tmp/claude-test-home/projects/${projectPath.replace(/\//g, "-")}/${sessionId}.jsonl`;
-    case "codex": {
-      const path = findFileRecursive(
-        "/tmp/codex-test-home/sessions",
-        (candidate) =>
-          candidate.endsWith(".jsonl") &&
-          candidate.endsWith(`${sessionId}.jsonl`),
-      );
-      if (!path) throw new Error(`Could not find Codex history file for ${sessionId}`);
-      return path;
-    }
-    case "copilot":
-      return `/tmp/copilot-test-home/session-state/${sessionId}/events.jsonl`;
-  }
-}
-
-function readHistoryFile(historyPath: string): string {
-  if (!existsSync(historyPath))
-    throw new Error(`History file does not exist: ${historyPath}`);
-  return readFileSync(historyPath, "utf8");
-}
 
 function compactRawJson(rawJson: string): string {
   return JSON.stringify(JSON.parse(rawJson) as unknown);
