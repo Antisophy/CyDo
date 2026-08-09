@@ -564,7 +564,7 @@ class CodexAgent : Agent
 			server.sendRequest("thread/rollback", toJson(params))
 				.then((JsonRpcResponse resp) {
 					try
-						resp.getResult!SO(); // throws on RPC error
+						ThreadRollbackResult.fromJSON(resp.getResult!SO());
 					catch (Exception e)
 					{
 						outcome.fulfill(ThreadRollbackOutcome(false, e.msg));
@@ -2044,6 +2044,7 @@ class CodexSession : AgentSession
 	private string activeTurnId_;
 	private string model;
 	private string workDir;
+	private string rolloutPath_;
 	private bool alive_;
 	private bool turnInProgress;
 	private bool hadItemsSinceLastStop_;
@@ -2198,12 +2199,23 @@ class CodexSession : AgentSession
 		);
 	}
 
+	package @property string rolloutPath() const
+	{
+		return rolloutPath_;
+	}
+
+	protected Promise!JsonRpcResponse sendCodexRequest(string method, string params)
+	{
+		return server.sendRequest(method, params);
+	}
+
 	/// Called when thread/start or thread/resume response arrives.
 	package void onThreadStarted(ThreadStartResult result, string resumeId,
 		string model, string workDir, string rawResultJson)
 	{
 		this.model = model;
 		this.workDir = workDir;
+		rolloutPath_ = result.thread.path;
 
 		if (result.thread.id.length > 0)
 			threadId = result.thread.id;
@@ -2378,9 +2390,15 @@ class CodexSession : AgentSession
 		expectedEchoMessages_ ~= submission;
 		try
 		{
-			server.sendRequest("turn/steer",
-				toJson(TurnSteerParams(threadId,
-					[TurnStartInput("text", submission.text)], activeTurnId_)))
+			TurnSteerParams steerParams;
+			steerParams.threadId = threadId;
+			// Bootstrap input is deliberately anonymous: it has no user message
+			// in the UI, so Codex must not correlate an echo back to one.
+			if (!submission.isContextBootstrap)
+				steerParams.clientUserMessageId = submission.correlationId;
+			steerParams.input = [TurnStartInput("text", submission.text)];
+			steerParams.expectedTurnId = activeTurnId_;
+			sendCodexRequest("turn/steer", toJson(steerParams))
 				.then((JsonRpcResponse response) {
 					if (submission.settled)
 						return;
@@ -2422,10 +2440,13 @@ class CodexSession : AgentSession
 		expectedEchoMessages_ ~= submission;
 		try
 		{
-			server.sendRequest("turn/start",
-				toJson(TurnStartParams(threadId,
-					[TurnStartInput("text", submission.text)],
-					SandboxPolicy("externalSandbox", "enabled"))))
+			TurnStartParams startParams;
+			startParams.threadId = threadId;
+			if (!submission.isContextBootstrap)
+				startParams.clientUserMessageId = submission.correlationId;
+			startParams.input = [TurnStartInput("text", submission.text)];
+			startParams.sandboxPolicy = SandboxPolicy("externalSandbox", "enabled");
+			sendCodexRequest("turn/start", toJson(startParams))
 				.then((JsonRpcResponse response) {
 					if (submission.settled)
 						return;
@@ -3655,6 +3676,29 @@ unittest
 
 unittest
 {
+	class RecordingCodexSession : CodexSession
+	{
+		string[] methods;
+		string[] sentParams;
+
+		this()
+		{
+			super(new AppServerProcess([]), 1, SessionConfig.init);
+		}
+
+		override protected Promise!JsonRpcResponse sendCodexRequest(string method,
+			string params)
+		{
+			methods ~= method;
+			sentParams ~= params;
+			JsonRpcResponse response;
+			response.result = jsonParse!SO(method == "turn/start"
+				? "{\"turn\":{\"id\":\"started-turn\"}}"
+				: "{}");
+			return resolve(response);
+		}
+	}
+
 	ThreadForkParams tfp;
 	tfp.threadId = "thread-parent";
 	tfp.path = "/tmp/fork-source.jsonl";
@@ -3670,15 +3714,146 @@ unittest
 		"thread/fork payload must preserve the source thread id/path; actual=" ~ forkJson,
 	);
 
-	auto steerJson = toJson(TurnSteerParams(
-		"thread-steer",
-		[TurnStartInput("text", "stage and nix flake check")],
-		"turn-steer",
-	));
+	// A direct turn/start carries the browser correlation UUID to Codex.
+	TurnStartParams startParams;
+	startParams.threadId = "thread-start";
+	startParams.clientUserMessageId = "caller-uuid-start";
+	startParams.input = [TurnStartInput("text", "stage and nix flake check")];
+	startParams.sandboxPolicy = SandboxPolicy("externalSandbox", "enabled");
+	auto startJson = toJson(startParams);
 	assert(
-		steerJson == `{"threadId":"thread-steer","input":[{"type":"text","text":"stage and nix flake check"}],"expectedTurnId":"turn-steer"}`,
-		"turn/steer payload must use input + expectedTurnId for Codex v2; actual=" ~ steerJson,
+		startJson == `{"threadId":"thread-start","clientUserMessageId":"caller-uuid-start","input":[{"type":"text","text":"stage and nix flake check"}],"sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"}}`,
+		"turn/start payload must preserve the caller UUID; actual=" ~ startJson,
 	);
+
+	// An active turn/steer carries its own browser correlation UUID as well.
+	TurnSteerParams steerParams;
+	steerParams.threadId = "thread-steer";
+	steerParams.clientUserMessageId = "caller-uuid-steer";
+	steerParams.input = [TurnStartInput("text", "stage and nix flake check")];
+	steerParams.expectedTurnId = "turn-steer";
+	auto steerJson = toJson(steerParams);
+	assert(
+		steerJson == `{"threadId":"thread-steer","clientUserMessageId":"caller-uuid-steer","input":[{"type":"text","text":"stage and nix flake check"}],"expectedTurnId":"turn-steer"}`,
+		"turn/steer payload must preserve the caller UUID; actual=" ~ steerJson,
+	);
+
+	// A message queued before thread/start retains its own UUID until the
+	// thread is ready and drainPendingMessages resubmits it.
+	auto queuedStart = new CodexSession(cast(AppServerProcess) null, 1, SessionConfig.init);
+	queuedStart.sendMessage([ContentBlock("text", "queued start")], "uuid-queued-start").ignoreResult();
+	assert(queuedStart.pendingMessages_.length == 1
+		&& queuedStart.pendingMessages_[0].correlationId == "uuid-queued-start"
+		&& !queuedStart.pendingMessages_[0].isContextBootstrap);
+
+	// The same association is retained while waiting for an active turn's
+	// native ID, before the message is resubmitted as turn/steer.
+	auto queuedSteer = new CodexSession(cast(AppServerProcess) null, 1, SessionConfig.init);
+	queuedSteer.threadId = "thread-queued-steer";
+	queuedSteer.turnInProgress = true;
+	queuedSteer.sendMessage([ContentBlock("text", "queued steer")], "uuid-queued-steer").ignoreResult();
+	assert(queuedSteer.pendingMessages_.length == 1
+		&& queuedSteer.pendingMessages_[0].correlationId == "uuid-queued-steer"
+		&& !queuedSteer.pendingMessages_[0].isContextBootstrap);
+
+	// Context bootstrap deliberately has no native user-message ID for either
+	// turn/start or turn/steer.
+	TurnStartParams bootstrapStart;
+	bootstrapStart.threadId = "thread-bootstrap";
+	bootstrapStart.input = [TurnStartInput("text", "bootstrap context")];
+	bootstrapStart.sandboxPolicy = SandboxPolicy("externalSandbox", "enabled");
+	assert(toJson(bootstrapStart)
+		== `{"threadId":"thread-bootstrap","input":[{"type":"text","text":"bootstrap context"}],"sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"}}`);
+	TurnSteerParams bootstrapSteer;
+	bootstrapSteer.threadId = "thread-bootstrap";
+	bootstrapSteer.input = [TurnStartInput("text", "bootstrap context")];
+	bootstrapSteer.expectedTurnId = "turn-bootstrap";
+	assert(toJson(bootstrapSteer)
+		== `{"threadId":"thread-bootstrap","input":[{"type":"text","text":"bootstrap context"}],"expectedTurnId":"turn-bootstrap"}`);
+
+	// The real immediate start and active steer branches preserve the browser
+	// UUID in the request handed to Codex.
+	auto direct = new RecordingCodexSession;
+	direct.threadId = "thread-direct";
+	direct.sendMessage([ContentBlock("text", "direct message")], "uuid-direct").ignoreResult();
+	assert(direct.methods == ["turn/start"]);
+	assert(direct.sentParams[0]
+		== "{\"threadId\":\"thread-direct\",\"clientUserMessageId\":\"uuid-direct\",\"input\":[{\"type\":\"text\",\"text\":\"direct message\"}],\"sandboxPolicy\":{\"type\":\"externalSandbox\",\"networkAccess\":\"enabled\"}}");
+
+	auto active = new RecordingCodexSession;
+	active.threadId = "thread-active";
+	active.turnInProgress = true;
+	active.activeTurnId_ = "turn-active";
+	active.sendMessage([ContentBlock("text", "steered message")], "uuid-steered").ignoreResult();
+	assert(active.methods == ["turn/steer"]);
+	assert(active.sentParams[0]
+		== "{\"threadId\":\"thread-active\",\"clientUserMessageId\":\"uuid-steered\",\"input\":[{\"type\":\"text\",\"text\":\"steered message\"}],\"expectedTurnId\":\"turn-active\"}");
+
+	// A pre-thread queued message drains to turn/start with its stored UUID.
+	auto queuedStartDrain = new RecordingCodexSession;
+	queuedStartDrain.sendMessage([ContentBlock("text", "queued start")],
+		"uuid-queued-start-drain").ignoreResult();
+	assert(queuedStartDrain.methods.length == 0);
+	ThreadStartResult queuedStartResult;
+	queuedStartResult.thread.id = "thread-queued-start";
+	queuedStartResult.thread.path = "/exact/queued-start-rollout.jsonl";
+	queuedStartDrain.onThreadStarted(queuedStartResult, null, "model", "/workspace", "");
+	assert(queuedStartDrain.methods == ["turn/start"]);
+	assert(queuedStartDrain.sentParams[0]
+		== "{\"threadId\":\"thread-queued-start\",\"clientUserMessageId\":\"uuid-queued-start-drain\",\"input\":[{\"type\":\"text\",\"text\":\"queued start\"}],\"sandboxPolicy\":{\"type\":\"externalSandbox\",\"networkAccess\":\"enabled\"}}");
+
+	// A message queued before Codex knows the active turn drains to turn/steer
+	// with the same stored UUID.
+	auto queuedSteerDrain = new RecordingCodexSession;
+	queuedSteerDrain.threadId = "thread-queued-steer";
+	queuedSteerDrain.turnInProgress = true;
+	queuedSteerDrain.sendMessage([ContentBlock("text", "queued steer")],
+		"uuid-queued-steer-drain").ignoreResult();
+	assert(queuedSteerDrain.methods.length == 0);
+	queuedSteerDrain.handleTurnStarted(TurnRef("turn-queued-steer"));
+	assert(queuedSteerDrain.methods == ["turn/steer"]);
+	assert(queuedSteerDrain.sentParams[0]
+		== "{\"threadId\":\"thread-queued-steer\",\"clientUserMessageId\":\"uuid-queued-steer-drain\",\"input\":[{\"type\":\"text\",\"text\":\"queued steer\"}],\"expectedTurnId\":\"turn-queued-steer\"}");
+
+	// Bootstrap/context traffic alone omits a native client ID while retaining
+	// the existing UI reconciliation correlation.
+	auto bootstrapStartDrain = new RecordingCodexSession;
+	bootstrapStartDrain.threadId = "thread-bootstrap-start";
+	bootstrapStartDrain.sendMessage([ContentBlock("text", "bootstrap context")],
+		"bootstrap-ui-start", true).ignoreResult();
+	assert(bootstrapStartDrain.methods == ["turn/start"]);
+	assert(bootstrapStartDrain.sentParams[0]
+		== "{\"threadId\":\"thread-bootstrap-start\",\"input\":[{\"type\":\"text\",\"text\":\"bootstrap context\"}],\"sandboxPolicy\":{\"type\":\"externalSandbox\",\"networkAccess\":\"enabled\"}}");
+	assert(bootstrapStartDrain.expectedEchoMessages_.length == 1
+		&& bootstrapStartDrain.expectedEchoMessages_[0].correlationId == "bootstrap-ui-start");
+
+	auto bootstrapSteerDrain = new RecordingCodexSession;
+	bootstrapSteerDrain.threadId = "thread-bootstrap-steer";
+	bootstrapSteerDrain.turnInProgress = true;
+	bootstrapSteerDrain.activeTurnId_ = "turn-bootstrap-steer";
+	bootstrapSteerDrain.sendMessage([ContentBlock("text", "bootstrap context")],
+		"bootstrap-ui-steer", true).ignoreResult();
+	assert(bootstrapSteerDrain.methods == ["turn/steer"]);
+	assert(bootstrapSteerDrain.sentParams[0]
+		== "{\"threadId\":\"thread-bootstrap-steer\",\"input\":[{\"type\":\"text\",\"text\":\"bootstrap context\"}],\"expectedTurnId\":\"turn-bootstrap-steer\"}");
+	assert(bootstrapSteerDrain.expectedEchoMessages_.length == 1
+		&& bootstrapSteerDrain.expectedEchoMessages_[0].correlationId == "bootstrap-ui-steer");
+
+	// Startup/resume plumbing retains the path returned by Codex without a filesystem lookup.
+	auto registrationServer = new AppServerProcess([]);
+	auto fresh = new CodexSession(registrationServer, 1, SessionConfig.init);
+	ThreadStartResult freshResult;
+	freshResult.thread.id = "thread-fresh";
+	freshResult.thread.path = "/exact/fresh-rollout.jsonl";
+	fresh.onThreadStarted(freshResult, null, "model", "/workspace", "");
+	assert(fresh.rolloutPath == "/exact/fresh-rollout.jsonl");
+
+	auto resumed = new CodexSession(registrationServer, 1, SessionConfig.init);
+	ThreadStartResult resumedResult;
+	resumedResult.thread.id = "thread-resumed";
+	resumedResult.thread.path = "/exact/resumed-rollout.jsonl";
+	resumed.onThreadStarted(resumedResult, "thread-resumed", "model", "/workspace", "");
+	assert(resumed.rolloutPath == "/exact/resumed-rollout.jsonl");
 
 	@JSONPartial
 	struct StartedNotification
