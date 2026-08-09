@@ -2,14 +2,15 @@
  * @vitest-environment jsdom
  * @vitest-environment-options { "pretendToBeVisual": true }
  *
- * SPIKE 34492 — deterministic reproduction of the recovered-draft race behind
- * the intermittent `e2e-codex-undo-codex-alive-L331` failure.
+ * Deterministic reproduction of the recovered-draft race: an intermittent
+ * failure where a just-typed composer message gets silently overwritten by
+ * a stale recovered draft.
  *
  * Preact flushes a component's pending `useEffect` callbacks synchronously at
  * the START of its next render (preact/hooks `options._render`, the
  * `previousComponent !== currentComponent` branch), i.e. BEFORE the component
- * function body runs and therefore before `textRef.current = text`
- * (InputBox.tsx:85-86) is re-assigned.
+ * function body runs and therefore before the composer text ref is
+ * re-assigned.
  *
  * So a recovery effect scheduled by render N, but not yet flushed by
  * `afterPaint`, runs at the top of render N+1 — the very render that carries

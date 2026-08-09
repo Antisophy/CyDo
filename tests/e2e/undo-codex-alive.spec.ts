@@ -23,7 +23,7 @@ import {
   responseTimeout,
   visibleHistory,
   installCydoE2eBridge,
-  undoThroughBridge,
+  undoThroughBridge, currentTaskTid, codexRolloutRecords, expectUndoRefusalForUserMessage, // One line on purpose: check attribute names are pinned to test() line numbers.
 } from "./fixtures";
 import type { Page } from "@playwright/test";
 
@@ -84,9 +84,25 @@ async function openUndoDialogForUserMessage(
   await userMsg.hover();
   await expect(userMsg.locator(".undo-btn")).toBeVisible({ timeout: 5_000 });
   await userMsg.locator(".undo-btn").click();
-  await expect(page.locator(".undo-dialog:visible")).toBeVisible({
-    timeout: 5_000,
-  });
+  const confirmation = page.locator(
+    ".undo-dialog:not(.command-error-dialog):visible",
+  );
+  const commandError = page.locator(".command-error-dialog:visible");
+  await expect
+    .poll(
+      async () =>
+        (await commandError.count()) > 0
+          ? "error"
+          : (await confirmation.count()) > 0
+            ? "confirmation"
+            : "pending",
+      { timeout: 5_000 },
+    )
+    .not.toBe("pending");
+  if ((await commandError.count()) > 0)
+    throw new Error(
+      `Unexpected undo command error: ${await commandError.innerText()}`,
+    );
 }
 
 async function undoUserMessage(
@@ -635,6 +651,24 @@ test(
     });
     await expect(activeUsers).toHaveCount(4, { timeout: 15_000 });
 
+    const tid = currentTaskTid(page);
+    await expect
+      .poll(
+        () =>
+          codexRolloutRecords(tid).some(
+            (record) =>
+              record.type === "response_item" &&
+              record.payload?.type === "message" &&
+              record.payload?.role === "user" &&
+              (record.payload?.content ?? [])
+                .map((part: any) => part?.text ?? "")
+                .join("")
+                .includes("<turn_aborted>"),
+          ),
+        { timeout: 15_000 },
+      )
+      .toBe(true);
+
     await openUndoDialogForUserMessage(
       page,
       'Please reply with "interrupt-undo-two"',
@@ -669,6 +703,260 @@ test(
     }).toEqual({
       secondUndoPreview: "3 messages will be removed.",
       retainedContext: "context-check-passed",
+    });
+
+    await expect
+      .poll(
+        () =>
+          codexRolloutRecords(tid)
+            .filter(
+              (record) =>
+                record.type === "event_msg" &&
+                record.payload?.type === "thread_rolled_back",
+            )
+            .map((record) => record.payload.num_turns),
+        { timeout: 15_000 },
+      )
+      .toEqual([1, 3]);
+  },
+);
+
+test(
+  "codex live undo of a duplicate prompt retires only the later client id",
+  { tag: "@codex-only" },
+  async ({ page }) => {
+    await enterSession(page);
+
+    await sendMessage(page, 'Please reply with "dup-first"');
+    await expect(assistantText(page, "dup-first")).toBeVisible({
+      timeout: 90_000,
+    });
+
+    await sendMessage(page, 'Please reply with "dup-marker"');
+    await expect(assistantText(page, "dup-marker")).toBeVisible({
+      timeout: 90_000,
+    });
+
+    await sendMessage(page, 'Please reply with "dup-marker"');
+    await expect(assistantText(page, "dup-marker").nth(1)).toBeVisible({
+      timeout: 90_000,
+    });
+
+    const tid = currentTaskTid(page);
+    const dupWrappers = page.locator(".message-wrapper", {
+      has: page.locator(
+        ".message.user-message:not(.pending):not(.meta-message)",
+        { hasText: "dup-marker" },
+      ),
+    });
+    // Wait for both wrappers' fork anchors to be bound before the one-shot
+    // evaluateAll read below: the rollout-identity late bind means a
+    // just-sent message's uuid/anchor may not be attached yet.
+    await expect(dupWrappers.locator(".fork-btn")).toHaveCount(2, {
+      timeout: 15_000,
+    });
+    const dupAnchors = await dupWrappers.evaluateAll((wrappers) =>
+      wrappers.map((wrapper) =>
+        wrapper.querySelector(".fork-btn")?.getAttribute("data-fork-anchor") ?? null,
+      ),
+    );
+    expect(dupAnchors).toHaveLength(2);
+    const [earlierAnchor, laterAnchor] = dupAnchors;
+    expect(earlierAnchor).toMatch(/^line:\d+$/);
+    expect(laterAnchor).toMatch(/^line:\d+$/);
+    expect(earlierAnchor).not.toBe(laterAnchor);
+
+    await openUndoDialogForUserMessage(page, 'Please reply with "dup-marker"');
+    await expect(page.locator(".undo-dialog-count:visible")).toContainText(
+      "1 message will be removed.",
+    );
+    await page.locator(".btn-undo:visible").click();
+
+    const remainingDupMarkers = page.locator(
+      ".message.user-message:visible:not(.pending):not(.meta-message)",
+      { hasText: "dup-marker" },
+    );
+    await expect(remainingDupMarkers).toHaveCount(1, { timeout: 15_000 });
+    const remainingWrapper = page
+      .locator(".message-wrapper:visible", { has: remainingDupMarkers })
+      .last();
+    await expect(remainingWrapper.locator(".fork-btn")).toHaveAttribute(
+      "data-fork-anchor",
+      earlierAnchor!,
+    );
+
+    await expect(
+      page.locator(".message.user-message:visible:not(.pending):not(.meta-message)", {
+        hasText: "dup-first",
+      }),
+    ).toBeVisible();
+    await expect(assistantText(page, "dup-first")).toBeVisible();
+
+    // Rollout evidence for the undo itself, asserted before any further
+    // message adds another client-id-bearing turn to the ledger.
+    await expect
+      .poll(() => {
+        const clientIds = codexRolloutRecords(tid)
+          .filter(
+            (record) =>
+              record.type === "event_msg" && record.payload?.type === "user_message",
+          )
+          .map((record) => record.payload?.client_id)
+          .filter((clientId) => typeof clientId === "string" && clientId.length > 0);
+        return { count: clientIds.length, distinct: new Set(clientIds).size };
+      }, { timeout: 15_000 })
+      .toEqual({ count: 2, distinct: 2 });
+
+    await expect
+      .poll(
+        () =>
+          codexRolloutRecords(tid)
+            .filter(
+              (record) =>
+                record.type === "event_msg" &&
+                record.payload?.type === "thread_rolled_back",
+            )
+            .map((record) => record.payload.num_turns),
+        { timeout: 15_000 },
+      )
+      .toEqual([1]);
+
+    const probeMarker = Buffer.from("dup-first").toString("base64");
+    await sendMessage(page, `check context contains ${probeMarker}`);
+    await expect(
+      assistantText(page, /context-check-(?:passed|failed)/).last(),
+    ).toBeVisible({ timeout: 90_000 });
+    expect(
+      await assistantText(page, /context-check-(?:passed|failed)/)
+        .last()
+        .innerText(),
+    ).toBe("context-check-passed");
+  },
+);
+
+test(
+  "codex refuses native undo of a steered turn without side effects",
+  { tag: "@codex-only" },
+  async ({ page }) => {
+    const frames: any[] = [];
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", (event) => {
+        try {
+          frames.push(JSON.parse(event.payload.toString()));
+        } catch {
+          // ignore non-JSON frames
+        }
+      });
+    });
+
+    await enterSession(page);
+
+    await sendMessage(page, 'Please reply with "steer-first"');
+    await expect(assistantText(page, "steer-first")).toBeVisible({
+      timeout: 90_000,
+    });
+
+    await sendMessage(page, "run command sleep 5");
+    await expect(
+      page.locator(".tool-call", { hasText: "sleep 5" }).first(),
+    ).toBeVisible({ timeout: 90_000 });
+
+    await sendMessage(page, 'Also please reply with "steer-marker"');
+
+    await expect(
+      page.locator(".message.user-message:visible:not(.pending):not(.meta-message)", {
+        hasText: "steer-marker",
+      }),
+    ).toBeVisible({ timeout: 90_000 });
+    await expect(page.locator(".btn-stop:visible")).toHaveCount(0, {
+      timeout: 90_000,
+    });
+
+    const tid = currentTaskTid(page);
+    const history = await visibleHistory(page);
+    // Read before/after the two refusal attempts below; this spans a
+    // multi-second window, so a late-flushed record from the *preceding*
+    // turn could in principle fail this check pointing at an innocent undo
+    // (plan §3.3c).
+    const before = codexRolloutRecords(tid).length;
+    const frameStart = frames.length;
+
+    await expectUndoRefusalForUserMessage(
+      page,
+      'Also please reply with "steer-marker"',
+      "Native Codex undo preparation refused: completed native turn does not match the simple one-user grammar",
+    );
+    await expectUndoRefusalForUserMessage(
+      page,
+      "run command sleep 5",
+      "Native Codex undo preparation refused: candidate suffix reuses a raw turn id",
+    );
+
+    await expect
+      .poll(
+        () =>
+          frames.slice(frameStart).filter((frame) => frame?.type === "error")
+            .length,
+        { timeout: 15_000 },
+      )
+      .toBe(2);
+    expect(
+      frames
+        .slice(frameStart)
+        .filter((frame) => frame?.type === "error")
+        .map((frame) => ({ tid: frame.tid, message: frame.message })),
+    ).toEqual([
+      {
+        tid,
+        message:
+          "Native Codex undo preparation refused: completed native turn does not match the simple one-user grammar",
+      },
+      {
+        tid,
+        message:
+          "Native Codex undo preparation refused: candidate suffix reuses a raw turn id",
+      },
+    ]);
+    expect(
+      frames
+        .slice(frameStart)
+        .some(
+          (frame) =>
+            frame?.type === "undo_preview" ||
+            frame?.type === "undo_result" ||
+            frame?.type === "task_reload",
+        ),
+    ).toBe(false);
+
+    // See the "before" comment above re: the multi-second comparison window.
+    expect(await visibleHistory(page)).toEqual(history);
+    expect(codexRolloutRecords(tid).length).toBe(before);
+
+    const sleepProbe = Buffer.from("run command sleep 5").toString("base64");
+    await sendMessage(page, `check context contains ${sleepProbe}`);
+    await expect(
+      assistantText(page, /context-check-(?:passed|failed)/).last(),
+    ).toBeVisible({ timeout: 90_000 });
+    expect(
+      await assistantText(page, /context-check-(?:passed|failed)/)
+        .last()
+        .innerText(),
+    ).toBe("context-check-passed");
+
+    const steerProbe = Buffer.from("steer-marker").toString("base64");
+    await sendMessage(page, `check context contains ${steerProbe}`);
+    await expect(
+      assistantText(page, /context-check-(?:passed|failed)/).last(),
+    ).toBeVisible({ timeout: 90_000 });
+    expect(
+      await assistantText(page, /context-check-(?:passed|failed)/)
+        .last()
+        .innerText(),
+    ).toBe("context-check-passed");
+
+    await sendMessage(page, 'Please reply with "steer-final"');
+    await expect(assistantText(page, "steer-final")).toBeVisible({
+      timeout: 90_000,
     });
   },
 );

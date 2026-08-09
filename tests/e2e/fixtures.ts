@@ -397,6 +397,47 @@ export async function killBackend(proc: ChildProcess): Promise<void> {
   await exitPromise;
 }
 
+/** Read and parse every record from the Codex rollout JSONL for the given task. */
+export function codexRolloutRecords(tid: number): any[] {
+  const task = lookupTaskSession(tid);
+  if (task.agentType !== "codex")
+    throw new Error(`Task ${tid} is not a Codex task: ${task.agentType}`);
+  const raw = readHistoryFile(historyPathForTask(tid));
+  const lines = raw.split("\n");
+  // Codex may be mid-append; a file not ending in a newline has a torn final
+  // line that would fail JSON.parse, so drop it rather than parse garbage.
+  if (!raw.endsWith("\n")) lines.pop();
+  return lines.filter((line) => line.length > 0).map((line) => JSON.parse(line));
+}
+
+/** The error-branch sibling of openUndoDialogForUserMessage in undo-codex-alive.spec.ts. */
+export async function expectUndoRefusalForUserMessage(
+  page: Page,
+  userText: string,
+  expectedMessage: string,
+): Promise<void> {
+  // Duplicates openUndoDialogForUserMessage's wrapper-locating block rather than
+  // sharing it: that helper lives above line 72 of undo-codex-alive.spec.ts,
+  // and deduping would delete lines there, renumbering the pinned check attributes.
+  const userMsg = page
+    .locator(".message-wrapper:visible", {
+      has: page.locator(
+        ".message.user-message:visible:not(.pending):not(.meta-message)",
+        { hasText: userText },
+      ),
+    })
+    .last();
+  await userMsg.hover({ timeout: 15_000 });
+  await expect(userMsg.locator(".undo-btn")).toBeVisible({ timeout: 5_000 });
+  await userMsg.locator(".undo-btn").click();
+  const errorDialog = page.locator(".command-error-dialog");
+  await expect(page.locator(".command-error-message:visible")).toHaveText(expectedMessage, {
+    timeout: 15_000,
+  });
+  await errorDialog.getByRole("button", { name: "Dismiss" }).click();
+  await expect(errorDialog).not.toBeVisible();
+}
+
 export { expect } from "@playwright/test";
 export type { Locator, Page } from "@playwright/test";
 export type { AgentType };

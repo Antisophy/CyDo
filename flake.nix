@@ -817,7 +817,9 @@ EOF
               CYDO_CFG
 
               export CYDO_BIN="${cydoDebug}/bin/cydo"
-              ${lib.optionalString (agentType == "codex" && lib.hasPrefix "e2e/codex-compaction.spec.ts:" testMatch) ''
+              ${lib.optionalString (agentType == "codex" && (
+                  lib.hasPrefix "e2e/codex-compaction.spec.ts:" testMatch
+                  || lib.hasPrefix "e2e/undo-codex-compaction.spec.ts:" testMatch)) ''
               export CYDO_CODEX_COMPACT_LIMIT=10000
               ''}
 
