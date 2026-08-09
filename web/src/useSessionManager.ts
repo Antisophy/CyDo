@@ -55,6 +55,7 @@ import {
 import {
   buildProjectHref,
   buildScopedHref,
+  canonicalTaskRedirect,
   decodeProjectSegment,
   taskPath,
 } from "./routing";
@@ -2228,6 +2229,36 @@ export function useTaskManager(
     handleControlMessage,
     handleUnconfirmedUserMessage,
     isCurrentOpenEpoch,
+  ]);
+
+  // The workspace/project segments of a task URL are derived from the task; enforce
+  // that. The URL is the source of truth for which task is open, so correct the URL
+  // rather than teaching its consumers to tolerate a mismatch.
+  //
+  // `tasks` and `workspaces` are load-bearing dependencies and must not be removed
+  // by a later cleanup. `taskContext` is a `useCallback([])` that reads a
+  // module-level map and a ref, so neither the task list nor the workspace list
+  // arriving would re-run this effect on its own — `tasks` and `workspaces` are
+  // what make it fire.
+  useEffect(() => {
+    const tid = parseTaskId(activeTaskId);
+    if (tid === null) return;
+    const [ws, proj] = taskContext(tid);
+    const target = canonicalTaskRedirect({
+      tid,
+      taskWorkspace: ws,
+      taskProject: proj,
+      urlWorkspace: activeWorkspace,
+      urlProject: activeProject,
+    });
+    if (target !== null) routeRef.current(target, true);
+  }, [
+    activeTaskId,
+    activeWorkspace,
+    activeProject,
+    tasks,
+    workspaces,
+    taskContext,
   ]);
 
   // Request history when the active task changes and hasn't been loaded yet

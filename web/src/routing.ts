@@ -33,3 +33,26 @@ export function taskPath(
 ): string {
   return `${buildProjectHref(workspace, projectName)}/task/${tid}`;
 }
+
+/**
+ * The path a task URL should be rewritten to, or null when the URL is already
+ * canonical or the task's project cannot be resolved.
+ *
+ * The comparison is against the round-trip of our own encoding, so it is a fixed
+ * point of encode∘parse: a project name containing ':' cannot cause a redirect loop.
+ */
+export function canonicalTaskRedirect(args: {
+  tid: number;
+  taskWorkspace: string | null;
+  taskProject: string | null;
+  urlWorkspace: string | null;
+  urlProject: string | null;
+}): string | null {
+  const { tid, taskWorkspace, taskProject, urlWorkspace, urlProject } = args;
+  if (taskWorkspace === null || taskProject === null) return null;
+  const canonicalProject = decodeProjectSegment(encodeProjectName(taskProject));
+  if (urlWorkspace === taskWorkspace && urlProject === canonicalProject) {
+    return null;
+  }
+  return taskPath(taskWorkspace, taskProject, tid);
+}
