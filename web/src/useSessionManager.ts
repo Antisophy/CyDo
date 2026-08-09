@@ -52,6 +52,12 @@ import {
   type TaskObservation,
   type TaskSnapshot,
 } from "./draftReconciler";
+import {
+  buildProjectHref,
+  buildScopedHref,
+  decodeProjectSegment,
+  taskPath,
+} from "./routing";
 
 export interface ImageAttachment {
   id: string;
@@ -508,25 +514,6 @@ function parseTaskId(id: string | null): number | null {
   return String(n) === id ? n : null;
 }
 
-function encodeProjectName(projectName: string): string {
-  return projectName.replace(/\//g, ":");
-}
-
-function buildProjectHref(workspace: string, projectName: string): string {
-  return `/${workspace}/${encodeProjectName(projectName)}`;
-}
-
-function buildScopedHref(
-  workspace: string | null,
-  projectName: string | null,
-  suffix: string,
-): string {
-  if (workspace && projectName) {
-    return `${buildProjectHref(workspace, projectName)}${suffix}`;
-  }
-  return suffix;
-}
-
 function readLocalBuildId(): string {
   const script = document.querySelector<HTMLScriptElement>(
     'script[type="module"][src*="/assets/index-"]',
@@ -601,7 +588,7 @@ export function useTaskManager(
         : (params.tid ?? params.sid ?? null);
     return {
       workspace: params.workspace ?? null,
-      project: params.project ? params.project.replace(/:/g, "/") : null,
+      project: params.project ? decodeProjectSegment(params.project) : null,
       tid,
     };
   }, [
@@ -1090,7 +1077,7 @@ export function useTaskManager(
             const projectName = currentRouteProjectName(slot.project, null);
             if (!projectName) break;
             routeRef.current(
-              `${buildProjectHref(slot.project.workspace, projectName)}/task/${effect.tid}`,
+              taskPath(slot.project.workspace, projectName, effect.tid),
               true,
             );
             break;
@@ -1445,7 +1432,7 @@ export function useTaskManager(
               const projectName = currentRouteProjectName(before.project, null);
               if (projectName) {
                 routeRef.current(
-                  `${buildProjectHref(before.project.workspace, projectName)}/task/${tid}`,
+                  taskPath(before.project.workspace, projectName, tid),
                   true,
                 );
               }
@@ -2719,7 +2706,7 @@ export function useTaskManager(
         const projectName = currentRouteProjectName(slot.project, null);
         if (!projectName) return;
         routeRef.current(
-          `${buildProjectHref(slot.project.workspace, projectName)}/task/${presentSubmission.tid}`,
+          taskPath(slot.project.workspace, projectName, presentSubmission.tid),
           true,
         );
       }
