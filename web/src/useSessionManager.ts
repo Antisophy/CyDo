@@ -509,7 +509,7 @@ function findByTid(tid: number): TaskState | undefined {
 }
 
 /** Convert a string task id to a numeric tid; returns null for non-numeric strings. */
-function parseTaskId(id: string | null): number | null {
+export function parseTaskId(id: string | null): number | null {
   if (id === null) return null;
   const n = parseInt(id, 10);
   return String(n) === id ? n : null;

@@ -26,6 +26,7 @@ const state = vi.hoisted(() => ({
   entryPoints: [] as TaskManager["entryPoints"],
   agents: [] as TaskManager["agents"],
   connected: true,
+  getByTid: vi.fn(),
 }));
 
 const controlledImageStore = vi.hoisted(() => ({
@@ -45,6 +46,11 @@ vi.hoisted(() => {
 });
 
 vi.mock("./useSessionManager", () => ({
+  parseTaskId: (id: string | null) => {
+    if (id === null) return null;
+    const tid = parseInt(id, 10);
+    return String(tid) === id ? tid : null;
+  },
   useTaskManager: () =>
     ({
       tasks: state.tasks,
@@ -91,8 +97,7 @@ vi.mock("./useSessionManager", () => ({
       navigateToProject: vi.fn(),
       getProjectHref: vi.fn(),
       getTaskHref: vi.fn(),
-      getByTid: (tid: number) =>
-        Array.from(state.tasks.values()).find((task) => task.tid === tid),
+      getByTid: state.getByTid,
       refreshWorkspaces: vi.fn(),
       scanState: "idle",
     }) satisfies TaskManager,
@@ -118,6 +123,11 @@ vi.mock("preact-iso", () => ({
     return h(firstRoute.props.component, {});
   },
   Route: () => null,
+}));
+
+vi.mock("./components/Sidebar", () => ({
+  Sidebar: () => null,
+  flatTaskOrder: () => [],
 }));
 
 vi.mock("./useTheme", () => ({
@@ -147,22 +157,26 @@ vi.mock("./useErrorOverlay", () => ({
 
 import { App } from "./app";
 
+beforeEach(() => {
+  state.serverError = null;
+  state.dismissServerError.mockReset();
+  state.draftView = null;
+  state.activeTaskId = null;
+  state.activeWorkspace = null;
+  state.activeProject = null;
+  state.tasks = new Map();
+  state.entryPoints = [];
+  state.agents = [];
+  state.connected = true;
+  state.getByTid.mockReset();
+  state.getByTid.mockImplementation((tid: number) =>
+    Array.from(state.tasks.values()).find((task) => task.tid === tid),
+  );
+  controlledImageStore.current = null;
+});
+
 describe("server command errors", () => {
   let container: HTMLDivElement | null = null;
-
-  beforeEach(() => {
-    state.serverError = null;
-    state.dismissServerError.mockReset();
-    state.draftView = null;
-    state.activeTaskId = null;
-    state.activeWorkspace = null;
-    state.activeProject = null;
-    state.tasks = new Map();
-    state.entryPoints = [];
-    state.agents = [];
-    state.connected = true;
-    controlledImageStore.current = null;
-  });
 
   afterEach(() => {
     if (!container) return;
@@ -1085,5 +1099,38 @@ describe("server command errors", () => {
     } finally {
       readAsDataURL.mockRestore();
     }
+  });
+});
+
+describe("missing numeric tasks", () => {
+  const tid = 123;
+
+  it("shows a not-found message after connecting", () => {
+    state.activeTaskId = String(tid);
+
+    const html = renderToString(h(App, {}));
+
+    expect(html).toContain(`Task ${tid} not found`);
+    expect(html).not.toContain("Loading task…");
+  });
+
+  it("keeps loading while disconnected", () => {
+    state.activeTaskId = String(tid);
+    state.connected = false;
+
+    expect(renderToString(h(App, {}))).toContain("Loading task…");
+  });
+
+  it("shows a not-found message for a malformed task id", () => {
+    const task = makeTaskState(tid, false, false, "Known task 123");
+    state.tasks.set(task.uuid, task);
+    state.activeTaskId = "123junk";
+
+    const html = renderToString(h(App, {}));
+
+    expect(html).toContain("Task 123junk not found");
+    expect(html).not.toContain("Loading task…");
+    expect(html).not.toContain("Known task 123");
+    expect(state.getByTid).not.toHaveBeenCalled();
   });
 });

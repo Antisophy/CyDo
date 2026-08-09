@@ -7,7 +7,7 @@ import {
   useState,
 } from "preact/hooks";
 import { Router, Route } from "preact-iso";
-import { useTaskManager } from "./useSessionManager";
+import { parseTaskId, useTaskManager } from "./useSessionManager";
 import { useNotifications } from "./useNotifications";
 import { useToast } from "./useToast";
 import { useErrorCapture } from "./useErrorOverlay";
@@ -123,8 +123,8 @@ function AppContent() {
     setSidebarOpen((v) => !v);
   }, []);
 
-  const activeTid = activeTaskId !== null ? parseInt(activeTaskId, 10) : NaN;
-  const active = !isNaN(activeTid) ? (getByTid(activeTid) ?? null) : null;
+  const activeTid = parseTaskId(activeTaskId);
+  const active = activeTid !== null ? (getByTid(activeTid) ?? null) : null;
   const activeTaskPaneRenderable =
     active !== null &&
     !(
@@ -535,6 +535,13 @@ function AppContent() {
               <div class="session-empty">
                 <div class="session-empty-inner">
                   <span class="archive-placeholder">Importable sessions</span>
+                </div>
+              </div>
+            ) : connected && activeTaskId !== null && active === null ? (
+              <div class="session-empty">
+                <div class="session-empty-inner">
+                  <span>Task {activeTaskId} not found</span>
+                  <a href="/">Go to home</a>
                 </div>
               </div>
             ) : (
