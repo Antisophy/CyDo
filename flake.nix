@@ -627,6 +627,10 @@ EOF
 
               export MOCK_ANTHROPIC_CAPTURE=/tmp/mock-anthropic-requests.ndjson
               rm -f "$MOCK_ANTHROPIC_CAPTURE"
+              ${lib.optionalString (lib.hasPrefix "e2e/model-effort-reaches-api.spec.ts:" testMatch) ''
+              export MOCK_OPENAI_CAPTURE=/tmp/mock-openai-requests.ndjson
+              rm -f "$MOCK_OPENAI_CAPTURE"
+              ''}
               ${pkgs.nodejs_22}/bin/node $src/mock-api/server.mjs &
               MOCK_PID=$!
               for i in $(seq 1 15); do
@@ -669,6 +673,17 @@ EOF
               workspaces:
                 local:
                   root: /tmp/cydo-test-workspace
+              ${lib.optionalString (lib.hasPrefix "e2e/model-effort-reaches-api.spec.ts:" testMatch) ''
+              agents:
+                codex:
+                  model_aliases:
+                    large:
+                      effort: high
+                claude:
+                  model_aliases:
+                    large:
+                      effort: low
+              ''}
               CYDO_CFG
 
               export CYDO_BIN="${cydoDebug}/bin/cydo"

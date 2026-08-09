@@ -731,6 +731,18 @@ function handleResponses(req, res) {
       : userText;
     const isToolOutput = hasToolOutput(input);
     const intent = intentText === null ? null : matchPattern(intentText);
+    if (process.env.MOCK_OPENAI_CAPTURE) {
+      appendFileSync(
+        process.env.MOCK_OPENAI_CAPTURE,
+        JSON.stringify({
+          path: req.url || "/v1/responses",
+          model: requestedModel,
+          userText,
+          isToolOutput,
+          reasoningEffort: parsed.reasoning?.effort ?? null,
+        }) + "\n",
+      );
+    }
     console.log(
       `[mock-api] [responses] model=${requestedModel} userText=${JSON.stringify(userText)} intentText=${JSON.stringify(intentText)} isToolOutput=${isToolOutput} inputLen=${input.length}`,
     );
@@ -1042,6 +1054,7 @@ function handleMessages(req, res) {
           messageCount: messages.length,
           userText: extractLastUserText(messages),
           isToolResult: hasToolResult(messages),
+          effort: parsed.output_config?.effort ?? null,
           tools: Array.isArray(parsed.tools)
             ? parsed.tools.map((tool) => ({
                 name: tool?.name ?? null,
