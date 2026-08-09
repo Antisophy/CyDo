@@ -8,6 +8,13 @@ export function decodeProjectSegment(segment: string): string {
   return segment.replace(/:/g, "/");
 }
 
+/**
+ * Parses a matched route into its workspace, project, and task ID.
+ *
+ * The kind is read positionally so a project named "archive" or "import"
+ * cannot be mistaken for a special route. A bound workspace param identifies
+ * the optional workspace/project scope and therefore the kind's segment.
+ */
 export function parseRoute(
   path: string,
   params: Record<string, string>,
