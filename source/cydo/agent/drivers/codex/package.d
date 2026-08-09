@@ -31,6 +31,7 @@ import cydo.agent.contract : Agent, DiscoveredSession, InterruptedToolCallRepair
 import cydo.agent.process : AgentProcess, FramingMode;
 import cydo.agent.drivers.codex.app_server : CodexSessionRouteTarget;
 public import cydo.agent.drivers.codex.process : AppServerProcess;
+public import cydo.agent.drivers.codex.native_undo;
 public import cydo.agent.drivers.codex.rollout;
 public import cydo.agent.drivers.codex.rpc;
 import cydo.protocol : ContentBlock, ProcessStderrEvent, SessionCompactedEvent,
