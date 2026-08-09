@@ -7,9 +7,14 @@ import std.logger : tracef;
 import std.typecons : Nullable;
 
 import ae.utils.json : JSONFragment, JSONOptional, JSONPartial, jsonParse, toJson;
+import ae.utils.serialization.json : JsonParser;
+import ae.utils.serialization.serialization : isProtocolArray, isProtocolBoolean,
+	isProtocolField, isProtocolMap, isProtocolNull, isProtocolNumeric,
+	isProtocolString;
 
 import cydo.agent.contract : PersistedHistoryBoundary, PersistedHistoryBoundaryKind;
 import cydo.protocol : ContentBlock, decomposeToolName, makeUnrecognizedEvent;
+public import cydo.agent.drivers.codex.ledger;
 
 package enum ForkableMessageRole
 {
@@ -18,83 +23,24 @@ package enum ForkableMessageRole
 	assistant,
 }
 
-package struct RolloutLineProbe
+package enum CodexUserMessageLineClassification
 {
-	bool isSessionMeta;
-	bool isTurnContext;
-	bool isResponseItem;
-	bool isEventMsg;
-	bool isTaskStarted;
-	bool isThreadRolledBack;
-	uint rollbackNumTurns;
-	ForkableMessageRole messageRole = ForkableMessageRole.none;
-
-	@property bool isUserMessage() const
-	{
-		return messageRole == ForkableMessageRole.user;
-	}
-
-	@property bool isAssistantMessage() const
-	{
-		return messageRole == ForkableMessageRole.assistant;
-	}
-
-	@property bool isForkableMessage() const
-	{
-		return isUserMessage || isAssistantMessage;
-	}
+	normal,
+	contextOnly,
+	turnAborted,
 }
 
-/// Parse one rollout JSONL line and return only the fields relevant to
-/// history/forkable-line classification.
-package RolloutLineProbe parseRolloutLineProbe(string line)
+package enum RolloutTopLevelKind
 {
-	@JSONPartial
-	static struct TopLevelProbe
-	{
-		@JSONOptional string type;
-		@JSONOptional JSONFragment payload;
-	}
-
-	@JSONPartial
-	static struct PayloadProbe
-	{
-		@JSONOptional string type;
-		@JSONOptional string role;
-		@JSONOptional uint num_turns;
-	}
-
-	RolloutLineProbe result;
-	try
-	{
-		auto top = jsonParse!TopLevelProbe(line);
-		result.isSessionMeta = top.type == "session_meta";
-		result.isTurnContext = top.type == "turn_context";
-		result.isResponseItem = top.type == "response_item";
-		result.isEventMsg = top.type == "event_msg";
-
-		if (top.payload.json is null || top.payload.json.length == 0)
-			return result;
-
-		auto payload = jsonParse!PayloadProbe(top.payload.json);
-		if (result.isEventMsg)
-		{
-			result.isTaskStarted = payload.type == "task_started";
-			result.isThreadRolledBack = payload.type == "thread_rolled_back";
-			if (result.isThreadRolledBack)
-				result.rollbackNumTurns = payload.num_turns;
-		}
-		if (result.isResponseItem && payload.type == "message")
-		{
-			if (payload.role == "user")
-				result.messageRole = ForkableMessageRole.user;
-			else if (payload.role == "assistant")
-				result.messageRole = ForkableMessageRole.assistant;
-		}
-	}
-	catch (Exception) {}
-	return result;
+	unknown,
+	sessionMeta,
+	worldState,
+	turnContext,
+	responseItem,
+	eventMsg,
+	compacted,
 }
+
 
 /// Parse `num_turns` from a ThreadRolledBack event_msg JSONL line.
 /// The payload is `{"type":"thread_rolled_back","num_turns":N}`.
@@ -128,43 +74,37 @@ PersistedHistoryBoundary[] applyRollbackToIdsWithInfo(PersistedHistoryBoundary[]
 
 package PersistedHistoryBoundary[] extractPersistedHistoryBoundariesImpl(string content, int lineOffset = 0)
 {
-	import std.string : lineSplitter;
-
 	PersistedHistoryBoundary[] ids;
-	int lineNum = lineOffset;
+	auto scan = scanRollout(content, lineOffset);
 	// Codex prepends system context as a role=user response_item before the
 	// first task_started event. Skip role=user lines until task_started is seen
 	// so the system context is not treated as a forkable user message.
 	bool seenTaskStarted = lineOffset > 0;
-	foreach (line; content.lineSplitter)
+	foreach (ref line; scan.lines)
 	{
-		lineNum++;
-		if (line.length == 0)
-			continue;
-		auto probe = parseRolloutLineProbe(line);
-		if (!seenTaskStarted && probe.isTaskStarted)
+		if (!seenTaskStarted && line.probe.isTaskStarted)
 		{
 			seenTaskStarted = true;
 			continue;
 		}
-		if (probe.isThreadRolledBack)
+		if (line.probe.isThreadRolledBack)
 		{
-			if (probe.rollbackNumTurns > 0)
-				ids = applyRollbackToIdsWithInfo(ids, probe.rollbackNumTurns);
+			if (line.probe.rollbackNumTurns > 0)
+				ids = applyRollbackToIdsWithInfo(ids, line.probe.rollbackNumTurns);
 			continue;
 		}
-		if (!probe.isForkableMessage)
+		if (!line.probe.isForkableMessage)
 			continue;
-		if (probe.isUserMessage && !seenTaskStarted)
+		if (line.probe.isUserMessage && !seenTaskStarted)
 			continue;
-		if (probe.isUserMessage)
+		if (line.probe.isUserMessage)
 		{
-			auto classification = classifyCodexUserMessageLine(line);
-			if (isCodexContextOnlyUserMessage(classification))
+			if (isCodexContextOnlyUserMessage(line.userClassification))
 				continue;
 		}
-		ids ~= PersistedHistoryBoundary("line:" ~ to!string(lineNum),
-			probe.isUserMessage ? PersistedHistoryBoundaryKind.user : PersistedHistoryBoundaryKind.agent_turn, null);
+		ids ~= PersistedHistoryBoundary("line:" ~ to!string(line.lineNumber),
+			line.probe.isUserMessage ? PersistedHistoryBoundaryKind.user
+				: PersistedHistoryBoundaryKind.agent_turn, null);
 	}
 	return ids;
 }
@@ -410,57 +350,17 @@ package bool isCodexTurnAbortedUserText(string text)
 
 package bool extractCodexUserMessageText(string line, out string text)
 {
-	@JSONPartial
-	static struct Probe
-	{
-		@JSONPartial
-		static struct Payload
-		{
-			string type;
-			string role;
-			JSONFragment content;
-		}
-		Payload payload;
-	}
-	@JSONPartial
-	static struct TextBlock
-	{
-		string type;
-		@JSONOptional string text;
-	}
-
-	try
-	{
-		auto probe = jsonParse!Probe(line);
-		if (probe.payload.type != "message" || probe.payload.role != "user"
-			|| probe.payload.content.json is null)
-			return false;
-		foreach (ref block; jsonParse!(TextBlock[])(probe.payload.content.json))
-			if (block.type == "input_text" || block.type == "text")
-				text ~= block.text;
-		return true;
-	}
-	catch (Exception)
+	auto evidence = parseRolloutLineEvidence(line, 0);
+	if (!evidence.probe.isUserMessage || !evidence.contentClassificationKnown)
 		return false;
-}
-
-package enum CodexUserMessageLineClassification
-{
-	normal,
-	contextOnly,
-	turnAborted,
+	text = evidence.inputText;
+	return true;
 }
 
 package CodexUserMessageLineClassification classifyCodexUserMessageLine(string line)
 {
-	string text;
-	if (!extractCodexUserMessageText(line, text))
-		return CodexUserMessageLineClassification.normal;
-	if (isCodexTurnAbortedUserText(text))
-		return CodexUserMessageLineClassification.turnAborted;
-	return isCodexContextOnlyUserText(text)
-		? CodexUserMessageLineClassification.contextOnly
-		: CodexUserMessageLineClassification.normal;
+	auto evidence = parseRolloutLineEvidence(line, 0);
+	return evidence.userClassification;
 }
 
 package bool isCodexContextOnlyUserMessage(
@@ -551,10 +451,12 @@ bool isRollbackMarker(string line)
 /// the next user response_item).
 bool[int] computeRollbackSkipLines(string content)
 {
-	import std.algorithm : canFind;
-	import std.string : lineSplitter;
-
-	if (!content.canFind("thread_rolled_back"))
+	auto scan = scanRollout(content);
+	bool hasRollback;
+	foreach (ref line; scan.lines)
+		if (line.probe.isThreadRolledBack)
+			hasRollback = true;
+	if (!hasRollback)
 		return (bool[int]).init;
 
 	struct TurnBoundary { int lineNum; }
@@ -563,27 +465,21 @@ bool[int] computeRollbackSkipLines(string content)
 	RollbackInfo[] rollbacks;
 
 	bool seenTaskStarted = false;
-	int lineNum = 0;
-	foreach (line; content.lineSplitter)
+	foreach (ref line; scan.lines)
 	{
-		lineNum++;
-		if (line.length == 0)
-			continue;
-		auto probe = parseRolloutLineProbe(line);
-		if (!seenTaskStarted && probe.isTaskStarted)
+		if (!seenTaskStarted && line.probe.isTaskStarted)
 		{
 			seenTaskStarted = true;
 			continue;
 		}
-		if (probe.isThreadRolledBack)
+		if (line.probe.isThreadRolledBack)
 		{
-			rollbacks ~= RollbackInfo(lineNum, probe.rollbackNumTurns);
+			rollbacks ~= RollbackInfo(line.lineNumber, line.probe.rollbackNumTurns);
 			continue;
 		}
-		if (seenTaskStarted && probe.isUserMessage
-			&& isCodexRollbackEligibleUserMessage(
-				classifyCodexUserMessageLine(line)))
-			userTurnStarts ~= TurnBoundary(lineNum);
+		if (seenTaskStarted && line.probe.isUserMessage
+			&& isCodexRollbackEligibleUserMessage(line.userClassification))
+			userTurnStarts ~= TurnBoundary(line.lineNumber);
 	}
 
 	if (rollbacks.length == 0)
@@ -625,6 +521,7 @@ bool[int] computeRollbackSkipLines(string content)
 	return skipLines;
 }
 
+
 unittest
 {
 	// Genuine message response_item lines are forkable.
@@ -648,6 +545,21 @@ unittest
 	assert(parseRollbackNumTurns(`{"timestamp":"2025-01-01T00:00:00.000Z","type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":2}}`) == 2);
 	assert(parseRollbackNumTurns(`{"timestamp":"2025-01-01T00:00:00.000Z","type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":0}}`) == 0);
 	assert(parseRollbackNumTurns(`{"type":"event_msg","payload":{"type":"task_started"}}`) == 0);
+	auto validRollbackMarker = classifyNativeRollbackMarker(
+		`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":2}}`);
+	assert(validRollbackMarker.status == NativeRollbackMarkerStatus.valid
+		&& validRollbackMarker.numTurns == 2);
+	auto malformedRollbackMarker = classifyNativeRollbackMarker(
+		`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":"two"}}`);
+	assert(malformedRollbackMarker.status == NativeRollbackMarkerStatus.malformed);
+	assert(classifyNativeRollbackMarker(
+		`{"type":"unexpected","payload":{"type":"thread_rolled_back","num_turns":2}}`)
+		.status == NativeRollbackMarkerStatus.malformed);
+	assert(classifyNativeRollbackMarker(
+		`{"type":"event_msg","payload":{"type":"thread_rolled_back"`)
+		.status == NativeRollbackMarkerStatus.malformed);
+	assert(classifyNativeRollbackMarker(`{"type":"event_msg","payload":{"type":"task_complete"}}`)
+		.status == NativeRollbackMarkerStatus.none);
 
 	// Test applyRollbackToIdsWithInfo
 	auto ids = [
@@ -747,12 +659,8 @@ unittest
 			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"interrupt-undo-running"}]}}` ~ "\n" ~
 			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>"}]}}`;
 
-		auto afterSelected = countActiveUserTurnsAfterForkId(
-			beforeSecondRollback, "line:4");
-		assert(afterSelected.status == CodexActiveUserTurnsAfterStatus.ok);
-		assert(afterSelected.count == 2,
-			"the contextual v1 abort marker must not count as an active user turn");
-
+		assert(countActiveFallbackRecordsFromBoundary(beforeSecondRollback, "line:4") == 5,
+			"the contextual v1 abort wrapper must not add a fallback history entry");
 		auto skip = computeRollbackSkipLines(beforeSecondRollback ~ "\n" ~
 			`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":3}}`);
 		assert(2 !in skip && 3 !in skip,
@@ -776,12 +684,8 @@ unittest
 			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"` ~ abortLikeText ~ `"}]}}` ~ "\n" ~
 			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}`;
 
-		auto afterPrefix = countActiveUserTurnsAfterForkId(
-			beforeRollback, "line:2");
-		assert(afterPrefix.status == CodexActiveUserTurnsAfterStatus.ok);
-		assert(afterPrefix.count == 1,
-			"abort-like ordinary user text must count as a rollback turn");
-
+		assert(countActiveFallbackRecordsFromBoundary(beforeRollback, "line:2") == 4,
+			"ordinary abort-like text must retain its fallback history entry");
 		auto skip = computeRollbackSkipLines(beforeRollback ~ "\n" ~
 			`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`);
 		assert(2 !in skip && 3 !in skip,
@@ -802,12 +706,8 @@ unittest
 			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
 			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"  \n<TURN_ABORTED>\nThe user interrupted the previous turn on purpose.\n</TURN_ABORTED>\n\t  "}]}}`;
 
-		auto afterPrefix = countActiveUserTurnsAfterForkId(
-			beforeRollback, "line:2");
-		assert(afterPrefix.status == CodexActiveUserTurnsAfterStatus.ok);
-		assert(afterPrefix.count == 1,
-			"a case-insensitive complete abort wrapper must not count as a turn");
-
+		assert(countActiveFallbackRecordsFromBoundary(beforeRollback, "line:2") == 4,
+			"the complete v1 abort wrapper must not add a fallback history entry");
 		auto skip = computeRollbackSkipLines(beforeRollback ~ "\n" ~
 			`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`);
 		assert(2 !in skip && 3 !in skip,

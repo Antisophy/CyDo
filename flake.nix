@@ -966,6 +966,11 @@ EOF
 
             CI = "1";
 
+            # The Codex driver's exact-shape grammar transcribes the model
+            # catalog compiled into this binary; a unit test reads the catalog
+            # back out of it and fails when a version bump changes it.
+            CYDO_TEST_CODEX_BIN = "${codex}/bin/codex";
+
             # Provide git identity so worktree unit tests can create commits.
             GIT_AUTHOR_NAME = "CyDo Test";
             GIT_AUTHOR_EMAIL = "test@example.com";
@@ -1136,6 +1141,11 @@ EOF
               pkg-config
               playwright-test
             ];
+
+            # The Codex driver's exact-shape grammar transcribes the model
+            # catalog compiled into this binary; a unit test reads the catalog
+            # back out of it, so `nix develop -ic dub test` needs it too.
+            CYDO_TEST_CODEX_BIN = "${self.packages.${system}.codex-cli}/bin/codex";
           };
         });
     };

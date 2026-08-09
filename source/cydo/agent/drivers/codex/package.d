@@ -3375,12 +3375,47 @@ unittest
 
 unittest
 {
+	import std.algorithm : canFind, sort, uniq;
+	import std.array : array;
+
+	// rollout.d's capturedModelShapes table carries per-slug turn_context data
+	// read out of the pinned Codex binary's model catalog. Admission fails
+	// closed for any slug outside it, so the slugs this driver can request must
+	// stay exactly the slugs the table covers.
+	auto agent = new CodexAgent;
+	string[] requestable;
+	foreach (modelClass; ["small", "medium", "large"])
+		requestable ~= agent.resolveModelSpec(modelClass).model;
+	enum recapture = " — re-capture turn_context from the pinned Codex binary"
+		~ " and update rollout.d's capturedModelShapes, or native undo will"
+		~ " silently refuse every rollout written for the uncovered slug.";
+	foreach (slug; requestable)
+		assert(hasCapturedModelShape(slug),
+			"resolveModelSpec can request uncaptured model " ~ slug ~ recapture);
+	foreach (slug; capturedModelShapeSlugs())
+		assert(requestable.canFind(slug),
+			"capturedModelShapes covers " ~ slug ~ " which resolveModelSpec can"
+			~ " no longer request" ~ recapture);
+	assert(requestable.sort.uniq.array.length == capturedModelShapeSlugs().length,
+		"resolveModelSpec slug set and capturedModelShapes must match exactly"
+		~ recapture);
+}
+
+unittest
+{
 	import std.string : indexOf;
 
 	SessionConfig noEffort;
 	auto overrides = buildConfigOverride(1, noEffort);
 	assert(overrides.indexOf(`"features.multi_agent":false`) >= 0,
-		"Codex config must disable the built-in multi-agent feature; actual=" ~ overrides);
+		"Codex config must disable the built-in multi-agent feature; actual=" ~ overrides
+		~ " (this knob does NOT determine turn_context.multi_agent_version: for a"
+		~ " catalogued model Codex 0.144.1 reports the catalog's own value, which"
+		~ " rollout.d's capturedModelShapes table carries per slug)");
+	assert(overrides.indexOf(`"model_reasoning_summary":"auto"`) >= 0,
+		"Codex config must request reasoning summaries; actual=" ~ overrides
+		~ " (rollout.d isExactCapturedThreadSettings expects a \"reasoning_summary\":\"auto\" key "
+		~ "from this knob; if it changes, that predicate's key list and exact value must change too)");
 	assert(overrides.indexOf(`"features.code_mode.direct_only_tool_namespaces":["mcp__cydo"]`) >= 0,
 		"Codex config must expose CyDo MCP tools as direct calls; actual=" ~ overrides);
 	assert(overrides.indexOf(`"model_reasoning_effort"`) < 0,
