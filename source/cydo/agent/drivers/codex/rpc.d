@@ -89,12 +89,6 @@ struct ThreadReadParams
 	bool includeTurns;
 }
 
-struct ThreadRollbackOutcome
-{
-	bool ok;
-	string error;
-}
-
 @RPCFlatten @JSONPartial
 struct TurnStartInput
 {

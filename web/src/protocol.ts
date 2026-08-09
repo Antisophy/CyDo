@@ -350,10 +350,12 @@ export interface ErrorMessage {
   message: string;
   tid?: number;
 }
+export type UndoCountUnit = "codex_turns" | "history_entries";
 export interface UndoPreviewMessage {
   type: "undo_preview";
   tid: number;
   messages_removed: number;
+  count_unit: UndoCountUnit;
 }
 export interface UndoResultMessage {
   type: "undo_result";

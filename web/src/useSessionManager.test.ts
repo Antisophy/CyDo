@@ -30,6 +30,7 @@ function task(tid: number, undoPending = false): TaskState {
       ? {
           afterUuid: `message-${tid}`,
           messagesRemoved: 2,
+          countUnit: "codex_turns",
           canRevertFiles: false,
           retainsPrompt: false,
         }
@@ -66,6 +67,7 @@ describe("receiveServerError", () => {
     expect(other.undoPending).toEqual({
       afterUuid: "message-2",
       messagesRemoved: 2,
+      countUnit: "codex_turns",
       canRevertFiles: false,
       retainsPrompt: false,
     });
@@ -85,6 +87,7 @@ describe("receiveServerError", () => {
     expect(pending.undoPending).toEqual({
       afterUuid: "message-1",
       messagesRemoved: 2,
+      countUnit: "codex_turns",
       canRevertFiles: false,
       retainsPrompt: false,
     });

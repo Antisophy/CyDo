@@ -1780,7 +1780,7 @@ export function useTaskManager(
           break;
         }
         case "undo_preview": {
-          const { tid, messages_removed } = msg;
+          const { tid, messages_removed, count_unit } = msg;
           const t = findByTid(tid);
           if (!t) break;
           const updated = {
@@ -1788,6 +1788,7 @@ export function useTaskManager(
             undoPending: {
               afterUuid: t.undoPending?.afterUuid ?? "",
               messagesRemoved: messages_removed,
+              countUnit: count_unit,
               canRevertFiles: t.undoPending?.canRevertFiles ?? false,
               retainsPrompt: t.undoPending?.retainsPrompt ?? false,
               supportsFileRevert: t.undoPending?.supportsFileRevert ?? true,
@@ -2801,6 +2802,7 @@ export function useTaskManager(
         undoPending: {
           afterUuid,
           messagesRemoved: -1,
+          countUnit: undefined,
           canRevertFiles,
           retainsPrompt: boundary?.history_boundary?.kind === "agent_turn",
           supportsFileRevert: t.sessionInfo?.supports_file_revert !== false,
@@ -2826,6 +2828,9 @@ export function useTaskManager(
         false,
         revertConversation,
         revertFilesForUndo(t.undoPending.canRevertFiles, revertFiles),
+        t.undoPending.countUnit === "codex_turns"
+          ? t.undoPending.messagesRemoved
+          : undefined,
       );
       // Clear undoPending
       const updated = { ...t, undoPending: null };

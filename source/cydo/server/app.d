@@ -1586,12 +1586,41 @@ class App
 		return plan;
 	}
 
+	/// Refusal text for a task whose Codex native undo forbids delivery, or
+	/// null when delivery is allowed. Callers report it in their own idiom:
+	/// the entry guard sends it to task subscribers, while the delivery funnel
+	/// rejects the submission promise.
+	private string nativeUndoDeliveryRefusal(TaskData* td)
+	{
+		if (!td.codexNativeUndoBlocksDelivery)
+			return null;
+		final switch (td.codexNativeUndoState)
+		{
+			case CodexNativeUndoState.idle:
+				assert(false, "idle native undo state cannot block delivery");
+			case CodexNativeUndoState.inFlight:
+				return "Native Codex undo is in progress and this message was not sent";
+			case CodexNativeUndoState.unverified:
+				return "Codex may already have changed or lost history; sends are blocked only in this running CyDo process and this message was not sent";
+		}
+	}
+
 	private void handleUserMessage(WsMessage json)
 	{
 		auto tid = json.tid;
 		if (tid < 0 || tid !in tasks)
 			return;
 		auto td = &tasks[tid];
+		// Refuse at the entry point so a blocked send performs no task
+		// materialization, nonce leasing, or process start on the way to the
+		// delivery funnel's fail-closed backstop. The blockage is a property of
+		// the task, not of one requester, so every subscribed client hears it.
+		if (auto refusal = nativeUndoDeliveryRefusal(td))
+		{
+			clientHub.sendToSubscribed(tid,
+				Data(toJson(ErrorMessage("error", refusal, tid)).representation));
+			return;
+		}
 		if (isArchiveTransitioning(tid))
 			return;
 		assert(td.taskType.length > 0, "Task must have a task_type when receiving a message");
@@ -1919,6 +1948,10 @@ class App
 		auto td = tid in tasks;
 		assert(td !is null, "Task must exist when sending a message");
 		assert(td.taskType.length > 0, "Task must have a task_type when sending a message");
+		// Fail-closed backstop for internal and already-scheduled sends: a
+		// refused submission was never accepted, so it must reject.
+		if (auto refusal = nativeUndoDeliveryRefusal(td))
+			return reject!void(new Exception(refusal));
 
 		// --- send to agent ---
 		// Snapshot the JSONL before the agent processes the new message.
@@ -3690,6 +3723,102 @@ unittest
 		`{"type":"cydo/task_diagnostic","severity":"error","subject":"no active turn to steer","body":"ordinary diagnostic"}`));
 	assert(App.isCompactionReminderSteerFailureEvent(
 		`{"type":"cydo/task_diagnostic","body":"no active turn to steer"`));
+}
+
+unittest
+{
+	import ae.net.asockets : ConnectionState, IConnection;
+	import ae.sys.dataset : joinData;
+	import ae.utils.array : as;
+	import std.algorithm : canFind;
+
+	class StubWebSocketAdapter : WebSocketAdapter
+	{
+		string[] sent;
+
+		this()
+		{
+			super(new class IConnection
+			{
+				ConnectionState state_ = ConnectionState.connected;
+				void delegate(string, DisconnectType) disconnectHandler;
+
+				@property ConnectionState state() { return state_; }
+				void send(scope Data[] data, int priority) {}
+				void disconnect(string reason, DisconnectType type)
+				{
+					state_ = ConnectionState.disconnected;
+					disconnectHandler(reason, type);
+				}
+				@property void handleConnect(void delegate() value) {}
+				@property void handleReadData(void delegate(Data) value) {}
+				@property void handleDisconnect(void delegate(string, DisconnectType) value)
+				{
+					disconnectHandler = value;
+				}
+				@property void handleBufferFlushed(void delegate() value) {}
+			});
+		}
+
+		override void send(scope Data[] data, int priority)
+		{
+			sent ~= cast(string) data.joinData().toGC().as!string;
+		}
+	}
+
+	enum tid = 91;
+	auto app = new App;
+	app.tasks[tid] = TaskData(tid, "local", "/tmp");
+	app.tasks[tid].taskType = "implement";
+	auto ws = new StubWebSocketAdapter;
+	scope(exit) ws.disconnect("test complete", DisconnectType.requested);
+	app.clientHub.add(ws);
+	app.clientHub.subscribe(ws, tid);
+
+	app.tasks[tid].beginConfirmedNativeUndo();
+
+	// The entry guard precedes idle-start/active-steer work. It rejects both
+	// paths to the task's subscribers without materializing a message.
+	app.handleUserMessage(WsMessage(type: "message", tid: tid));
+	app.tasks[tid].isProcessing = true;
+	app.handleUserMessage(WsMessage(type: "message", tid: tid));
+	assert(ws.sent.length == 2 && ws.sent[0].canFind("in progress")
+		&& ws.sent[1].canFind("in progress"));
+
+	// The final delivery funnel independently protects internal and already
+	// scheduled sends. It has no requesting socket, so it reports refusal the
+	// way every other non-acceptance does: by rejecting the submission promise,
+	// which the callers' `.except` handlers surface as a task diagnostic.
+	// Reaching the agent at all would trip the "session must exist" assert
+	// below it, so a silently-fulfilled refusal cannot pass this test either.
+	void drainPromiseNextTicks()
+	{
+		for (;;)
+		{
+			auto handlers = __traits(getMember, socketManager, "nextTickHandlers");
+			if (handlers.length == 0)
+				return;
+			mixin(`__traits(getMember, socketManager, "nextTickHandlers") = null;`);
+			foreach (handler; handlers)
+				handler();
+		}
+	}
+
+	string[] funnelRefusals;
+	foreach (text; ["internal", "queued before undo"])
+		app.sendPreparedTaskMessage(tid, [ContentBlock("text", text)])
+			.except((Exception e) { funnelRefusals ~= e.msg; }).ignoreResult();
+	drainPromiseNextTicks();
+	assert(funnelRefusals.length == 2 && funnelRefusals[0].canFind("not sent")
+		&& funnelRefusals[1].canFind("not sent"),
+		"Refused funnel delivery must reject the submission promise");
+	assert(ws.sent.length == 2, "Funnel refusal must not emit a socket error");
+
+	app.tasks[tid].markCodexNativeUndoUnverified();
+	app.handleUserMessage(WsMessage(type: "message", tid: tid));
+	assert(ws.sent.length == 3
+		&& ws.sent[$ - 1].canFind("may already have changed or lost history")
+		&& ws.sent[$ - 1].canFind("blocked only in this running CyDo process"));
 }
 
 /// Install robust logger implementation once.

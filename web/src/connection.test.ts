@@ -28,7 +28,7 @@ class MockWebSocket {
   }
 }
 
-describe("Connection client error reporting", () => {
+describe("Connection client behavior", () => {
   beforeEach(() => {
     MockWebSocket.instances = [];
     Object.defineProperty(globalThis, "location", {
@@ -151,7 +151,6 @@ describe("Connection client error reporting", () => {
     expect(replacement).toHaveBeenCalledOnce();
     expect(ordinary).not.toHaveBeenCalled();
   });
-
   it("sends task promotion with its target workspace", () => {
     const conn = new Connection();
     conn.connect();
@@ -166,5 +165,56 @@ describe("Connection client error reporting", () => {
         workspace: "destination",
       }),
     );
+  });
+
+  describe("undo request serialization", () => {
+    function lastSentJson(ws: MockWebSocket): Record<string, unknown> {
+      const call = ws.send.mock.calls.at(-1);
+      expect(call).toBeDefined();
+      return JSON.parse(call![0] as string) as Record<string, unknown>;
+    }
+
+    it("omits the expected turn count from preview requests", () => {
+      const conn = new Connection();
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+
+      conn.undoTask(7, "boundary-7", true, false, false);
+
+      const request = lastSentJson(ws);
+      expect(request).toMatchObject({
+        type: "undo_task",
+        tid: 7,
+        after_uuid: "boundary-7",
+        dry_run: true,
+      });
+      expect(request).not.toHaveProperty("expected_num_turns");
+    });
+
+    it("serializes the expected native turn count for a confirmation", () => {
+      const conn = new Connection();
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+
+      conn.undoTask(7, "boundary-7", false, true, false, 3);
+
+      expect(lastSentJson(ws)).toMatchObject({
+        type: "undo_task",
+        tid: 7,
+        after_uuid: "boundary-7",
+        dry_run: false,
+        expected_num_turns: 3,
+      });
+    });
+
+    it("omits the expected turn count for history-entry confirmations", () => {
+      const conn = new Connection();
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+
+      conn.undoTask(7, "boundary-7", false, true, false, undefined);
+
+      expect(lastSentJson(ws)).not.toHaveProperty("expected_num_turns");
+    });
   });
 });

@@ -25,6 +25,7 @@ const testState = vi.hoisted(() => {
     connection: null as {
       onControlMessage: ((message: unknown) => void) | null;
       promoteTask: ReturnType<typeof vi.fn>;
+      undoTask: ReturnType<typeof vi.fn>;
     } | null,
   };
 });
@@ -56,6 +57,7 @@ vi.mock("./connection", () => {
     readonly connect = vi.fn();
     readonly disconnect = vi.fn();
     readonly promoteTask = vi.fn();
+    readonly undoTask = vi.fn();
     readonly requestTaskTypes = vi.fn();
     readonly requestHistory = vi.fn(() => false);
 
@@ -139,5 +141,83 @@ describe("task promotion", () => {
 
     expect(connection.promoteTask).toHaveBeenCalledWith(42, "destination");
     expect(currentManager.getByTid(42)?.status).toBe("importable");
+  });
+
+  async function seedUndoTask() {
+    await renderManager();
+    const connection = testState.connection!;
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "tasks_list",
+        tasks: [
+          {
+            tid: 42,
+            alive: false,
+            resumable: true,
+            isProcessing: false,
+            status: "importable",
+          },
+        ],
+      } satisfies ControlMessage);
+    });
+    return connection;
+  }
+
+  it("echoes a native preview count when confirming undo", async () => {
+    const connection = await seedUndoTask();
+    const currentManager = await renderManager();
+
+    currentManager.undoPreview(42, "boundary-42");
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "undo_preview",
+        tid: 42,
+        messages_removed: 3,
+        count_unit: "codex_turns",
+      } satisfies ControlMessage);
+    });
+
+    expect((await renderManager()).getByTid(42)?.undoPending).toMatchObject({
+      afterUuid: "boundary-42",
+      messagesRemoved: 3,
+      countUnit: "codex_turns",
+    });
+
+    manager!.undoConfirm(42, true, false);
+
+    expect(connection.undoTask).toHaveBeenLastCalledWith(
+      42,
+      "boundary-42",
+      false,
+      true,
+      false,
+      3,
+    );
+  });
+
+  it("omits an expected count for history-entry undo", async () => {
+    const connection = await seedUndoTask();
+    const currentManager = await renderManager();
+
+    currentManager.undoPreview(42, "boundary-42");
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "undo_preview",
+        tid: 42,
+        messages_removed: 4,
+        count_unit: "history_entries",
+      } satisfies ControlMessage);
+    });
+
+    manager!.undoConfirm(42, true, false);
+
+    expect(connection.undoTask).toHaveBeenLastCalledWith(
+      42,
+      "boundary-42",
+      false,
+      true,
+      false,
+      undefined,
+    );
   });
 });

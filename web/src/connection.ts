@@ -272,6 +272,7 @@ export class Connection {
     dryRun: boolean,
     revertConversation?: boolean,
     revertFiles?: boolean,
+    expectedNumTurns?: number,
   ) {
     this.send(
       JSON.stringify({
@@ -281,6 +282,9 @@ export class Connection {
         dry_run: dryRun,
         revert_conversation: revertConversation ?? true,
         revert_files: revertFiles ?? true,
+        ...(expectedNumTurns !== undefined
+          ? { expected_num_turns: expectedNumTurns }
+          : {}),
       }),
     );
   }

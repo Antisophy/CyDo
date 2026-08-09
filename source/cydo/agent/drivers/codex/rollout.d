@@ -383,50 +383,6 @@ package bool isCodexRollbackEligibleUserMessage(
 	return classification != CodexUserMessageLineClassification.turnAborted;
 }
 
-enum CodexActiveUserTurnsAfterStatus
-{
-	ok,
-	targetMissing,
-	targetNotUser,
-}
-
-struct CodexActiveUserTurnsAfterResult
-{
-	CodexActiveUserTurnsAfterStatus status;
-	int count;
-}
-
-/// Count active (marker-aware) user turns after `forkId` in Codex JSONL content.
-/// Returns status `ok` with count for valid user targets, otherwise a status
-/// describing whether the target is missing from active history or non-user.
-CodexActiveUserTurnsAfterResult countActiveUserTurnsAfterForkId(string content, string forkId)
-{
-	auto ids = extractPersistedHistoryBoundariesImpl(content);
-
-	size_t targetIdx = size_t.max;
-	foreach (i, ref idInfo; ids)
-	{
-		if (idInfo.anchor == forkId)
-		{
-			targetIdx = i;
-			break;
-		}
-	}
-
-	if (targetIdx == size_t.max)
-		return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.targetMissing, 0);
-	if (ids[targetIdx].kind != PersistedHistoryBoundaryKind.user)
-		return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.targetNotUser, 0);
-
-	int count = 0;
-	foreach (ref idInfo; ids[targetIdx + 1 .. $])
-	{
-		if (idInfo.kind == PersistedHistoryBoundaryKind.user)
-			count++;
-	}
-	return CodexActiveUserTurnsAfterResult(CodexActiveUserTurnsAfterStatus.ok, count);
-}
-
 /// Count active persisted message records from `anchor` onward for JSONL undo.
 /// Rollback-dead records are excluded by the active-boundary extraction.
 int countActiveFallbackRecordsFromBoundary(string content, string anchor)
@@ -581,31 +537,6 @@ unittest
 	auto rolledAll = applyRollbackToIdsWithInfo(ids, 10);
 	assert(rolledAll.length == 0, "rollback > total should remove everything");
 
-	// Test countActiveUserTurnsAfterForkId with rollback markers
-	{
-		string jsonl =
-			`{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}`;
-
-		auto ok = countActiveUserTurnsAfterForkId(jsonl, "line:4");
-		assert(ok.status == CodexActiveUserTurnsAfterStatus.ok);
-		assert(ok.count == 1, "only visible user turn after line:4 should be counted");
-
-		auto hidden = countActiveUserTurnsAfterForkId(jsonl, "line:6");
-		assert(hidden.status == CodexActiveUserTurnsAfterStatus.targetMissing);
-
-		auto assistant = countActiveUserTurnsAfterForkId(jsonl, "line:5");
-		assert(assistant.status == CodexActiveUserTurnsAfterStatus.targetNotUser);
-	}
-
 	// Fallback JSONL preview counts any active boundary, including assistants.
 	{
 		string jsonl =
@@ -619,27 +550,6 @@ unittest
 		assert(countActiveFallbackRecordsFromBoundary(jsonl, "line:2") == 2);
 		assert(countActiveFallbackRecordsFromBoundary(jsonl, "line:5") == -1);
 		assert(countActiveFallbackRecordsFromBoundary(jsonl, "line:999999") == -1);
-	}
-
-	// Count user-turn groups, not raw user lines, after rollback.
-	{
-		string jsonl =
-			`{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}`;
-
-		auto afterSecond = countActiveUserTurnsAfterForkId(jsonl, "line:4");
-		assert(afterSecond.status == CodexActiveUserTurnsAfterStatus.ok);
-		assert(afterSecond.count == 2,
-			"rollback count should include all active user segments");
 	}
 
 	// A v1 interrupted turn persists a contextual role=user abort marker. It
@@ -715,30 +625,6 @@ unittest
 		foreach (line; 4 .. 8)
 			assert(line in skip,
 				"replay must remove the interrupted turn and contextual abort record");
-	}
-
-	// CyDo's injected session instruction is persisted as a user response_item,
-	// but it has no visible user-message counterpart and must not shift line
-	// boundary correlation for subsequent visible turns.
-	{
-		string jsonl =
-			`{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"[SYSTEM: Session start]"}]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alive-one"}]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alive-two"}]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alive-three"}]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alive-four"}]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"alive-five"}]}}` ~ "\n" ~
-			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}`;
-
-		auto afterThird = countActiveUserTurnsAfterForkId(jsonl, "line:8");
-		assert(afterThird.status == CodexActiveUserTurnsAfterStatus.ok);
-		assert(afterThird.count == 2);
 	}
 
 	// Test isRollbackMarker

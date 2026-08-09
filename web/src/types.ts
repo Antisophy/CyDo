@@ -304,6 +304,7 @@ export interface TaskState {
   undoPending?: {
     afterUuid: string;
     messagesRemoved: number;
+    countUnit?: import("./protocol").UndoCountUnit;
     canRevertFiles: boolean;
     retainsPrompt: boolean;
     supportsFileRevert?: boolean;
