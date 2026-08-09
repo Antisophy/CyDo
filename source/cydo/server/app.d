@@ -72,7 +72,7 @@ import cydo.agent.drivers.codex : CodexSession;
 import cydo.runtime.config : AgentConfig, AgentDriver, CydoConfig, PathMode, SandboxConfig, WorkspaceConfig;
 import cydo.domain.storage.persistence : Persistence, openDatabase;
 import cydo.server.config_resolution : loadRuntimeConfig, reloadRuntimeConfig;
-import cydo.runtime.launch.sandbox : cleanup, resolveExecutablePath, runtimeDir;
+import cydo.runtime.launch.sandbox : cleanup, resolveExecutablePath, runtimeDir, sharedTmpBaseDir;
 import cydo.domain.task_types.definition : TaskTypeDef, OutputType, WorktreeMode, byName, loadTaskTypes,
 	loadTaskTypeSystemPrompt, renderPrompt, substituteVars,
 	loadProjectMemory, resolveAgent;
@@ -2885,7 +2885,7 @@ class App
 		import std.path : buildPath;
 
 		int rootTid = findRootTid(tid);
-		auto path = buildPath(runtimeDir(), "tmp-" ~ rootTid.to!string);
+		auto path = buildPath(sharedTmpBaseDir(), "tmp-" ~ rootTid.to!string);
 		if (!exists(path))
 			mkdirRecurse(path);
 		return path;

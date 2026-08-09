@@ -10,7 +10,7 @@ import ae.net.http.websocket : WebSocketAdapter;
 import ae.utils.promise : Promise;
 import ae.utils.promise.concurrency : threadAsync;
 
-import cydo.runtime.launch.sandbox : runtimeDir;
+import cydo.runtime.launch.sandbox : runtimeDir, sharedTmpBaseDir;
 import cydo.domain.tasks.model : ArchiveState;
 import cydo.domain.tasks.model : worktreePathForTaskDir;
 import cydo.workflow.workspace.worktree : archiveWorktree, hasArchiveRef, unarchiveWorktree;
@@ -167,7 +167,7 @@ private:
 		{
 			auto rootTask = rootTid in tasks;
 			if (rootTask !is null && (rootTid == tid || rootTask.archived))
-				cleanupTmpPath = buildPath(runtimeDir(), "tmp-" ~ rootTid.to!string);
+				cleanupTmpPath = buildPath(sharedTmpBaseDir(), "tmp-" ~ rootTid.to!string);
 		}
 
 		infof("archive transition start: transitionTid=%d rootTid=%d goal=%s operationCount=%d",
@@ -434,7 +434,7 @@ unittest
 	assert(capturedPlan.ops.length == 2);
 	assert(capturedPlan.ops[0].tid == 1);
 	assert(capturedPlan.ops[1].tid == 2);
-	assert(capturedPlan.cleanupTmpPath == buildPath(runtimeDir(), "tmp-1"));
+	assert(capturedPlan.cleanupTmpPath == buildPath(sharedTmpBaseDir(), "tmp-1"));
 }
 
 version(unittest)
