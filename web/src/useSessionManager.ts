@@ -56,7 +56,7 @@ import {
   buildProjectHref,
   buildScopedHref,
   canonicalTaskRedirect,
-  decodeProjectSegment,
+  parseRoute,
   taskPath,
 } from "./routing";
 
@@ -576,30 +576,17 @@ export function useTaskManager(
   defaultAgentRef.current = defaultAgent;
 
   const { params, path } = useRoute();
-  const parsed = useMemo(() => {
-    // Archive routes set parentTid param; derive the virtual archive ID
-    const isArchive = path.includes("/archive");
-    const isImport = path.includes("/import");
-    const tid = isArchive
-      ? params.parentTid
-        ? `archive:${params.parentTid}`
-        : "archive"
-      : isImport
-        ? "import"
-        : (params.tid ?? params.sid ?? null);
-    return {
-      workspace: params.workspace ?? null,
-      project: params.project ? decodeProjectSegment(params.project) : null,
-      tid,
-    };
-  }, [
-    path,
-    params.workspace,
-    params.project,
-    params.tid,
-    params.sid,
-    params.parentTid,
-  ]);
+  const parsed = useMemo(
+    () => parseRoute(path, params),
+    [
+      path,
+      params.workspace,
+      params.project,
+      params.tid,
+      params.sid,
+      params.parentTid,
+    ],
+  );
   const activeTaskIdRef = useRef<string | null>(parsed.tid);
   activeTaskIdRef.current = parsed.tid;
   const activeTaskId = parsed.tid;

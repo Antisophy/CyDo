@@ -8,6 +8,27 @@ export function decodeProjectSegment(segment: string): string {
   return segment.replace(/:/g, "/");
 }
 
+export function parseRoute(
+  path: string,
+  params: Record<string, string>,
+): { workspace: string | null; project: string | null; tid: string | null } {
+  const segments = path.split("/").filter(Boolean);
+  const kind = segments[params.workspace !== undefined ? 2 : 0];
+  const tid =
+    kind === "archive"
+      ? params.parentTid
+        ? `archive:${params.parentTid}`
+        : "archive"
+      : kind === "import"
+        ? "import"
+        : (params.tid ?? params.sid ?? null);
+  return {
+    workspace: params.workspace ?? null,
+    project: params.project ? decodeProjectSegment(params.project) : null,
+    tid,
+  };
+}
+
 export function buildProjectHref(
   workspace: string,
   projectName: string,

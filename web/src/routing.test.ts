@@ -5,6 +5,7 @@ import {
   canonicalTaskRedirect,
   decodeProjectSegment,
   encodeProjectName,
+  parseRoute,
   taskPath,
 } from "./routing";
 
@@ -17,6 +18,66 @@ describe("encodeProjectName", () => {
 describe("decodeProjectSegment", () => {
   it("replaces colons with slashes", () => {
     expect(decodeProjectSegment("a:b")).toBe("a/b");
+  });
+});
+
+describe("parseRoute", () => {
+  const cases: [
+    string,
+    Record<string, string>,
+    ReturnType<typeof parseRoute>,
+  ][] = [
+    ["/", {}, { workspace: null, project: null, tid: null }],
+    [
+      "/task/32639",
+      { tid: "32639" },
+      { workspace: null, project: null, tid: "32639" },
+    ],
+    [
+      "/cydo/cydo/task/32639",
+      { workspace: "cydo", project: "cydo", tid: "32639" },
+      { workspace: "cydo", project: "cydo", tid: "32639" },
+    ],
+    [
+      "/local/foo:bar/task/7",
+      { workspace: "local", project: "foo:bar", tid: "7" },
+      { workspace: "local", project: "foo/bar", tid: "7" },
+    ],
+    ["/archive", {}, { workspace: null, project: null, tid: "archive" }],
+    [
+      "/archive/5",
+      { parentTid: "5" },
+      { workspace: null, project: null, tid: "archive:5" },
+    ],
+    [
+      "/cydo/cydo/archive",
+      { workspace: "cydo", project: "cydo" },
+      { workspace: "cydo", project: "cydo", tid: "archive" },
+    ],
+    [
+      "/cydo/cydo/archive/9",
+      { workspace: "cydo", project: "cydo", parentTid: "9" },
+      { workspace: "cydo", project: "cydo", tid: "archive:9" },
+    ],
+    [
+      "/cydo/cydo/import",
+      { workspace: "cydo", project: "cydo" },
+      { workspace: "cydo", project: "cydo", tid: "import" },
+    ],
+    [
+      "/cydo/archive/task/5",
+      { workspace: "cydo", project: "archive", tid: "5" },
+      { workspace: "cydo", project: "archive", tid: "5" },
+    ],
+    [
+      "/cydo/import/task/5",
+      { workspace: "cydo", project: "import", tid: "5" },
+      { workspace: "cydo", project: "import", tid: "5" },
+    ],
+  ];
+
+  it.each(cases)("parses %s", (path, params, expected) => {
+    expect(parseRoute(path, params)).toEqual(expected);
   });
 });
 

@@ -615,9 +615,9 @@ export function App() {
           path="/:workspace/:project/session/:sid"
           component={AppContent}
         />
-        <Route path="/:workspace/:project" component={AppContent} />
         <Route path="/archive/:parentTid" component={AppContent} />
         <Route path="/archive" component={AppContent} />
+        <Route path="/:workspace/:project" component={AppContent} />
         <Route path="/import" component={AppContent} />
         <Route path="/" component={AppContent} />
         <Route default component={NotFound} />
