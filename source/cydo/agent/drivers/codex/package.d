@@ -7,6 +7,7 @@ import std.conv : to;
 import std.exception : enforce;
 import std.logger : errorf, tracef, warningf;
 import std.path : buildPath, dirName, isAbsolute;
+import std.typecons : Nullable;
 
 import ae.sys.data : Data;
 import ae.sys.timing : setTimeout, TimerTask;
@@ -34,8 +35,8 @@ public import cydo.agent.drivers.codex.process : AppServerProcess;
 public import cydo.agent.drivers.codex.native_undo;
 public import cydo.agent.drivers.codex.rollout;
 public import cydo.agent.drivers.codex.rpc;
-import cydo.protocol : ContentBlock, ProcessStderrEvent, SessionCompactedEvent,
-	TranslatedEvent, extrasToFragment;
+import cydo.protocol : ContentBlock, HistoryBoundary, HistoryBoundaryKind,
+	ProcessStderrEvent, SessionCompactedEvent, TranslatedEvent, extrasToFragment;
 import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.runtime.config : AgentDriver, ModelSpec, ModelSpecFields;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
@@ -2031,6 +2032,812 @@ private class AppServerStartupLease
 // CodexSession — one Codex thread, implementing AgentSession.
 // ---------------------------------------------------------------------------
 
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import ae.sys.file : getFileID;
+	import std.file : exists, isDir, isSymlink, mkdir, remove, rmdir, symlink, write;
+	import std.stdio : File;
+
+	enum rolloutPath = "/tmp/cydo-native-undo-preparation-unittest.jsonl";
+	enum rollout =
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"prepare-turn","started_at":1,"model_context_window":1,"collaboration_mode_kind":"default"}}` ~ "\n"
+		~ `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"prepare prompt"}],"internal_chat_message_metadata_passthrough":{"turn_id":"prepare-turn"}}}` ~ "\n"
+		~ `{"type":"event_msg","payload":{"type":"user_message","client_id":"prepare-client","message":"prepare prompt","images":[],"local_images":[],"text_elements":[]}}` ~ "\n"
+		~ `{"type":"event_msg","payload":{"type":"agent_message","message":"prepare answer","phase":null,"memory_citation":null}}` ~ "\n"
+		~ `{"type":"response_item","payload":{"type":"message","id":"raw-agent","role":"assistant","content":[{"type":"output_text","text":"prepare answer"}],"internal_chat_message_metadata_passthrough":{"turn_id":"prepare-turn"}}}` ~ "\n"
+		~ `{"type":"event_msg","payload":{"type":"task_complete","turn_id":"prepare-turn","last_agent_message":"prepare answer","completed_at":1,"duration_ms":1,"time_to_first_token_ms":1}}`;
+	enum ledger =
+		`{"thread":{"id":"prepare-thread","status":{"type":"idle"},"turns":[{"id":"prepare-turn","items":[{"type":"userMessage","id":"user-item","clientId":"prepare-client","content":[{"type":"text","text":"prepare prompt","text_elements":[]}]},{"type":"agentMessage","id":"agent-item","text":"prepare answer","phase":null,"memoryCitation":null}],"itemsView":"full","status":"completed","error":null,"startedAt":1,"completedAt":1,"durationMs":1}]}}`;
+
+	class RecordingPreparationSession : CodexSession
+	{
+		string[] methods;
+		string[] params;
+		string responseJson = ledger;
+		bool throwRequest;
+		bool rejectRequest;
+		void delegate() afterRolloutRead;
+
+		this()
+		{
+			super(new AppServerProcess([]), 1, SessionConfig.init);
+		}
+
+		override protected Promise!JsonRpcResponse sendCodexRequest(string method,
+			string requestParams)
+		{
+			methods ~= method;
+			params ~= requestParams;
+			if (throwRequest)
+				throw new Exception("thread/read send failed");
+			if (rejectRequest)
+			{
+				auto result = new Promise!JsonRpcResponse;
+				result.reject(new Exception("thread/read transport failed"));
+				return result;
+			}
+			JsonRpcResponse response;
+			response.result = jsonParse!SO(responseJson);
+			return resolve(response);
+		}
+
+		override protected void onNativeUndoRolloutRead()
+		{
+			if (afterRolloutRead !is null)
+				afterRolloutRead();
+		}
+	}
+
+	void expectPreparationRefusal(RecordingPreparationSession session,
+		NativeUndoPreparationRefusalCategory expectedCategory, size_t expectedRequests)
+	{
+		bool fulfilled;
+		bool rejected;
+		session.prepareNativeUndo(
+			HistoryBoundary("line:2", HistoryBoundaryKind.user, null)).then(
+			(NativeUndoPlan _) { fulfilled = true; },
+			(Exception e) {
+				auto refusal = cast(NativeUndoPreparationRefusal) e;
+				assert(refusal !is null && refusal.category == expectedCategory, e.msg);
+				rejected = true;
+			},
+		).ignoreResult();
+		socketManager.loop();
+		assert(rejected && !fulfilled && session.methods.length == expectedRequests);
+		foreach (method; session.methods)
+			assert(method != "thread/rollback");
+	}
+
+	// Clears whatever the previous case left at rolloutPath — regular file,
+	// symlink, or directory — so each case starts from a genuinely absent path.
+	void clearRolloutPath()
+	{
+		bool linkExists;
+		try linkExists = isSymlink(rolloutPath);
+		catch (Throwable) linkExists = false;
+		if (!exists(rolloutPath) && !linkExists)
+			return;
+		if (linkExists || !isDir(rolloutPath))
+			remove(rolloutPath);
+		else
+			rmdir(rolloutPath);
+	}
+
+	clearRolloutPath();
+	scope(exit) clearRolloutPath();
+	write(rolloutPath, rollout);
+
+	auto expectedScan = scanRollout(rollout);
+	auto expectedRead = jsonParse!ThreadReadResult(ledger);
+	auto expected = prepareNativeUndoPlan(
+		HistoryBoundary("line:2", HistoryBoundaryKind.user, null), expectedScan, expectedRead,
+		"prepare-thread");
+
+	auto session = new RecordingPreparationSession;
+	session.threadId = "prepare-thread";
+	session.retainRolloutPath(rolloutPath);
+	NativeUndoPlan received;
+	bool fulfilled;
+	session.prepareNativeUndo(HistoryBoundary("line:2", HistoryBoundaryKind.user, null)).then(
+		(NativeUndoPlan plan) {
+			received = plan;
+			fulfilled = true;
+		},
+		(Exception e) { assert(false, e.msg); },
+	).ignoreResult();
+	socketManager.loop();
+	assert(fulfilled);
+	assert(session.methods == ["thread/read"]);
+	auto params = jsonParse!ThreadReadParams(session.params[0]);
+	assert(params.threadId == "prepare-thread" && params.includeTurns);
+	assert(received.numTurns == expected.numTurns
+		&& received.targetLedgerIndex == expected.targetLedgerIndex
+		&& received.targetTurnId == expected.targetTurnId
+		&& received.retainedPrefix.length == expected.retainedPrefix.length
+		&& received.retainedRawPrefix.length == expected.retainedRawPrefix.length
+		&& received.preparedThreadId == "prepare-thread"
+		&& received.preparedRolloutPath == rolloutPath
+		&& received.preparedRolloutFileId == getFileID(rolloutPath)
+		&& received.preparedRolloutSize == rollout.length);
+	assert(session.threadId == "prepare-thread" && session.rolloutPath_ == rolloutPath
+		&& !session.turnInProgress && session.pendingMessages_.length == 0);
+
+	auto dead = new RecordingPreparationSession;
+	dead.alive_ = false;
+	expectPreparationRefusal(dead, NativeUndoPreparationRefusalCategory.sessionDead, 0);
+
+	auto missingThread = new RecordingPreparationSession;
+	missingThread.retainRolloutPath(rolloutPath);
+	expectPreparationRefusal(missingThread, NativeUndoPreparationRefusalCategory.missingThread, 0);
+
+	auto noPath = new RecordingPreparationSession;
+	noPath.threadId = "prepare-thread";
+	expectPreparationRefusal(noPath, NativeUndoPreparationRefusalCategory.missingRolloutPath, 0);
+
+	auto inProgress = new RecordingPreparationSession;
+	inProgress.threadId = "prepare-thread";
+	inProgress.retainRolloutPath(rolloutPath);
+	inProgress.turnInProgress = true;
+	expectPreparationRefusal(inProgress, NativeUndoPreparationRefusalCategory.turnInProgress, 0);
+
+	auto queued = new RecordingPreparationSession;
+	queued.threadId = "prepare-thread";
+	queued.retainRolloutPath(rolloutPath);
+	queued.pendingMessages_ ~= new CodexSession.PendingMessage([ContentBlock("text", "queued")], "queued", "queued-uuid", false);
+	expectPreparationRefusal(queued, NativeUndoPreparationRefusalCategory.queuedNativeInput, 0);
+
+	// A steer response and the turn.completed notification are unordered
+	// event-loop callbacks: turnInProgress can already read false while the
+	// outstanding steer submission is still in inFlightMessages_, so undo
+	// must refuse on that alone rather than relying on turnInProgress.
+	auto inFlightSteer = new RecordingPreparationSession;
+	inFlightSteer.threadId = "prepare-thread";
+	inFlightSteer.retainRolloutPath(rolloutPath);
+	inFlightSteer.inFlightMessages_ ~= new CodexSession.PendingMessage([ContentBlock("text", "steering")], "steering", "steering-uuid", false);
+	assert(!inFlightSteer.canRollbackThread);
+	expectPreparationRefusal(inFlightSteer, NativeUndoPreparationRefusalCategory.inFlightSubmission, 0);
+
+	auto unavailable = new RecordingPreparationSession;
+	unavailable.threadId = "prepare-thread";
+	unavailable.retainRolloutPath("/tmp/cydo-native-undo-missing-rollout.jsonl");
+	expectPreparationRefusal(unavailable,
+		NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+
+	auto malformedRead = new RecordingPreparationSession;
+	malformedRead.threadId = "prepare-thread";
+	malformedRead.retainRolloutPath(rolloutPath);
+	malformedRead.responseJson = "{}";
+	expectPreparationRefusal(malformedRead,
+		NativeUndoPreparationRefusalCategory.threadReadFailed, 1);
+
+	auto rejectedRead = new RecordingPreparationSession;
+	rejectedRead.threadId = "prepare-thread";
+	rejectedRead.retainRolloutPath(rolloutPath);
+	rejectedRead.rejectRequest = true;
+	expectPreparationRefusal(rejectedRead,
+		NativeUndoPreparationRefusalCategory.threadReadFailed, 1);
+
+	auto thrownRead = new RecordingPreparationSession;
+	thrownRead.threadId = "prepare-thread";
+	thrownRead.retainRolloutPath(rolloutPath);
+	thrownRead.throwRequest = true;
+	expectPreparationRefusal(thrownRead,
+		NativeUndoPreparationRefusalCategory.threadReadFailed, 1);
+
+	// The retained identity is a path gate, not a content fingerprint. Keep the
+	// original inode live while replacing the pathname with the same bytes so a
+	// same-content remove/recreate cannot be mistaken for the retained rollout.
+	write(rolloutPath, rollout);
+	auto replacement = new RecordingPreparationSession;
+	replacement.threadId = "prepare-thread";
+	replacement.retainRolloutPath(rolloutPath);
+	auto originalHandle = File(rolloutPath, "r");
+	scope(exit) originalHandle.close();
+	remove(rolloutPath);
+	write(rolloutPath, rollout);
+	expectPreparationRefusal(replacement,
+		NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+
+	// A replacement after reading the retained rollout but before dispatch must
+	// still refuse without issuing thread/read.
+	write(rolloutPath, rollout);
+	auto replacementAfterRead = new RecordingPreparationSession;
+	replacementAfterRead.threadId = "prepare-thread";
+	replacementAfterRead.retainRolloutPath(rolloutPath);
+	auto postReadOriginalHandle = File(rolloutPath, "r");
+	scope(exit) postReadOriginalHandle.close();
+	replacementAfterRead.afterRolloutRead = {
+		remove(rolloutPath);
+		write(rolloutPath, rollout);
+	};
+	expectPreparationRefusal(replacementAfterRead,
+		NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+
+	// A current update to the original regular file is still current evidence;
+	// only replacement at the retained pathname is refused.
+	auto appended = new RecordingPreparationSession;
+	appended.threadId = "prepare-thread";
+	appended.retainRolloutPath(rolloutPath);
+	{
+		auto file = File(rolloutPath, "a");
+		file.write("\n");
+		file.close();
+	}
+	NativeUndoPlan appendedPlan;
+	bool appendedFulfilled;
+	appended.prepareNativeUndo(HistoryBoundary("line:2", HistoryBoundaryKind.user, null)).then(
+		(NativeUndoPlan plan) {
+			appendedPlan = plan;
+			appendedFulfilled = true;
+		},
+		(Exception e) { assert(false, e.msg); },
+	).ignoreResult();
+	socketManager.loop();
+	assert(appendedFulfilled && appendedPlan.numTurns == 1
+		&& appended.methods == ["thread/read"]);
+
+	// T1: Codex 0.144.1 returns the exact rollout pathname before creating the
+	// file. The history watcher's first attachment is the only authorized late
+	// identity capture, and it lets preparation proceed exactly as if the file
+	// had existed at thread/start.
+	clearRolloutPath();
+	auto lateBind = new RecordingPreparationSession;
+	ThreadStartResult lateBindStart;
+	lateBindStart.thread.id = "prepare-thread";
+	lateBindStart.thread.path = rolloutPath;
+	lateBind.onThreadStarted(lateBindStart, null, "model", "/workspace", "");
+	assert(lateBind.rolloutPath_ == rolloutPath && !lateBind.rolloutFileIdentityKnown_
+		&& lateBind.awaitingFirstRolloutMaterialization_);
+	expectPreparationRefusal(lateBind, NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+
+	write(rolloutPath, rollout);
+	lateBind.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(lateBind.rolloutFileIdentityKnown_ && lateBind.rolloutFileId_ == getFileID(rolloutPath));
+
+	NativeUndoPlan lateBindPlan;
+	bool lateBindFulfilled;
+	lateBind.prepareNativeUndo(HistoryBoundary("line:2", HistoryBoundaryKind.user, null)).then(
+		(NativeUndoPlan plan) {
+			lateBindPlan = plan;
+			lateBindFulfilled = true;
+		},
+		(Exception e) { assert(false, e.msg); },
+	).ignoreResult();
+	socketManager.loop();
+	assert(lateBindFulfilled && lateBind.methods == ["thread/read"]);
+	auto lateBindParams = jsonParse!ThreadReadParams(lateBind.params[0]);
+	assert(lateBindParams.threadId == "prepare-thread" && lateBindParams.includeTurns);
+	assert(lateBindPlan.numTurns == expected.numTurns
+		&& lateBindPlan.targetLedgerIndex == expected.targetLedgerIndex
+		&& lateBindPlan.targetTurnId == expected.targetTurnId);
+
+	// T2: the bind rejection matrix. Every case ends terminally unbound with
+	// zero provider requests; only the two mismatch cases must leave the
+	// pending bit unconsumed so a subsequent correct call still binds.
+
+	// Wrong thread id: rejected, and does not consume the pending bit.
+	clearRolloutPath();
+	auto wrongThread = new RecordingPreparationSession;
+	ThreadStartResult wrongThreadStart;
+	wrongThreadStart.thread.id = "prepare-thread";
+	wrongThreadStart.thread.path = rolloutPath;
+	wrongThread.onThreadStarted(wrongThreadStart, null, "model", "/workspace", "");
+	write(rolloutPath, rollout);
+	wrongThread.bindPendingRolloutIdentity("other-thread", rolloutPath);
+	assert(!wrongThread.rolloutFileIdentityKnown_);
+	expectPreparationRefusal(wrongThread, NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+	wrongThread.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(wrongThread.rolloutFileIdentityKnown_
+		&& wrongThread.rolloutFileId_ == getFileID(rolloutPath));
+
+	// Wrong path: rejected, and does not consume the pending bit.
+	enum wrongPath = "/tmp/cydo-native-undo-late-bind-wrong-path.jsonl";
+	clearRolloutPath();
+	scope(exit) if (exists(wrongPath)) remove(wrongPath);
+	auto wrongPathSession = new RecordingPreparationSession;
+	ThreadStartResult wrongPathStart;
+	wrongPathStart.thread.id = "prepare-thread";
+	wrongPathStart.thread.path = rolloutPath;
+	wrongPathSession.onThreadStarted(wrongPathStart, null, "model", "/workspace", "");
+	write(rolloutPath, rollout);
+	write(wrongPath, rollout);
+	wrongPathSession.bindPendingRolloutIdentity("prepare-thread", wrongPath);
+	assert(!wrongPathSession.rolloutFileIdentityKnown_);
+	expectPreparationRefusal(wrongPathSession, NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+	wrongPathSession.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(wrongPathSession.rolloutFileIdentityKnown_
+		&& wrongPathSession.rolloutFileId_ == getFileID(rolloutPath));
+
+	// Symlink: consumed and terminal.
+	enum symlinkSibling = "/tmp/cydo-native-undo-late-bind-symlink-sibling.jsonl";
+	clearRolloutPath();
+	scope(exit) if (exists(symlinkSibling)) remove(symlinkSibling);
+	auto symlinkSession = new RecordingPreparationSession;
+	ThreadStartResult symlinkStart;
+	symlinkStart.thread.id = "prepare-thread";
+	symlinkStart.thread.path = rolloutPath;
+	symlinkSession.onThreadStarted(symlinkStart, null, "model", "/workspace", "");
+	write(symlinkSibling, rollout);
+	symlink(symlinkSibling, rolloutPath);
+	symlinkSession.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(!symlinkSession.rolloutFileIdentityKnown_
+		&& !symlinkSession.awaitingFirstRolloutMaterialization_);
+	expectPreparationRefusal(symlinkSession, NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+	// Consumed: a later legitimate materialization at the same pathname still
+	// refuses.
+	clearRolloutPath();
+	write(rolloutPath, rollout);
+	symlinkSession.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(!symlinkSession.rolloutFileIdentityKnown_);
+	expectPreparationRefusal(symlinkSession, NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+
+	// Nonregular: consumed and terminal.
+	clearRolloutPath();
+	auto nonregularSession = new RecordingPreparationSession;
+	ThreadStartResult nonregularStart;
+	nonregularStart.thread.id = "prepare-thread";
+	nonregularStart.thread.path = rolloutPath;
+	nonregularSession.onThreadStarted(nonregularStart, null, "model", "/workspace", "");
+	mkdir(rolloutPath);
+	nonregularSession.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(!nonregularSession.rolloutFileIdentityKnown_
+		&& !nonregularSession.awaitingFirstRolloutMaterialization_);
+	expectPreparationRefusal(nonregularSession, NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+	// Consumed: a later legitimate materialization at the same pathname still
+	// refuses.
+	clearRolloutPath();
+	write(rolloutPath, rollout);
+	nonregularSession.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(!nonregularSession.rolloutFileIdentityKnown_);
+	expectPreparationRefusal(nonregularSession, NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+
+	// Still absent: consumed and terminal.
+	clearRolloutPath();
+	auto stillAbsentSession = new RecordingPreparationSession;
+	ThreadStartResult stillAbsentStart;
+	stillAbsentStart.thread.id = "prepare-thread";
+	stillAbsentStart.thread.path = rolloutPath;
+	stillAbsentSession.onThreadStarted(stillAbsentStart, null, "model", "/workspace", "");
+	stillAbsentSession.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(!stillAbsentSession.rolloutFileIdentityKnown_
+		&& !stillAbsentSession.awaitingFirstRolloutMaterialization_);
+	expectPreparationRefusal(stillAbsentSession, NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+	// Consumed: a later legitimate materialization does not bind.
+	write(rolloutPath, rollout);
+	stillAbsentSession.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(!stillAbsentSession.rolloutFileIdentityKnown_);
+	expectPreparationRefusal(stillAbsentSession, NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+
+	// Already-known identity: a session whose path existed at retainRolloutPath
+	// has no pending bit, so a bind call cannot re-snapshot it.
+	clearRolloutPath();
+	write(rolloutPath, rollout);
+	auto alreadyKnownSession = new RecordingPreparationSession;
+	alreadyKnownSession.threadId = "prepare-thread";
+	alreadyKnownSession.retainRolloutPath(rolloutPath);
+	assert(alreadyKnownSession.rolloutFileIdentityKnown_
+		&& !alreadyKnownSession.awaitingFirstRolloutMaterialization_);
+	auto originalFileId = alreadyKnownSession.rolloutFileId_;
+	remove(rolloutPath);
+	write(rolloutPath, rollout);
+	alreadyKnownSession.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(alreadyKnownSession.rolloutFileId_ == originalFileId);
+
+	// T3: replacement after a successful late bind still refuses with zero
+	// provider requests, and a second attachment (the post-rollback watcher
+	// restart) does not change that.
+	clearRolloutPath();
+	auto lateBindReplacement = new RecordingPreparationSession;
+	ThreadStartResult lateBindReplacementStart;
+	lateBindReplacementStart.thread.id = "prepare-thread";
+	lateBindReplacementStart.thread.path = rolloutPath;
+	lateBindReplacement.onThreadStarted(lateBindReplacementStart, null, "model", "/workspace", "");
+	write(rolloutPath, rollout);
+	lateBindReplacement.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	assert(lateBindReplacement.rolloutFileIdentityKnown_);
+	auto lateBindOriginalHandle = File(rolloutPath, "r");
+	scope(exit) lateBindOriginalHandle.close();
+	remove(rolloutPath);
+	write(rolloutPath, rollout);
+	expectPreparationRefusal(lateBindReplacement,
+		NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+	lateBindReplacement.bindPendingRolloutIdentity("prepare-thread", rolloutPath);
+	expectPreparationRefusal(lateBindReplacement,
+		NativeUndoPreparationRefusalCategory.rolloutUnavailable, 0);
+}
+
+unittest
+{
+	import ae.net.asockets : socketManager;
+	import ae.sys.file : getFileID;
+	import std.file : exists, getSize, remove, write;
+	import std.stdio : File;
+	import std.string : replace;
+
+	enum rolloutPath = "/tmp/cydo-native-undo-execution-unittest.jsonl";
+	enum prePayload = `{"thread":{"id":"execution-thread","status":{"type":"idle"},"turns":[{"id":"execution-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":1,"completedAt":1,"durationMs":1}]}}`;
+	enum exactRollbackPayload = `{"thread":{"id":"execution-thread","status":{"type":"idle"},"turns":[]}}`;
+	enum richPrePayload = `{"thread":{"id":"execution-thread","status":{"type":"idle"},"turns":[{"id":"retained-turn","items":[{"type":"userMessage","id":"retained-user-item","clientId":"retained-client","content":[{"type":"text","text":"retained input","text_elements":[{"type":"input_text","text":"element"}],"input_extra":{"input":"extra"}}],"text":"retained item text","phase":"retained phase","memoryCitation":{"citation":"retained"},"item_extra":{"item":"extra"}}],"itemsView":"full","status":"completed","error":{"message":"retained error"},"startedAt":11,"completedAt":12,"durationMs":13,"turn_extra":{"turn":"extra"}},{"id":"execution-turn","items":[],"itemsView":"full","status":"completed","error":null,"startedAt":1,"completedAt":1,"durationMs":1}]}}`;
+	enum exactRichRollbackPayload = `{"thread":{"id":"execution-thread","status":{"type":"idle"},"turns":[{"id":"retained-turn","items":[{"type":"userMessage","id":"retained-user-item","clientId":"retained-client","content":[{"type":"text","text":"retained input","text_elements":[{"type":"input_text","text":"element"}],"input_extra":{"input":"extra"}}],"text":"retained item text","phase":"retained phase","memoryCitation":{"citation":"retained"},"item_extra":{"item":"extra"}}],"itemsView":"full","status":"completed","error":{"message":"retained error"},"startedAt":11,"completedAt":12,"durationMs":13,"turn_extra":{"turn":"extra"}}]}}`;
+
+	class RecordingExecutionSession : CodexSession
+	{
+		enum AfterDispatchMutation { none, shrink, replace, disappear }
+
+		string[] methods;
+		string[] params;
+		string responseJson = exactRollbackPayload;
+		string marker;
+		bool throwRollback;
+		bool rejectRollback;
+		AfterDispatchMutation afterDispatchMutation;
+		void delegate() onRollbackRequest;
+
+		this()
+		{
+			super(new AppServerProcess([]), 1, SessionConfig.init);
+		}
+
+		override protected uint nativeUndoMarkerAttempts()
+		{
+			return 0;
+		}
+
+		override protected Promise!JsonRpcResponse sendCodexRequest(string method,
+			string requestParams)
+		{
+			methods ~= method;
+			params ~= requestParams;
+			if (onRollbackRequest !is null)
+				onRollbackRequest();
+			if (throwRollback)
+				throw new Exception("thread/rollback send failed");
+			if (rejectRollback)
+			{
+				auto rejected = new Promise!JsonRpcResponse;
+				rejected.reject(new Exception("thread/rollback transport failed"));
+				return rejected;
+			}
+			final switch (afterDispatchMutation)
+			{
+				case AfterDispatchMutation.none:
+					if (marker.length > 0)
+					{
+						auto file = File(rolloutPath, "a");
+						file.write(marker);
+						file.close();
+					}
+					break;
+				case AfterDispatchMutation.shrink:
+					write(rolloutPath, "");
+					break;
+				case AfterDispatchMutation.replace:
+					remove(rolloutPath);
+					write(rolloutPath, "replacement rollout\n");
+					break;
+				case AfterDispatchMutation.disappear:
+					remove(rolloutPath);
+					break;
+			}
+			JsonRpcResponse response;
+			response.result = jsonParse!SO(responseJson);
+			return resolve(response);
+		}
+	}
+
+	NativeUndoPlan executionPlan(RecordingExecutionSession session)
+	{
+		auto read = jsonParse!ThreadReadResult(prePayload);
+		NativeUndoPlan plan;
+		plan.numTurns = 1;
+		plan.preTurns = cloneTurns(read.thread.turns);
+		plan.preRawTurns = cloneRawValues(read.rawTurns);
+		plan.retainedPrefix = cloneTurns(read.thread.turns[0 .. 0]);
+		plan.retainedRawPrefix = cloneRawValues(read.rawTurns[0 .. 0]);
+		plan.targetLedgerIndex = 0;
+		plan.targetTurnId = "execution-turn";
+		plan.preparedThreadId = "execution-thread";
+		plan.preparedRolloutPath = rolloutPath;
+		plan.preparedRolloutFileId = session.rolloutFileId_;
+		plan.preparedRolloutSize = getSize(rolloutPath);
+		return plan;
+	}
+
+	NativeUndoPlan richExecutionPlan(RecordingExecutionSession session)
+	{
+		auto read = jsonParse!ThreadReadResult(richPrePayload);
+		NativeUndoPlan plan;
+		plan.numTurns = 1;
+		plan.preTurns = cloneTurns(read.thread.turns);
+		plan.preRawTurns = cloneRawValues(read.rawTurns);
+		plan.retainedPrefix = cloneTurns(read.thread.turns[0 .. 1]);
+		plan.retainedRawPrefix = cloneRawValues(read.rawTurns[0 .. 1]);
+		plan.targetLedgerIndex = 1;
+		plan.targetTurnId = "execution-turn";
+		plan.preparedThreadId = "execution-thread";
+		plan.preparedRolloutPath = rolloutPath;
+		plan.preparedRolloutFileId = session.rolloutFileId_;
+		plan.preparedRolloutSize = getSize(rolloutPath);
+		return plan;
+	}
+
+	NativeUndoExecutionResult execute(RecordingExecutionSession session,
+		NativeUndoPlan plan, ref bool callbackCalled)
+	{
+		NativeUndoExecutionResult observed;
+		bool fulfilled;
+		session.executeNativeUndo(plan, {
+			callbackCalled = true;
+		}).then((NativeUndoExecutionResult outcome) {
+			observed = outcome;
+			fulfilled = true;
+		}, (Exception e) { assert(false, e.msg); }).ignoreResult();
+		socketManager.loop();
+		assert(fulfilled, "native undo execution must fulfill an explicit outcome");
+		return observed;
+	}
+
+	if (exists(rolloutPath))
+		remove(rolloutPath);
+	scope(exit) if (exists(rolloutPath)) remove(rolloutPath);
+
+	RecordingExecutionSession newSession()
+	{
+		write(rolloutPath, "retained rollout\n");
+		auto session = new RecordingExecutionSession;
+		session.threadId = "execution-thread";
+		session.retainRolloutPath(rolloutPath);
+		assert(session.rolloutFileIdentityKnown_
+			&& session.rolloutFileId_ == getFileID(rolloutPath));
+		return session;
+	}
+
+	void expectRichUnverifiable(string responseJson)
+	{
+		auto session = newSession();
+		session.responseJson = responseJson;
+		session.marker = `{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`;
+		bool callbackCalled;
+		auto outcome = execute(session, richExecutionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.unverifiableAfterDispatch
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+	}
+
+	void expectPreflightRefusal(RecordingExecutionSession session, NativeUndoPlan plan)
+	{
+		bool callbackCalled;
+		auto outcome = execute(session, plan, callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.refusedBeforeDispatch
+			&& !callbackCalled && session.methods.length == 0);
+	}
+
+	{
+		auto session = newSession();
+		session.marker = `{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`;
+		bool callbackCalled;
+		session.onRollbackRequest = {
+			assert(callbackCalled, "point-of-no-return callback must precede rollback dispatch");
+		};
+		auto outcome = execute(session, executionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.verified
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+		auto params = jsonParse!ThreadRollbackParams(session.params[0]);
+		assert(params.threadId == "execution-thread" && params.numTurns == 1);
+	}
+
+	{
+		auto session = newSession();
+		auto plan = executionPlan(session);
+		plan.numTurns = 0;
+		expectPreflightRefusal(session, plan);
+	}
+
+	// Every pre-dispatch session, plan, and retained-file refusal leaves the
+	// callback untouched and forms no provider request.
+	{
+		auto session = newSession();
+		session.alive_ = false;
+		expectPreflightRefusal(session, executionPlan(session));
+	}
+	{
+		auto session = newSession();
+		auto plan = executionPlan(session);
+		session.threadId = null;
+		expectPreflightRefusal(session, plan);
+	}
+	{
+		auto session = newSession();
+		auto plan = executionPlan(session);
+		session.turnInProgress = true;
+		expectPreflightRefusal(session, plan);
+	}
+	{
+		auto session = newSession();
+		auto plan = executionPlan(session);
+		session.pendingMessages_ ~= new CodexSession.PendingMessage([ContentBlock("text", "queued")], "queued", "queued-uuid", false);
+		expectPreflightRefusal(session, plan);
+	}
+	{
+		// Same in-flight-steer race as prepareNativeUndo's inFlightSubmission
+		// case: turnInProgress can already read false while the outstanding
+		// steer submission is still in inFlightMessages_.
+		auto session = newSession();
+		auto plan = executionPlan(session);
+		session.inFlightMessages_ ~= new CodexSession.PendingMessage([ContentBlock("text", "steering")], "steering", "steering-uuid", false);
+		expectPreflightRefusal(session, plan);
+	}
+	{
+		auto session = newSession();
+		auto plan = executionPlan(session);
+		plan.targetLedgerIndex = 1;
+		expectPreflightRefusal(session, plan);
+	}
+	{
+		auto session = newSession();
+		auto plan = executionPlan(session);
+		plan.preparedThreadId = "other-thread";
+		expectPreflightRefusal(session, plan);
+	}
+	{
+		auto session = newSession();
+		auto plan = executionPlan(session);
+		write(rolloutPath, "");
+		expectPreflightRefusal(session, plan);
+	}
+	{
+		auto session = newSession();
+		auto plan = executionPlan(session);
+		auto originalHandle = File(rolloutPath, "r");
+		scope(exit) originalHandle.close();
+		remove(rolloutPath);
+		write(rolloutPath, "retained rollout\n");
+		expectPreflightRefusal(session, plan);
+	}
+
+	{
+		auto session = newSession();
+		session.throwRollback = true;
+		bool callbackCalled;
+		auto outcome = execute(session, executionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.unverifiableAfterDispatch
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+	}
+
+	{
+		auto session = newSession();
+		session.rejectRollback = true;
+		bool callbackCalled;
+		auto outcome = execute(session, executionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.unverifiableAfterDispatch
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+	}
+
+	{
+		auto session = newSession();
+		session.responseJson = `{"thread":{"id":"wrong-thread","status":{"type":"idle"},"turns":[]}}`;
+		bool callbackCalled;
+		auto outcome = execute(session, executionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.unverifiableAfterDispatch
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+	}
+
+	{
+		auto session = newSession();
+		session.marker = `{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":2}}`;
+		bool callbackCalled;
+		auto outcome = execute(session, executionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.unverifiableAfterDispatch
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+	}
+
+	{
+		auto session = newSession();
+		bool callbackCalled;
+		auto outcome = execute(session, executionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.unverifiableAfterDispatch
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+	}
+
+	{
+		auto session = newSession();
+		session.marker = `{"type":"unexpected","payload":{"type":"thread_rolled_back","num_turns":1}}`;
+		bool callbackCalled;
+		auto outcome = execute(session, executionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.unverifiableAfterDispatch
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+	}
+
+	foreach (mutation; [RecordingExecutionSession.AfterDispatchMutation.shrink,
+		RecordingExecutionSession.AfterDispatchMutation.replace,
+		RecordingExecutionSession.AfterDispatchMutation.disappear])
+	{
+		auto session = newSession();
+		session.afterDispatchMutation = mutation;
+		bool callbackCalled;
+		auto outcome = execute(session, executionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.unverifiableAfterDispatch
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+	}
+
+	// A historical marker before the captured dispatch offset cannot satisfy a
+	// later rollback operation.
+	{
+		auto session = newSession();
+		auto file = File(rolloutPath, "a");
+		file.write(`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`);
+		file.close();
+		bool callbackCalled;
+		auto outcome = execute(session, executionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.unverifiableAfterDispatch
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+	}
+
+	{
+		auto session = newSession();
+		session.responseJson = exactRichRollbackPayload;
+		session.marker = `{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`;
+		bool callbackCalled;
+		auto outcome = execute(session, richExecutionPlan(session), callbackCalled);
+		assert(outcome.status == NativeUndoExecutionStatus.verified
+			&& callbackCalled && session.methods == ["thread/rollback"]);
+	}
+
+	// Every typed field carried by a retained turn is a post-dispatch
+	// predicate, not merely an acknowledgement count or ID check.
+	foreach (mismatched; [
+		exactRollbackPayload,
+		`{}`,
+		exactRichRollbackPayload.replace(`"status":{"type":"idle"}`,
+			`"status":{"type":"idle","activeFlags":[]}`),
+		exactRichRollbackPayload.replace(`"id":"retained-turn"`, `"id":"wrong-turn"`),
+		exactRichRollbackPayload.replace(`"status":"completed"`, `"status":"failed"`),
+		exactRichRollbackPayload.replace(`"itemsView":"full"`, `"itemsView":"summary"`),
+		exactRichRollbackPayload.replace(`"error":{"message":"retained error"}`,
+			`"error":null`),
+		exactRichRollbackPayload.replace(`"startedAt":11`, `"startedAt":99`),
+		exactRichRollbackPayload.replace(`"type":"userMessage"`, `"type":"otherMessage"`),
+		exactRichRollbackPayload.replace(`"id":"retained-user-item"`,
+			`"id":"wrong-item"`),
+		exactRichRollbackPayload.replace(`"clientId":"retained-client"`,
+			`"clientId":"wrong-client"`),
+		exactRichRollbackPayload.replace(`"text":"retained input"`,
+			`"text":"wrong input"`),
+		exactRichRollbackPayload.replace(`"text":"retained item text"`,
+			`"text":"wrong item text"`),
+		exactRichRollbackPayload.replace(`"phase":"retained phase"`,
+			`"phase":"wrong phase"`),
+		exactRichRollbackPayload.replace(`"memoryCitation":{"citation":"retained"}`,
+			`"memoryCitation":null`),
+		exactRichRollbackPayload.replace(`"text_elements":[{"type":"input_text","text":"element"}]`,
+			`"text_elements":[]`),
+		exactRichRollbackPayload.replace(`"input_extra":{"input":"extra"}`,
+			`"input_extra":{"input":"wrong"}`),
+		exactRichRollbackPayload.replace(`"item_extra":{"item":"extra"}`,
+			`"item_extra":{"item":"wrong"}`),
+		exactRichRollbackPayload.replace(`"turn_extra":{"turn":"extra"}`,
+			`"turn_extra":{"turn":"wrong"}`),
+	])
+		expectRichUnverifiable(mismatched);
+
+	// The raw sidecar preserves object ordering that typed decoding intentionally
+	// does not model, so a semantically equivalent but opaque-prefix-different
+	// response cannot satisfy the predicate.
+	auto reorderedRawPrefix = exactRichRollbackPayload
+		.replace(`{"id":"retained-turn","items":`,
+			`{"itemsView":"full","id":"retained-turn","items":`)
+		.replace(`"item_extra":{"item":"extra"}}],"itemsView":"full","status":"completed"`,
+			`"item_extra":{"item":"extra"}}],"status":"completed"`);
+	expectRichUnverifiable(reorderedRawPrefix);
+
+	assert(verifyNativeUndoMarkerWindow("abc", 4, 1).status
+		== NativeUndoMarkerVerificationStatus.failure);
+	assert(verifyNativeUndoMarkerWindow("abc", 3, 1).status
+		== NativeUndoMarkerVerificationStatus.waiting);
+}
+
+
 class CodexSession : AgentSession
 {
 	private AppServerProcess server;
@@ -2046,6 +2853,12 @@ class CodexSession : AgentSession
 	private string model;
 	private string workDir;
 	private string rolloutPath_;
+	private ulong rolloutFileId_;
+	private bool rolloutFileIdentityKnown_;
+	/// Codex returns the rollout pathname from thread/start before it creates
+	/// that file. This bit is the single authorization for one later identity
+	/// capture, consumed by bindPendingRolloutIdentity.
+	private bool awaitingFirstRolloutMaterialization_;
 	private bool alive_;
 	private bool turnInProgress;
 	private bool hadItemsSinceLastStop_;
@@ -2205,9 +3018,79 @@ class CodexSession : AgentSession
 		return rolloutPath_;
 	}
 
+	/// Retain the identity of the exact regular rollout file returned by Codex.
+	/// Preparation later rereads this same file but must not rediscover or trust
+	/// a replacement at the retained pathname.
+	private void retainRolloutPath(string path)
+	{
+		import ae.sys.file : getFileID;
+		import std.file : exists, isFile, isSymlink;
+
+		rolloutPath_ = path;
+		rolloutFileId_ = 0;
+		rolloutFileIdentityKnown_ = false;
+		awaitingFirstRolloutMaterialization_ = false;
+		if (path.length == 0)
+			return;
+		if (!exists(path))
+		{
+			// Codex 0.144.1 returns the exact rollout pathname before creating
+			// the file. The history watcher already watches this exact path;
+			// its first attachment is the only authorized late identity capture.
+			// `exists` follows symlinks, so a dangling symlink also lands here;
+			// the bind re-checks isSymlink and refuses it.
+			awaitingFirstRolloutMaterialization_ = true;
+			return;
+		}
+		if (isSymlink(path) || !isFile(path))
+			return;
+		try
+		{
+			rolloutFileId_ = getFileID(path);
+			rolloutFileIdentityKnown_ = true;
+		}
+		catch (Throwable) {}
+	}
+
+	/// Bind the identity of the exact provider-returned rollout file the first
+	/// time the history watcher attaches to it. This is the only late identity
+	/// authority: it is one-shot, requires the caller's registration to name this
+	/// session's live thread and its exact retained pathname, and never
+	/// re-snapshots. A failed first materialization is terminal, so a later
+	/// replacement at the same pathname can never become trusted.
+	package(cydo) void bindPendingRolloutIdentity(string expectedThreadId,
+		string observedPath)
+	{
+		import ae.sys.file : getFileID;
+		import std.file : exists, isFile, isSymlink;
+
+		if (!awaitingFirstRolloutMaterialization_)
+			return;
+		if (expectedThreadId.length == 0 || expectedThreadId != threadId)
+			return;
+		if (observedPath.length == 0 || observedPath != rolloutPath_)
+			return;
+		// Consume before any filesystem work: a duplicate, restarted, or racing
+		// attachment must not get a second attempt at a different file.
+		awaitingFirstRolloutMaterialization_ = false;
+		if (!exists(observedPath) || isSymlink(observedPath) || !isFile(observedPath))
+			return;
+		try
+		{
+			rolloutFileId_ = getFileID(observedPath);
+			rolloutFileIdentityKnown_ = true;
+		}
+		catch (Throwable) {}
+	}
+
 	protected Promise!JsonRpcResponse sendCodexRequest(string method, string params)
 	{
 		return server.sendRequest(method, params);
+	}
+
+	version (unittest)
+	protected void onNativeUndoRolloutRead()
+	{
 	}
 
 	/// Called when thread/start or thread/resume response arrives.
@@ -2216,7 +3099,7 @@ class CodexSession : AgentSession
 	{
 		this.model = model;
 		this.workDir = workDir;
-		rolloutPath_ = result.thread.path;
+		retainRolloutPath(result.thread.path);
 
 		if (result.thread.id.length > 0)
 			threadId = result.thread.id;
@@ -2568,7 +3451,324 @@ class CodexSession : AgentSession
 
 	@property bool canRollbackThread() const
 	{
-		return alive_ && threadId.length > 0 && !turnInProgress;
+		// startInFlight_ needs no separate check: its own start submission sits in
+		// inFlightMessages_ for exactly as long as startInFlight_ is set, so the
+		// check below already covers it. turnInProgress does not — handleTurnCompleted
+		// clears it without consulting either.
+		return alive_ && threadId.length > 0 && !turnInProgress
+			&& inFlightMessages_.length == 0;
+	}
+
+	/// Read the exact current rollout path and one fresh native ledger, then
+	/// produce the immutable plan consumed by the later rollback unit. This
+	/// method deliberately performs no rollback, truncation, or session-state
+	/// mutation on either success or refusal.
+	Promise!NativeUndoPlan prepareNativeUndo(HistoryBoundary boundary)
+	{
+		if (!alive_ || server is null || server.dead)
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.sessionDead,
+				"Codex session is not alive");
+		if (threadId.length == 0)
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.missingThread,
+				"Codex session has no live thread id");
+		if (rolloutPath_.length == 0)
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.missingRolloutPath,
+				"Codex session has no retained rollout path");
+		if (turnInProgress)
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.turnInProgress,
+				"Codex turn is still in progress");
+		if (pendingMessages_.length != 0)
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.queuedNativeInput,
+				"Codex session has queued native input");
+		if (inFlightMessages_.length != 0)
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.inFlightSubmission,
+				"Codex session has an in-flight submission");
+		auto liveThreadId = threadId;
+
+		import ae.sys.file : getFileID;
+		import std.file : exists, isFile, isSymlink, readText;
+		if (!rolloutFileIdentityKnown_ || !exists(rolloutPath_)
+			|| isSymlink(rolloutPath_) || !isFile(rolloutPath_))
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.rolloutUnavailable,
+				"retained Codex rollout path is missing, replaced, or is not a regular file");
+		try
+		{
+			if (getFileID(rolloutPath_) != rolloutFileId_)
+				return refusedNativeUndoPreparation(
+					NativeUndoPreparationRefusalCategory.rolloutUnavailable,
+					"retained Codex rollout path no longer identifies the original regular file");
+		}
+		catch (Throwable e)
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.rolloutUnavailable,
+				"unable to identify retained Codex rollout path: " ~ e.msg);
+		string rollout;
+		try
+			rollout = readText(rolloutPath_);
+		catch (Exception e)
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.rolloutUnavailable,
+				"unable to read retained Codex rollout path: " ~ e.msg);
+		version (unittest)
+			onNativeUndoRolloutRead();
+		if (!exists(rolloutPath_) || isSymlink(rolloutPath_) || !isFile(rolloutPath_))
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.rolloutUnavailable,
+				"retained Codex rollout path changed while reading");
+		try
+		{
+			if (getFileID(rolloutPath_) != rolloutFileId_)
+				return refusedNativeUndoPreparation(
+					NativeUndoPreparationRefusalCategory.rolloutUnavailable,
+					"retained Codex rollout path changed while reading");
+		}
+		catch (Throwable e)
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.rolloutUnavailable,
+				"unable to identify retained Codex rollout path after reading: " ~ e.msg);
+
+		RolloutScan scan;
+		try
+			scan = scanRollout(rollout);
+		catch (Exception e)
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.rolloutUnavailable,
+				"unable to scan retained Codex rollout path: " ~ e.msg);
+
+		ThreadReadParams params;
+		params.threadId = liveThreadId;
+		params.includeTurns = true;
+		auto result = new Promise!NativeUndoPlan;
+		try
+		{
+			sendCodexRequest("thread/read", toJson(params)).then((JsonRpcResponse response) {
+			try
+			{
+				auto read = ThreadReadResult.fromJSON(response.getResult!SO());
+				auto plan = prepareNativeUndoPlan(boundary, scan, read, liveThreadId);
+				plan.preparedThreadId = liveThreadId;
+				plan.preparedRolloutPath = rolloutPath_;
+				plan.preparedRolloutFileId = rolloutFileId_;
+				plan.preparedRolloutSize = rollout.length;
+				result.fulfill(plan);
+			}
+			catch (NativeUndoPreparationRefusal e)
+				result.reject(e);
+			catch (Throwable e)
+				result.reject(new NativeUndoPreparationRefusal(
+					NativeUndoPreparationRefusalCategory.threadReadFailed,
+					"thread/read did not yield an admissible native ledger: " ~ e.msg));
+			}).except((Exception e) {
+			result.reject(new NativeUndoPreparationRefusal(
+				NativeUndoPreparationRefusalCategory.threadReadFailed,
+				"thread/read request failed: " ~ e.msg));
+			}).ignoreResult();
+		}
+		catch (Throwable e)
+		{
+			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.threadReadFailed,
+				"thread/read request could not be sent: " ~ e.msg);
+		}
+		return result;
+	}
+
+	protected uint nativeUndoMarkerAttempts()
+	{
+		return 500;
+	}
+
+	protected Duration nativeUndoMarkerPollInterval()
+	{
+		return 10.msecs;
+	}
+
+	/// Consume one freshly prepared native undo plan. All refusals before the
+	/// callback leave provider history untouched; once the callback starts,
+	/// uncertainty is deliberately fail-stop because Codex may have accepted
+	/// the request even when a local transport or verification step fails.
+	Promise!NativeUndoExecutionResult executeNativeUndo(NativeUndoPlan plan,
+		void delegate() pointOfNoReturn)
+	{
+		auto result = new Promise!NativeUndoExecutionResult;
+		void refuse(string diagnostic)
+		{
+			result.fulfill(NativeUndoExecutionResult(
+				NativeUndoExecutionStatus.refusedBeforeDispatch, diagnostic));
+		}
+		void unverifiable(string diagnostic)
+		{
+			result.fulfill(NativeUndoExecutionResult(
+				NativeUndoExecutionStatus.unverifiableAfterDispatch, diagnostic));
+		}
+
+		if (!alive_ || server is null || server.dead)
+		{
+			refuse("Codex session is not alive");
+			return result;
+		}
+		if (threadId.length == 0 || rolloutPath_.length == 0)
+		{
+			refuse("Codex session has no live thread id and retained rollout path");
+			return result;
+		}
+		if (turnInProgress)
+		{
+			refuse("Codex turn is still in progress");
+			return result;
+		}
+		if (pendingMessages_.length != 0)
+		{
+			refuse("Codex session has queued native input");
+			return result;
+		}
+		if (inFlightMessages_.length != 0)
+		{
+			refuse("Codex session has an in-flight submission");
+			return result;
+		}
+		if (pointOfNoReturn is null)
+		{
+			refuse("native undo execution requires a point-of-no-return callback");
+			return result;
+		}
+
+		string diagnostic;
+		if (!validNativeUndoPlan(plan, diagnostic))
+		{
+			refuse(diagnostic);
+			return result;
+		}
+		if (plan.preparedThreadId.length == 0 || plan.preparedRolloutPath.length == 0
+			|| plan.preparedThreadId != threadId || plan.preparedRolloutPath != rolloutPath_
+			|| plan.preparedRolloutFileId == 0
+			|| plan.preparedRolloutFileId != rolloutFileId_)
+		{
+			refuse("native undo plan does not belong to this live Codex thread and rollout");
+			return result;
+		}
+
+		import ae.sys.file : getFileID;
+		import std.file : exists, getSize, isFile, isSymlink, readText;
+		if (!rolloutFileIdentityKnown_ || !exists(rolloutPath_) || isSymlink(rolloutPath_)
+			|| !isFile(rolloutPath_))
+		{
+			refuse("retained Codex rollout path is missing, replaced, or is not a regular file");
+			return result;
+		}
+
+		size_t dispatchOffset;
+		try
+		{
+			if (getFileID(rolloutPath_) != rolloutFileId_)
+			{
+				refuse("retained Codex rollout path no longer identifies the original regular file");
+				return result;
+			}
+			readText(rolloutPath_);
+			if (getFileID(rolloutPath_) != rolloutFileId_)
+			{
+				refuse("retained Codex rollout path changed while verifying pre-dispatch state");
+				return result;
+			}
+			dispatchOffset = getSize(rolloutPath_);
+			if (getFileID(rolloutPath_) != rolloutFileId_)
+			{
+				refuse("retained Codex rollout path changed before rollback dispatch");
+				return result;
+			}
+			if (dispatchOffset < plan.preparedRolloutSize)
+			{
+				refuse("retained Codex rollout file shrank before rollback dispatch");
+				return result;
+			}
+		}
+		catch (Throwable e)
+		{
+			refuse("unable to verify retained Codex rollout path before dispatch: " ~ e.msg);
+			return result;
+		}
+
+		auto liveThreadId = threadId;
+		try
+			pointOfNoReturn();
+		catch (Throwable e)
+		{
+			unverifiable("native undo point-of-no-return callback failed: " ~ e.msg);
+			return result;
+		}
+
+		void waitForRollbackMarker(uint attemptsRemaining)
+		{
+			try
+			{
+				if (!exists(rolloutPath_) || isSymlink(rolloutPath_)
+					|| !isFile(rolloutPath_) || getFileID(rolloutPath_) != rolloutFileId_)
+				{
+					unverifiable("retained Codex rollout path changed after rollback dispatch");
+					return;
+				}
+				auto content = readText(rolloutPath_);
+				if (!exists(rolloutPath_) || isSymlink(rolloutPath_)
+					|| !isFile(rolloutPath_) || getFileID(rolloutPath_) != rolloutFileId_)
+				{
+					unverifiable("retained Codex rollout path changed while reading after rollback dispatch");
+					return;
+				}
+				auto verification = verifyNativeUndoMarkerWindow(content, dispatchOffset,
+					plan.numTurns);
+				final switch (verification.status)
+				{
+					case NativeUndoMarkerVerificationStatus.verified:
+						result.fulfill(NativeUndoExecutionResult(
+							NativeUndoExecutionStatus.verified, ""));
+						return;
+					case NativeUndoMarkerVerificationStatus.failure:
+						unverifiable(verification.diagnostic);
+						return;
+					case NativeUndoMarkerVerificationStatus.waiting:
+						break;
+				}
+			}
+			catch (Throwable e)
+			{
+				unverifiable("unable to read retained Codex rollout after rollback dispatch: "
+					~ e.msg);
+				return;
+			}
+			if (attemptsRemaining == 0)
+			{
+				unverifiable("thread/rollback completed without a new persisted thread_rolled_back marker");
+				return;
+			}
+			try
+				setTimeout({ waitForRollbackMarker(attemptsRemaining - 1); },
+					nativeUndoMarkerPollInterval());
+			catch (Throwable e)
+				unverifiable("unable to schedule Codex rollback marker verification: " ~ e.msg);
+		}
+
+		ThreadRollbackParams params;
+		params.threadId = liveThreadId;
+		params.numTurns = plan.numTurns;
+		try
+		{
+			sendCodexRequest("thread/rollback", toJson(params)).then((JsonRpcResponse response) {
+				try
+				{
+					auto rollback = ThreadRollbackResult.fromJSON(response.getResult!SO());
+					string responseDiagnostic;
+					if (!validNativeUndoResponse(rollback, plan, liveThreadId,
+						responseDiagnostic))
+					{
+						unverifiable(responseDiagnostic);
+						return;
+					}
+					waitForRollbackMarker(nativeUndoMarkerAttempts());
+				}
+				catch (Throwable e)
+					unverifiable("thread/rollback response could not be verified: " ~ e.msg);
+			}).except((Exception e) {
+				unverifiable("thread/rollback request failed after dispatch: " ~ e.msg);
+			}).ignoreResult();
+		}
+		catch (Throwable e)
+			unverifiable("thread/rollback request could not be sent after dispatch: " ~ e.msg);
+		return result;
 	}
 
 	void interrupt()
@@ -3712,6 +4912,8 @@ unittest
 
 unittest
 {
+	import std.file : exists, remove;
+
 	class RecordingCodexSession : CodexSession
 	{
 		string[] methods;
@@ -3875,14 +5077,22 @@ unittest
 	assert(bootstrapSteerDrain.expectedEchoMessages_.length == 1
 		&& bootstrapSteerDrain.expectedEchoMessages_[0].correlationId == "bootstrap-ui-steer");
 
-	// Startup/resume plumbing retains the path returned by Codex without a filesystem lookup.
+	// Startup/resume plumbing classifies an absent provider-returned path as pending.
+	enum freshRolloutPath = "/tmp/cydo-codex-fresh-start-pending-unittest.jsonl";
+	if (exists(freshRolloutPath))
+		remove(freshRolloutPath);
+	scope(exit) if (exists(freshRolloutPath)) remove(freshRolloutPath);
 	auto registrationServer = new AppServerProcess([]);
 	auto fresh = new CodexSession(registrationServer, 1, SessionConfig.init);
 	ThreadStartResult freshResult;
 	freshResult.thread.id = "thread-fresh";
-	freshResult.thread.path = "/exact/fresh-rollout.jsonl";
+	freshResult.thread.path = freshRolloutPath;
+	assert(!exists(freshResult.thread.path));
 	fresh.onThreadStarted(freshResult, null, "model", "/workspace", "");
-	assert(fresh.rolloutPath == "/exact/fresh-rollout.jsonl");
+	assert(fresh.rolloutPath == freshRolloutPath);
+	// A valid provider-returned path that does not yet exist is a pending
+	// bind, not an unavailable identity.
+	assert(fresh.awaitingFirstRolloutMaterialization_ && !fresh.rolloutFileIdentityKnown_);
 
 	auto resumed = new CodexSession(registrationServer, 1, SessionConfig.init);
 	ThreadStartResult resumedResult;

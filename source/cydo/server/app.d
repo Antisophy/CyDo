@@ -48,7 +48,8 @@ import cydo.web.snapshots : buildAgentsList, buildNoticesList,
 import cydo.workflow.history.pipeline : HistoryBroadcastPlan, HistoryEventPipeline,
 	HistoryEventPipelineHost;
 import cydo.workflow.history.native_history : ConfiguredNativeHistoryContext,
-	HistoryAccess, LiveHistoryWatchResolution, ResolvedNativeHistoryContext,
+	HistoryAccess, LiveHistoryWatchResolution, LiveHistoryWatchResolutionKind,
+	LiveHistoryWatchTarget, ResolvedNativeHistoryContext,
 	TaskHistoryResolution, TaskHistoryResolutionKind, UnavailableHistory,
 	UnavailableHistoryKind, resolveNativeHistoryContext;
 import cydo.workflow.history.abbrev : extractMessageText;
@@ -784,6 +785,28 @@ class App
 			jsonlTracker.startJsonlWatch(tid);
 		};
 		jsonlTracker.onJsonlLine = &onTailedJsonlLine;
+		jsonlTracker.onJsonlFileAttached = (int tid,
+			LiveHistoryWatchTarget watchedTarget) {
+			auto td = tid in tasks;
+			if (td is null || td.agentSessionId != watchedTarget.context.sessionId)
+				return;
+			auto resolution = resolveLiveHistoryWatch(tid);
+			if (resolution.kind != LiveHistoryWatchResolutionKind.target)
+				return;
+			auto currentTarget = resolution.requireTarget();
+			if (currentTarget.context.agent !is watchedTarget.context.agent
+				|| currentTarget.context.profile.driver != watchedTarget.context.profile.driver
+				|| currentTarget.context.profile.root != watchedTarget.context.profile.root
+				|| currentTarget.context.sessionId != watchedTarget.context.sessionId
+				|| currentTarget.context.effectiveCwd != watchedTarget.context.effectiveCwd
+				|| currentTarget.path != watchedTarget.path)
+				return;
+			auto codex = cast(CodexSession) sessionForTask(tid);
+			if (codex is null)
+				return;
+			codex.bindPendingRolloutIdentity(watchedTarget.context.sessionId,
+				watchedTarget.path);
+		};
 
 		// Load task type definitions
 		auto types = taskTypeCatalog.getTaskTypes();

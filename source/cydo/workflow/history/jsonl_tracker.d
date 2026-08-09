@@ -17,7 +17,8 @@ import cydo.foundation.platform.inotify : RefCountedINotify;
 import cydo.domain.tasks.model : TaskData, Watermark,
 	extractEventFromEnvelope;
 import cydo.workflow.history.native_history : LiveHistoryContext,
-	LiveHistoryWatchResolution, LiveHistoryWatchResolutionKind, TaskHistoryResolution,
+	LiveHistoryWatchResolution, LiveHistoryWatchResolutionKind, LiveHistoryWatchTarget,
+	TaskHistoryResolution,
 	TaskHistoryResolutionKind;
 
 struct JsonlTracker
@@ -48,6 +49,11 @@ struct JsonlTracker
 	/// the session file, so this feed is where the live queue lifecycle of
 	/// user messages is observed.
 	void delegate(int tid, string line, int lineNum) onJsonlLine;
+	/// Called when a watch registration first attaches to its exact target file,
+	/// before any content is consumed, carrying the immutable registration
+	/// target. Codex creates its rollout file after returning the pathname, so
+	/// this is where a driver may capture the file's identity.
+	void delegate(int tid, LiveHistoryWatchTarget watchedTarget) onJsonlFileAttached;
 
 	private RefCountedINotify rcINotify;
 	private RefCountedINotify.Handle[int] jsonlWatches;
@@ -288,7 +294,7 @@ struct JsonlTracker
 
 		if (exists(jsonlPath))
 		{
-			watchJsonlFile(tid, jsonlPath);
+			watchJsonlFile(tid, target);
 		}
 		else
 		{
@@ -312,7 +318,7 @@ struct JsonlTracker
 							rcINotify.remove(*h);
 							jsonlWatches.remove(tid);
 						}
-						watchJsonlFile(tid, jsonlPath);
+						watchJsonlFile(tid, target);
 					}
 				}
 			);
@@ -358,9 +364,11 @@ struct JsonlTracker
 		processNewJsonlContent(tid, jsonlPath);
 	}
 
-	void watchJsonlFile(int tid, string jsonlPath)
+	void watchJsonlFile(int tid, LiveHistoryWatchTarget watchedTarget)
 	{
-		attachAndCatchUp(tid, jsonlPath);
+		if (onJsonlFileAttached !is null)
+			onJsonlFileAttached(tid, watchedTarget);
+		attachAndCatchUp(tid, watchedTarget.path);
 	}
 
 	/// Read new content from the JSONL file and reconcile persisted boundaries.
@@ -653,6 +661,64 @@ unittest
 	tracker.attachAndCatchUp(1, path, false);
 	assert(tracker.jsonlReadPos[1] > 0);
 	assert(resolved == ["line:2"]);
+	remove(path);
+}
+
+unittest
+{
+	// onJsonlFileAttached carries the registration's captured target and fires
+	// before any content is consumed — Codex creates its rollout file after
+	// returning the pathname, so this is where a driver may capture the file's
+	// identity, before catch-up publishes boundaries.
+	import std.algorithm : canFind, startsWith;
+	import std.conv : to;
+	import std.file : remove, write;
+	import cydo.agent.drivers.codex : CodexAgent;
+	import cydo.runtime.launch.types : NativeHistoryProfile;
+	auto path = "/tmp/cydo-jsonl-tracker-attach-delegate.jsonl";
+	write(path, `{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n"
+		~ `{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}` ~ "\n");
+	TaskData task = TaskData(1, "", "");
+	task.history.reset(Watermark.none());
+	JsonlTracker tracker;
+	tracker.getTask = (int) => &task;
+	tracker.historyGeneration = (int) => task.history.generation;
+	auto agent = new CodexAgent();
+	auto target = LiveHistoryWatchTarget(LiveHistoryContext(agent,
+		NativeHistoryProfile(agent.driver, "/tmp/cydo-jsonl-tracker-profile"),
+		"sid-a", "/tmp/cydo-jsonl-tracker-cwd"), path);
+	tracker.attachLiveContext(1, target.context);
+	tracker.boundaryState[1] = JsonlTracker.BoundaryReconcileState.init;
+	tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user] ~=
+		JsonlTracker.LiveBoundaryCandidate(0, PersistedHistoryBoundaryKind.user, "", task.history.generation);
+
+	string[] log;
+	bool attachedExpectedAgent;
+	tracker.onJsonlFileAttached = (int tid, LiveHistoryWatchTarget attached) {
+		attachedExpectedAgent = attached.context.agent is agent;
+		log ~= "attach:" ~ to!string(tid) ~ ":"
+			~ to!string(attached.context.profile.driver) ~ ":"
+			~ attached.context.profile.root ~ ":" ~ attached.context.sessionId ~ ":"
+			~ attached.context.effectiveCwd ~ ":" ~ attached.path;
+	};
+	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary b, bool, ulong) {
+		log ~= "boundary:" ~ b.anchor;
+	};
+	tracker.onJsonlLine = (int tid, string line, int lineNum) {
+		log ~= "line:" ~ to!string(lineNum);
+	};
+
+	tracker.watchJsonlFile(1, target);
+	assert(log.length >= 2);
+	assert(attachedExpectedAgent);
+	assert(log[0] == "attach:1:codex:/tmp/cydo-jsonl-tracker-profile:sid-a:"
+		~ "/tmp/cydo-jsonl-tracker-cwd:" ~ path);
+	foreach (entry; log[1 .. $])
+		assert(entry.startsWith("line:") || entry.startsWith("boundary:"));
+	assert(log[1 .. $].canFind("line:1"));
+	assert(log[1 .. $].canFind("boundary:line:2"));
+
+	tracker.stopJsonlWatch(1);
 	remove(path);
 }
 
