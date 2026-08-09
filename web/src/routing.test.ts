@@ -33,8 +33,14 @@ describe("taskPath", () => {
 });
 
 describe("buildScopedHref", () => {
-  it("returns the bare suffix when workspace/project are null", () => {
-    expect(buildScopedHref(null, null, "/task/7")).toBe("/task/7");
+  it("keeps an unresolvable task at the unscoped /task/<tid> href", () => {
+    const currentWorkspace = "current-workspace";
+    const currentProject = "current-project";
+    const href = buildScopedHref(null, null, "/task/32639");
+
+    expect(href).toBe("/task/32639");
+    expect(href).not.toContain(currentWorkspace);
+    expect(href).not.toContain(currentProject);
   });
 
   it("scopes the suffix under the workspace/project href", () => {

@@ -170,8 +170,10 @@ test("Import group node in sidebar expands on click and navigates correctly", { 
     // Click the importable session to load its history.
     await importableEntry.click();
 
-    // URL must preserve workspace/project context (not just /task/<tid>).
-    await expect(page).toHaveURL(/\/testws\/cydo-test-workspace\/task\//, { timeout: 5_000 });
+    // An unresolvable imported task keeps the honest, unscoped task URL.
+    await expect
+      .poll(() => new URL(page.url()).pathname, { timeout: 5_000 })
+      .toMatch(/^\/task\/\d+$/);
 
     // History loads.
     await expect(
@@ -255,8 +257,7 @@ test("importable session appears on startup, history loads, Import Session promo
     );
     await expect(importableLabel).toBeVisible({ timeout: 15_000 });
 
-    // Click the importable session to navigate to it.  This triggers
-    // setActiveTaskId(String(tid)) which routes to /:ws/:proj/task/:tid.
+    // Click the importable session to navigate to its unscoped task URL.
     await importableLabel.click();
 
     // Session view with sidebar should now be visible.

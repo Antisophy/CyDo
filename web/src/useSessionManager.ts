@@ -676,11 +676,7 @@ export function useTaskManager(
       const tid = parseInt(id, 10);
       if (!isNaN(tid)) {
         const [ws, proj] = taskContext(tid);
-        return buildScopedHref(
-          ws ?? activeWorkspaceRef.current,
-          proj ?? activeProjectRef.current,
-          `/task/${id}`,
-        );
+        return buildScopedHref(ws, proj, `/task/${id}`);
       }
 
       return "/";
