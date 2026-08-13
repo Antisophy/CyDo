@@ -1060,9 +1060,29 @@ export function useTaskManager(
             projectDraft(effect.tid, effect.form.text, effect.form);
             break;
 
-          case "delete-task":
+          case "delete-task": {
+            const uuid = tidToUuid.get(effect.tid);
+            setTasks((previous) => {
+              if (!uuid || !previous.has(uuid)) return previous;
+              const next = new Map(previous);
+              next.delete(uuid);
+              return next;
+            });
+            const slot = getSlot(draftStateRef.current, effect.projectKey);
+            const projectName = currentRouteProjectName(
+              slot.project,
+              effect.tid,
+            );
+            if (projectName) {
+              activeTaskIdRef.current = null;
+              routeRef.current(
+                buildProjectHref(slot.project.workspace, projectName),
+                true,
+              );
+            }
             connRef.current?.deleteTask(effect.tid);
             break;
+          }
 
           case "draft-ready": {
             const slot = getSlot(draftStateRef.current, effect.projectKey);
@@ -1734,9 +1754,11 @@ export function useTaskManager(
         case "task_deleted": {
           const { tid } = msg;
           const projectKey = ownedTidToProjectRef.current.get(tid);
-          const deletedProject = projectKey
-            ? getSlot(draftStateRef.current, projectKey).project
+          const deletedSlot = projectKey
+            ? getSlot(draftStateRef.current, projectKey)
             : null;
+          const deletedProject = deletedSlot?.project ?? null;
+          const wasDeleting = deletedSlot?.remote.kind === "deleting";
           const result = projectKey
             ? applyDraftEvent({ type: "task-deleted", tid })
             : null;
@@ -1754,7 +1776,7 @@ export function useTaskManager(
             return next;
           });
           if (result) executeDraftEffects(result.effects);
-          if (deletedProject) {
+          if (deletedProject && !wasDeleting) {
             const projectName = currentRouteProjectName(deletedProject, tid);
             if (projectName) {
               routeRef.current(
@@ -3156,6 +3178,11 @@ export function useTaskManager(
     return result;
   }, [tasks, activeWorkspace, activeProject, workspaces]);
 
+  const getProjectedByTid = useCallback((tid: number) => {
+    if (tombstoneTidToProjectRef.current.has(tid)) return undefined;
+    return findByTid(tid);
+  }, []);
+
   return {
     tasks,
     activeTaskId,
@@ -3204,7 +3231,7 @@ export function useTaskManager(
     navigateToProject,
     getProjectHref,
     getTaskHref,
-    getByTid: findByTid,
+    getByTid: getProjectedByTid,
     refreshWorkspaces: () => {
       setScanState("requested");
       connRef.current?.refreshWorkspaces();

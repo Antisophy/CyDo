@@ -604,7 +604,15 @@ describe("submission acknowledgement routing", () => {
     await act(() => {
       draftView.onTextChange("");
     });
+    expect(testState.connection!.deleteTask).toHaveBeenCalledTimes(1);
     expect(testState.connection!.deleteTask).toHaveBeenCalledWith(71);
+    expect(testState.navigate).toHaveBeenCalledTimes(1);
+    expect(testState.navigate).toHaveBeenCalledWith("/source/project", true);
+    const afterLocalClear = await renderManager();
+    expect(
+      [...afterLocalClear.tasks.values()].filter((task) => task.tid === 71),
+    ).toHaveLength(0);
+    expect(afterLocalClear.getByTid(71)).toBeUndefined();
     await act(() => {
       testState.connection!.onControlMessage?.({
         type: "task_deleted",
@@ -742,6 +750,11 @@ describe("submission acknowledgement routing", () => {
     "retains replacement B ownership through authoritative %s activity",
     async (source) => {
       await prepareRetainedReplacementDraft();
+      const deleting = await renderManager();
+      expect(deleting.getByTid(71)).toBeUndefined();
+      expect(
+        [...deleting.tasks.values()].filter((task) => task.tid === 71),
+      ).toHaveLength(0);
       testState.route.tid = null;
       const replacement = (await renderManager()).draftView;
       if (!replacement || replacement.kind !== "resolved") {
@@ -773,17 +786,23 @@ describe("submission acknowledgement routing", () => {
         }
       });
 
-      const afterHandoff = (await renderManager()).draftView;
+      const afterHandoffManager = await renderManager();
+      const afterHandoff = afterHandoffManager.draftView;
       if (!afterHandoff || afterHandoff.kind !== "resolved") {
         throw new Error("Replacement draft did not survive tombstone handoff");
       }
+      expect(afterHandoffManager.getByTid(71)).toMatchObject({
+        tid: 71,
+        alive: true,
+        isProcessing: true,
+        status: "active",
+      });
       expect(afterHandoff).toMatchObject({
         projectKey: "source\0/source-project",
         text: "replacement draft B",
         composerResetToken,
         disabled: false,
       });
-      expect((await renderManager()).getByTid(71)?.status).toBe("active");
       await act(() => {
         afterHandoff.onSubmit("replacement draft B", [
           {
@@ -866,7 +885,11 @@ describe("submission acknowledgement routing", () => {
     });
 
     expect(connection.deleteTask).toHaveBeenCalledWith(tidA);
+    expect(connection.deleteTask).toHaveBeenCalledTimes(1);
     expect(manager!.getByTid(tidA)).toBeUndefined();
+    expect(
+      [...manager!.tasks.values()].filter((task) => task.tid === tidA),
+    ).toHaveLength(0);
     expect((await renderManager()).draftView).toMatchObject({
       lifecycle: "deleting",
       remoteTid: tidA,
@@ -2140,5 +2163,510 @@ describe("submission acknowledgement routing", () => {
 
     expect(testState.outbox.remove).toHaveBeenCalledTimes(1);
     expect(testState.outbox.all).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles a detached current acknowledgement with its latest form before generic focus resumes", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await bootstrapProject();
+    const connection = testState.connection!;
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "project_task_types_list",
+        project_path: "/source-project",
+        entry_points: [
+          {
+            name: "entry",
+            task_type: "blank",
+            description: "",
+            model_class: "",
+            read_only: false,
+          },
+          {
+            name: "latest-entry",
+            task_type: "latest-blank",
+            description: "",
+            model_class: "",
+            read_only: false,
+          },
+        ],
+        type_info: [],
+      } satisfies ControlMessage);
+    });
+
+    const sourceDraft = (await renderManager()).draftView;
+    if (!sourceDraft || sourceDraft.kind !== "resolved") {
+      throw new Error("Source draft did not resolve");
+    }
+
+    testState.uuid = "current-detached-ack";
+    await act(() => {
+      sourceDraft.onTextChange("initial text");
+      vi.advanceTimersByTime(16);
+    });
+    expect(connection.createTask).toHaveBeenCalledWith(
+      "source",
+      "/source-project",
+      "entry",
+      undefined,
+      "agent",
+      "current-detached-ack",
+    );
+
+    await act(() => {
+      sourceDraft.onTextChange("latest detached text");
+      sourceDraft.onEntryPointChange("latest-entry");
+      sourceDraft.onAgentChange("latest-agent");
+    });
+
+    testState.route.workspace = "other";
+    testState.route.project = "other-project";
+    testState.route.tid = null;
+    await renderManager();
+    connection.setEntryPoint.mockClear();
+    connection.setAgentName.mockClear();
+    connection.saveDraft.mockClear();
+    connection.requestHistory.mockClear();
+    testState.navigate.mockClear();
+
+    const tid = 951;
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "task_created",
+        tid,
+        workspace: "source",
+        project_path: "/source-project",
+        correlation_id: "current-detached-ack",
+      } satisfies ControlMessage);
+    });
+
+    expect(testState.navigate).not.toHaveBeenCalled();
+    expect(connection.requestHistory).not.toHaveBeenCalled();
+    expect(connection.setEntryPoint).toHaveBeenCalledTimes(1);
+    expect(connection.setEntryPoint).toHaveBeenCalledWith(tid, "latest-entry");
+    expect(connection.setAgentName).toHaveBeenCalledTimes(1);
+    expect(connection.setAgentName).toHaveBeenCalledWith(tid, "latest-agent");
+    expect(connection.saveDraft).toHaveBeenCalledTimes(1);
+    expect(connection.saveDraft).toHaveBeenCalledWith(
+      tid,
+      "latest detached text",
+    );
+    expect(connection.setEntryPoint.mock.invocationCallOrder[0]).toBeLessThan(
+      connection.setAgentName.mock.invocationCallOrder[0]!,
+    );
+    expect(connection.setAgentName.mock.invocationCallOrder[0]).toBeLessThan(
+      connection.saveDraft.mock.invocationCallOrder[0]!,
+    );
+
+    const acknowledged = await renderManager();
+    expect(acknowledged.getByTid(tid)).toMatchObject({
+      tid,
+      status: "pending",
+      title: "latest detached text",
+      serverDraft: "latest detached text",
+      entryPoint: "latest-entry",
+      agentName: "latest-agent",
+      taskType: "latest-blank",
+    });
+    expect(
+      [...acknowledged.tasks.values()].filter((task) => task.tid === tid),
+    ).toHaveLength(1);
+
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "focus_hint",
+        from_tid: 0,
+        to_tid: tid,
+      } satisfies ControlMessage);
+    });
+    expect(testState.navigate).not.toHaveBeenCalled();
+
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "task_updated",
+        task: activeSnapshot(tid),
+      } satisfies ControlMessage);
+    });
+    expect((await renderManager()).getByTid(tid)).toMatchObject({
+      tid,
+      status: "active",
+      alive: true,
+      isProcessing: true,
+    });
+
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "focus_hint",
+        from_tid: 0,
+        to_tid: tid,
+      } satisfies ControlMessage);
+    });
+    expect(testState.navigate).toHaveBeenCalledTimes(1);
+    expect(testState.navigate).toHaveBeenCalledWith("/source/project/task/951");
+  });
+
+  it("abandons expected focus on reset before an ordinary reused task ID arrives", async () => {
+    await prepareCreatingDraft();
+    const connection = testState.connection!;
+    const tid = 952;
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "task_created",
+        tid,
+        workspace: "source",
+        project_path: "/source-project",
+        correlation_id: "submission-uuid",
+      } satisfies ControlMessage);
+    });
+
+    await act(() => {
+      connection.onStatusChange?.(false);
+      connection.onStatusChange?.(true);
+      connection.onControlMessage?.(workspaceCatalog());
+      connection.onControlMessage?.({
+        type: "tasks_list",
+        tasks: [activeSnapshot(tid)],
+      } satisfies ControlMessage);
+    });
+
+    const fresh = await renderManager();
+    expect(fresh.getByTid(tid)).toMatchObject({
+      tid,
+      status: "active",
+      alive: true,
+      isProcessing: true,
+    });
+    testState.navigate.mockClear();
+
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "focus_hint",
+        from_tid: 0,
+        to_tid: tid,
+      } satisfies ControlMessage);
+    });
+
+    expect(testState.navigate).toHaveBeenCalledTimes(1);
+    expect(testState.navigate).toHaveBeenCalledWith("/source/project/task/952");
+  });
+
+  it("materializes an unknown create correlation exactly once as an ordinary task", async () => {
+    await bootstrapProject();
+    const connection = testState.connection!;
+    const tid = 953;
+
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "task_created",
+        tid,
+        workspace: "source",
+        project_path: "/source-project",
+        correlation_id: "unknown-correlation",
+      } satisfies ControlMessage);
+    });
+
+    const snapshot = await renderManager();
+    expect(snapshot.getByTid(tid)).toMatchObject({
+      tid,
+      status: "pending",
+      workspace: "source",
+      projectPath: "/source-project",
+    });
+    expect(
+      [...snapshot.tasks.values()].filter((task) => task.tid === tid),
+    ).toHaveLength(1);
+    expect(connection.deleteTask).not.toHaveBeenCalled();
+  });
+
+  it("keeps retained stale generations isolated across canonical project keys", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await bootstrapProject();
+    const connection = testState.connection!;
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "project_task_types_list",
+        project_path: "/other-project",
+        entry_points: [
+          {
+            name: "entry",
+            task_type: "blank",
+            description: "",
+            model_class: "",
+            read_only: false,
+          },
+        ],
+        type_info: [],
+      } satisfies ControlMessage);
+    });
+
+    const sourceDraft = (await renderManager()).draftView;
+    if (!sourceDraft || sourceDraft.kind !== "resolved") {
+      throw new Error("Source draft did not resolve");
+    }
+    testState.uuid = "source-a-correlation";
+    await act(() => {
+      sourceDraft.onTextChange("source A");
+      vi.advanceTimersByTime(16);
+    });
+
+    testState.route.workspace = "other";
+    testState.route.project = "other-project";
+    testState.route.tid = null;
+    const otherDraft = (await renderManager()).draftView;
+    if (!otherDraft || otherDraft.kind !== "resolved") {
+      throw new Error("Other draft did not resolve");
+    }
+    expect(otherDraft).toMatchObject({
+      projectKey: "other\0/other-project",
+      entryPoint: "entry",
+      agent: "agent",
+    });
+    testState.uuid = "other-c-correlation";
+    await act(() => {
+      otherDraft.onTextChange("other C");
+      vi.advanceTimersByTime(16);
+    });
+
+    testState.uuid = "source-b-correlation";
+    await act(() => {
+      sourceDraft.onTextChange("");
+      sourceDraft.onTextChange("source B");
+    });
+    testState.uuid = "other-d-correlation";
+    await act(() => {
+      otherDraft.onTextChange("");
+      otherDraft.onTextChange("other D");
+    });
+
+    expect(connection.createTask).toHaveBeenCalledTimes(2);
+    expect(connection.createTask).toHaveBeenNthCalledWith(
+      1,
+      "source",
+      "/source-project",
+      "entry",
+      undefined,
+      "agent",
+      "source-a-correlation",
+    );
+    expect(connection.createTask).toHaveBeenNthCalledWith(
+      2,
+      "other",
+      "/other-project",
+      "entry",
+      undefined,
+      "agent",
+      "other-c-correlation",
+    );
+
+    const sourceTid = 954;
+    const otherTid = 955;
+    connection.deleteTask.mockClear();
+    connection.requestHistory.mockClear();
+    testState.navigate.mockClear();
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "task_created",
+        tid: otherTid,
+        workspace: "other",
+        project_path: "/other-project",
+        correlation_id: "other-c-correlation",
+      } satisfies ControlMessage);
+      connection.onControlMessage?.({
+        type: "task_created",
+        tid: sourceTid,
+        workspace: "source",
+        project_path: "/source-project",
+        correlation_id: "source-a-correlation",
+      } satisfies ControlMessage);
+    });
+
+    expect(connection.deleteTask).toHaveBeenCalledTimes(2);
+    expect(connection.deleteTask).toHaveBeenNthCalledWith(1, otherTid);
+    expect(connection.deleteTask).toHaveBeenNthCalledWith(2, sourceTid);
+    expect(connection.requestHistory).not.toHaveBeenCalled();
+    expect(testState.navigate).not.toHaveBeenCalled();
+    expect(manager!.getByTid(sourceTid)).toBeUndefined();
+    expect(manager!.getByTid(otherTid)).toBeUndefined();
+    expect(
+      [...manager!.tasks.values()].filter(
+        (task) => task.tid === sourceTid || task.tid === otherTid,
+      ),
+    ).toHaveLength(0);
+
+    testState.route.workspace = "source";
+    testState.route.project = "project";
+    const sourceDeleting = commitRouteWithoutPassiveEffects().draftView;
+    if (!sourceDeleting || sourceDeleting.kind !== "resolved") {
+      throw new Error("Source retained generation did not remain resolved");
+    }
+    expect(sourceDeleting).toMatchObject({
+      projectKey: "source\0/source-project",
+      text: "source B",
+      entryPoint: "entry",
+      agent: "agent",
+      lifecycle: "deleting",
+      remoteTid: sourceTid,
+    });
+    testState.route.workspace = "other";
+    testState.route.project = "other-project";
+    const otherDeleting = commitRouteWithoutPassiveEffects().draftView;
+    if (!otherDeleting || otherDeleting.kind !== "resolved") {
+      throw new Error("Other retained generation did not remain resolved");
+    }
+    expect(otherDeleting).toMatchObject({
+      projectKey: "other\0/other-project",
+      text: "other D",
+      entryPoint: "entry",
+      agent: "agent",
+      lifecycle: "deleting",
+      remoteTid: otherTid,
+    });
+
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "focus_hint",
+        from_tid: 0,
+        to_tid: otherTid,
+      } satisfies ControlMessage);
+      connection.onControlMessage?.({
+        type: "focus_hint",
+        from_tid: 0,
+        to_tid: sourceTid,
+      } satisfies ControlMessage);
+      connection.onTaskMessage?.(sourceTid, {
+        type: "item/started",
+        item_id: "source-tombstone-message",
+        item_type: "user_message",
+        content: [{ type: "text", text: "source pending traffic" }],
+      });
+      connection.onAgentAck?.(sourceTid, "source-tombstone-ack");
+      connection.onControlMessage?.({
+        type: "task_updated",
+        task: persistedSnapshot(sourceTid, "source pending traffic"),
+      } satisfies ControlMessage);
+      connection.onTaskMessage?.(otherTid, {
+        type: "item/started",
+        item_id: "other-tombstone-message",
+        item_type: "user_message",
+        content: [{ type: "text", text: "other pending traffic" }],
+      });
+      connection.onAgentAck?.(otherTid, "other-tombstone-ack");
+      connection.onControlMessage?.({
+        type: "task_updated",
+        task: {
+          ...persistedSnapshot(otherTid, "other pending traffic"),
+          workspace: "other",
+          project_path: "/other-project",
+        },
+      } satisfies ControlMessage);
+    });
+
+    expect(testState.navigate).not.toHaveBeenCalled();
+    expect(manager!.getByTid(sourceTid)).toBeUndefined();
+    expect(manager!.getByTid(otherTid)).toBeUndefined();
+    expect(connection.deleteTask).toHaveBeenCalledTimes(2);
+    expect(connection.createTask).toHaveBeenCalledTimes(2);
+
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "task_deleted",
+        tid: sourceTid,
+      } satisfies ControlMessage);
+      vi.advanceTimersByTime(15);
+    });
+    expect(connection.createTask).toHaveBeenCalledTimes(2);
+    await act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(connection.createTask).toHaveBeenCalledTimes(3);
+    expect(connection.createTask).toHaveBeenNthCalledWith(
+      3,
+      "source",
+      "/source-project",
+      "entry",
+      undefined,
+      "agent",
+      "source-b-correlation",
+    );
+
+    const otherStillDeleting = commitRouteWithoutPassiveEffects().draftView;
+    if (!otherStillDeleting || otherStillDeleting.kind !== "resolved") {
+      throw new Error("Other deletion wait did not retain its generation");
+    }
+    expect(otherStillDeleting).toMatchObject({
+      projectKey: "other\0/other-project",
+      text: "other D",
+      entryPoint: "entry",
+      agent: "agent",
+      lifecycle: "deleting",
+      remoteTid: otherTid,
+    });
+
+    testState.route.workspace = "source";
+    testState.route.project = "project";
+    const sourceReplacement = commitRouteWithoutPassiveEffects().draftView;
+    if (!sourceReplacement || sourceReplacement.kind !== "resolved") {
+      throw new Error("Source replacement did not remain resolved");
+    }
+    expect(sourceReplacement).toMatchObject({
+      projectKey: "source\0/source-project",
+      text: "source B",
+      entryPoint: "entry",
+      agent: "agent",
+      lifecycle: "creating",
+    });
+
+    testState.route.workspace = "other";
+    testState.route.project = "other-project";
+
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "task_deleted",
+        tid: otherTid,
+      } satisfies ControlMessage);
+      vi.advanceTimersByTime(15);
+    });
+    expect(connection.createTask).toHaveBeenCalledTimes(3);
+    await act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(connection.createTask).toHaveBeenCalledTimes(4);
+    expect(connection.createTask).toHaveBeenNthCalledWith(
+      4,
+      "other",
+      "/other-project",
+      "entry",
+      undefined,
+      "agent",
+      "other-d-correlation",
+    );
+    const otherReplacement = commitRouteWithoutPassiveEffects().draftView;
+    if (!otherReplacement || otherReplacement.kind !== "resolved") {
+      throw new Error("Other replacement did not remain resolved");
+    }
+    expect(otherReplacement).toMatchObject({
+      projectKey: "other\0/other-project",
+      text: "other D",
+      entryPoint: "entry",
+      agent: "agent",
+      lifecycle: "creating",
+    });
+
+    testState.route.workspace = "source";
+    testState.route.project = "project";
+    expect(commitRouteWithoutPassiveEffects().draftView).toMatchObject({
+      projectKey: "source\0/source-project",
+      text: "source B",
+      entryPoint: "entry",
+      agent: "agent",
+      lifecycle: "creating",
+    });
+    expect(
+      connection.createTask.mock.calls.map((call) => String(call[5])),
+    ).toEqual([
+      "source-a-correlation",
+      "other-c-correlation",
+      "source-b-correlation",
+      "other-d-correlation",
+    ]);
   });
 });
