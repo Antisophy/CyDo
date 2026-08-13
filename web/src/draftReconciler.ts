@@ -177,7 +177,12 @@ export type DraftEffect =
       tid: number;
       content: DraftContent;
     }
-  | { type: "release-task"; projectKey: ProjectKey; tid: number };
+  | {
+      type: "release-task";
+      projectKey: ProjectKey;
+      tid: number;
+      resetComposer: boolean;
+    };
 
 export type DraftEvent =
   | {
@@ -856,7 +861,12 @@ function taskObserved(
       return {
         state: reconciled.state,
         effects: [
-          { type: "release-task", projectKey, tid: observation.tid },
+          {
+            type: "release-task",
+            projectKey,
+            tid: observation.tid,
+            resetComposer: false,
+          },
           ...reconciled.effects,
         ],
       };
@@ -867,7 +877,12 @@ function taskObserved(
       state: replaceSlot(state, projectKey, next),
       effects: [
         ...cancelSaveEffect(current, projectKey),
-        { type: "release-task", projectKey, tid: observation.tid },
+        {
+          type: "release-task",
+          projectKey,
+          tid: observation.tid,
+          resetComposer: true,
+        },
       ],
     };
   }
@@ -1024,6 +1039,7 @@ function switchPersisted(
         type: "release-task",
         projectKey: event.projectKey,
         tid: current.remote.tid,
+        resetComposer: true,
       },
     ],
   };
@@ -1201,7 +1217,14 @@ function submitPresent(
   if (current.desired.delivery === "atomic-create") {
     return {
       state: next,
-      effects: [{ type: "release-task", projectKey, tid: current.remote.tid }],
+      effects: [
+        {
+          type: "release-task",
+          projectKey,
+          tid: current.remote.tid,
+          resetComposer: true,
+        },
+      ],
     };
   }
 
@@ -1246,7 +1269,12 @@ function submitPresent(
         tid: current.remote.tid,
         content: contentOf(current.desired),
       },
-      { type: "release-task", projectKey, tid: current.remote.tid },
+      {
+        type: "release-task",
+        projectKey,
+        tid: current.remote.tid,
+        resetComposer: true,
+      },
     ],
   };
 }

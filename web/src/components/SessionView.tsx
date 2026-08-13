@@ -13,13 +13,14 @@ import type {
   ImageAttachment,
   EntryPointInfo,
   AgentInfo,
+  DraftView,
 } from "../useSessionManager";
 import type { AgentUsageMessage, Notice } from "../protocol";
 import { NoticeBar } from "./NoticeBar";
 import { SystemBanner, normalizeSessionStatus } from "./SystemBanner";
 import { deriveBandStatus } from "./StatusBand";
 import { MessageList } from "./MessageList";
-import { InputBox, drafts as inputDrafts } from "./InputBox";
+import { InputBox, type ControlledImageStore } from "./InputBox";
 import { SessionConfig } from "./SessionConfig";
 import { AgentPicker } from "./AgentPicker";
 import { AskUserForm } from "./AskUserForm";
@@ -33,13 +34,7 @@ interface Props {
   task: TaskState;
   connected: boolean;
   isActive: boolean;
-  onSend: (
-    uuid: string,
-    text: string,
-    images?: ImageAttachment[],
-    entryPointName?: string,
-    agentName?: string,
-  ) => void;
+  onSend: (uuid: string, text: string, images?: ImageAttachment[]) => void;
   onInterrupt: (uuid: string) => void;
   onStop: (uuid: string) => void;
   onCloseStdin: (uuid: string) => void;
@@ -55,8 +50,6 @@ interface Props {
   onUndoDismiss: (tid: number) => void;
   onClearInputDraft: (tid: number) => void;
   onSaveDraft?: (tid: number, draft: string) => void;
-  onSetEntryPoint?: (tid: number, entryPoint: string) => void;
-  onSetAgentName?: (tid: number, agentName: string) => void;
   onAskUserResponse: (tid: number, content: string) => void;
   onPermissionPromptResponse: (tid: number, content: string) => void;
   theme: Theme;
@@ -66,15 +59,9 @@ interface Props {
   onSetArchived?: (tid: number, archived: boolean) => void;
   onEditMessage?: (tid: number, uuid: string, content: string) => void;
   onEditRawEvent?: (tid: number, seq: number, content: string) => void;
-  entryPoints?: EntryPointInfo[];
-  agents?: AgentInfo[];
   defaultAgent?: string;
-  defaultTaskType?: string;
-  onContentStart?: (entryPointName: string, agentName: string) => void;
-  onContentEnd?: () => void;
   exportMode?: boolean;
   getTaskHref?: (id: string) => string;
-  notices?: Record<string, Notice>;
   agentUsage?: Record<string, AgentUsageMessage>;
 }
 
@@ -94,8 +81,6 @@ function SessionViewInner({
   onUndoDismiss,
   onClearInputDraft,
   onSaveDraft,
-  onSetEntryPoint,
-  onSetAgentName,
   onAskUserResponse,
   onPermissionPromptResponse,
   theme,
@@ -105,15 +90,9 @@ function SessionViewInner({
   onSetArchived,
   onEditMessage,
   onEditRawEvent,
-  entryPoints,
-  agents,
   defaultAgent,
-  defaultTaskType,
-  onContentStart,
-  onContentEnd,
   exportMode,
   getTaskHref,
-  notices,
   agentUsage,
 }: Props) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -121,90 +100,19 @@ function SessionViewInner({
   const pasteTextRef = useRef<((text: string) => void) | null>(null);
   const resumeRef = useRef<HTMLButtonElement>(null);
 
-  const isDraft =
-    task.status === "pending" &&
-    task.messages.length === 0 &&
-    !task.isProcessing;
   const tid = task.tid as number;
-
-  // Entry point picker state (only used in draft mode)
-  const initialEntryPoint =
-    task.entryPoint ??
-    entryPoints?.find((e) => e.task_type === task.taskType)?.name ??
-    (defaultTaskType
-      ? entryPoints?.find(
-          (e) => e.name === defaultTaskType || e.task_type === defaultTaskType,
-        )?.name
-      : undefined) ??
-    entryPoints?.[0]?.name ??
-    "blank";
-  const [selectedEntryPoint, setSelectedEntryPoint] =
-    useState(initialEntryPoint);
-  const entryPointPickerRef = useRef<HTMLDivElement>(null);
-
-  // Agent picker state (only used in draft mode)
-  const [selectedAgent, setSelectedAgent] = useState(task.agentName ?? "");
-
-  const focusTaskTypePicker = useCallback(() => {
-    entryPointPickerRef.current?.focus();
-  }, []);
-
-  const handleTaskTypeChange = useCallback(
-    (entryPoint: string) => {
-      setSelectedEntryPoint(entryPoint);
-      if (isDraft && task.tid !== null) onSetEntryPoint?.(task.tid, entryPoint);
-    },
-    [isDraft, task.tid, onSetEntryPoint],
-  );
-
-  const handleAgentChange = useCallback(
-    (agentName: string) => {
-      setSelectedAgent(agentName);
-      if (isDraft && task.tid !== null) onSetAgentName?.(task.tid, agentName);
-    },
-    [isDraft, task.tid, onSetAgentName],
-  );
 
   const handleSend = useCallback(
     (text: string, images?: ImageAttachment[]) => {
       requestNotificationPermissionFromGesture();
-      if (isDraft) {
-        onSend(
-          task.uuid,
-          text,
-          images,
-          selectedEntryPoint,
-          selectedAgent || defaultAgent || "",
-        );
-      } else {
-        onSend(task.uuid, text, images);
-      }
+      onSend(task.uuid, text, images);
     },
-    [
-      onSend,
-      task.uuid,
-      isDraft,
-      selectedEntryPoint,
-      selectedAgent,
-      defaultAgent,
-    ],
+    [onSend, task.uuid],
   );
 
   const handlePromote = useCallback(() => {
     onPromote?.(tid);
   }, [onPromote, tid]);
-
-  const handleContentStart = useCallback(() => {
-    onContentStart?.(selectedEntryPoint, selectedAgent || defaultAgent || "");
-  }, [onContentStart, selectedEntryPoint, selectedAgent, defaultAgent]);
-
-  useEffect(() => {
-    if (isDraft) setSelectedEntryPoint(initialEntryPoint);
-  }, [isDraft, initialEntryPoint]);
-
-  useEffect(() => {
-    if (isDraft) setSelectedAgent(task.agentName ?? "");
-  }, [isDraft, task.agentName]);
 
   const [fileViewerState, setFileViewerState] = useState<{
     open: boolean;
@@ -272,14 +180,8 @@ function SessionViewInner({
       return;
     }
     if (matchMedia("(pointer: coarse)").matches) return;
-    const draftHasText =
-      Boolean(task.serverDraft) ||
-      Boolean(task.inputDraft) ||
-      Boolean(inputDrafts.get(task.uuid));
     let target: HTMLElement | null;
-    if (isDraft && !draftHasText) {
-      target = entryPointPickerRef.current;
-    } else if (task.status === "importable") {
+    if (task.status === "importable") {
       target = resumeRef.current;
     } else {
       target = inputRef.current;
@@ -318,10 +220,6 @@ function SessionViewInner({
 
   const handleResize = useCallback((h: number) => {
     setFileViewerState((s) => (s ? { ...s, height: h } : s));
-  }, []);
-
-  const handleSessionConfigFocus = useCallback(() => {
-    inputRef.current?.focus();
   }, []);
 
   const handleInputDraftConsumed = useCallback(() => {
@@ -505,59 +403,12 @@ function SessionViewInner({
           )}
         </div>
       ) : task.messages.length === 0 && !task.isProcessing ? (
-        isDraft && entryPoints ? (
-          <div class="message-list welcome-prompt">
-            <div class="session-empty-inner">
-              <div class="welcome-page-header">
-                <LogoBanner />
-              </div>
-              {notices && <NoticeBar notices={notices} />}
-              <SessionConfig
-                entryPoints={entryPoints}
-                selected={selectedEntryPoint}
-                onEntryPointChange={handleTaskTypeChange}
-                pickerRef={entryPointPickerRef}
-                onConfirm={handleSessionConfigFocus}
-                onType={handleSessionConfigFocus}
-              />
-              <AgentPicker
-                agents={agents || []}
-                selected={selectedAgent || defaultAgent || ""}
-                onChange={handleAgentChange}
-              />
-              <InputBox
-                onSend={handleSend}
-                onInterrupt={() => {
-                  onInterrupt(task.uuid);
-                }}
-                isProcessing={task.isProcessing}
-                stdinClosed={task.stdinClosed}
-                disabled={false}
-                sessionId={task.uuid}
-                inputDraft={task.inputDraft}
-                onInputDraftConsumed={handleInputDraftConsumed}
-                serverDraft={task.serverDraft}
-                onSaveDraft={
-                  task.tid !== null && onSaveDraft ? handleSaveDraft : undefined
-                }
-                inputRef={inputRef}
-                insertTextRef={insertTextRef}
-                pasteTextRef={pasteTextRef}
-                onEscape={focusTaskTypePicker}
-                suggestions={task.suggestions}
-                onContentStart={handleContentStart}
-                onContentEnd={onContentEnd}
-              />
-            </div>
+        <div class="message-list welcome-prompt">
+          <div class="welcome-box">
+            <LogoBanner />
+            <p class="welcome-subtitle">Multi-agent orchestration system</p>
           </div>
-        ) : (
-          <div class="message-list welcome-prompt">
-            <div class="welcome-box">
-              <LogoBanner />
-              <p class="welcome-subtitle">Multi-agent orchestration system</p>
-            </div>
-          </div>
-        )
+        </div>
       ) : (
         <MessageList
           taskTid={tid}
@@ -622,7 +473,7 @@ function SessionViewInner({
           onSubmit={handleAskUserSubmit}
           onAbort={handleAskUserAbort}
         />
-      ) : (isDraft && entryPoints) || exportMode ? null : (
+      ) : exportMode ? null : (
         <>
           {task.resumable && task.error && (
             <div key="resumable-error" class="resume-bar">
@@ -644,9 +495,7 @@ function SessionViewInner({
             inputDraft={task.inputDraft}
             onInputDraftConsumed={handleInputDraftConsumed}
             serverDraft={task.serverDraft}
-            onSaveDraft={
-              task.tid !== null && onSaveDraft ? handleSaveDraft : undefined
-            }
+            onSaveDraft={onSaveDraft ? handleSaveDraft : undefined}
             inputRef={inputRef}
             insertTextRef={insertTextRef}
             pasteTextRef={pasteTextRef}
@@ -659,6 +508,194 @@ function SessionViewInner({
 }
 
 export const SessionView = memo(SessionViewInner);
+
+interface DraftSessionViewProps {
+  draftView: DraftView;
+  connected: boolean;
+  entryPoints: EntryPointInfo[];
+  agents: AgentInfo[];
+  defaultAgent: string;
+  notices?: Record<string, Notice>;
+  theme: Theme;
+  onToggleTheme: () => void;
+  onToggleSidebar: () => void;
+  hasGlobalAttention?: boolean;
+  imageStore?: ControlledImageStore;
+}
+
+export function DraftSessionView({
+  draftView,
+  connected,
+  entryPoints,
+  agents,
+  defaultAgent,
+  notices,
+  theme,
+  onToggleTheme,
+  onToggleSidebar,
+  hasGlobalAttention,
+  imageStore,
+}: DraftSessionViewProps) {
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const insertTextRef = useRef<((text: string) => void) | null>(null);
+  const pasteTextRef = useRef<((text: string) => void) | null>(null);
+  const entryPointPickerRef = useRef<HTMLDivElement>(null);
+  const lastFocusTargetRef = useRef<HTMLElement | null>(null);
+  const disabled = draftView.disabled;
+
+  const focusInput = useCallback(() => {
+    inputRef.current?.focus();
+  }, []);
+  const focusPicker = useCallback(() => {
+    entryPointPickerRef.current?.focus();
+  }, []);
+
+  useLayoutEffect(() => {
+    if (disabled || matchMedia("(pointer: coarse)").matches) {
+      lastFocusTargetRef.current = null;
+      return;
+    }
+    const target = draftView.text.trim()
+      ? inputRef.current
+      : entryPointPickerRef.current;
+    if (!target || target === lastFocusTargetRef.current) return;
+    target.focus();
+    lastFocusTargetRef.current = target;
+  }, [disabled, draftView.text, draftView.viewKey]);
+
+  useLayoutEffect(() => {
+    if (disabled) return;
+    const handler = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLInputElement
+      )
+        return;
+      if (
+        event.ctrlKey ||
+        event.metaKey ||
+        event.altKey ||
+        event.key.length !== 1
+      )
+        return;
+      inputRef.current?.focus();
+    };
+    document.addEventListener("keydown", handler);
+    return () => {
+      document.removeEventListener("keydown", handler);
+    };
+  }, [disabled]);
+
+  useLayoutEffect(() => {
+    if (disabled) return;
+    const handler = (event: ClipboardEvent) => {
+      const target = event.target;
+      if (
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLInputElement
+      )
+        return;
+      const text = event.clipboardData?.getData("text");
+      if (!text) return;
+      event.preventDefault();
+      pasteTextRef.current?.(text);
+    };
+    document.addEventListener("paste", handler);
+    return () => {
+      document.removeEventListener("paste", handler);
+    };
+  }, [disabled]);
+
+  const taskType = entryPoints.find(
+    (entryPoint) => entryPoint.name === draftView.entryPoint,
+  )?.task_type;
+  const changeText = (text: string) => {
+    if (draftView.kind === "resolved") draftView.onTextChange(text);
+  };
+  const changeEntryPoint = (entryPoint: string) => {
+    if (draftView.kind === "resolved") draftView.onEntryPointChange(entryPoint);
+  };
+  const changeAgent = (agent: string) => {
+    if (draftView.kind === "resolved") draftView.onAgentChange(agent);
+  };
+  const flush = () => {
+    if (draftView.kind === "resolved") draftView.onBlur();
+  };
+  const submit = (text: string, images: ImageAttachment[]) => {
+    if (draftView.kind === "resolved") {
+      requestNotificationPermissionFromGesture();
+      draftView.onSubmit(text, images);
+    }
+  };
+
+  return (
+    <>
+      <SystemBanner
+        sessionInfo={null}
+        defaultAgent={defaultAgent}
+        connected={connected}
+        totalCost={0}
+        isProcessing={false}
+        stdinClosed={false}
+        alive={false}
+        canStop={false}
+        theme={theme}
+        onToggleTheme={onToggleTheme}
+        onStop={() => {}}
+        onCloseStdin={() => {}}
+        taskType={taskType}
+        onToggleSidebar={onToggleSidebar}
+        hasGlobalAttention={hasGlobalAttention}
+      />
+      <div class="message-list welcome-prompt">
+        <div class="session-empty-inner">
+          <div class="welcome-page-header">
+            <LogoBanner />
+          </div>
+          {notices && <NoticeBar notices={notices} />}
+          <SessionConfig
+            entryPoints={entryPoints}
+            selected={draftView.entryPoint}
+            onEntryPointChange={changeEntryPoint}
+            disabled={disabled}
+            pickerRef={entryPointPickerRef}
+            onConfirm={focusInput}
+            onType={focusInput}
+          />
+          <AgentPicker
+            agents={agents}
+            selected={draftView.agent || defaultAgent}
+            onChange={changeAgent}
+            disabled={disabled}
+          />
+          <InputBox
+            mode="controlled"
+            value={draftView.text}
+            onChange={changeText}
+            onBlur={flush}
+            onSubmit={submit}
+            composerResetToken={draftView.composerResetToken}
+            imageStore={imageStore}
+            imageKey={
+              draftView.kind === "resolved" ? draftView.projectKey : undefined
+            }
+            preserveImagesWhenDisabled={
+              draftView.preserveImagesWhenDisabled ?? false
+            }
+            onInterrupt={() => {}}
+            isProcessing={false}
+            disabled={disabled}
+            inputRef={inputRef}
+            insertTextRef={insertTextRef}
+            pasteTextRef={pasteTextRef}
+            onEscape={focusPicker}
+          />
+        </div>
+      </div>
+    </>
+  );
+}
 
 function QuoteSelectionButton({
   isActive,

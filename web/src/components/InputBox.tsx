@@ -13,24 +13,77 @@ export const drafts = new Map<string, string>();
 
 const supportsFieldSizing = CSS.supports("field-sizing", "content");
 
-interface Props {
-  onSend: (text: string, images?: ImageAttachment[]) => void;
+interface CommonProps {
   onInterrupt: () => void;
   isProcessing: boolean;
   stdinClosed?: boolean;
   disabled: boolean;
+  inputRef?: RefObject<HTMLTextAreaElement>;
+  insertTextRef?: RefObject<((text: string) => void) | null>;
+  pasteTextRef?: RefObject<((text: string) => void) | null>;
+  onEscape?: () => void;
+}
+
+interface OrdinaryProps extends CommonProps {
+  mode?: "ordinary";
+  onSend: (text: string, images?: ImageAttachment[]) => void;
   sessionId: string;
   inputDraft?: string;
   onInputDraftConsumed?: () => void;
   serverDraft?: string;
   onSaveDraft?: (text: string) => void;
-  inputRef?: RefObject<HTMLTextAreaElement>;
-  insertTextRef?: RefObject<((text: string) => void) | null>;
-  pasteTextRef?: RefObject<((text: string) => void) | null>;
-  onEscape?: () => void;
   suggestions?: string[];
-  onContentStart?: () => void;
-  onContentEnd?: () => void;
+}
+
+interface ControlledProps extends CommonProps {
+  mode: "controlled";
+  value: string;
+  onChange: (value: string) => void;
+  onBlur: () => void;
+  onSubmit: (text: string, images: ImageAttachment[]) => void;
+  composerResetToken: number;
+  preserveImagesWhenDisabled?: boolean;
+  imageStore?: ControlledImageStore;
+  imageKey?: string;
+}
+
+export type InputBoxProps = OrdinaryProps | ControlledProps;
+
+export interface ControlledImageEntry {
+  resetToken: number;
+  generation: number;
+  images: ImageAttachment[];
+  listeners: Set<(images: ImageAttachment[], generation: number) => void>;
+}
+
+export interface ControlledImageStore {
+  entries: Map<string, ControlledImageEntry>;
+}
+
+export function createControlledImageStore(): ControlledImageStore {
+  return { entries: new Map() };
+}
+
+function invalidateControlledImageEntry(
+  entry: ControlledImageEntry,
+  notify = true,
+) {
+  entry.generation++;
+  entry.images = [];
+  if (notify) {
+    for (const listener of entry.listeners) {
+      listener([], entry.generation);
+    }
+  }
+  entry.listeners.clear();
+}
+
+export function resetControlledImageStore(store: ControlledImageStore) {
+  const entries = Array.from(store.entries.values());
+  store.entries.clear();
+  for (const entry of entries) {
+    invalidateControlledImageEntry(entry);
+  }
 }
 
 function debounce<A extends unknown[]>(
@@ -54,7 +107,275 @@ function debounce<A extends unknown[]>(
   return debounced;
 }
 
-export function InputBox({
+function controlledImageEntry(
+  store: ControlledImageStore,
+  key: string,
+  resetToken: number,
+): ControlledImageEntry {
+  const existing = store.entries.get(key);
+  if (existing?.resetToken === resetToken) return existing;
+  const entry: ControlledImageEntry = {
+    resetToken,
+    generation: existing ? existing.generation + 1 : 0,
+    images: [],
+    listeners: new Set(),
+  };
+  store.entries.set(key, entry);
+  if (existing) invalidateControlledImageEntry(existing, false);
+  return entry;
+}
+
+function publishImages(entry: ControlledImageEntry, images: ImageAttachment[]) {
+  entry.images = images;
+  for (const listener of entry.listeners) {
+    listener(images, entry.generation);
+  }
+}
+
+function useImageAttachments(
+  enabled = true,
+  resetToken?: number,
+  preserveImagesWhenDisabled = false,
+  imageStore?: ControlledImageStore,
+  imageKey?: string,
+) {
+  const imageEntry =
+    imageStore && imageKey !== undefined && resetToken !== undefined
+      ? enabled ||
+        preserveImagesWhenDisabled ||
+        imageStore.entries.has(imageKey)
+        ? controlledImageEntry(imageStore, imageKey, resetToken)
+        : null
+      : null;
+  const [images, setImagesState] = useState<ImageAttachment[]>(
+    () => imageEntry?.images ?? [],
+  );
+  const [imagesGeneration, setImagesGeneration] = useState(
+    () => imageEntry?.generation ?? 0,
+  );
+  const [isDragging, setIsDragging] = useState(false);
+  const enabledRef = useRef(enabled);
+  const resetTokenRef = useRef(resetToken);
+  const preserveImagesWhenDisabledRef = useRef(preserveImagesWhenDisabled);
+  const generationRef = useRef(imageEntry?.generation ?? 0);
+  const imagesRef = useRef(images);
+  const invalidatedRef = useRef(false);
+
+  const wasEnabled = enabledRef.current;
+  const wasPreservingDisabled =
+    !wasEnabled && preserveImagesWhenDisabledRef.current;
+  if (
+    resetTokenRef.current !== resetToken ||
+    (!enabled && !preserveImagesWhenDisabled && wasPreservingDisabled) ||
+    (wasEnabled !== enabled &&
+      !(!enabled && preserveImagesWhenDisabled) &&
+      !(enabled && wasPreservingDisabled))
+  ) {
+    generationRef.current =
+      (imageEntry?.generation ?? generationRef.current) + 1;
+    if (imageEntry) {
+      imageEntry.generation = generationRef.current;
+      imageEntry.images = [];
+    }
+    invalidatedRef.current = true;
+  }
+  enabledRef.current = enabled;
+  resetTokenRef.current = resetToken;
+  preserveImagesWhenDisabledRef.current = preserveImagesWhenDisabled;
+
+  useLayoutEffect(() => {
+    if (!imageEntry) return;
+    const receive = (next: ImageAttachment[], generation: number) => {
+      imagesRef.current = next;
+      setImagesState(next);
+      setImagesGeneration(generation);
+    };
+    imageEntry.listeners.add(receive);
+    if (
+      imagesRef.current !== imageEntry.images ||
+      imagesGeneration !== imageEntry.generation
+    )
+      receive(imageEntry.images, imageEntry.generation);
+    return () => {
+      imageEntry.listeners.delete(receive);
+    };
+  }, [imageEntry]);
+
+  useLayoutEffect(() => {
+    if (!invalidatedRef.current) return;
+    invalidatedRef.current = false;
+    const next: ImageAttachment[] = [];
+    imagesRef.current = next;
+    if (imageEntry) publishImages(imageEntry, next);
+    else setImagesState(next);
+    setImagesGeneration(generationRef.current);
+    setIsDragging(false);
+  }, [enabled, imageEntry, preserveImagesWhenDisabled, resetToken]);
+
+  const setImages = (
+    next:
+      | ImageAttachment[]
+      | ((previous: ImageAttachment[]) => ImageAttachment[]),
+  ) => {
+    const resolved =
+      typeof next === "function" ? next(imagesRef.current) : next;
+    imagesRef.current = resolved;
+    if (imageEntry) {
+      if (imageStore?.entries.get(imageKey!) !== imageEntry) return;
+      publishImages(imageEntry, resolved);
+      return;
+    }
+    setImagesState(resolved);
+  };
+
+  const processFile = (file: File) => {
+    if (!enabledRef.current || !file.type.startsWith("image/")) return;
+    const generation = generationRef.current;
+    const entry = imageEntry;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const dataURL = event.target!.result as string;
+      const base64 = dataURL.split(",")[1] ?? "";
+      const image = {
+        id: crypto.randomUUID(),
+        dataURL,
+        base64,
+        mediaType: file.type,
+      };
+      if (entry) {
+        if (
+          imageStore?.entries.get(imageKey!) !== entry ||
+          entry.generation !== generation
+        )
+          return;
+        publishImages(entry, [...entry.images, image]);
+        return;
+      }
+      if (generation !== generationRef.current) return;
+      setImages((previous) => [...previous, image]);
+      setImagesGeneration(generation);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const onPaste = (event: ClipboardEvent) => {
+    const items = event.clipboardData?.items;
+    if (!items) return;
+    if (!enabledRef.current) {
+      for (let index = 0; index < items.length; index++) {
+        const item = items[index];
+        if (item?.kind === "file" && item.type.startsWith("image/")) {
+          event.preventDefault();
+          break;
+        }
+      }
+      return;
+    }
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
+      if (!item) continue;
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        event.preventDefault();
+        const file = item.getAsFile();
+        if (file) processFile(file);
+      }
+    }
+  };
+
+  const onDragOver = (event: DragEvent) => {
+    if (!event.dataTransfer?.types.includes("Files")) return;
+    event.preventDefault();
+    if (!enabledRef.current) return;
+    event.dataTransfer.dropEffect = "copy";
+    setIsDragging(true);
+  };
+
+  const onDragLeave = (event: DragEvent) => {
+    if (event.currentTarget === event.target) setIsDragging(false);
+  };
+
+  const onDrop = (event: DragEvent) => {
+    setIsDragging(false);
+    const files = event.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+    event.preventDefault();
+    if (!enabledRef.current) return;
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      if (file) processFile(file);
+    }
+  };
+
+  return {
+    images:
+      (enabled || preserveImagesWhenDisabled) &&
+      imagesGeneration === generationRef.current
+        ? images
+        : [],
+    setImages,
+    isDragging: enabled && isDragging,
+    onPaste,
+    onDragOver,
+    onDragLeave,
+    onDrop,
+  };
+}
+
+function ImagePreviews({
+  images,
+  onRemove,
+  disabled = false,
+}: {
+  images: ImageAttachment[];
+  onRemove: (id: string) => void;
+  disabled?: boolean;
+}) {
+  if (images.length === 0) return null;
+  return (
+    <div key="image-previews" class="image-previews">
+      {images.map((image) => (
+        <div key={image.id} class="image-preview">
+          <img src={image.dataURL} alt="Attached" />
+          <button
+            class="image-preview-remove"
+            onClick={() => {
+              if (disabled) return;
+              onRemove(image.id);
+            }}
+            aria-label="Remove image"
+            disabled={disabled}
+          >
+            ×
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function inputPlaceholder({
+  stdinClosed,
+  disabled,
+  isProcessing,
+}: Pick<CommonProps, "stdinClosed" | "disabled" | "isProcessing">) {
+  return stdinClosed
+    ? "Session ending..."
+    : disabled
+      ? "Connecting..."
+      : isProcessing
+        ? "Type a steering message..."
+        : "Type a message...";
+}
+
+export function InputBox(props: InputBoxProps) {
+  return props.mode === "controlled" ? (
+    <ControlledInputBox {...props} />
+  ) : (
+    <OrdinaryInputBox {...props} />
+  );
+}
+
+function OrdinaryInputBox({
   onSend,
   onInterrupt,
   isProcessing,
@@ -70,58 +391,51 @@ export function InputBox({
   pasteTextRef,
   onEscape,
   suggestions,
-  onContentStart,
-  onContentEnd,
-}: Props) {
+}: OrdinaryProps) {
   const [text, setText] = useState(() => {
-    const memDraft = drafts.get(sessionId);
-    if (memDraft !== undefined) return memDraft;
+    const memoryDraft = drafts.get(sessionId);
+    if (memoryDraft !== undefined) return memoryDraft;
     return serverDraft ?? "";
   });
-  const [images, setImages] = useState<ImageAttachment[]>([]);
-  const [isDragging, setIsDragging] = useState(false);
+  const {
+    images,
+    setImages,
+    isDragging,
+    onPaste,
+    onDragOver,
+    onDragLeave,
+    onDrop,
+  } = useImageAttachments();
   const internalRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = inputRef ?? internalRef;
   const textRef = useRef(text);
   const lastServerDraftRef = useRef<string>(serverDraft ?? "");
 
-  // The single writer for `text`. `textRef` must be updated by the writer, not
-  // during render: preact flushes a component's pending useEffects at the START
-  // of its next render (hooks `options._render`), i.e. before the render body
-  // would refresh a render-time mirror. An effect that reads `textRef` to
-  // decide whether the composer is occupied would therefore see the value from
-  // the *previous* render and clobber text the user typed in the meantime.
   const applyText = (next: string) => {
     textRef.current = next;
     setText(next);
   };
 
   const saveDraftDebounced = useMemo(
-    () => debounce((t: string) => onSaveDraft?.(t), 500),
+    () => debounce((draft: string) => onSaveDraft?.(draft), 500),
     [onSaveDraft],
   );
+  const previousOnSaveDraft = useRef(onSaveDraft);
 
-  // When onSaveDraft becomes available (draft task promoted to real task),
-  // immediately flush current text to backend. The sessionId no longer changes
-  // on promotion (it's a stable uuid), so the sessionId effect won't fire.
-  const prevOnSaveDraftRef = useRef(onSaveDraft);
   useEffect(() => {
-    const prev = prevOnSaveDraftRef.current;
-    prevOnSaveDraftRef.current = onSaveDraft;
-    if (!prev && onSaveDraft && textRef.current) {
+    const previous = previousOnSaveDraft.current;
+    previousOnSaveDraft.current = onSaveDraft;
+    if (!previous && onSaveDraft && textRef.current) {
       onSaveDraft(textRef.current);
     }
   }, [onSaveDraft]);
 
   useEffect(() => {
-    // On sessionId change: use in-memory draft if available, else server draft
-    const memDraft = drafts.get(sessionId);
-    const initial = memDraft !== undefined ? memDraft : (serverDraft ?? "");
+    const memoryDraft = drafts.get(sessionId);
+    const initial =
+      memoryDraft !== undefined ? memoryDraft : (serverDraft ?? "");
     applyText(initial);
     lastServerDraftRef.current = serverDraft ?? "";
-    // Trigger a save if there's content — handles the case where the previous
-    // session had onSaveDraft=undefined (e.g. virtual draft tid=0) and its
-    // debounce was cancelled, leaving unsaved text.
     if (initial) saveDraftDebounced(initial);
     return () => {
       drafts.set(sessionId, textRef.current);
@@ -129,22 +443,27 @@ export function InputBox({
     };
   }, [sessionId]);
 
-  // Apply incoming draft_updated from other clients if local text hasn't diverged
   useEffect(() => {
-    if (serverDraft === undefined) return;
+    const incoming = serverDraft ?? "";
     const localText = textRef.current;
     if (localText === "" || localText === lastServerDraftRef.current) {
-      applyText(serverDraft);
-      drafts.set(sessionId, serverDraft);
+      applyText(incoming);
+      drafts.set(sessionId, incoming);
     }
-    lastServerDraftRef.current = serverDraft;
+    lastServerDraftRef.current = incoming;
   }, [serverDraft]);
+
+  const handleChange = (next: string) => {
+    applyText(next);
+    drafts.set(sessionId, next);
+    saveDraftDebounced(next);
+  };
 
   useEffect(() => {
     if (!insertTextRef) return;
     insertTextRef.current = (quoted: string) => {
-      const prev = textRef.current;
-      handleChange(prev ? `${prev.trimEnd()}\n\n${quoted}` : quoted);
+      const previous = textRef.current;
+      handleChange(previous ? `${previous.trimEnd()}\n\n${quoted}` : quoted);
       textareaRef.current?.focus();
       requestAnimationFrame(() => {
         if (textareaRef.current)
@@ -159,19 +478,19 @@ export function InputBox({
   useLayoutEffect(() => {
     if (!pasteTextRef) return;
     pasteTextRef.current = (pasted: string) => {
-      const ta = textareaRef.current;
-      const start = ta?.selectionStart ?? 0;
-      const end = ta?.selectionEnd ?? 0;
-      const prev = textRef.current;
-      handleChange(prev.slice(0, start) + pasted + prev.slice(end));
+      const textarea = textareaRef.current;
+      const start = textarea?.selectionStart ?? 0;
+      const end = textarea?.selectionEnd ?? 0;
+      const previous = textRef.current;
+      handleChange(previous.slice(0, start) + pasted + previous.slice(end));
       requestAnimationFrame(() => {
-        if (ta) {
-          const pos = start + pasted.length;
-          ta.selectionStart = pos;
-          ta.selectionEnd = pos;
+        if (textarea) {
+          const position = start + pasted.length;
+          textarea.selectionStart = position;
+          textarea.selectionEnd = position;
         }
       });
-      ta?.focus();
+      textarea?.focus();
     };
     return () => {
       pasteTextRef.current = null;
@@ -180,18 +499,17 @@ export function InputBox({
 
   useEffect(() => {
     if (supportsFieldSizing) return;
-    const ta = textareaRef.current;
-    if (!ta) return;
+    const textarea = textareaRef.current;
+    if (!textarea) return;
     const handle = requestAnimationFrame(() => {
-      ta.style.height = "0";
-      ta.style.height = `${ta.scrollHeight}px`;
+      textarea.style.height = "0";
+      textarea.style.height = `${textarea.scrollHeight}px`;
     });
     return () => {
       cancelAnimationFrame(handle);
     };
   }, [text]);
 
-  // Pre-fill with unsaved user messages recovered after session reload
   useEffect(() => {
     if (!inputDraft) return;
     const next = applyRecoveredInputDraft(inputDraft, textRef.current);
@@ -202,82 +520,9 @@ export function InputBox({
     onInputDraftConsumed?.();
   }, [inputDraft, onInputDraftConsumed, sessionId]);
 
-  const handleChange = (newText: string) => {
-    const wasEmpty = textRef.current.trim() === "";
-    const isEmpty = newText.trim() === "";
-    applyText(newText);
-    drafts.set(sessionId, newText);
-    saveDraftDebounced(newText);
-    if (wasEmpty && !isEmpty) onContentStart?.();
-    if (!wasEmpty && isEmpty) onContentEnd?.();
-  };
-
-  const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      send();
-    } else if (e.key === "Escape" && onEscape) {
-      e.preventDefault();
-      onEscape();
-    }
-  };
-
-  const processFile = (file: File) => {
-    if (!file.type.startsWith("image/")) return;
-    const reader = new FileReader();
-    reader.readAsDataURL(file);
-    reader.onload = (e) => {
-      const dataURL = e.target!.result as string;
-      const base64 = dataURL.split(",")[1] ?? "";
-      setImages((prev) => [
-        ...prev,
-        { id: crypto.randomUUID(), dataURL, base64, mediaType: file.type },
-      ]);
-    };
-  };
-
-  const handlePaste = (e: ClipboardEvent) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (!item) continue;
-      if (item.kind === "file" && item.type.startsWith("image/")) {
-        e.preventDefault();
-        const file = item.getAsFile();
-        if (file) processFile(file);
-      }
-    }
-  };
-
-  const handleDragOver = (e: DragEvent) => {
-    if (!e.dataTransfer?.types.includes("Files")) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "copy";
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = (e: DragEvent) => {
-    if (e.currentTarget === e.target) setIsDragging(false);
-  };
-
-  const handleDrop = (e: DragEvent) => {
-    setIsDragging(false);
-    const files = e.dataTransfer?.files;
-    if (!files || files.length === 0) return;
-    e.preventDefault();
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (file) processFile(file);
-    }
-  };
-
   const send = () => {
     const trimmed = text.trim();
     if (!trimmed && images.length === 0) return;
-    // Clear text eagerly: onSend may trigger a re-render that unmounts this
-    // InputBox (e.g. draft → active transition).  Without this, the cleanup
-    // function saves stale text to `drafts` because setState hasn't flushed.
     applyText("");
     setImages([]);
     drafts.set(sessionId, "");
@@ -287,82 +532,73 @@ export function InputBox({
     textareaRef.current?.focus();
   };
 
+  const handleKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      send();
+    } else if (event.key === "Escape" && onEscape) {
+      event.preventDefault();
+      onEscape();
+    }
+  };
+
   return (
     <div
       class={`input-box${isDragging ? " input-box-dragging" : ""}`}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
     >
       {!isProcessing &&
         !text.trim() &&
         suggestions &&
         suggestions.length > 0 && (
           <div key="suggestions" class="suggestions">
-            {suggestions.map((s) => (
+            {suggestions.map((suggestion) => (
               <button
-                key={s}
+                key={suggestion}
                 class="btn btn-suggestion"
                 draggable
-                onDragStart={(e) => {
-                  e.dataTransfer!.setData("text/plain", s);
-                  e.dataTransfer!.effectAllowed = "copy";
+                onDragStart={(event) => {
+                  event.dataTransfer!.setData("text/plain", suggestion);
+                  event.dataTransfer!.effectAllowed = "copy";
                 }}
-                onClick={(e) => {
-                  if (e.shiftKey) {
-                    handleChange(s);
+                onClick={(event) => {
+                  if (event.shiftKey) {
+                    handleChange(suggestion);
                     textareaRef.current?.focus();
                   } else {
-                    onSend(s);
+                    onSend(suggestion);
                   }
                 }}
                 title="Click to send, drag and drop to edit"
               >
-                {s}
+                {suggestion}
               </button>
             ))}
           </div>
         )}
-      {images.length > 0 && (
-        <div key="image-previews" class="image-previews">
-          {images.map((img) => (
-            <div key={img.id} class="image-preview">
-              <img src={img.dataURL} alt="Attached" />
-              <button
-                class="image-preview-remove"
-                onClick={() => {
-                  setImages((prev) => prev.filter((i) => i.id !== img.id));
-                }}
-                aria-label="Remove image"
-              >
-                ×
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
+      <ImagePreviews
+        images={images}
+        disabled={disabled}
+        onRemove={(id) => {
+          setImages((previous) => previous.filter((image) => image.id !== id));
+        }}
+      />
       <textarea
         key="textarea"
         ref={textareaRef}
         class="input-textarea"
         value={text}
-        onInput={(e) => {
-          handleChange((e.target as HTMLTextAreaElement).value);
+        onInput={(event) => {
+          handleChange((event.target as HTMLTextAreaElement).value);
         }}
         onBlur={() => {
           onSaveDraft?.(textRef.current);
         }}
         onKeyDown={handleKeyDown}
-        onPaste={handlePaste}
-        placeholder={
-          stdinClosed
-            ? "Session ending..."
-            : disabled
-              ? "Connecting..."
-              : isProcessing
-                ? "Type a steering message..."
-                : "Type a message..."
-        }
+        onPaste={onPaste}
+        placeholder={inputPlaceholder({ stdinClosed, disabled, isProcessing })}
         disabled={disabled}
         rows={1}
       />
@@ -377,6 +613,171 @@ export function InputBox({
         onClick={send}
         disabled={
           disabled || !!stdinClosed || (!text.trim() && images.length === 0)
+        }
+      >
+        Send
+      </button>
+    </div>
+  );
+}
+
+function ControlledInputBox({
+  onInterrupt,
+  isProcessing,
+  stdinClosed,
+  disabled,
+  value,
+  onChange,
+  onBlur,
+  onSubmit,
+  composerResetToken,
+  preserveImagesWhenDisabled = false,
+  imageStore,
+  imageKey,
+  inputRef,
+  insertTextRef,
+  pasteTextRef,
+  onEscape,
+}: ControlledProps) {
+  const {
+    images,
+    setImages,
+    isDragging,
+    onPaste,
+    onDragOver,
+    onDragLeave,
+    onDrop,
+  } = useImageAttachments(
+    !disabled,
+    composerResetToken,
+    preserveImagesWhenDisabled,
+    imageStore,
+    imageKey,
+  );
+  const internalRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = inputRef ?? internalRef;
+  const valueRef = useRef(value);
+
+  useLayoutEffect(() => {
+    valueRef.current = value;
+  }, [value]);
+
+  const change = (next: string) => {
+    valueRef.current = next;
+    onChange(next);
+  };
+
+  useEffect(() => {
+    if (!insertTextRef) return;
+    insertTextRef.current = (quoted: string) => {
+      const previous = valueRef.current;
+      change(previous ? `${previous.trimEnd()}\n\n${quoted}` : quoted);
+      textareaRef.current?.focus();
+      requestAnimationFrame(() => {
+        if (textareaRef.current)
+          textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
+      });
+    };
+    return () => {
+      insertTextRef.current = null;
+    };
+  }, [insertTextRef, onChange]);
+
+  useLayoutEffect(() => {
+    if (!pasteTextRef) return;
+    pasteTextRef.current = (pasted: string) => {
+      const textarea = textareaRef.current;
+      const start = textarea?.selectionStart ?? 0;
+      const end = textarea?.selectionEnd ?? 0;
+      const previous = valueRef.current;
+      change(previous.slice(0, start) + pasted + previous.slice(end));
+      requestAnimationFrame(() => {
+        if (textarea) {
+          const position = start + pasted.length;
+          textarea.selectionStart = position;
+          textarea.selectionEnd = position;
+        }
+      });
+      textarea?.focus();
+    };
+    return () => {
+      pasteTextRef.current = null;
+    };
+  }, [pasteTextRef, onChange]);
+
+  useEffect(() => {
+    if (supportsFieldSizing) return;
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    const handle = requestAnimationFrame(() => {
+      textarea.style.height = "0";
+      textarea.style.height = `${textarea.scrollHeight}px`;
+    });
+    return () => {
+      cancelAnimationFrame(handle);
+    };
+  }, [value]);
+
+  const submit = () => {
+    if (disabled) return;
+    const text = valueRef.current.trim();
+    if (!text && images.length === 0) return;
+    const attachments = images;
+    setImages([]);
+    onSubmit(text, attachments);
+    textareaRef.current?.focus();
+  };
+
+  const handleKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      submit();
+    } else if (event.key === "Escape" && onEscape) {
+      event.preventDefault();
+      onEscape();
+    }
+  };
+
+  return (
+    <div
+      class={`input-box${isDragging ? " input-box-dragging" : ""}`}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      <ImagePreviews
+        images={images}
+        disabled={disabled}
+        onRemove={(id) => {
+          setImages((previous) => previous.filter((image) => image.id !== id));
+        }}
+      />
+      <textarea
+        key="textarea"
+        ref={textareaRef}
+        class="input-textarea"
+        value={value}
+        onInput={(event) => {
+          change((event.target as HTMLTextAreaElement).value);
+        }}
+        onBlur={onBlur}
+        onKeyDown={handleKeyDown}
+        onPaste={onPaste}
+        placeholder={inputPlaceholder({ stdinClosed, disabled, isProcessing })}
+        disabled={disabled}
+        rows={1}
+      />
+      {isProcessing && (
+        <button key="stop" class="btn btn-stop" onClick={onInterrupt}>
+          Stop
+        </button>
+      )}
+      <button
+        key="send"
+        class="btn btn-send"
+        onClick={submit}
+        disabled={
+          disabled || !!stdinClosed || (!value.trim() && images.length === 0)
         }
       >
         Send

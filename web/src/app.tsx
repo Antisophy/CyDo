@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "preact/hooks";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "preact/hooks";
 import { Router, Route } from "preact-iso";
 import { useTaskManager } from "./useSessionManager";
 import { useNotifications } from "./useNotifications";
@@ -7,11 +14,15 @@ import { useErrorCapture } from "./useErrorOverlay";
 import { useTheme, ThemeContext } from "./useTheme";
 import { DevModeContext } from "./devMode";
 import { Sidebar, flatTaskOrder } from "./components/Sidebar";
-import { SessionView } from "./components/SessionView";
+import { DraftSessionView, SessionView } from "./components/SessionView";
 import { WelcomePage } from "./components/WelcomePage";
 import { SearchPopup } from "./components/SearchPopup";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Toast } from "./components/Toast";
+import {
+  createControlledImageStore,
+  resetControlledImageStore,
+} from "./components/InputBox";
 import "./e2e";
 
 function shortProjectName(projectName: string): string {
@@ -20,6 +31,7 @@ function shortProjectName(projectName: string): string {
 }
 
 function AppContent() {
+  const [controlledImageStore] = useState(createControlledImageStore);
   const { toasts, addToast, dismissToast, clearToasts } = useToast();
   const {
     tasks,
@@ -42,22 +54,17 @@ function AppContent() {
     clearInputDraft,
     setArchived,
     saveDraft,
-    setEntryPoint,
-    setAgentName,
     sendAskUserResponse,
     sendPermissionPromptResponse,
     editMessage,
     editRawEvent,
-    createDraftTask,
-    deleteDraftTask,
-    draftRenderKey,
+    draftView,
     sidebarTasks,
     workspaces,
     entryPoints,
     typeInfo,
     agents,
     defaultAgent,
-    defaultTaskType,
     activeWorkspace,
     activeProject,
     notices,
@@ -74,6 +81,14 @@ function AppContent() {
     refreshWorkspaces,
     scanState,
   } = useTaskManager(addToast);
+  const previousConnectedRef = useRef(connected);
+  useLayoutEffect(() => {
+    const wasConnected = previousConnectedRef.current;
+    previousConnectedRef.current = connected;
+    if (wasConnected && !connected) {
+      resetControlledImageStore(controlledImageStore);
+    }
+  }, [connected, controlledImageStore]);
   useEffect(() => {
     if (!window.__cydoE2e) return;
     window.__cydoE2e.fork = fork;
@@ -101,10 +116,6 @@ function AppContent() {
     const ws = workspaces.find((w) => w.name === activeWorkspace);
     return ws?.default_agent || defaultAgent;
   }, [workspaces, activeWorkspace, defaultAgent]);
-  const effectiveDefaultTaskType = useMemo(() => {
-    const ws = workspaces.find((w) => w.name === activeWorkspace);
-    return ws?.default_task_type || defaultTaskType;
-  }, [workspaces, activeWorkspace, defaultTaskType]);
   const [showSearch, setShowSearch] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -114,6 +125,14 @@ function AppContent() {
 
   const activeTid = activeTaskId !== null ? parseInt(activeTaskId, 10) : NaN;
   const active = !isNaN(activeTid) ? (getByTid(activeTid) ?? null) : null;
+  const activeTaskPaneRenderable =
+    active !== null &&
+    !(
+      active.status === "pending" &&
+      active.messages.length === 0 &&
+      !active.isProcessing
+    ) &&
+    !(draftView?.kind === "resolved" && draftView.remoteTid === active.tid);
 
   // Resolve active project path for attention scoping
   const activeProjectPath = useMemo(() => {
@@ -247,8 +266,6 @@ function AppContent() {
     );
   }
 
-  // Navigate to the "new task" view (project page with no tid)
-  // The useEffect in useTaskManager auto-creates a virtual draft when at project root
   const handleNewTask = useCallback(() => {
     if (activeWorkspace && activeProject) {
       navigateToProject(activeWorkspace, activeProject);
@@ -377,13 +394,6 @@ function AppContent() {
     [getByTid, setArchived],
   );
 
-  const handleDraftContentStart = useCallback(
-    (entryPointName: string, agentName: string) => {
-      createDraftTask(entryPointName, agentName);
-    },
-    [createDraftTask],
-  );
-
   const handleSidebarSelect = useCallback(() => {
     setSidebarOpen(false);
   }, []);
@@ -391,8 +401,6 @@ function AppContent() {
   const handleSidebarNewTask = useCallback(() => {
     setSidebarOpen(false);
   }, []);
-
-  const hasDraftView = activeTaskId === null && draftRenderKey !== null;
 
   return (
     <DevModeContext.Provider value={devMode}>
@@ -433,41 +441,54 @@ function AppContent() {
             onArchive={handleSidebarArchive}
             hasGlobalAttention={hasOtherProjectAttention}
           />
+          {draftView && (
+            <div key={draftView.viewKey} style={{ display: "contents" }}>
+              <DraftSessionView
+                draftView={draftView}
+                connected={connected}
+                entryPoints={entryPoints}
+                agents={agents}
+                defaultAgent={effectiveDefaultAgent}
+                notices={mergedNotices}
+                theme={theme}
+                onToggleTheme={toggleTheme}
+                onToggleSidebar={toggleSidebar}
+                hasGlobalAttention={attention.size > 0}
+                imageStore={controlledImageStore}
+              />
+            </div>
+          )}
           {Array.from(tasks.values())
             .filter((t) => {
-              // Virtual drafts (tid=null) should only render in draft mode
-              if (t.tid === null) {
-                return (
-                  activeTaskId === null &&
-                  draftRenderKey !== null &&
-                  t.uuid === draftRenderKey
-                );
-              }
-              // Also keep real draft tasks visible while user is still at project root.
-              // everLoaded keeps tasks rendered across task_reload cycles (which
-              // briefly flip historyLoaded back to false) so that InputBox doesn't
-              // unmount mid-interaction.
+              if (
+                draftView?.kind === "resolved" &&
+                draftView.remoteTid === t.tid
+              )
+                return false;
+              if (
+                t.status === "pending" &&
+                t.messages.length === 0 &&
+                !t.isProcessing
+              )
+                return false;
               return (
                 t.everLoaded ||
                 t.historyLoaded ||
                 String(t.tid) === activeTaskId ||
-                String(t.tid) === activeTaskIdRef.current ||
-                (activeTaskId === null &&
-                  draftRenderKey !== null &&
-                  t.uuid === draftRenderKey)
+                String(t.tid) === activeTaskIdRef.current
               );
             })
             .map((task) => {
+              if (task.tid === null) {
+                throw new Error("Task pane requires a numeric tid");
+              }
               const isActive =
                 String(task.tid) === activeTaskId ||
-                String(task.tid) === activeTaskIdRef.current ||
-                (activeTaskId === null &&
-                  draftRenderKey !== null &&
-                  task.uuid === draftRenderKey);
+                String(task.tid) === activeTaskIdRef.current;
               return (
                 <div
                   key={task.uuid}
-                  data-tid={task.tid ?? undefined}
+                  data-tid={task.tid}
                   style={{ display: isActive ? "contents" : "none" }}
                 >
                   <SessionView
@@ -486,8 +507,6 @@ function AppContent() {
                     onUndoDismiss={undoDismiss}
                     onClearInputDraft={clearInputDraft}
                     onSaveDraft={saveDraft}
-                    onSetEntryPoint={setEntryPoint}
-                    onSetAgentName={setAgentName}
                     theme={theme}
                     onToggleTheme={toggleTheme}
                     onToggleSidebar={toggleSidebar}
@@ -497,35 +516,15 @@ function AppContent() {
                     onPermissionPromptResponse={sendPermissionPromptResponse}
                     onEditMessage={editMessage}
                     onEditRawEvent={editRawEvent}
-                    entryPoints={
-                      task.uuid === draftRenderKey ? entryPoints : undefined
-                    }
-                    agents={task.uuid === draftRenderKey ? agents : undefined}
                     defaultAgent={effectiveDefaultAgent}
-                    defaultTaskType={
-                      task.uuid === draftRenderKey
-                        ? effectiveDefaultTaskType
-                        : undefined
-                    }
-                    onContentStart={
-                      task.uuid === draftRenderKey
-                        ? handleDraftContentStart
-                        : undefined
-                    }
-                    notices={
-                      task.uuid === draftRenderKey ? mergedNotices : undefined
-                    }
                     agentUsage={agentUsage}
-                    onContentEnd={
-                      task.uuid === draftRenderKey ? deleteDraftTask : undefined
-                    }
                     getTaskHref={getTaskHref}
                   />
                 </div>
               );
             })}
-          {!active &&
-            !hasDraftView &&
+          {!draftView &&
+            !activeTaskPaneRenderable &&
             (activeTaskId?.startsWith("archive") ? (
               <div class="session-empty">
                 <div class="session-empty-inner">

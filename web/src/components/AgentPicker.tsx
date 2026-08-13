@@ -4,15 +4,23 @@ interface Props {
   agents: AgentInfo[];
   selected: string;
   onChange: (agentName: string) => void;
+  disabled?: boolean;
 }
 
-export function AgentPicker({ agents, selected, onChange }: Props) {
+export function AgentPicker({
+  agents,
+  selected,
+  onChange,
+  disabled = false,
+}: Props) {
   if (agents.length === 0) return null;
   return (
     <select
       class="agent-picker"
       value={selected}
+      disabled={disabled}
       onChange={(e) => {
+        if (disabled) return;
         onChange((e.target as HTMLSelectElement).value);
       }}
     >

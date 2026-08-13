@@ -7,6 +7,7 @@ if (import.meta.hot) import.meta.hot.invalidate();
 import {
   useState,
   useEffect,
+  useLayoutEffect,
   useRef,
   useCallback,
   useMemo,
@@ -29,7 +30,6 @@ import {
   reduceMessage,
   replaceHistoryBoundary,
 } from "./sessionReducer";
-import { drafts as inputDrafts } from "./components/InputBox";
 import { outbox } from "./outbox";
 import {
   beginTaskHistoryReplay,
@@ -37,6 +37,20 @@ import {
   resetTaskForReload,
   snapshotUserDrafts,
 } from "./historyReplayReset";
+import {
+  createDraftState,
+  createProjectKey,
+  getSlot,
+  reduceDraft,
+  type DraftEffect,
+  type DraftEvent,
+  type DraftForm,
+  type DraftSlotState,
+  type DraftState,
+  type ProjectKey,
+  type TaskObservation,
+  type TaskSnapshot,
+} from "./draftReconciler";
 
 export interface ImageAttachment {
   id: string;
@@ -44,29 +58,6 @@ export interface ImageAttachment {
   base64: string;
   mediaType: string;
 }
-
-type DraftPhase =
-  | { phase: "none" }
-  | { phase: "virtual"; uuid: string }
-  | {
-      phase: "timer_pending";
-      uuid: string;
-      timerId: ReturnType<typeof setTimeout>;
-      entryPoint?: string;
-      agentName?: string;
-    }
-  | { phase: "create_pending"; uuid: string }
-  | { phase: "create_cancelled"; uuid: string }
-  | {
-      phase: "send_pending";
-      uuid: string;
-      firstMessage: {
-        text: string;
-        entryPointName?: string;
-        images?: ImageAttachment[];
-      };
-    }
-  | { phase: "promoted"; uuid: string };
 
 type HistoryBoundaryEvent =
   | (Extract<AgnosticEvent, { type: "item/started" }> & {
@@ -94,7 +85,7 @@ export function revertFilesForUndo(
 
 function buildContentBlocks(
   text: string,
-  images?: ImageAttachment[],
+  images?: readonly ImageAttachment[],
 ): ContentBlock[] {
   const blocks: ContentBlock[] = [];
   if (text) blocks.push({ type: "text", text });
@@ -108,6 +99,10 @@ function buildContentBlocks(
     }
   }
   return blocks;
+}
+
+function assertNeverDraftEffect(effect: never): never {
+  throw new Error(`Unexpected draft effect: ${JSON.stringify(effect)}`);
 }
 
 export interface ProjectInfo {
@@ -145,19 +140,51 @@ export interface TypeInfo {
   icon?: string;
 }
 
+export type DraftLifecycle =
+  | "idle"
+  | "creating"
+  | "present"
+  | "deleting"
+  | "submitting";
+
+interface DraftViewBase {
+  viewKey: string;
+  workspace: string;
+  projectName: string;
+  projectPath: string;
+  remoteTid: number | null;
+  text: string;
+  entryPoint: string;
+  agent: string;
+  lifecycle: DraftLifecycle;
+  disabled: boolean;
+  preserveImagesWhenDisabled?: boolean;
+  composerResetToken: number;
+}
+
+export interface UnresolvedDraftView extends DraftViewBase {
+  kind: "unresolved";
+}
+
+export interface DraftViewSnapshot extends DraftViewBase {
+  kind: "resolved";
+  projectKey: ProjectKey;
+  onTextChange: (text: string) => void;
+  onEntryPointChange: (entryPoint: string) => void;
+  onAgentChange: (agent: string) => void;
+  onBlur: () => void;
+  onSubmit: (text: string, images: ImageAttachment[]) => void;
+}
+
+export type DraftView = UnresolvedDraftView | DraftViewSnapshot;
+
 export interface TaskManager {
   tasks: Map<string, TaskState>;
   activeTaskId: string | null;
   activeTaskIdRef: { current: string | null };
   setActiveTaskId: (id: string) => void;
   connected: boolean;
-  send: (
-    uuid: string,
-    text: string,
-    images?: ImageAttachment[],
-    entryPointName?: string,
-    agentName?: string,
-  ) => void;
+  send: (uuid: string, text: string, images?: ImageAttachment[]) => void;
   interrupt: (uuid: string) => void;
   stop: (uuid: string) => void;
   closeStdin: (uuid: string) => void;
@@ -182,15 +209,11 @@ export interface TaskManager {
   clearInputDraft: (tid: number) => void;
   setArchived: (tid: number, archived: boolean) => void;
   saveDraft: (tid: number, draft: string) => void;
-  setEntryPoint: (tid: number, entryPoint: string) => void;
-  setAgentName: (tid: number, agentName: string) => void;
   sendAskUserResponse: (tid: number, content: string) => void;
   sendPermissionPromptResponse: (tid: number, content: string) => void;
   editMessage: (tid: number, uuid: string, content: string) => void;
   editRawEvent: (tid: number, seq: number, content: string) => void;
-  createDraftTask: (entryPointName?: string, agentName?: string) => void;
-  deleteDraftTask: () => void;
-  draftRenderKey: string | null;
+  draftView: DraftView | null;
   sidebarTasks: Array<{
     tid: number;
     alive: boolean;
@@ -231,6 +254,78 @@ export interface TaskManager {
   scanState: "idle" | "requested" | "scanning";
 }
 
+function makeDraftViewSnapshot(
+  slot: DraftSlotState,
+  projectKey: ProjectKey,
+  projectName: string,
+  metadataDisabled: boolean,
+  preserveImagesWhenDisabled: boolean,
+  composerResetToken: number,
+  editText: (projectKey: ProjectKey, text: string) => void,
+  dispatch: (event: DraftEvent) => void,
+  submit: (projectKey: ProjectKey, images: ImageAttachment[]) => void,
+): DraftViewSnapshot {
+  const form =
+    slot.desired.kind === "none"
+      ? { text: "", ...slot.defaults }
+      : {
+          text: slot.desired.text,
+          entryPoint: slot.desired.entryPoint,
+          agent: slot.desired.agent,
+        };
+  const lifecycle: DraftLifecycle =
+    slot.desired.kind === "submitting"
+      ? "submitting"
+      : slot.remote.kind === "creating"
+        ? "creating"
+        : slot.remote.kind === "present"
+          ? "present"
+          : slot.remote.kind === "deleting"
+            ? "deleting"
+            : "idle";
+  const disabled = metadataDisabled || slot.desired.kind === "submitting";
+  return {
+    kind: "resolved",
+    projectKey,
+    viewKey: projectKey,
+    workspace: slot.project.workspace,
+    projectName,
+    projectPath: slot.project.projectPath,
+    remoteTid:
+      slot.remote.kind === "present" || slot.remote.kind === "deleting"
+        ? slot.remote.tid
+        : null,
+    text: form.text,
+    entryPoint: form.entryPoint,
+    agent: form.agent,
+    lifecycle,
+    disabled,
+    preserveImagesWhenDisabled:
+      preserveImagesWhenDisabled && slot.desired.kind !== "submitting",
+    composerResetToken,
+    onTextChange: (text) => {
+      if (disabled) return;
+      editText(projectKey, text);
+    },
+    onEntryPointChange: (entryPoint) => {
+      if (disabled) return;
+      dispatch({ type: "change-entry-point", projectKey, entryPoint });
+    },
+    onAgentChange: (agent) => {
+      if (disabled) return;
+      dispatch({ type: "change-agent", projectKey, agent });
+    },
+    onBlur: () => {
+      if (disabled) return;
+      dispatch({ type: "flush", projectKey });
+    },
+    onSubmit: (_text, images) => {
+      if (disabled) return;
+      submit(projectKey, images);
+    },
+  };
+}
+
 export function receiveServerError(
   tasks: Map<string, TaskState>,
   message: string,
@@ -262,6 +357,7 @@ export function taskStateFromEntry(
 ): TaskState {
   const workspace = entry.workspace || "";
   const projectPath = entry.project_path || "";
+  const hasDraft = Object.prototype.hasOwnProperty.call(entry, "draft");
   if (!existing || !existingUuid) {
     const base = makeTaskState(
       entry.tid,
@@ -291,7 +387,7 @@ export function taskStateFromEntry(
     return {
       ...base,
       uuid: existingUuid ?? base.uuid,
-      serverDraft: entry.draft || undefined,
+      serverDraft: hasDraft ? entry.draft || undefined : base.serverDraft,
       error: entry.error || undefined,
     };
   }
@@ -329,6 +425,57 @@ export function taskStateFromEntry(
     error: entry.error || undefined,
     createdAt: entry.created_at || existing.createdAt,
     lastActive: entry.last_active || existing.lastActive,
+    serverDraft: hasDraft ? entry.draft || undefined : existing.serverDraft,
+  };
+}
+
+export function taskObservationFromEntry(
+  entry: TaskSnapshotEntry,
+  hasKnownMessages: boolean,
+): TaskObservation {
+  const observation: TaskObservation = { tid: entry.tid };
+  if (
+    Object.prototype.hasOwnProperty.call(entry, "draft") &&
+    typeof entry.draft === "string"
+  )
+    observation.text = entry.draft;
+  if (
+    Object.prototype.hasOwnProperty.call(entry, "entry_point") &&
+    typeof entry.entry_point === "string"
+  )
+    observation.entryPoint = entry.entry_point;
+  if (
+    Object.prototype.hasOwnProperty.call(entry, "agent_name") &&
+    typeof entry.agent_name === "string"
+  )
+    observation.agent = entry.agent_name;
+  if (
+    Object.prototype.hasOwnProperty.call(entry, "status") &&
+    typeof entry.status === "string"
+  )
+    observation.active = entry.status !== "pending";
+  if (entry.alive) observation.active = true;
+  if (entry.isProcessing) observation.processing = true;
+  if (hasKnownMessages) observation.hasMessages = true;
+  return observation;
+}
+
+function isAuthoritativeActivity(observation: TaskObservation): boolean {
+  return (
+    observation.active === true ||
+    observation.processing === true ||
+    observation.hasMessages === true
+  );
+}
+
+function activityOnlyObservation(
+  observation: TaskObservation,
+): TaskObservation {
+  return {
+    tid: observation.tid,
+    ...(observation.active ? { active: true } : {}),
+    ...(observation.processing ? { processing: true } : {}),
+    ...(observation.hasMessages ? { hasMessages: true } : {}),
   };
 }
 
@@ -346,7 +493,6 @@ function extractTextContent(msg: AgnosticEvent): string {
 const liveStates = new Map<string, TaskState>();
 
 // Index: backend tid → frontend uuid. Maintained in lockstep with liveStates.
-// Every task with a real tid has an entry here; virtual drafts (tid=null) do not.
 const tidToUuid = new Map<number, string>();
 
 function findByTid(tid: number): TaskState | undefined {
@@ -413,6 +559,9 @@ export function useTaskManager(
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [defaultAgent, setDefaultAgent] = useState("");
   const [defaultTaskType, setDefaultTaskType] = useState("");
+  const [globalTaskTypesLoaded, setGlobalTaskTypesLoaded] = useState(false);
+  const [agentsLoaded, setAgentsLoaded] = useState(false);
+  const [tasksListEpoch, setTasksListEpoch] = useState<number | null>(null);
   const [notices, setNotices] = useState<Record<string, Notice>>({});
   const [localNotices, setLocalNotices] = useState<Record<string, Notice>>({});
   const [agentUsage, setAgentUsage] = useState<
@@ -432,6 +581,10 @@ export function useTaskManager(
   routeRef.current = route;
   const workspacesRef = useRef(workspaces);
   workspacesRef.current = workspaces;
+  const projectEntryPointsRef = useRef(projectEntryPoints);
+  projectEntryPointsRef.current = projectEntryPoints;
+  const defaultAgentRef = useRef(defaultAgent);
+  defaultAgentRef.current = defaultAgent;
 
   const { params, path } = useRoute();
   const parsed = useMemo(() => {
@@ -485,6 +638,26 @@ export function useTaskManager(
   const getProjectHref = useCallback(
     (workspace: string, projectName: string) =>
       buildProjectHref(workspace, projectName),
+    [],
+  );
+
+  const currentRouteProjectName = useCallback(
+    (
+      project: { workspace: string; projectPath: string },
+      tid: number | null,
+    ): string | null => {
+      if (
+        activeWorkspaceRef.current !== project.workspace ||
+        activeTaskIdRef.current !== (tid === null ? null : String(tid))
+      )
+        return null;
+      const projectName = findProjectName(
+        workspacesRef.current,
+        project.workspace,
+        project.projectPath,
+      );
+      return projectName === activeProjectRef.current ? projectName : null;
+    },
     [],
   );
 
@@ -551,188 +724,479 @@ export function useTaskManager(
   const connRef = useRef<Connection | null>(null);
   // Track which tasks have had history requested (avoid duplicate requests), keyed by uuid
   const requestedHistoryRef = useRef(new Set<string>());
+  const outboxReplayedEpochRef = useRef<number | null>(null);
+  const outboxAttemptedNoncesRef = useRef(new Set<string>());
+  const tasksListEpochRef = useRef<number | null>(null);
+  const connectionEpochRef = useRef(0);
+  const openConnectionEpochRef = useRef<number | null>(0);
 
-  // Draft task management state
-  const draftRef = useRef<DraftPhase>({ phase: "none" });
-  const [draftRenderKey, setDraftRenderKey] = useState<string | null>(null);
-  // Set when a promoted draft is deleted; cleared on task_deleted.
-  // Guards handleTaskMessage against stale history events.
-  const deletedDraftTid = useRef<number | null>(null);
-
-  const setDraft = useCallback((next: DraftPhase) => {
-    draftRef.current = next;
-    const rk = next.phase !== "none" ? next.uuid : null;
-    setDraftRenderKey((prev) => (prev === rk ? prev : rk));
-  }, []);
-
-  /** Remove virtual draft from task map and input drafts. */
-  const teardownVirtualDraft = useCallback(() => {
-    const draft = draftRef.current;
-    const uuid = draft.phase !== "none" ? draft.uuid : null;
-    if (!uuid) return;
-    liveStates.delete(uuid);
-    setTasks((prev) => {
-      if (!prev.has(uuid)) return prev;
-      const next = new Map(prev);
-      next.delete(uuid);
-      return next;
-    });
-    inputDrafts.delete(uuid);
-  }, []);
-
-  /** Clear draft state when navigating away. Handles all phases correctly. */
-  const clearDraftForNav = useCallback(
-    (opts: { teardownVirtual: boolean }) => {
-      const cur = draftRef.current;
-      if (cur.phase === "none") return;
-      if (cur.phase === "timer_pending") clearTimeout(cur.timerId);
-      if (opts.teardownVirtual) teardownVirtualDraft();
-      if (cur.phase === "create_pending") {
-        setDraft({
-          phase: "create_cancelled",
-          uuid: cur.uuid,
-        });
-      } else if (
-        !opts.teardownVirtual &&
-        (cur.phase === "create_cancelled" || cur.phase === "send_pending")
-      ) {
-        // navigate-to-task: leave these phases active so task_created can
-        // still clean up the zombie or deliver the pending message.
-      } else {
-        setDraft({ phase: "none" });
-      }
+  const isCurrentOpenEpoch = useCallback(
+    (epoch: number | null): epoch is number => {
+      return (
+        epoch !== null &&
+        connectionEpochRef.current === epoch &&
+        openConnectionEpochRef.current === epoch
+      );
     },
-    [setDraft, teardownVirtualDraft],
+    [],
   );
+  const renderedConnectionEpoch = openConnectionEpochRef.current;
 
-  const createVirtualDraft = useCallback(() => {
-    const ws = activeWorkspaceRef.current ?? "";
-    const proj = activeProjectRef.current;
-    const projPath = proj
-      ? (findProjectPath(workspacesRef.current, ws, proj) ?? "")
-      : "";
-    const t = makeTaskState(null, false, false, undefined, true, ws, projPath);
-    liveStates.set(t.uuid, t);
-    setTasks((prev) => {
-      const next = new Map(prev);
-      next.set(t.uuid, t);
-      return next;
-    });
-    setDraft({ phase: "virtual", uuid: t.uuid });
-    return t.uuid;
-  }, [setDraft]);
+  const draftStateRef = useRef<DraftState>(createDraftState());
+  const [draftRevision, setDraftRevision] = useState(0);
+  const requestedProjectTypesRef = useRef(new Map<string, number>());
+  const createRuntimeRef = useRef(
+    new Map<
+      ProjectKey,
+      {
+        generation: string;
+        token: number;
+        handle: ReturnType<typeof setTimeout>;
+      }
+    >(),
+  );
+  const saveRuntimeRef = useRef(
+    new Map<
+      number,
+      {
+        projectKey: ProjectKey;
+        formVersion: number;
+        handle: ReturnType<typeof setTimeout>;
+      }
+    >(),
+  );
+  const createTokenRef = useRef(0);
+  const correlationToProjectRef = useRef(new Map<string, ProjectKey>());
+  const ownedTidToProjectRef = useRef(new Map<number, ProjectKey>());
+  const tombstoneTidToProjectRef = useRef(new Map<number, ProjectKey>());
+  const expectedFocusRef = useRef(new Set<string>());
+  const draftAttachmentRef = useRef<{
+    projectKey: ProjectKey;
+    routeTid: number | null;
+  } | null>(null);
+  const routeProjectCacheRef = useRef<{
+    epoch: number;
+    workspace: string;
+    projectName: string;
+    projectPath: string;
+  } | null>(null);
+  const deferredDraftAttachmentRef = useRef<{
+    projectKey: ProjectKey;
+    tid: number;
+  } | null>(null);
+  const composerResetSequenceRef = useRef(0);
+  const composerResetEpochRef = useRef(0);
+  const composerResetRef = useRef(new Map<ProjectKey, number>());
+  const executeDraftEffectsRef = useRef<
+    (effects: readonly DraftEffect[]) => void
+  >(() => {
+    throw new Error("Draft effect executor is not installed");
+  });
 
-  const createDraftTask = useCallback(
-    (entryPointName?: string, agentName?: string) => {
-      const cur = draftRef.current;
-      if (cur.phase !== "virtual") return;
-      const ws = activeWorkspaceRef.current;
-      const proj = activeProjectRef.current;
-      if (!ws || !proj) return;
-      const { uuid } = cur;
-      // Debounce: delay sending create_task so that rapid fill()+click()
-      // sequences (common in Playwright tests) don't create zombie tasks.
-      const timerId = setTimeout(() => {
-        const projPath = findProjectPath(workspacesRef.current, ws, proj);
-        setDraft({ phase: "create_pending", uuid });
-        // The draft's uuid serves as the correlation_id for the handshake.
-        connRef.current?.createTask(
-          ws,
-          projPath || "",
-          entryPointName,
-          undefined,
-          agentName,
-          uuid,
+  const refreshDraftView = useCallback(() => {
+    setDraftRevision((revision) => revision + 1);
+  }, []);
+
+  const rebuildDraftIndexes = useCallback((state: DraftState) => {
+    correlationToProjectRef.current.clear();
+    ownedTidToProjectRef.current.clear();
+    tombstoneTidToProjectRef.current.clear();
+    for (const [projectKey, slot] of Object.entries(state.slots)) {
+      if (slot.remote.kind === "creating") {
+        correlationToProjectRef.current.set(
+          slot.remote.correlationId,
+          projectKey,
         );
-      }, 16);
-      setDraft({
-        phase: "timer_pending",
-        uuid,
-        timerId,
-        entryPoint: entryPointName,
-        agentName,
-      });
+      }
+      if (slot.remote.kind === "present" || slot.remote.kind === "deleting") {
+        ownedTidToProjectRef.current.set(slot.remote.tid, projectKey);
+      }
+      if (slot.remote.kind === "deleting") {
+        tombstoneTidToProjectRef.current.set(slot.remote.tid, projectKey);
+      }
+    }
+  }, []);
+
+  const applyDraftEvent = useCallback(
+    (event: DraftEvent) => {
+      const result = reduceDraft(draftStateRef.current, event);
+      draftStateRef.current = result.state;
+      rebuildDraftIndexes(result.state);
+      refreshDraftView();
+      return result;
     },
-    [setDraft],
+    [rebuildDraftIndexes, refreshDraftView],
   );
 
-  const deleteDraftTask = useCallback(() => {
-    const cur = draftRef.current;
-    switch (cur.phase) {
-      case "timer_pending":
-        clearTimeout(cur.timerId);
-        setDraft({ phase: "virtual", uuid: cur.uuid });
-        return;
-
-      case "promoted": {
-        const { uuid } = cur;
-        const existing = liveStates.get(uuid);
-        const tid = existing?.tid ?? null;
-        if (tid !== null) {
-          // Real backend task — delete it
-          deletedDraftTid.current = tid;
-          connRef.current?.deleteTask(tid);
-          tidToUuid.delete(tid);
-        }
-        inputDrafts.delete(uuid);
-        liveStates.delete(uuid);
-        setTasks((prev) => {
-          if (!prev.has(uuid)) return prev;
-          const next = new Map(prev);
-          next.delete(uuid);
-          return next;
-        });
-        // Reset virtual draft reusing the same uuid so InputBox key stays stable
-        const ws = activeWorkspaceRef.current ?? "";
-        const proj = activeProjectRef.current;
-        const projPath = proj
-          ? (findProjectPath(workspacesRef.current, ws, proj) ?? "")
-          : "";
-        const t: TaskState = {
-          ...makeTaskState(null, false, false, undefined, true, ws, projPath),
-          uuid,
-          entryPoint: existing?.entryPoint,
-          taskType: existing?.taskType,
-          agentName: existing?.agentName,
-          driver: existing?.driver,
-        };
-        // Clear stale in-memory draft so InputBox starts fresh on the next cycle
-        inputDrafts.delete(uuid);
-        liveStates.set(uuid, t);
-        setTasks((prev) => {
-          const next = new Map(prev);
-          next.set(uuid, t);
-          return next;
-        });
-        setDraft({ phase: "virtual", uuid });
-        // Navigate back to project root so activeTaskId becomes null
-        // and the virtual draft view renders.
-        if (ws && proj) {
-          const encodedProject = proj.replace(/\//g, ":");
-          routeRef.current(`/${ws}/${encodedProject}`, true);
-        }
-        return;
+  const entryPointFor = useCallback(
+    (projectPath: string, entryPointName: string) => {
+      const candidates = projectEntryPointsRef.current.get(projectPath);
+      if (!candidates) {
+        throw new Error(`Project entry points unavailable for ${projectPath}`);
       }
+      const entryPoint = candidates.find(
+        (candidate) => candidate.name === entryPointName,
+      );
+      if (!entryPoint) {
+        throw new Error(`Unknown entry point: ${entryPointName}`);
+      }
+      return entryPoint;
+    },
+    [],
+  );
 
-      case "create_pending":
-        setDraft({
-          phase: "create_cancelled",
-          uuid: cur.uuid,
-        });
-        return;
+  const projectDraft = useCallback(
+    (
+      tid: number,
+      text: string,
+      form?: Pick<DraftForm, "entryPoint" | "agent">,
+    ) => {
+      const task = findByTid(tid);
+      if (!task) throw new Error(`Draft projection requires task ${tid}`);
+      const title = text.trim().split("\n")[0]?.slice(0, 100) || undefined;
+      let updated: TaskState = {
+        ...task,
+        serverDraft: text || undefined,
+        title,
+      };
+      if (form) {
+        const projectPath = task.projectPath;
+        if (!projectPath)
+          throw new Error(`Draft projection requires project ${tid}`);
+        const entryPoint = entryPointFor(projectPath, form.entryPoint);
+        updated = {
+          ...updated,
+          entryPoint: form.entryPoint,
+          agentName: form.agent,
+          taskType: entryPoint.task_type,
+        };
+      }
+      liveStates.set(task.uuid, updated);
+      setTasks((previous) => new Map(previous).set(task.uuid, updated));
+    },
+    [entryPointFor],
+  );
 
-      default:
-        return; // none, virtual, send_pending, create_cancelled — no-op
+  const sendRealTask = useCallback(
+    (uuid: string, text: string, images?: readonly ImageAttachment[]) => {
+      const task = liveStates.get(uuid);
+      if (!task || task.tid === null) {
+        throw new Error(`Cannot send to missing real task ${uuid}`);
+      }
+      const content = buildContentBlocks(text, images);
+      const displayContent =
+        content as import("./protocol").AssistantContentBlock[];
+      const nonce = crypto.randomUUID();
+      outbox.add({ tid: task.tid, nonce, content, createdAt: Date.now() });
+      if (outboxReplayedEpochRef.current !== openConnectionEpochRef.current) {
+        outboxAttemptedNoncesRef.current.add(nonce);
+      }
+      connRef.current?.sendMessage(task.tid, content, nonce);
+      const messageId = `opt-${++task.msgIdCounter}`;
+      const updated: TaskState = {
+        ...task,
+        messages: [
+          ...task.messages,
+          {
+            id: messageId,
+            type: "user",
+            content: displayContent,
+            ackState: 4,
+            pending: true,
+            nonce,
+            isProvisional: true,
+          },
+        ],
+        isProcessing: true,
+        suggestions: undefined,
+      };
+      liveStates.set(uuid, updated);
+      setTasks((previous) => new Map(previous).set(uuid, updated));
+    },
+    [],
+  );
+
+  const clearComposerImages = useCallback(
+    (projectKey: ProjectKey) => {
+      composerResetSequenceRef.current++;
+      composerResetRef.current.set(
+        projectKey,
+        composerResetSequenceRef.current,
+      );
+      refreshDraftView();
+    },
+    [refreshDraftView],
+  );
+
+  const composerResetTokenFor = useCallback((projectKey: ProjectKey) => {
+    return (
+      composerResetRef.current.get(projectKey) ?? composerResetEpochRef.current
+    );
+  }, []);
+
+  const executeDraftEffects = useCallback(
+    (effects: readonly DraftEffect[]) => {
+      for (const effect of effects) {
+        switch (effect.type) {
+          case "schedule-create": {
+            const existing = createRuntimeRef.current.get(effect.projectKey);
+            if (existing) {
+              if (existing.generation !== effect.generation) {
+                throw new Error(
+                  "Different draft creation is already scheduled",
+                );
+              }
+              break;
+            }
+            const token = ++createTokenRef.current;
+            const handle = setTimeout(() => {
+              const current = createRuntimeRef.current.get(effect.projectKey);
+              if (
+                !current ||
+                current.generation !== effect.generation ||
+                current.token !== token
+              )
+                return;
+              createRuntimeRef.current.delete(effect.projectKey);
+              const result = applyDraftEvent({
+                type: "create-timer-due",
+                projectKey: effect.projectKey,
+                generation: effect.generation,
+              });
+              executeDraftEffectsRef.current(result.effects);
+            }, effect.delayMs);
+            createRuntimeRef.current.set(effect.projectKey, {
+              generation: effect.generation,
+              token,
+              handle,
+            });
+            break;
+          }
+
+          case "cancel-create-schedule": {
+            const existing = createRuntimeRef.current.get(effect.projectKey);
+            if (existing?.generation === effect.generation) {
+              clearTimeout(existing.handle);
+              createRuntimeRef.current.delete(effect.projectKey);
+            }
+            break;
+          }
+
+          case "create-task": {
+            const slot = getSlot(draftStateRef.current, effect.projectKey);
+            connRef.current?.createTask(
+              slot.project.workspace,
+              slot.project.projectPath,
+              effect.entryPoint,
+              effect.content
+                ? buildContentBlocks(effect.content.text, effect.content.images)
+                : undefined,
+              effect.agent,
+              effect.correlationId,
+            );
+            break;
+          }
+
+          case "ensure-draft-save": {
+            const existing = saveRuntimeRef.current.get(effect.tid);
+            if (
+              existing &&
+              existing.projectKey === effect.projectKey &&
+              existing.formVersion === effect.formVersion
+            )
+              break;
+            if (existing) clearTimeout(existing.handle);
+            const handle = setTimeout(() => {
+              const current = saveRuntimeRef.current.get(effect.tid);
+              if (
+                !current ||
+                current.projectKey !== effect.projectKey ||
+                current.formVersion !== effect.formVersion
+              )
+                return;
+              saveRuntimeRef.current.delete(effect.tid);
+              const result = applyDraftEvent({
+                type: "save-timer-due",
+                projectKey: effect.projectKey,
+                tid: effect.tid,
+                formVersion: effect.formVersion,
+              });
+              executeDraftEffectsRef.current(result.effects);
+            }, effect.delayMs);
+            saveRuntimeRef.current.set(effect.tid, {
+              projectKey: effect.projectKey,
+              formVersion: effect.formVersion,
+              handle,
+            });
+            break;
+          }
+
+          case "cancel-draft-save": {
+            const existing = saveRuntimeRef.current.get(effect.tid);
+            if (
+              existing &&
+              existing.projectKey === effect.projectKey &&
+              existing.formVersion === effect.formVersion
+            ) {
+              clearTimeout(existing.handle);
+              saveRuntimeRef.current.delete(effect.tid);
+            }
+            break;
+          }
+
+          case "set-entry-point":
+            connRef.current?.setEntryPoint(effect.tid, effect.entryPoint);
+            break;
+
+          case "set-agent":
+            connRef.current?.setAgentName(effect.tid, effect.agent);
+            break;
+
+          case "set-draft":
+            connRef.current?.saveDraft(effect.tid, effect.text);
+            break;
+
+          case "project-draft":
+            projectDraft(effect.tid, effect.form.text, effect.form);
+            break;
+
+          case "delete-task":
+            connRef.current?.deleteTask(effect.tid);
+            break;
+
+          case "draft-ready": {
+            const slot = getSlot(draftStateRef.current, effect.projectKey);
+            const projectName = currentRouteProjectName(slot.project, null);
+            if (!projectName) break;
+            routeRef.current(
+              `${buildProjectHref(slot.project.workspace, projectName)}/task/${effect.tid}`,
+              true,
+            );
+            break;
+          }
+
+          case "send-first-message": {
+            const uuid = tidToUuid.get(effect.tid);
+            if (!uuid) {
+              throw new Error(`First message requires task ${effect.tid}`);
+            }
+            sendRealTask(uuid, effect.content.text, effect.content.images);
+            break;
+          }
+
+          case "release-task":
+            if (effect.resetComposer) clearComposerImages(effect.projectKey);
+            break;
+
+          default:
+            assertNeverDraftEffect(effect);
+        }
+      }
+    },
+    [
+      applyDraftEvent,
+      clearComposerImages,
+      currentRouteProjectName,
+      projectDraft,
+      sendRealTask,
+    ],
+  );
+  executeDraftEffectsRef.current = executeDraftEffects;
+
+  const materializeDraftTask = useCallback(
+    (
+      tid: number,
+      workspace: string,
+      projectPath: string,
+      parentTid: number | undefined,
+      relationType: string | undefined,
+      desired: Exclude<ReturnType<typeof getSlot>["desired"], { kind: "none" }>,
+    ) => {
+      const entryPoint = entryPointFor(projectPath, desired.entryPoint);
+      const submitting = desired.kind === "submitting";
+      const title = submitting
+        ? undefined
+        : desired.text.trim().split("\n")[0]?.slice(0, 100) || undefined;
+      const base = makeTaskState(
+        tid,
+        false,
+        false,
+        title,
+        submitting,
+        workspace,
+        projectPath,
+        parentTid,
+        relationType,
+        "pending",
+        submitting,
+        false,
+        false,
+        false,
+        entryPoint.task_type,
+        false,
+        undefined,
+        undefined,
+        desired.agent,
+        desired.entryPoint,
+      );
+      const task: TaskState = {
+        ...base,
+        uuid: desired.uuid,
+        serverDraft: submitting ? undefined : desired.text || undefined,
+        everLoaded: submitting,
+      };
+      liveStates.set(task.uuid, task);
+      tidToUuid.set(tid, task.uuid);
+      setTasks((previous) => new Map(previous).set(task.uuid, task));
+    },
+    [entryPointFor],
+  );
+
+  const requestTaskHistory = useCallback((tid: number) => {
+    const task = findByTid(tid);
+    if (!task) throw new Error(`History request requires task ${tid}`);
+    if (requestedHistoryRef.current.has(task.uuid)) return;
+    if (!connRef.current?.requestHistory(tid)) {
+      throw new Error(`History request failed for ${tid}`);
     }
-  }, [setDraft]);
+    requestedHistoryRef.current.add(task.uuid);
+  }, []);
+
+  const releaseTombstonedActivity = useCallback(
+    (
+      projectKey: ProjectKey,
+      observation: TaskObservation,
+    ): readonly DraftEffect[] | null => {
+      if (!isAuthoritativeActivity(observation)) return null;
+      const result = applyDraftEvent({
+        type: "task-observed",
+        projectKey,
+        observation: activityOnlyObservation(observation),
+      });
+      return result.effects;
+    },
+    [applyDraftEvent],
+  );
 
   // -- Live stdout message handler --
   // Reduces against the mutable liveStates map (synchronous), fires
   // notifications, then enqueues a Preact state update for rendering.
   const handleUnconfirmedUserMessage = useCallback(
     (tid: number, msg: AgnosticEvent, correlationId?: string) => {
+      if (tombstoneTidToProjectRef.current.has(tid)) return;
+      const projectKey = ownedTidToProjectRef.current.get(tid);
+      const effects = projectKey
+        ? applyDraftEvent({
+            type: "task-observed",
+            projectKey,
+            observation: { tid, hasMessages: true },
+          }).effects
+        : [];
       const uuid = tidToUuid.get(tid);
-      if (!uuid) return;
+      if (!uuid) {
+        executeDraftEffectsRef.current(effects);
+        return;
+      }
       const prev = liveStates.get(uuid) ?? {
         ...makeTaskState(tid, true),
         uuid,
@@ -772,6 +1236,7 @@ export function useTaskManager(
             next.set(uuid, updated);
             return next;
           });
+          executeDraftEffectsRef.current(effects);
           return;
         }
       }
@@ -799,17 +1264,27 @@ export function useTaskManager(
         next.set(uuid, updated);
         return next;
       });
+      executeDraftEffectsRef.current(effects);
     },
-    [],
+    [applyDraftEvent],
   );
 
   const handleTaskMessage = useCallback(
     (tid: number, msg: AgnosticEvent, seq?: number, ts?: number) => {
-      // Skip stale events for recently deleted draft tasks (e.g. from
-      // requestHistory responses arriving after deleteDraftTask).
-      if (deletedDraftTid.current === tid) return;
+      if (tombstoneTidToProjectRef.current.has(tid)) return;
+      const projectKey = ownedTidToProjectRef.current.get(tid);
+      const effects = projectKey
+        ? applyDraftEvent({
+            type: "task-observed",
+            projectKey,
+            observation: { tid, hasMessages: true },
+          }).effects
+        : [];
       const uuid = tidToUuid.get(tid);
-      if (!uuid) return;
+      if (!uuid) {
+        executeDraftEffectsRef.current(effects);
+        return;
+      }
       const prev = liveStates.get(uuid) ?? {
         ...makeTaskState(tid, true),
         uuid,
@@ -830,14 +1305,29 @@ export function useTaskManager(
         next.set(uuid, updated);
         return next;
       });
+      executeDraftEffectsRef.current(effects);
     },
-    [],
+    [applyDraftEvent],
   );
 
   const handleControlMessage = useCallback(
     (msg: ControlMessage) => {
+      const controlledTid =
+        msg.type === "task_updated"
+          ? msg.task.tid
+          : "tid" in msg && typeof msg.tid === "number"
+            ? msg.tid
+            : undefined;
+      if (
+        controlledTid !== undefined &&
+        msg.type !== "task_deleted" &&
+        msg.type !== "task_updated" &&
+        tombstoneTidToProjectRef.current.has(controlledTid)
+      )
+        return;
       switch (msg.type) {
         case "workspaces_list": {
+          workspacesRef.current = msg.workspaces;
           setWorkspaces(msg.workspaces);
           setConnected(true);
           break;
@@ -849,7 +1339,8 @@ export function useTaskManager(
         case "task_types_list": {
           setEntryPoints(msg.entry_points);
           setTypeInfo(msg.type_info);
-          if (msg.default_task_type) setDefaultTaskType(msg.default_task_type);
+          setDefaultTaskType(msg.default_task_type ?? "");
+          setGlobalTaskTypesLoaded(true);
           break;
         }
         case "project_task_types_list": {
@@ -857,6 +1348,7 @@ export function useTaskManager(
           setProjectEntryPoints((prev) => {
             const next = new Map(prev);
             next.set(project_path, entry_points);
+            projectEntryPointsRef.current = next;
             return next;
           });
           setProjectTypeInfo((prev) => {
@@ -868,7 +1360,10 @@ export function useTaskManager(
         }
         case "agents_list": {
           setAgents(msg.agents);
-          if (msg.default_agent) setDefaultAgent(msg.default_agent);
+          const nextDefaultAgent = msg.default_agent ?? "";
+          defaultAgentRef.current = nextDefaultAgent;
+          setDefaultAgent(nextDefaultAgent);
+          setAgentsLoaded(true);
           break;
         }
         case "task_created": {
@@ -878,107 +1373,60 @@ export function useTaskManager(
           const parentTid = msg.parent_tid || undefined;
           const relationType = msg.relation_type || undefined;
 
-          // Check if this is a draft task creation — the draft's uuid IS the correlation_id.
-          const draft = draftRef.current;
-          const isDraftCreation =
-            (draft.phase === "create_pending" ||
-              draft.phase === "create_cancelled" ||
-              draft.phase === "send_pending") &&
-            draft.uuid === msg.correlation_id;
-
-          if (isDraftCreation) {
-            const { uuid } = draft;
-
-            if (draft.phase === "create_cancelled") {
-              // User navigated away before task_created arrived — delete zombie.
-              connRef.current?.deleteTask(tid);
-              teardownVirtualDraft();
-              setDraft({ phase: "none" });
-              break;
-            }
-
-            const firstMsg =
-              draft.phase === "send_pending" ? draft.firstMessage : null;
-
-            // Clear the in-memory draft text when piggybacking a first message
-            if (firstMsg !== null) {
-              inputDrafts.set(uuid, "");
-            }
-
-            // The draft task state already exists in liveStates keyed by uuid.
-            // Stamp the real tid onto it — no rekeying needed.
-            const existing = liveStates.get(uuid);
-            if (!existing) {
-              console.warn("task_created with no matching draft", uuid);
-              break;
-            }
-            const realTask: TaskState = {
-              ...existing,
-              tid,
-              historyLoaded: true,
-              everLoaded: true,
-            };
-            liveStates.set(uuid, realTask);
-            tidToUuid.set(tid, uuid);
-            setTasks((prev) => {
-              const next = new Map(prev);
-              next.set(uuid, realTask);
-              return next;
-            });
-
-            // Subscribe to live events for the new task.
-            connRef.current?.requestHistory(tid);
-            requestedHistoryRef.current.add(uuid);
-
-            if (firstMsg !== null) {
-              // Path (c): user sent before task_created arrived — send now.
-              // Navigate URL to reflect the real tid.
-              if (workspace && projectPath) {
-                const projName = findProjectName(
-                  workspacesRef.current,
-                  workspace,
-                  projectPath,
-                );
-                if (projName) {
-                  const encodedProject = projName.replace(/\//g, ":");
-                  routeRef.current(
-                    `/${workspace}/${encodedProject}/task/${tid}`,
-                    true,
-                  );
-                }
-              }
-              connRef.current?.sendMessage(
-                tid,
-                buildContentBlocks(firstMsg.text, firstMsg.images),
+          const correlationId = msg.correlation_id;
+          const projectKey = correlationId
+            ? correlationToProjectRef.current.get(correlationId)
+            : undefined;
+          if (projectKey && correlationId) {
+            const before = getSlot(draftStateRef.current, projectKey);
+            if (
+              before.remote.kind !== "creating" ||
+              before.remote.correlationId !== correlationId
+            ) {
+              throw new Error(
+                "Draft create index does not match reducer state",
               );
-              setDraft({ phase: "none" });
-              setTasks((prev) => {
-                const taskState = prev.get(uuid);
-                if (!taskState) return prev;
-                const next = new Map(prev);
-                next.set(uuid, {
-                  ...taskState,
-                  isProcessing: true,
-                  suggestions: undefined,
-                });
-                return next;
-              });
-            } else {
-              // User is still typing — navigate URL to reflect the real tid.
-              setDraft({ phase: "promoted", uuid });
-              if (workspace && projectPath) {
-                const projName = findProjectName(
-                  workspacesRef.current,
-                  workspace,
-                  projectPath,
+            }
+            if (
+              before.project.workspace !== workspace ||
+              before.project.projectPath !== projectPath
+            ) {
+              throw new Error(
+                "Draft creation acknowledgement has wrong project",
+              );
+            }
+            const currentDesired =
+              before.desired.kind !== "none" &&
+              before.desired.uuid === correlationId
+                ? before.desired
+                : null;
+            const result = applyDraftEvent({
+              type: "task-created",
+              correlationId,
+              tid,
+            });
+            expectedFocusRef.current.add(`0:${tid}`);
+            if (currentDesired) {
+              materializeDraftTask(
+                tid,
+                workspace,
+                projectPath,
+                parentTid,
+                relationType,
+                currentDesired,
+              );
+            }
+            if (currentDesired?.kind === "submitting") {
+              requestTaskHistory(tid);
+            }
+            executeDraftEffects(result.effects);
+            if (currentDesired?.kind === "submitting") {
+              const projectName = currentRouteProjectName(before.project, null);
+              if (projectName) {
+                routeRef.current(
+                  `${buildProjectHref(before.project.workspace, projectName)}/task/${tid}`,
+                  true,
                 );
-                if (projName) {
-                  const encodedProject = projName.replace(/\//g, ":");
-                  routeRef.current(
-                    `/${workspace}/${encodedProject}/task/${tid}`,
-                    true,
-                  );
-                }
               }
             }
             break;
@@ -1009,9 +1457,31 @@ export function useTaskManager(
         }
         case "tasks_list": {
           const updates = new Map<string, TaskState>();
+          const effects: DraftEffect[] = [];
           for (const entry of msg.tasks) {
-            // Skip recently deleted draft tasks
-            if (deletedDraftTid.current === entry.tid) continue;
+            const observation = taskObservationFromEntry(
+              entry,
+              (findByTid(entry.tid)?.messages.length ?? 0) > 0,
+            );
+            const tombstoneProjectKey = tombstoneTidToProjectRef.current.get(
+              entry.tid,
+            );
+            if (tombstoneProjectKey) {
+              const released = releaseTombstonedActivity(
+                tombstoneProjectKey,
+                observation,
+              );
+              if (!released) continue;
+              effects.push(...released);
+            }
+            const projectKey = ownedTidToProjectRef.current.get(entry.tid);
+            const result = projectKey
+              ? applyDraftEvent({
+                  type: "task-observed",
+                  projectKey,
+                  observation,
+                })
+              : null;
             const existingUuid = tidToUuid.get(entry.tid);
             const existing = existingUuid
               ? liveStates.get(existingUuid)
@@ -1020,6 +1490,7 @@ export function useTaskManager(
             liveStates.set(state.uuid, state);
             tidToUuid.set(entry.tid, state.uuid);
             updates.set(state.uuid, state);
+            if (result) effects.push(...result.effects);
           }
           setTasks((prev) => {
             const next = new Map(prev);
@@ -1028,12 +1499,40 @@ export function useTaskManager(
             }
             return next;
           });
+          const epoch = openConnectionEpochRef.current;
+          if (!isCurrentOpenEpoch(epoch))
+            throw new Error("Tasks list arrived outside an open connection");
+          tasksListEpochRef.current = epoch;
+          setTasksListEpoch(epoch);
+          executeDraftEffects(effects);
           break;
         }
         case "task_updated": {
           const entry = msg.task;
-          // Skip updates for recently deleted draft tasks
-          if (deletedDraftTid.current === entry.tid) break;
+          const observation = taskObservationFromEntry(
+            entry,
+            (findByTid(entry.tid)?.messages.length ?? 0) > 0,
+          );
+          const tombstoneProjectKey = tombstoneTidToProjectRef.current.get(
+            entry.tid,
+          );
+          const effects: DraftEffect[] = [];
+          if (tombstoneProjectKey) {
+            const released = releaseTombstonedActivity(
+              tombstoneProjectKey,
+              observation,
+            );
+            if (!released) break;
+            effects.push(...released);
+          }
+          const projectKey = ownedTidToProjectRef.current.get(entry.tid);
+          const result = projectKey
+            ? applyDraftEvent({
+                type: "task-observed",
+                projectKey,
+                observation,
+              })
+            : null;
           const existingUuid = tidToUuid.get(entry.tid);
           const existing = existingUuid
             ? liveStates.get(existingUuid)
@@ -1046,11 +1545,16 @@ export function useTaskManager(
             next.set(taskUpdated.uuid, taskUpdated);
             return next;
           });
+          if (result) effects.push(...result.effects);
+          executeDraftEffects(effects);
           break;
         }
         case "focus_hint": {
           const fromTid = msg.from_tid;
           const toTid = msg.to_tid;
+          const expectedKey = `${fromTid}:${toTid}`;
+          if (expectedFocusRef.current.delete(expectedKey)) break;
+          if (tombstoneTidToProjectRef.current.has(toTid)) break;
           const currentId = activeTaskIdRef.current;
           const currentTid = currentId !== null ? parseInt(currentId, 10) : NaN;
           const matches =
@@ -1205,33 +1709,60 @@ export function useTaskManager(
         }
         case "draft_updated": {
           const { tid, new_draft } = msg;
+          const projectKey = ownedTidToProjectRef.current.get(tid);
+          const result = projectKey
+            ? applyDraftEvent({
+                type: "task-observed",
+                projectKey,
+                observation: { tid, text: new_draft },
+              })
+            : null;
           const t = findByTid(tid);
-          if (!t) break;
-          const updated = { ...t, serverDraft: new_draft };
-          liveStates.set(t.uuid, updated);
-          setTasks((prev) => {
-            if (!prev.has(t.uuid)) return prev;
-            const next = new Map(prev);
-            next.set(t.uuid, updated);
-            return next;
-          });
+          if (t) {
+            const updated = { ...t, serverDraft: new_draft || undefined };
+            liveStates.set(t.uuid, updated);
+            setTasks((prev) => {
+              if (!prev.has(t.uuid)) return prev;
+              const next = new Map(prev);
+              next.set(t.uuid, updated);
+              return next;
+            });
+          }
+          if (result) executeDraftEffects(result.effects);
           break;
         }
         case "task_deleted": {
           const { tid } = msg;
-          const t = findByTid(tid);
-          if (deletedDraftTid.current === tid) deletedDraftTid.current = null;
-          if (t) {
-            liveStates.delete(t.uuid);
+          const projectKey = ownedTidToProjectRef.current.get(tid);
+          const deletedProject = projectKey
+            ? getSlot(draftStateRef.current, projectKey).project
+            : null;
+          const result = projectKey
+            ? applyDraftEvent({ type: "task-deleted", tid })
+            : null;
+          const uuid = tidToUuid.get(tid);
+          outbox.removeForTask(tid);
+          if (uuid) {
+            liveStates.delete(uuid);
             tidToUuid.delete(tid);
-            requestedHistoryRef.current.delete(t.uuid);
+            requestedHistoryRef.current.delete(uuid);
           }
           setTasks((prev) => {
-            if (!t || !prev.has(t.uuid)) return prev;
+            if (!uuid || !prev.has(uuid)) return prev;
             const next = new Map(prev);
-            next.delete(t.uuid);
+            next.delete(uuid);
             return next;
           });
+          if (result) executeDraftEffects(result.effects);
+          if (deletedProject) {
+            const projectName = currentRouteProjectName(deletedProject, tid);
+            if (projectName) {
+              routeRef.current(
+                buildProjectHref(deletedProject.workspace, projectName),
+                true,
+              );
+            }
+          }
           break;
         }
         case "history_operations": {
@@ -1399,7 +1930,15 @@ export function useTaskManager(
         }
       }
     },
-    [teardownVirtualDraft],
+    [
+      applyDraftEvent,
+      currentRouteProjectName,
+      executeDraftEffects,
+      materializeDraftTask,
+      releaseTombstonedActivity,
+      requestTaskHistory,
+      isCurrentOpenEpoch,
+    ],
   );
 
   useEffect(() => {
@@ -1408,7 +1947,7 @@ export function useTaskManager(
 
     // Buffer incoming messages and flush on rAF so that hundreds of replay
     // messages are processed in a single render pass instead of one-per-message.
-    type BufferedMsg =
+    type BufferedPayload =
       | {
           kind: "task";
           tid: number;
@@ -1430,6 +1969,7 @@ export function useTaskManager(
         }
       | { kind: "agentAck"; tid: number; nonce: string }
       | { kind: "control"; msg: ControlMessage };
+    type BufferedMsg = BufferedPayload & { epoch: number };
     let buffer: BufferedMsg[] = [];
     const pendingHistoryBoundaries = new Map<
       number,
@@ -1439,18 +1979,35 @@ export function useTaskManager(
     let flushTimerId: ReturnType<typeof setTimeout> | null = null;
 
     const handleAgentAck = (tid: number, nonce: string) => {
+      if (tombstoneTidToProjectRef.current.has(tid)) return;
+      const projectKey = ownedTidToProjectRef.current.get(tid);
+      const effects = projectKey
+        ? applyDraftEvent({
+            type: "task-observed",
+            projectKey,
+            observation: { tid, hasMessages: true },
+          }).effects
+        : [];
       const uuid = tidToUuid.get(tid);
-      if (!uuid) return;
+      if (!uuid) {
+        executeDraftEffects(effects);
+        return;
+      }
       const t = liveStates.get(uuid);
-      if (!t) return;
+      if (!t) {
+        executeDraftEffects(effects);
+        return;
+      }
       const updated = reduceAgentAck(t, nonce);
-      if (updated === t) return;
-      liveStates.set(uuid, updated);
-      setTasks((map) => {
-        const next = new Map(map);
-        next.set(uuid, updated);
-        return next;
-      });
+      if (updated !== t) {
+        liveStates.set(uuid, updated);
+        setTasks((map) => {
+          const next = new Map(map);
+          next.set(uuid, updated);
+          return next;
+        });
+      }
+      executeDraftEffects(effects);
     };
 
     const flush = () => {
@@ -1462,11 +2019,13 @@ export function useTaskManager(
       const batch = buffer;
       buffer = [];
       for (const item of batch) {
+        if (!isCurrentOpenEpoch(item.epoch)) continue;
         if (item.kind === "control") handleControlMessage(item.msg);
         else if (item.kind === "unconfirmed")
           handleUnconfirmedUserMessage(item.tid, item.msg, item.correlationId);
         else if (item.kind === "agentAck") handleAgentAck(item.tid, item.nonce);
         else if (item.kind === "historyBoundary") {
+          if (tombstoneTidToProjectRef.current.has(item.tid)) continue;
           const uuid = tidToUuid.get(item.tid);
           if (uuid === undefined)
             throw new Error(`Replacement for unknown task ${item.tid}`);
@@ -1567,42 +2126,78 @@ export function useTaskManager(
 
     conn.onStatusChange = (connected) => {
       if (!connected) {
+        connectionEpochRef.current++;
+        openConnectionEpochRef.current = null;
+        cancelPendingFlush();
+        buffer = [];
+        pendingHistoryBoundaries.clear();
         setConnected(false);
         liveStates.clear();
         tidToUuid.clear();
         requestedHistoryRef.current.clear();
-        const cur = draftRef.current;
-        if (cur.phase === "timer_pending") clearTimeout(cur.timerId);
-        setDraft({ phase: "none" });
-        deletedDraftTid.current = null;
+        outboxReplayedEpochRef.current = null;
+        outboxAttemptedNoncesRef.current.clear();
+        tasksListEpochRef.current = null;
+        for (const runtime of createRuntimeRef.current.values())
+          clearTimeout(runtime.handle);
+        for (const runtime of saveRuntimeRef.current.values())
+          clearTimeout(runtime.handle);
+        createRuntimeRef.current.clear();
+        saveRuntimeRef.current.clear();
+        composerResetSequenceRef.current++;
+        composerResetEpochRef.current = composerResetSequenceRef.current;
+        composerResetRef.current.clear();
+        applyDraftEvent({ type: "connection-reset" });
+        expectedFocusRef.current.clear();
+        draftAttachmentRef.current = null;
+        deferredDraftAttachmentRef.current = null;
+        routeProjectCacheRef.current = null;
+        requestedProjectTypesRef.current.clear();
+        workspacesRef.current = [];
+        projectEntryPointsRef.current = new Map();
+        defaultAgentRef.current = "";
+        setWorkspaces([]);
+        setEntryPoints([]);
+        setTypeInfo([]);
+        setProjectEntryPoints(new Map());
+        setProjectTypeInfo(new Map());
+        setAgents([]);
+        setDefaultAgent("");
+        setDefaultTaskType("");
+        setGlobalTaskTypesLoaded(false);
+        setAgentsLoaded(false);
+        setTasksListEpoch(null);
         setTasks(new Map());
         setAgentUsage({});
       } else {
+        openConnectionEpochRef.current = connectionEpochRef.current;
         initialNoticeLoadRef.current = true;
       }
     };
 
-    conn.onTaskMessage = (tid, msg, seq, ts) => {
-      buffer.push({ kind: "task", tid, msg, seq, ts });
+    const enqueue = (item: BufferedPayload) => {
+      const epoch = openConnectionEpochRef.current;
+      if (!isCurrentOpenEpoch(epoch)) return;
+      buffer.push({ ...item, epoch });
       scheduleFlush();
+    };
+
+    conn.onTaskMessage = (tid, msg, seq, ts) => {
+      enqueue({ kind: "task", tid, msg, seq, ts });
     };
     conn.onHistoryBoundaryReplaced = (tid, msg, seq) => {
       if (!hasHistoryBoundary(msg))
         throw new Error("Replacement event has no history boundary");
-      buffer.push({ kind: "historyBoundary", tid, msg, seq });
-      scheduleFlush();
+      enqueue({ kind: "historyBoundary", tid, msg, seq });
     };
     conn.onUnconfirmedUserMessage = (tid, msg, correlationId) => {
-      buffer.push({ kind: "unconfirmed", tid, msg, correlationId });
-      scheduleFlush();
+      enqueue({ kind: "unconfirmed", tid, msg, correlationId });
     };
     conn.onAgentAck = (tid, nonce) => {
-      buffer.push({ kind: "agentAck", tid, nonce });
-      scheduleFlush();
+      enqueue({ kind: "agentAck", tid, nonce });
     };
     conn.onControlMessage = (msg) => {
-      buffer.push({ kind: "control", msg });
-      scheduleFlush();
+      enqueue({ kind: "control", msg });
     };
     conn.onClientError = (message) => {
       addToastRef.current("error", message);
@@ -1613,13 +2208,20 @@ export function useTaskManager(
       document.removeEventListener("visibilitychange", onVisibilityChange);
       conn.disconnect();
     };
-  }, [handleTaskMessage, handleControlMessage, handleUnconfirmedUserMessage]);
+  }, [
+    handleTaskMessage,
+    handleControlMessage,
+    handleUnconfirmedUserMessage,
+    isCurrentOpenEpoch,
+  ]);
 
   // Request history when the active task changes and hasn't been loaded yet
   useEffect(() => {
     if (!connected || activeTaskId === null) return;
     const tid = parseTaskId(activeTaskId);
     if (tid === null) return;
+    if (tombstoneTidToProjectRef.current.has(tid)) return;
+    if (ownedTidToProjectRef.current.has(tid)) return;
     const t = findByTid(tid);
     if (!t) return;
     if (requestedHistoryRef.current.has(t.uuid)) return;
@@ -1631,13 +2233,18 @@ export function useTaskManager(
 
   // Replay outbox entries after tasks_list arrives and WS is connected.
   // The backend deduplicates by nonce, so replaying is safe.
-  const outboxReplayedRef = useRef(false);
   useEffect(() => {
-    if (!connected || tasks.size === 0) return;
-    if (outboxReplayedRef.current) return;
-    outboxReplayedRef.current = true;
+    const epoch = renderedConnectionEpoch;
+    if (
+      !connected ||
+      tasksListEpoch !== epoch ||
+      tasksListEpochRef.current !== epoch ||
+      !isCurrentOpenEpoch(epoch)
+    )
+      return;
+    if (outboxReplayedEpochRef.current === epoch) return;
+    outboxReplayedEpochRef.current = epoch;
     const entries = outbox.all();
-    if (entries.length === 0) return;
     let dropped = 0;
     for (const entry of entries) {
       if (!tidToUuid.has(entry.tid)) {
@@ -1645,212 +2252,463 @@ export function useTaskManager(
         dropped++;
         continue;
       }
+      if (outboxAttemptedNoncesRef.current.has(entry.nonce)) continue;
+      outboxAttemptedNoncesRef.current.add(entry.nonce);
       connRef.current?.sendMessage(
         entry.tid,
         entry.content as import("./protocol").AssistantContentBlock[],
         entry.nonce,
       );
     }
+    outboxAttemptedNoncesRef.current.clear();
     if (dropped > 0) {
       console.warn(
         `[outbox] dropped ${dropped} unsent message(s): task no longer exists`,
       );
     }
-  }, [connected, tasks]);
-
-  // Request project-specific task types when the active project changes
-  useEffect(() => {
-    if (!activeWorkspace || !activeProject) return;
-    const projPath = findProjectPath(
-      workspacesRef.current,
-      activeWorkspace,
-      activeProject,
-    );
-    if (projPath) {
-      connRef.current?.requestTaskTypes(projPath);
-    }
-  }, [activeWorkspace, activeProject]);
-
-  // True when the active task is a pending draft not yet tracked by the draft state machine.
-  // Used as a dep below so re-adopt runs when the task first appears after page reload.
-  const activeTaskNeedsAdoption = useMemo(() => {
-    if (activeTaskId === null) return false;
-    const tid = parseTaskId(activeTaskId);
-    if (tid === null) return false;
-    const task = findByTid(tid);
-    return task
-      ? task.status === "pending" &&
-          task.messages.length === 0 &&
-          !task.isProcessing
-      : false;
-  }, [activeTaskId, tasks]);
-
-  // Manage draft tracking state in response to navigation.
-  //
-  // When activeTaskId is null (project root / "New Task"):
-  //   - Clear stale draft tracking and create a fresh virtual draft.
-  //   Both must happen atomically in one effect to avoid ordering issues.
-  //
-  // When activeTaskId points to a pending draft task:
-  //   - Re-adopt it as the active draft so isDraft/taskTypes/onContentEnd
-  //   are wired correctly (e.g. after navigating away and back, or after
-  //   page reload where the task loads from tasks_list asynchronously).
-  useEffect(() => {
-    if (activeTaskId !== null) {
-      // Re-adopt an existing draft task when navigating to it.
-      const tid = parseTaskId(activeTaskId);
-      if (tid !== null) {
-        const task = findByTid(tid);
-        if (
-          task &&
-          task.status === "pending" &&
-          task.messages.length === 0 &&
-          !task.isProcessing
-        ) {
-          // Every task has a uuid from creation — just set promoted state.
-          setDraft({ phase: "promoted", uuid: task.uuid });
-        } else {
-          clearDraftForNav({ teardownVirtual: false });
-        }
-      }
-      return;
-    }
-    if (activeWorkspace === null) {
-      clearDraftForNav({ teardownVirtual: true });
-      return;
-    }
-    // Clear existing draft tracking when a real promoted draft task exists
-    if (draftRef.current.phase === "promoted") {
-      setDraft({ phase: "none" });
-    }
-    // Create fresh virtual draft if none exists
-    if (draftRef.current.phase === "none") {
-      createVirtualDraft();
-    }
   }, [
-    activeTaskId,
-    activeWorkspace,
-    createVirtualDraft,
-    setDraft,
-    clearDraftForNav,
-    activeTaskNeedsAdoption,
+    connected,
+    tasks,
+    tasksListEpoch,
+    renderedConnectionEpoch,
+    isCurrentOpenEpoch,
   ]);
 
-  const send = useCallback(
-    (
-      uuid: string,
-      text: string,
-      images?: ImageAttachment[],
-      entryPointName?: string,
-      agentName?: string,
-    ) => {
-      const content = buildContentBlocks(text, images);
-      const taskState = liveStates.get(uuid);
-      const draft = draftRef.current;
-      const draftTid = taskState?.tid ?? null;
+  const cachedRouteProject = (() => {
+    const cached = routeProjectCacheRef.current;
+    if (
+      !cached ||
+      !activeWorkspace ||
+      !activeProject ||
+      cached.workspace !== activeWorkspace ||
+      cached.projectName !== activeProject ||
+      !isCurrentOpenEpoch(cached.epoch)
+    ) {
+      routeProjectCacheRef.current = null;
+      return null;
+    }
+    return cached;
+  })();
 
-      // Real backend task: covers regular send and the promoted-draft case.
-      if (draftTid !== null) {
-        const isPromotedDraft =
-          draft.phase === "promoted" && draft.uuid === uuid;
-        if (isPromotedDraft) {
-          if (entryPointName)
-            connRef.current?.setEntryPoint(draftTid, entryPointName);
-          if (agentName) connRef.current?.setAgentName(draftTid, agentName);
-        }
-        const nonce = crypto.randomUUID();
-        outbox.add({ tid: draftTid, nonce, content, createdAt: Date.now() });
-        connRef.current?.sendMessage(draftTid, content, nonce);
-        // Insert optimistic placeholder (ackState=4)
-        if (taskState) {
-          const msgId = `opt-${++taskState.msgIdCounter}`;
-          const withPlaceholder = {
-            ...taskState,
-            msgIdCounter: taskState.msgIdCounter,
-            messages: [
-              ...taskState.messages,
-              {
-                id: msgId,
-                type: "user" as const,
-                content:
-                  content as import("./protocol").AssistantContentBlock[],
-                ackState: 4 as const,
-                pending: true,
-                nonce,
-                isProvisional: true,
-              },
-            ],
-          };
-          liveStates.set(uuid, withPlaceholder);
-        }
+  const routeProject = useMemo(() => {
+    if (!connected || !activeWorkspace || !activeProject) return null;
+    const workspace = workspaces.find(
+      (candidate) => candidate.name === activeWorkspace,
+    );
+    const project = workspace?.projects.find(
+      (candidate) => candidate.name === activeProject,
+    );
+    if (!workspace || !project) return null;
+    return { workspace, projectName: activeProject, projectPath: project.path };
+  }, [activeWorkspace, activeProject, workspaces]);
 
-        if (
-          isPromotedDraft &&
-          taskState &&
-          taskState.workspace &&
-          taskState.projectPath
-        ) {
-          const projName = findProjectName(
-            workspacesRef.current,
-            taskState.workspace,
-            taskState.projectPath,
-          );
-          if (projName) {
-            const encodedProject = projName.replace(/\//g, ":");
-            routeRef.current(
-              `/${taskState.workspace}/${encodedProject}/task/${draftTid}`,
-              false,
-            );
-          }
-          setDraft({ phase: "none" });
-        }
+  if (
+    routeProject &&
+    isCurrentOpenEpoch(renderedConnectionEpoch) &&
+    draftStateRef.current.slots[
+      createProjectKey(routeProject.workspace.name, routeProject.projectPath)
+    ]
+  ) {
+    routeProjectCacheRef.current = {
+      epoch: renderedConnectionEpoch,
+      workspace: routeProject.workspace.name,
+      projectName: routeProject.projectName,
+      projectPath: routeProject.projectPath,
+    };
+  }
 
-        setTasks((prev) => {
-          const t = prev.get(uuid);
-          if (!t) return prev;
-          const next = new Map(prev);
-          const cur = liveStates.get(uuid) ?? t;
-          next.set(uuid, {
-            ...cur,
-            isProcessing: true,
-            suggestions: undefined,
-          });
-          return next;
-        });
+  // Project task types are keyed by the canonical workspace metadata path,
+  // which only exists after the workspace bootstrap has arrived.
+  useEffect(() => {
+    if (!connected || !routeProject) return;
+    if (projectEntryPoints.has(routeProject.projectPath)) return;
+    const epoch = renderedConnectionEpoch;
+    if (!isCurrentOpenEpoch(epoch)) return;
+    if (
+      requestedProjectTypesRef.current.get(routeProject.projectPath) === epoch
+    )
+      return;
+    const connection = connRef.current;
+    if (!connection) return;
+    connection.requestTaskTypes(routeProject.projectPath);
+    if (isCurrentOpenEpoch(epoch))
+      requestedProjectTypesRef.current.set(routeProject.projectPath, epoch);
+  }, [
+    connected,
+    routeProject,
+    projectEntryPoints,
+    renderedConnectionEpoch,
+    isCurrentOpenEpoch,
+  ]);
+
+  const routeDraftMetadata = useMemo(() => {
+    if (!activeWorkspace || !activeProject) return null;
+    if (!routeProject && cachedRouteProject) {
+      return {
+        workspace: cachedRouteProject.workspace,
+        projectName: cachedRouteProject.projectName,
+        projectPath: cachedRouteProject.projectPath,
+        entryPoint: undefined,
+        agent: "",
+        metadataReady: false,
+      };
+    }
+    if (!routeProject) {
+      return {
+        workspace: activeWorkspace,
+        projectName: activeProject,
+        projectPath: "",
+        entryPoint: undefined,
+        agent: "",
+        metadataReady: false,
+      };
+    }
+    const candidates = projectEntryPoints.get(routeProject.projectPath);
+    const preferred =
+      routeProject.workspace.default_task_type || defaultTaskType;
+    const agentReady = !!routeProject.workspace.default_agent || agentsLoaded;
+    const entryPoint =
+      candidates &&
+      agentReady &&
+      (routeProject.workspace.default_task_type || globalTaskTypesLoaded)
+        ? (candidates.find(
+            (candidate) =>
+              candidate.name === preferred || candidate.task_type === preferred,
+          ) ?? candidates[0])
+        : undefined;
+    return {
+      workspace: activeWorkspace,
+      projectName: routeProject.projectName,
+      projectPath: routeProject.projectPath,
+      entryPoint,
+      agent: agentReady
+        ? routeProject.workspace.default_agent || defaultAgent
+        : "",
+      metadataReady: entryPoint !== undefined,
+    };
+  }, [
+    activeWorkspace,
+    activeProject,
+    cachedRouteProject,
+    routeProject,
+    projectEntryPoints,
+    defaultTaskType,
+    globalTaskTypesLoaded,
+    agentsLoaded,
+    defaultAgent,
+  ]);
+
+  const setDraftAttachment = useCallback(
+    (next: { projectKey: ProjectKey; routeTid: number | null } | null) => {
+      const previous = draftAttachmentRef.current;
+      if (
+        previous?.projectKey === next?.projectKey &&
+        previous?.routeTid === next?.routeTid
+      )
         return;
-      }
-
-      // No real tid: virtual draft. Route through the create_task handshake.
-      if (draft.phase === "create_pending") {
-        // Timer fired but task_created hasn't arrived; stash the message.
-        setDraft({
-          phase: "send_pending",
-          uuid: draft.uuid,
-          firstMessage: { text, entryPointName, images },
-        });
-        return;
-      }
-      if (draft.phase === "timer_pending") {
-        clearTimeout(draft.timerId);
-      }
-      teardownVirtualDraft();
-      setDraft({ phase: "none" });
-
-      const correlationId = crypto.randomUUID();
-      const ws = activeWorkspaceRef.current;
-      const proj = activeProjectRef.current;
-      const projPath =
-        ws && proj ? findProjectPath(workspacesRef.current, ws, proj) : null;
-      connRef.current?.createTask(
-        ws ?? undefined,
-        projPath ?? (ws ? "" : undefined),
-        entryPointName,
-        content,
-        agentName,
-        correlationId,
-      );
+      draftAttachmentRef.current = next;
+      refreshDraftView();
     },
-    [setTasks, teardownVirtualDraft, setDraft],
+    [refreshDraftView],
+  );
+
+  const setDeferredDraftAttachment = useCallback(
+    (next: { projectKey: ProjectKey; tid: number } | null) => {
+      const previous = deferredDraftAttachmentRef.current;
+      if (
+        previous?.projectKey === next?.projectKey &&
+        previous?.tid === next?.tid
+      )
+        return;
+      deferredDraftAttachmentRef.current = next;
+    },
+    [],
+  );
+
+  const dispatchDraftIntent = useCallback(
+    (event: DraftEvent) => {
+      const result = applyDraftEvent(event);
+      executeDraftEffects(result.effects);
+    },
+    [applyDraftEvent, executeDraftEffects],
+  );
+
+  const persistedSnapshot = useCallback(
+    (task: TaskState, fallbackAgent: string): TaskSnapshot | null => {
+      if (
+        task.status !== "pending" ||
+        task.messages.length !== 0 ||
+        task.isProcessing ||
+        !task.serverDraft?.trim() ||
+        !task.entryPoint ||
+        task.tid === null
+      )
+        return null;
+      return {
+        tid: task.tid,
+        text: task.serverDraft,
+        entryPoint: task.entryPoint,
+        agent: task.agentName ?? fallbackAgent,
+        active: task.alive,
+        processing: task.isProcessing,
+        hasMessages: false,
+      };
+    },
+    [],
+  );
+
+  const switchStablePersistedRoute = useCallback(
+    (projectKey: ProjectKey, task: TaskState, snapshot: TaskSnapshot) => {
+      const slot = getSlot(draftStateRef.current, projectKey);
+      if (
+        slot.desired.kind !== "editing" ||
+        slot.remote.kind !== "present" ||
+        slot.remote.tid === snapshot.tid ||
+        (slot.remote.generation !== null &&
+          slot.remote.generation !== slot.desired.uuid)
+      )
+        return false;
+      const switched = applyDraftEvent({
+        type: "switch-persisted",
+        projectKey,
+        uuid: task.uuid,
+        snapshot,
+      });
+      executeDraftEffects(switched.effects);
+      return true;
+    },
+    [applyDraftEvent, executeDraftEffects],
+  );
+
+  useLayoutEffect(() => {
+    if (
+      !isCurrentOpenEpoch(renderedConnectionEpoch) ||
+      !connected ||
+      !routeDraftMetadata?.metadataReady ||
+      !routeDraftMetadata.projectPath ||
+      !routeDraftMetadata.entryPoint ||
+      activeTaskId === null
+    )
+      return;
+    const tid = parseTaskId(activeTaskId);
+    if (tid === null) return;
+    const task = findByTid(tid);
+    if (
+      !task ||
+      task.workspace !== routeDraftMetadata.workspace ||
+      task.projectPath !== routeDraftMetadata.projectPath
+    )
+      return;
+    const snapshot = persistedSnapshot(task, routeDraftMetadata.agent);
+    if (!snapshot) return;
+    const projectKey = createProjectKey(
+      routeDraftMetadata.workspace,
+      routeDraftMetadata.projectPath,
+    );
+    if (!draftStateRef.current.slots[projectKey]) return;
+    switchStablePersistedRoute(projectKey, task, snapshot);
+  }, [
+    activeTaskId,
+    connected,
+    draftRevision,
+    isCurrentOpenEpoch,
+    persistedSnapshot,
+    renderedConnectionEpoch,
+    routeDraftMetadata,
+    switchStablePersistedRoute,
+    tasks,
+  ]);
+
+  useEffect(() => {
+    if (!isCurrentOpenEpoch(renderedConnectionEpoch)) return;
+    if (!connected || !routeDraftMetadata?.projectPath) {
+      setDeferredDraftAttachment(null);
+      setDraftAttachment(null);
+      return;
+    }
+    const projectKey = createProjectKey(
+      routeDraftMetadata.workspace,
+      routeDraftMetadata.projectPath,
+    );
+    if (!routeDraftMetadata.metadataReady || !routeDraftMetadata.entryPoint) {
+      const slot = draftStateRef.current.slots[projectKey];
+      const routeTid = activeTaskId === null ? null : parseTaskId(activeTaskId);
+      const ownsCurrentRoute =
+        activeTaskId === null ||
+        (routeTid !== null &&
+          (slot?.remote.kind === "present" ||
+            slot?.remote.kind === "deleting") &&
+          slot.remote.tid === routeTid);
+      if (!slot || !ownsCurrentRoute) {
+        setDeferredDraftAttachment(null);
+        setDraftAttachment(null);
+      } else {
+        setDeferredDraftAttachment(null);
+        setDraftAttachment({ projectKey, routeTid });
+      }
+      return;
+    }
+    if (!draftStateRef.current.slots[projectKey]) {
+      const initialized = applyDraftEvent({
+        type: "initialize-slot",
+        project: {
+          workspace: routeDraftMetadata.workspace,
+          projectPath: routeDraftMetadata.projectPath,
+        },
+        defaults: {
+          entryPoint: routeDraftMetadata.entryPoint.name,
+          agent: routeDraftMetadata.agent,
+        },
+      });
+      executeDraftEffects(initialized.effects);
+    }
+    routeProjectCacheRef.current = {
+      epoch: renderedConnectionEpoch,
+      workspace: routeDraftMetadata.workspace,
+      projectName: routeDraftMetadata.projectName,
+      projectPath: routeDraftMetadata.projectPath,
+    };
+
+    if (activeTaskId === null) {
+      setDeferredDraftAttachment(null);
+      setDraftAttachment({ projectKey, routeTid: null });
+      return;
+    }
+
+    const tid = parseTaskId(activeTaskId);
+    if (tid === null) {
+      setDeferredDraftAttachment(null);
+      setDraftAttachment(null);
+      return;
+    }
+    const task = findByTid(tid);
+    if (
+      !task ||
+      task.workspace !== routeDraftMetadata.workspace ||
+      task.projectPath !== routeDraftMetadata.projectPath
+    ) {
+      setDeferredDraftAttachment(null);
+      setDraftAttachment(null);
+      return;
+    }
+    const slot = getSlot(draftStateRef.current, projectKey);
+    if (
+      (slot.remote.kind === "present" || slot.remote.kind === "deleting") &&
+      slot.remote.tid === tid
+    ) {
+      setDeferredDraftAttachment(null);
+      setDraftAttachment({ projectKey, routeTid: tid });
+      return;
+    }
+    const snapshot = persistedSnapshot(task, routeDraftMetadata.agent);
+    if (!snapshot) {
+      setDeferredDraftAttachment(null);
+      setDraftAttachment(null);
+      return;
+    }
+    const deferred = deferredDraftAttachmentRef.current;
+    if (
+      deferred &&
+      (deferred.projectKey !== projectKey || deferred.tid !== tid)
+    )
+      setDeferredDraftAttachment(null);
+    if (
+      slot.remote.kind === "creating" ||
+      slot.remote.kind === "deleting" ||
+      slot.desired.kind === "submitting"
+    ) {
+      setDeferredDraftAttachment({ projectKey, tid });
+      setDraftAttachment(null);
+      return;
+    }
+    if (slot.desired.kind === "none" && slot.remote.kind === "absent") {
+      const adopted = applyDraftEvent({
+        type: "adopt-persisted",
+        projectKey,
+        uuid: task.uuid,
+        snapshot,
+      });
+      executeDraftEffects(adopted.effects);
+      setDeferredDraftAttachment(null);
+      setDraftAttachment({ projectKey, routeTid: tid });
+      return;
+    }
+    if (switchStablePersistedRoute(projectKey, task, snapshot)) {
+      setDeferredDraftAttachment(null);
+      setDraftAttachment({ projectKey, routeTid: tid });
+      return;
+    }
+    setDeferredDraftAttachment(null);
+    setDraftAttachment(null);
+  }, [
+    activeTaskId,
+    applyDraftEvent,
+    connected,
+    draftRevision,
+    executeDraftEffects,
+    persistedSnapshot,
+    routeDraftMetadata,
+    renderedConnectionEpoch,
+    isCurrentOpenEpoch,
+    setDraftAttachment,
+    setDeferredDraftAttachment,
+    switchStablePersistedRoute,
+    tasks,
+  ]);
+
+  const editDraftText = useCallback(
+    (projectKey: ProjectKey, text: string) => {
+      const slot = getSlot(draftStateRef.current, projectKey);
+      if (slot.desired.kind !== "none" && text.trim().length === 0) {
+        clearComposerImages(projectKey);
+      }
+      dispatchDraftIntent({
+        type: "edit-text",
+        projectKey,
+        text,
+        ...(slot.desired.kind === "none" && text.trim().length > 0
+          ? { uuid: crypto.randomUUID() }
+          : {}),
+      });
+    },
+    [clearComposerImages, dispatchDraftIntent],
+  );
+
+  const submitDraft = useCallback(
+    (projectKey: ProjectKey, images: ImageAttachment[]) => {
+      const slot = getSlot(draftStateRef.current, projectKey);
+      const presentSubmission =
+        slot.remote.kind === "present" ? { tid: slot.remote.tid } : null;
+      const result = applyDraftEvent({
+        type: "submit",
+        projectKey,
+        images,
+        ...(slot.desired.kind === "none" ? { uuid: crypto.randomUUID() } : {}),
+      });
+      if (presentSubmission) requestTaskHistory(presentSubmission.tid);
+      executeDraftEffects(result.effects);
+      if (presentSubmission) {
+        const projectName = currentRouteProjectName(slot.project, null);
+        if (!projectName) return;
+        routeRef.current(
+          `${buildProjectHref(slot.project.workspace, projectName)}/task/${presentSubmission.tid}`,
+          true,
+        );
+      }
+    },
+    [
+      applyDraftEvent,
+      currentRouteProjectName,
+      executeDraftEffects,
+      requestTaskHistory,
+    ],
+  );
+
+  const send = useCallback(
+    (uuid: string, text: string, images?: ImageAttachment[]) => {
+      sendRealTask(uuid, text, images);
+    },
+    [sendRealTask],
   );
 
   const interrupt = useCallback((uuid: string) => {
@@ -2008,41 +2866,27 @@ export function useTaskManager(
     connRef.current?.setArchived(tid, archived);
   }, []);
 
-  const setEntryPoint = useCallback((tid: number, entryPoint: string) => {
-    connRef.current?.setEntryPoint(tid, entryPoint);
-  }, []);
-
-  const setAgentName = useCallback((tid: number, agentName: string) => {
-    connRef.current?.setAgentName(tid, agentName);
-  }, []);
-
   const saveDraft = useCallback((tid: number, draft: string) => {
     connRef.current?.saveDraft(tid, draft);
-    const t = findByTid(tid);
-    if (t) {
-      let updated: typeof t | null = null;
-      // When draft is cleared (message sent), clear serverDraft so InputBox doesn't
-      // restore a stale value on remount (e.g. after the welcome→active view transition).
-      if (!draft && t.serverDraft !== undefined) {
-        updated = { ...t, serverDraft: undefined };
-      }
-      // Derive sidebar title from draft text for pending tasks with no messages
-      if (t.status === "pending" && t.messages.length === 0) {
-        const firstLine =
-          draft.trim().split("\n")[0]?.slice(0, 100) || undefined;
-        if (firstLine !== (updated ?? t).title) {
-          updated = { ...(updated ?? t), title: firstLine };
-        }
-      }
-      if (updated) {
-        liveStates.set(t.uuid, updated);
-        setTasks((prev) => {
-          const next = new Map(prev);
-          next.set(t.uuid, updated);
-          return next;
-        });
+    const task = findByTid(tid);
+    if (!task) return;
+    let updated: TaskState | null = null;
+    if (!draft && task.serverDraft !== undefined) {
+      updated = { ...task, serverDraft: undefined };
+    }
+    if (task.status === "pending" && task.messages.length === 0) {
+      const title = draft.trim().split("\n")[0]?.slice(0, 100) || undefined;
+      if (title !== (updated ?? task).title) {
+        updated = { ...(updated ?? task), title };
       }
     }
+    if (!updated) return;
+    liveStates.set(task.uuid, updated);
+    setTasks((previous) => {
+      const next = new Map(previous);
+      next.set(task.uuid, updated);
+      return next;
+    });
   }, []);
 
   const sendAskUserResponse = useCallback((tid: number, content: string) => {
@@ -2093,44 +2937,151 @@ export function useTaskManager(
   );
 
   const resolvedEntryPoints = useMemo(() => {
-    if (activeWorkspace && activeProject) {
-      const projPath = findProjectPath(
-        workspacesRef.current,
-        activeWorkspace,
-        activeProject,
-      );
-      if (projPath) {
-        const projectEps = projectEntryPoints.get(projPath);
-        if (projectEps) return projectEps;
-      }
+    const projectPath = routeDraftMetadata?.projectPath;
+    if (projectPath) {
+      const projectEps = projectEntryPoints.get(projectPath);
+      if (projectEps) return projectEps;
     }
     return entryPoints;
-  }, [activeWorkspace, activeProject, entryPoints, projectEntryPoints]);
+  }, [entryPoints, projectEntryPoints, routeDraftMetadata]);
 
   const resolvedTypeInfo = useMemo(() => {
-    if (activeWorkspace && activeProject) {
-      const projPath = findProjectPath(
-        workspacesRef.current,
-        activeWorkspace,
-        activeProject,
-      );
-      if (projPath) {
-        const projectTi = projectTypeInfo.get(projPath);
-        if (projectTi) return projectTi;
-      }
+    const projectPath = routeDraftMetadata?.projectPath;
+    if (projectPath) {
+      const projectTi = projectTypeInfo.get(projectPath);
+      if (projectTi) return projectTi;
     }
     return typeInfo;
-  }, [activeWorkspace, activeProject, typeInfo, projectTypeInfo]);
+  }, [projectTypeInfo, routeDraftMetadata, typeInfo]);
+
+  const draftView = useMemo<DraftView | null>(() => {
+    if (!routeDraftMetadata) return null;
+    const routeViewKey = `route:${routeDraftMetadata.workspace}\0${routeDraftMetadata.projectName}`;
+    if (!routeDraftMetadata.projectPath) {
+      if (activeTaskId !== null) return null;
+      return {
+        kind: "unresolved",
+        viewKey: routeViewKey,
+        workspace: routeDraftMetadata.workspace,
+        projectName: routeDraftMetadata.projectName,
+        projectPath: routeDraftMetadata.projectPath,
+        remoteTid: null,
+        text: "",
+        entryPoint: "",
+        agent: "",
+        lifecycle: "idle",
+        disabled: true,
+        composerResetToken: 0,
+      };
+    }
+    const projectKey = createProjectKey(
+      routeDraftMetadata.workspace,
+      routeDraftMetadata.projectPath,
+    );
+    const slot = draftStateRef.current.slots[projectKey];
+    const metadataDisabled = !connected || !routeDraftMetadata.metadataReady;
+    const preserveImagesWhenDisabled =
+      connected && !routeDraftMetadata.metadataReady;
+    if (activeTaskId === null) {
+      if (!slot) {
+        return {
+          kind: "unresolved",
+          viewKey: routeViewKey,
+          workspace: routeDraftMetadata.workspace,
+          projectName: routeDraftMetadata.projectName,
+          projectPath: routeDraftMetadata.projectPath,
+          remoteTid: null,
+          text: "",
+          entryPoint: "",
+          agent: "",
+          lifecycle: "idle",
+          disabled: true,
+          composerResetToken: 0,
+        };
+      }
+      return makeDraftViewSnapshot(
+        slot,
+        projectKey,
+        routeDraftMetadata.projectName,
+        metadataDisabled,
+        preserveImagesWhenDisabled,
+        composerResetTokenFor(projectKey),
+        editDraftText,
+        dispatchDraftIntent,
+        submitDraft,
+      );
+    }
+
+    const tid = parseTaskId(activeTaskId);
+    if (tid === null || !slot) return null;
+    if (
+      (slot.remote.kind === "present" || slot.remote.kind === "deleting") &&
+      slot.remote.tid === tid
+    ) {
+      return makeDraftViewSnapshot(
+        slot,
+        projectKey,
+        routeDraftMetadata.projectName,
+        metadataDisabled,
+        preserveImagesWhenDisabled,
+        composerResetTokenFor(projectKey),
+        editDraftText,
+        dispatchDraftIntent,
+        submitDraft,
+      );
+    }
+    if (!routeDraftMetadata.metadataReady) return null;
+    const task = findByTid(tid);
+    const snapshot =
+      task &&
+      task.workspace === routeDraftMetadata.workspace &&
+      task.projectPath === routeDraftMetadata.projectPath
+        ? persistedSnapshot(task, routeDraftMetadata.agent)
+        : null;
+    if (
+      !snapshot ||
+      slot.desired.kind !== "editing" ||
+      slot.remote.kind !== "present" ||
+      (slot.remote.generation !== null &&
+        slot.remote.generation !== slot.desired.uuid)
+    )
+      return null;
+    return makeDraftViewSnapshot(
+      slot,
+      projectKey,
+      routeDraftMetadata.projectName,
+      true,
+      false,
+      composerResetTokenFor(projectKey),
+      editDraftText,
+      dispatchDraftIntent,
+      submitDraft,
+    );
+  }, [
+    activeTaskId,
+    connected,
+    composerResetTokenFor,
+    dispatchDraftIntent,
+    draftRevision,
+    editDraftText,
+    persistedSnapshot,
+    routeDraftMetadata,
+    submitDraft,
+    tasks,
+  ]);
 
   // Build sidebar task list filtered by active workspace/project and sorted by createdAt/tid
   const prevSidebarTasksRef = useRef<
     import("./components/Sidebar").SidebarTask[]
   >([]);
   const sidebarTasks = useMemo(() => {
-    // Exclude virtual drafts (tid === null)
-    let filtered = Array.from(tasks.values()).filter(
-      (t): t is TaskState & { tid: number } => t.tid !== null,
-    );
+    let filtered: Array<TaskState & { tid: number }> = [];
+    for (const task of tasks.values()) {
+      if (task.tid === null) {
+        throw new Error("Sidebar task must have a numeric tid");
+      }
+      filtered.push(task as TaskState & { tid: number });
+    }
     if (activeWorkspace !== null && activeProject !== null) {
       const activeProjectPath = findProjectPath(
         workspaces,
@@ -2226,15 +3177,11 @@ export function useTaskManager(
     clearInputDraft,
     setArchived,
     saveDraft,
-    setEntryPoint,
-    setAgentName,
     sendAskUserResponse,
     sendPermissionPromptResponse,
     editMessage,
     editRawEvent,
-    createDraftTask,
-    deleteDraftTask,
-    draftRenderKey,
+    draftView,
     sidebarTasks,
     workspaces,
     entryPoints: resolvedEntryPoints,

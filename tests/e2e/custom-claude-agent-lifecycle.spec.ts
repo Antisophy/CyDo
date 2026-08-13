@@ -132,7 +132,7 @@ workspaces:
     await expect(page.locator(".agent-picker")).toHaveValue("work-claude");
     const tid = parseInt(draftTid, 10);
     await expect
-      .poll(() => setAgentNameFrames.find((e) => e.tid === tid))
+      .poll(() => setAgentNameFrames.filter((e) => e.tid === tid).at(-1))
       .toMatchObject({
         tid,
         agent_name: "work-claude",

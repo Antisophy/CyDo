@@ -6,6 +6,7 @@ interface Props {
   entryPoints: EntryPointInfo[];
   selected: string;
   onEntryPointChange: (entryPoint: string) => void;
+  disabled?: boolean;
   pickerRef?: RefObject<HTMLDivElement>;
   onConfirm?: () => void;
   onType?: () => void;
@@ -15,6 +16,7 @@ export function SessionConfig({
   entryPoints,
   selected,
   onEntryPointChange,
+  disabled = false,
   pickerRef,
   onConfirm,
   onType,
@@ -25,6 +27,7 @@ export function SessionConfig({
   const selectedIdx = entryPoints.findIndex((t) => t.name === selected);
 
   const handleKeyDown = (e: KeyboardEvent) => {
+    if (disabled) return;
     if (
       (e.key === "ArrowDown" || e.key === "ArrowUp") &&
       !e.ctrlKey &&
@@ -50,7 +53,7 @@ export function SessionConfig({
     <div
       class="task-type-picker"
       ref={pickerRef}
-      tabIndex={0}
+      tabIndex={disabled ? -1 : 0}
       onKeyDown={handleKeyDown}
     >
       {entryPoints.map((t) => (
@@ -58,10 +61,12 @@ export function SessionConfig({
           key={t.name}
           class={`task-type-row ${t.name === selected ? "selected" : ""}`}
           tabIndex={-1}
+          disabled={disabled}
           onMouseDown={(e: MouseEvent) => {
             e.preventDefault();
           }}
           onClick={() => {
+            if (disabled) return;
             onEntryPointChange(t.name);
           }}
         >

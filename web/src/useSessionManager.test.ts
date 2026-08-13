@@ -5,7 +5,13 @@ vi.hoisted(() => {
   vi.stubGlobal("CSS", { supports: () => false });
   vi.stubGlobal("document", { querySelector: () => null });
 });
-import { receiveServerError, revertFilesForUndo } from "./useSessionManager";
+import {
+  receiveServerError,
+  revertFilesForUndo,
+  taskObservationFromEntry,
+  taskStateFromEntry,
+  type TaskSnapshotEntry,
+} from "./useSessionManager";
 
 describe("undo confirmation request", () => {
   it("forwards file revert only for the selected checkpoint boundary", () => {
@@ -81,6 +87,80 @@ describe("receiveServerError", () => {
       messagesRemoved: 2,
       canRevertFiles: false,
       retainsPrompt: false,
+    });
+  });
+});
+
+describe("taskStateFromEntry draft merge", () => {
+  const entry = (draft?: string) => ({
+    tid: 11,
+    alive: false,
+    resumable: false,
+    isProcessing: false,
+    ...(draft === undefined ? {} : { draft }),
+  });
+
+  it("applies an explicitly present newer draft, including a clear", () => {
+    const existing = { ...makeTaskState(11, false), serverDraft: "old draft" };
+
+    expect(
+      taskStateFromEntry(entry("new draft"), existing, existing.uuid)
+        .serverDraft,
+    ).toBe("new draft");
+    expect(
+      taskStateFromEntry(entry(""), existing, existing.uuid).serverDraft,
+    ).toBeUndefined();
+  });
+
+  it("preserves a prior draft when a snapshot omits the field", () => {
+    const existing = { ...makeTaskState(11, false), serverDraft: "old draft" };
+
+    expect(
+      taskStateFromEntry(entry(), existing, existing.uuid).serverDraft,
+    ).toBe("old draft");
+  });
+});
+
+describe("task observation adapter", () => {
+  const entry = (fields: Record<string, unknown> = {}) =>
+    ({
+      tid: 11,
+      alive: false,
+      resumable: false,
+      isProcessing: false,
+      ...fields,
+    }) as TaskSnapshotEntry;
+
+  it("drops own-present null and undefined form facts", () => {
+    expect(
+      taskObservationFromEntry(
+        entry({
+          draft: null,
+          entry_point: undefined,
+          agent_name: null,
+          status: undefined,
+        }),
+        false,
+      ),
+    ).toEqual({ tid: 11 });
+  });
+
+  it("omits absent form facts", () => {
+    expect(taskObservationFromEntry(entry(), false)).toEqual({ tid: 11 });
+  });
+
+  it("preserves explicitly empty form strings", () => {
+    expect(
+      taskObservationFromEntry(
+        entry({ draft: "", entry_point: "", agent_name: "", status: "" }),
+        false,
+      ),
+    ).toEqual({
+      tid: 11,
+      text: "",
+      entryPoint: "",
+      agent: "",
+      active: true,
     });
   });
 });

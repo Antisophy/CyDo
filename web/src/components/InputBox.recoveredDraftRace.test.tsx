@@ -229,4 +229,54 @@ describe("serverDraft push vs. a concurrently typed message", () => {
       sent: [TYPED],
     });
   });
+
+  it("clears a pristine local draft when the server clears it", async () => {
+    mount(RECOVERED);
+    await flushPaintEffects();
+    expect(textarea().value).toBe(RECOVERED);
+    expect(drafts.get(SESSION)).toBe(RECOVERED);
+
+    mount(undefined);
+    await flushPaintEffects();
+
+    expect(textarea().value).toBe("");
+    expect(drafts.get(SESSION)).toBe("");
+  });
+
+  it("preserves a diverged draft across a server clear and advances its baseline", async () => {
+    const initialServerDraft = "server draft before clear";
+    const localDraft = "locally diverged draft";
+    const laterServerDraft = "server draft after clear";
+
+    mount(initialServerDraft);
+    await flushPaintEffects();
+    fill(localDraft);
+    await flushRenderQueue();
+
+    mount(undefined);
+    await flushPaintEffects();
+
+    expect(textarea().value).toBe(localDraft);
+    expect(drafts.get(SESSION)).toBe(localDraft);
+
+    // This was the old server value, but is a local edit after its clear. A
+    // later server update must therefore leave it intact.
+    fill(initialServerDraft);
+    await flushRenderQueue();
+    mount(laterServerDraft);
+    await flushPaintEffects();
+
+    expect(textarea().value).toBe(initialServerDraft);
+    expect(drafts.get(SESSION)).toBe(initialServerDraft);
+  });
+
+  it("keeps an in-memory ordinary draft on an initial undefined server draft", async () => {
+    drafts.set(SESSION, RECOVERED);
+
+    mount(undefined);
+    await flushPaintEffects();
+
+    expect(textarea().value).toBe(RECOVERED);
+    expect(drafts.get(SESSION)).toBe(RECOVERED);
+  });
 });

@@ -227,55 +227,75 @@ test("draft task visible to second client", async ({ page, browser }) => {
   await context2.close();
 });
 
-test("new task after draft clears form correctly", async ({ page }) => {
+test("new task navigates to the project draft without deleting it", async ({
+  page,
+}) => {
+  const deletedTasks: number[] = [];
+  page.on("websocket", (ws) => {
+    ws.on("framesent", (frame) => {
+      try {
+        const message = JSON.parse(frame.payload.toString()) as {
+          type?: string;
+          tid?: number;
+        };
+        if (message.type === "delete_task" && typeof message.tid === "number")
+          deletedTasks.push(message.tid);
+      } catch {
+        // The application WebSocket transports JSON, but leave unrelated frames alone.
+      }
+    });
+  });
+
   await enterSession(page);
 
   const before = await snapshotTids(page);
 
-  // Step 1: Type something to create a draft task
+  // Create and persist draft A.
   const input = page.locator(".input-textarea:visible").first();
   await input.click();
   await input.fill("draft navigation test");
 
-  // Step 2: Wait for draft to appear in sidebar
+  // The sidebar's concrete task id confirms the empty draft was persisted.
   const draftTid = await waitForNewTid(page, before);
   await expect(
     page.locator(`.sidebar-item[data-tid="${draftTid}"] .draft-label`),
   ).toBeVisible({ timeout: 2_000 });
 
-  // Step 3: Click 'New Task' in the sidebar
+  // New Task is project-root navigation, not a request to discard A.
   await page.locator(".sidebar-new-task").click();
 
-  // Bug 1: Should show welcome prompt, not 'Loading task…'
-  await expect(page.locator(".session-loading")).not.toBeAttached({
+  const projectInput = page.locator(".input-textarea:visible").first();
+  await expect(page.locator(".session-loading")).not.toBeVisible({
     timeout: 5_000,
   });
   await expect(page.locator(".welcome-prompt:visible")).toBeVisible({
     timeout: 5_000,
   });
-
-  // Bug 1: Input should be empty in the new task form
-  const newInput = page.locator(".input-textarea:visible").first();
-  await expect(newInput).toHaveValue("", { timeout: 5_000 });
-
-  // Step 4: Click the draft task in sidebar to go back to it
-  await page.locator(`.sidebar-item[data-tid="${draftTid}"]`).click();
-
-  // Bug 2: Should show the task type picker (SessionConfig) on return
   await expect(page.locator(".welcome-prompt .task-type-picker")).toBeVisible({
     timeout: 5_000,
   });
+  await expect(projectInput).toBeEnabled({ timeout: 5_000 });
+  await expect(projectInput).toHaveValue("draft navigation test", {
+    timeout: 5_000,
+  });
+  await expect(
+    page.locator(`.sidebar-item[data-tid="${draftTid}"]`),
+  ).toHaveCount(1);
+  expect(deletedTasks).toEqual([]);
 
-  // Bug 3: Clear input text — draft should be deleted from sidebar
-  const draftInput = page.locator(".input-textarea:visible").first();
-  await expect(draftInput).toBeVisible({ timeout: 5_000 });
-  await draftInput.fill("");
+  // Explicit clearing, rather than navigation, deletes A and restores a blank form.
+  await projectInput.fill("");
+
+  await expect.poll(() => deletedTasks).toEqual([Number(draftTid)]);
 
   await expect(
     page.locator(`.sidebar-item[data-tid="${draftTid}"]`),
   ).not.toBeAttached({
     timeout: 5_000,
   });
+  const blankInput = page.locator(".input-textarea:visible").first();
+  await expect(blankInput).toBeEnabled({ timeout: 5_000 });
+  await expect(blankInput).toHaveValue("", { timeout: 5_000 });
 });
 
 test("draft persists across page reload", async ({ page }) => {
@@ -335,21 +355,21 @@ test("draft sidebar title survives page reload", async ({ page }) => {
   // Wait for debounce to persist draft to backend
   await page.waitForTimeout(1000);
 
-  // Navigate away so InputBox for this task is NOT mounted after reload
-  await page.locator(".sidebar-new-task").click();
-  await expect(page.locator(".welcome-prompt:visible")).toBeVisible({
-    timeout: 5_000,
-  });
+  // Navigate Home so InputBox for this task is NOT mounted after reload.
+  await page.locator(".sidebar-back-btn:visible").click();
+  await expect(page).toHaveURL(/\/$/, { timeout: 5_000 });
 
   // Reload the page
   await page.reload();
 
-  // Wait for the draft task to reappear in sidebar after reload
+  // Home intentionally renders its own task links. Re-enter the hydrated task
+  // route before asserting the project sidebar's persisted-draft title.
   await expect(
-    page.locator(`.sidebar-item[data-tid="${draftTid}"]`),
+    page.locator(`a[href$="/task/${draftTid}"]`),
   ).toBeAttached({
     timeout: 15_000,
   });
+  await page.locator(`a[href$="/task/${draftTid}"]`).click();
 
   // Sidebar title should still show the draft text, not "Task NNN"
   const reloadedLabel = page.locator(

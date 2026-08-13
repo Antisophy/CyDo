@@ -354,8 +354,9 @@ function sendFirstMessage(
 function releaseTask(
   projectKey: ProjectKey,
   tid: number,
+  resetComposer = true,
 ): Effect<"release-task"> {
-  return { type: "release-task", projectKey, tid };
+  return { type: "release-task", projectKey, tid, resetComposer };
 }
 
 function trace(initial: DraftState, steps: readonly TraceStep[]): DraftState {
@@ -2254,7 +2255,10 @@ describe("draft reconciler ownership boundaries", () => {
             DEFAULTS_A,
             bindings,
           ),
-          effects: [releaseTask(KEY_A, 303), scheduleCreate(KEY_A, UUID_B)],
+          effects: [
+            releaseTask(KEY_A, 303, false),
+            scheduleCreate(KEY_A, UUID_B),
+          ],
         },
       ],
     );
@@ -2319,7 +2323,7 @@ describe("draft reconciler ownership boundaries", () => {
             bindings,
           ),
           effects: [
-            releaseTask(KEY_A, 304),
+            releaseTask(KEY_A, 304, false),
             createTask(
               KEY_A,
               UUID_B,
