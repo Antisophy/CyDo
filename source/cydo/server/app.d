@@ -3401,6 +3401,7 @@ class App
 		discoveryService.discoverAllWorkspaces(config);
 		clientHub.broadcast(buildAgentsList(snapshotAgentEntries(), config.default_agent));
 		clientHub.broadcast(buildWorkspacesList(discoveryService.workspacesInfo));
+		broadcastTaskTypeLists();
 		clientHub.broadcast(buildServerStatus(
 			authUser.length > 0 || authPass.length > 0,
 			config.dev_mode,
@@ -3428,11 +3429,25 @@ class App
 	{
 		infof("User task types file changed, reloading task types...");
 		taskTypeCatalog.invalidateAll();
+		broadcastTaskTypeLists();
+	}
+
+	private void broadcastTaskTypeLists()
+	{
 		clientHub.broadcast(buildTaskTypesList(
 			taskTypeCatalog.getTaskTypes(),
 			taskTypeCatalog.getEntryPoints(),
 			config.default_task_type,
 		));
+		foreach (projectPath; configWatcher.watchedProjects())
+			clientHub.broadcast(buildTaskTypesListForProject(
+				projectPath,
+				taskTypeCatalog.getTaskTypesForProject(projectPath),
+				taskTypeCatalog.getEntryPointsForProject(projectPath),
+				workspaceNameForProjectPath(projectPath),
+				defaultAgentName(workspaceNameForProjectPath(projectPath)),
+				configuredAgentNames(),
+			));
 	}
 
 	private void handleRefreshWorkspacesMsg()
@@ -3440,6 +3455,7 @@ class App
 		taskTypeCatalog.invalidateAll();
 		discoveryService.discoverAllWorkspaces(config);
 		clientHub.broadcast(buildWorkspacesList(discoveryService.workspacesInfo));
+		broadcastTaskTypeLists();
 		discoveryService.enumerateSessions();
 	}
 

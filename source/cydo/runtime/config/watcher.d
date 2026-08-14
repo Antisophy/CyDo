@@ -142,6 +142,14 @@ class ConfigWatcher
 		);
 	}
 
+	string[] watchedProjects()
+	{
+		string[] projects;
+		foreach (projectPath; projectDirWatches_.keys)
+			projects ~= projectPath;
+		return projects;
+	}
+
 private:
 	void watchConfigFile(string cfgPath)
 	{
