@@ -30,6 +30,122 @@ async function waitForNewTid(page: Page, before: Set<string>): Promise<string> {
   return newTid!;
 }
 
+type ControlFrame = {
+  type?: string;
+  tid?: number;
+  correlation_id?: string;
+  content?: unknown;
+  entry_point?: string;
+  agent_name?: string;
+};
+
+type CreatedTask = {
+  tid: number;
+  correlationId: string | null;
+};
+
+interface OutboundRecorder {
+  mark(): number;
+  controls(
+    type: string,
+    query?: { tid?: number; since?: number },
+  ): readonly ControlFrame[];
+  createdTid(correlationId: string): number | null;
+}
+
+function parseControlFrame(payload: string): ControlFrame {
+  return JSON.parse(payload) as ControlFrame;
+}
+
+function installOutboundRecorder(page: Page): OutboundRecorder {
+  const outbound: ControlFrame[] = [];
+  const createdTasks: CreatedTask[] = [];
+
+  // This only observes the application's existing WebSocket; it never proxies
+  // or otherwise changes the traffic being exercised by the test.
+  page.on("websocket", (socket) => {
+    if (!socket.url().endsWith("/ws")) return;
+
+    socket.on("framesent", (event) => {
+      const frame = parseControlFrame(event.payload.toString());
+      if (frame.type) outbound.push(frame);
+    });
+    socket.on("framereceived", (event) => {
+      const frame = parseControlFrame(event.payload.toString());
+      if (frame.type === "task_created" && typeof frame.tid === "number") {
+        createdTasks.push({
+          tid: frame.tid,
+          correlationId:
+            typeof frame.correlation_id === "string"
+              ? frame.correlation_id
+              : null,
+        });
+      }
+    });
+  });
+
+  return {
+    mark: () => outbound.length,
+    controls: (type, query) =>
+      outbound
+        .slice(query?.since ?? 0)
+        .filter(
+          (frame) =>
+            frame.type === type &&
+            (query?.tid === undefined || frame.tid === query.tid),
+        ),
+    createdTid: (correlationId) =>
+      createdTasks.find((task) => task.correlationId === correlationId)?.tid ??
+      null,
+  };
+}
+
+function requireCorrelation(frame: ControlFrame, label: string): string {
+  if (!frame.correlation_id)
+    throw new Error(`${label} create_task did not carry a correlation_id`);
+  return frame.correlation_id;
+}
+
+async function waitForCreatedTid(
+  recorder: OutboundRecorder,
+  correlationId: string,
+): Promise<number> {
+  await expect.poll(() => recorder.createdTid(correlationId)).not.toBeNull();
+  const tid = recorder.createdTid(correlationId);
+  if (tid === null)
+    throw new Error(
+      `task_created acknowledgement missing for ${correlationId}`,
+    );
+  return tid;
+}
+
+async function waitForPersistedDraft(
+  recorder: OutboundRecorder,
+  since: number,
+  tid: number,
+  text: string,
+  metadata: { entryPoint?: string; agentName?: string },
+) {
+  await expect
+    .poll(() => {
+      const latestDraft = recorder.controls("set_draft", { tid, since }).at(-1);
+      const entryPointPersisted =
+        metadata.entryPoint === undefined ||
+        recorder
+          .controls("set_entry_point", { tid, since })
+          .some((frame) => frame.entry_point === metadata.entryPoint);
+      const agentPersisted =
+        metadata.agentName === undefined ||
+        recorder
+          .controls("set_agent_name", { tid, since })
+          .some((frame) => frame.agent_name === metadata.agentName);
+      return (
+        latestDraft?.content === text && entryPointPersisted && agentPersisted
+      );
+    })
+    .toBe(true);
+}
+
 test("sidebar icon updates when entry point changed on draft", async ({
   page,
 }) => {
@@ -61,14 +177,13 @@ test("sidebar icon updates when entry point changed on draft", async ({
     page.locator(".task-type-row.selected .task-type-name"),
   ).toHaveText("blank");
 
-  // BUG: sidebar icon should update to "blank" but stays as "conversation"
-  // because the selected entry point was not being persisted on the draft task
   await expect(
     page.locator(`.sidebar-item[data-tid="${draftTid}"] .task-type-icon-blank`),
   ).toBeVisible({ timeout: 3_000 });
 });
 
 test("entry point persists across page reload on draft", async ({ page }) => {
+  const recorder = installOutboundRecorder(page);
   await enterSession(page);
 
   const before = await snapshotTids(page);
@@ -85,13 +200,18 @@ test("entry point persists across page reload on draft", async ({ page }) => {
   ).toBeVisible({ timeout: 2_000 });
 
   // Change entry point to "blank"
+  const persistenceStart = recorder.mark();
   await page.locator(".task-type-row", { hasText: "blank" }).click();
   await expect(
     page.locator(".task-type-row.selected .task-type-name"),
   ).toHaveText("blank");
-
-  // Wait for any debounce
-  await page.waitForTimeout(1000);
+  await waitForPersistedDraft(
+    recorder,
+    persistenceStart,
+    Number(draftTid),
+    "entry point reload test",
+    { entryPoint: "blank" },
+  );
 
   // Reload the page
   await page.reload();
@@ -107,7 +227,6 @@ test("entry point persists across page reload on draft", async ({ page }) => {
     timeout: 5_000,
   });
 
-  // BUG: entry point should still be "blank" but reverts to default "agentic"
   await expect(
     page.locator(".task-type-row.selected .task-type-name"),
   ).toHaveText("blank");
@@ -142,6 +261,7 @@ test("agent type persists across page reload on draft", async ({
   agentType,
 }) => {
   const targetAgent = agentType === "codex" ? "claude" : "codex";
+  const recorder = installOutboundRecorder(page);
 
   await enterSession(page);
 
@@ -159,11 +279,16 @@ test("agent type persists across page reload on draft", async ({
   ).toBeVisible({ timeout: 2_000 });
 
   // Change the agent type
+  const persistenceStart = recorder.mark();
   await page.locator(".agent-picker").selectOption(targetAgent);
   await expect(page.locator(".agent-picker")).toHaveValue(targetAgent);
-
-  // Wait for any debounce
-  await page.waitForTimeout(1000);
+  await waitForPersistedDraft(
+    recorder,
+    persistenceStart,
+    Number(draftTid),
+    "agent type reload test",
+    { agentName: targetAgent },
+  );
 
   // Reload the page
   await page.reload();
@@ -179,6 +304,150 @@ test("agent type persists across page reload on draft", async ({
     timeout: 5_000,
   });
 
-  // BUG: agent type should still be the changed value but reverts to default
   await expect(page.locator(".agent-picker")).toHaveValue(targetAgent);
+});
+
+test("selector defaults survive draft generations and history reattachment", async ({
+  page,
+  agentType,
+}) => {
+  const recorder = installOutboundRecorder(page);
+  const targetAgent = agentType === "codex" ? "claude" : "codex";
+
+  await enterSession(page);
+
+  const input = page.locator(".input-textarea:visible");
+  const agentPicker = page.locator(".agent-picker:visible");
+  await expect(input).toHaveCount(1);
+  await expect(input).toHaveValue("");
+  await expect(
+    agentPicker.locator(`option[value="${targetAgent}"]`),
+  ).toHaveCount(1);
+
+  // Select both defaults while no draft generation exists yet.
+  await page.locator(".task-type-row", { hasText: "blank" }).click();
+  await expect(
+    page.locator(".task-type-row.selected .task-type-name"),
+  ).toHaveText("blank");
+  await agentPicker.selectOption(targetAgent);
+  await expect(agentPicker).toHaveValue(targetAgent);
+  expect(recorder.controls("create_task")).toHaveLength(0);
+
+  const textA = "selector defaults draft A";
+  const createAStart = recorder.mark();
+  await input.fill(textA);
+
+  await expect
+    .poll(
+      () => recorder.controls("create_task", { since: createAStart }).length,
+    )
+    .toBe(1);
+  const createA = recorder.controls("create_task", { since: createAStart })[0]!;
+  expect(createA.content).toEqual([]);
+  expect(createA.entry_point).toBe("blank");
+  expect(createA.agent_name).toBe(targetAgent);
+  const correlationA = requireCorrelation(createA, "A");
+  const tidA = await waitForCreatedTid(recorder, correlationA);
+  await expect(page.locator(`.sidebar-item[data-tid="${tidA}"]`)).toHaveCount(
+    1,
+  );
+  await waitForPersistedDraft(recorder, createAStart, tidA, textA, {
+    entryPoint: "blank",
+    agentName: targetAgent,
+  });
+
+  const clearAStart = recorder.mark();
+  await input.fill("");
+  await expect
+    .poll(
+      () =>
+        recorder.controls("delete_task", { tid: tidA, since: clearAStart })
+          .length,
+    )
+    .toBe(1);
+  await expect(page.locator(`.sidebar-item[data-tid="${tidA}"]`)).toHaveCount(
+    0,
+  );
+  await expect(input).toHaveCount(1);
+  await expect(input).toBeEnabled();
+  await expect(input).toHaveValue("");
+  await expect(
+    page.locator(".task-type-row.selected .task-type-name"),
+  ).toHaveText("blank");
+  await expect(agentPicker).toHaveValue(targetAgent);
+
+  const textB = "selector defaults draft B";
+  const createBStart = recorder.mark();
+  await input.fill(textB);
+
+  await expect
+    .poll(
+      () => recorder.controls("create_task", { since: createBStart }).length,
+    )
+    .toBe(1);
+  const createB = recorder.controls("create_task", { since: createBStart })[0]!;
+  expect(createB.content).toEqual([]);
+  expect(createB.entry_point).toBe("blank");
+  expect(createB.agent_name).toBe(targetAgent);
+  const correlationB = requireCorrelation(createB, "B");
+  expect(correlationB).not.toBe(correlationA);
+  const tidB = await waitForCreatedTid(recorder, correlationB);
+  expect(tidB).not.toBe(tidA);
+  await expect(page.locator(`.sidebar-item[data-tid="${tidB}"]`)).toHaveCount(
+    1,
+  );
+  await waitForPersistedDraft(recorder, createBStart, tidB, textB, {
+    entryPoint: "blank",
+    agentName: targetAgent,
+  });
+  await expect(input).toHaveValue(textB);
+  await expect(
+    page.locator(".task-type-row.selected .task-type-name"),
+  ).toHaveText("blank");
+  await expect(agentPicker).toHaveValue(targetAgent);
+  await expect(
+    page.locator(`.sidebar-item[data-tid="${tidB}"] .task-type-icon-blank`),
+  ).toBeVisible();
+
+  const createsBeforeReattach = recorder.controls("create_task").length;
+  const deletesBeforeReattach = recorder.controls("delete_task").length;
+  expect(createsBeforeReattach).toBe(2);
+  expect(deletesBeforeReattach).toBe(1);
+
+  await page.locator(".sidebar-back-btn:visible").click();
+  await expect(page).toHaveURL(/\/$/);
+  await page.goBack();
+  await expect(page).toHaveURL(new RegExp(`/task/${tidB}(?:/|$)`));
+  await expect(input).toHaveCount(1);
+  await expect(input).toHaveValue(textB);
+  await expect(
+    page.locator(".task-type-row.selected .task-type-name"),
+  ).toHaveText("blank");
+  await expect(agentPicker).toHaveValue(targetAgent);
+  await expect(page.locator(`.sidebar-item[data-tid="${tidB}"]`)).toHaveCount(
+    1,
+  );
+  await expect(
+    page.locator(`.sidebar-item[data-tid="${tidB}"] .task-type-icon-blank`),
+  ).toBeVisible();
+  expect(recorder.controls("create_task")).toHaveLength(createsBeforeReattach);
+  expect(recorder.controls("delete_task")).toHaveLength(deletesBeforeReattach);
+  expect(recorder.createdTid(correlationB)).toBe(tidB);
+
+  const clearBStart = recorder.mark();
+  await input.fill("");
+  await expect
+    .poll(
+      () =>
+        recorder.controls("delete_task", { tid: tidB, since: clearBStart })
+          .length,
+    )
+    .toBe(1);
+  await expect(page.locator(`.sidebar-item[data-tid="${tidB}"]`)).toHaveCount(
+    0,
+  );
+  expect(recorder.controls("delete_task").map((frame) => frame.tid)).toEqual([
+    tidA,
+    tidB,
+  ]);
 });
