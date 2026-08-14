@@ -49,6 +49,9 @@ class TaskTypeCatalog
 	{
 		import std.path : buildPath, expandTilde;
 
+		if (auto p = projectPath in taskTypesByProject)
+			return p.types;
+
 		try
 		{
 			auto userTypesPath = buildPath(expandTilde("~/.config/cydo"), "task-types.yaml");
@@ -204,10 +207,70 @@ unittest
 	auto loaded = catalog.getTaskTypesForProject("");
 	assert(loaded.byName("alpha") !is null);
 
-	write(globalPath, "task_types: [\n");
-	auto cached = catalog.getTaskTypesForProject("");
-	assert(cached.byName("alpha") !is null);
-	assert(cached.canFind!(t => t.name == "blank"));
+	auto projectPath = buildPath(tmp, "project");
+	writeProjectTaskTypes(projectPath, "task_types: [\n");
+	auto uncached = catalog.getTaskTypesForProject(projectPath);
+	assert(uncached is null);
+}
+
+unittest
+{
+	auto tmp = makeTempRoot("cydo-test-task-type-catalog-cache-hit");
+	scope (exit)
+	{
+		if (exists(tmp))
+			rmdirRecurse(tmp);
+	}
+	mkdirRecurse(tmp);
+
+	auto oldHome = environment.get("HOME", "");
+	auto hadHome = "HOME" in environment;
+	scope (exit)
+	{
+		if (hadHome)
+			environment["HOME"] = oldHome;
+		else
+			environment.remove("HOME");
+	}
+	auto home = buildPath(tmp, "home");
+	mkdirRecurse(home);
+	environment["HOME"] = home;
+
+	auto defsDir = buildPath(tmp, "defs");
+	auto globalPath = buildPath(defsDir, "task-types.yaml");
+	writeGlobalTaskTypes(defsDir,
+		"task_types:\n"
+		~ "  alpha:\n"
+		~ "    model_class: large\n"
+		~ "user_entry_points:\n"
+		~ "  start:\n"
+		~ "    task_type: alpha\n"
+		~ "    description: Start\n"
+		~ "    prompt_template: prompts/start.md\n");
+
+	auto catalog = new TaskTypeCatalog(defsDir, globalPath, &isKnownTestAgent);
+	auto loaded = catalog.getTaskTypesForProject("");
+	assert(loaded.byName("alpha") !is null);
+	assert(loaded.byName("beta") is null);
+
+	writeGlobalTaskTypes(defsDir,
+		"task_types:\n"
+		~ "  beta:\n"
+		~ "    model_class: large\n"
+		~ "user_entry_points:\n"
+		~ "  start:\n"
+		~ "    task_type: beta\n"
+		~ "    description: Start\n"
+		~ "    prompt_template: prompts/start.md\n");
+
+	auto stillCached = catalog.getTaskTypesForProject("");
+	assert(stillCached.byName("alpha") !is null);
+	assert(stillCached.byName("beta") is null);
+
+	catalog.invalidateProject("");
+	auto reloaded = catalog.getTaskTypesForProject("");
+	assert(reloaded.byName("beta") !is null);
+	assert(reloaded.byName("alpha") is null);
 }
 
 unittest

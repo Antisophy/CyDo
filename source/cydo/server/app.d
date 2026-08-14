@@ -301,6 +301,7 @@ class App
 		configWatcher = new ConfigWatcher(ConfigWatcherHost(
 			onConfigChanged: &onConfigChanged,
 			onProjectConfigChanged: &onProjectConfigChanged,
+			onUserTaskTypesChanged: &onUserTaskTypesChanged,
 		));
 		systemMessageNormalizer = new SystemMessageNormalizer(
 			SystemMessageNormalizerHost(
@@ -3423,8 +3424,20 @@ class App
 		));
 	}
 
+	private void onUserTaskTypesChanged()
+	{
+		infof("User task types file changed, reloading task types...");
+		taskTypeCatalog.invalidateAll();
+		clientHub.broadcast(buildTaskTypesList(
+			taskTypeCatalog.getTaskTypes(),
+			taskTypeCatalog.getEntryPoints(),
+			config.default_task_type,
+		));
+	}
+
 	private void handleRefreshWorkspacesMsg()
 	{
+		taskTypeCatalog.invalidateAll();
 		discoveryService.discoverAllWorkspaces(config);
 		clientHub.broadcast(buildWorkspacesList(discoveryService.workspacesInfo));
 		discoveryService.enumerateSessions();
@@ -5371,6 +5384,7 @@ unittest
 	assert(expectedViolations.length > 0);
 
 	writeToolDescriptionLimitFixture(tmp, buildTaskTypesYaml(8));
+	catalog.invalidateProject(projectPath);
 	typeDef = catalog.getTaskTypesForProject(projectPath).byName("parent");
 	runner.prepareTaskSessionLaunch(7, agent, typeDef);
 	assert(reportedViolations.length == 2);

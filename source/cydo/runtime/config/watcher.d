@@ -15,6 +15,7 @@ struct ConfigWatcherHost
 {
 	void delegate() onConfigChanged;
 	void delegate(string projectPath) onProjectConfigChanged;
+	void delegate() onUserTaskTypesChanged;
 }
 
 class ConfigWatcher
@@ -22,8 +23,10 @@ class ConfigWatcher
 	private ConfigWatcherHost host_;
 	private INotify.WatchDescriptor configFileWatch_;
 	private INotify.WatchDescriptor configDirWatch_;
+	private INotify.WatchDescriptor userTaskTypesFileWatch_;
 	private bool configFileWatchActive_;
 	private bool configDirWatchActive_;
+	private bool userTaskTypesFileWatchActive_;
 	private RefCountedINotify projectINotify_;
 	private RefCountedINotify.Handle[string] projectDirWatches_;
 	private RefCountedINotify.Handle[string] projectFileWatches_;
@@ -38,6 +41,8 @@ class ConfigWatcher
 		auto cfgPath = configPath;
 		auto cfgDir = dirName(cfgPath);
 		auto cfgFileName = baseName(cfgPath);
+		auto userTaskTypesPath = buildPath(cfgDir, "task-types.yaml");
+		enum userTaskTypesFileName = "task-types.yaml";
 
 		if (!exists(cfgDir))
 		{
@@ -48,9 +53,23 @@ class ConfigWatcher
 		if (exists(cfgPath))
 			watchConfigFile(cfgPath);
 
+		if (exists(userTaskTypesPath))
+			watchUserTaskTypesFile(userTaskTypesPath);
+
 		configDirWatch_ = iNotify.add(cfgDir, INotify.Mask.create | INotify.Mask.movedTo,
 			(in char[] name, INotify.Mask mask, uint cookie)
 			{
+				if (name == userTaskTypesFileName)
+				{
+					if (userTaskTypesFileWatchActive_)
+					{
+						iNotify.remove(userTaskTypesFileWatch_);
+						userTaskTypesFileWatchActive_ = false;
+					}
+					watchUserTaskTypesFile(userTaskTypesPath);
+					host_.onUserTaskTypesChanged();
+					return;
+				}
 				if (name != cfgFileName)
 					return;
 				if (configFileWatchActive_)
@@ -71,6 +90,11 @@ class ConfigWatcher
 		{
 			iNotify.remove(configFileWatch_);
 			configFileWatchActive_ = false;
+		}
+		if (userTaskTypesFileWatchActive_)
+		{
+			iNotify.remove(userTaskTypesFileWatch_);
+			userTaskTypesFileWatchActive_ = false;
 		}
 		if (configDirWatchActive_)
 		{
@@ -128,5 +152,16 @@ private:
 			}
 		);
 		configFileWatchActive_ = true;
+	}
+
+	void watchUserTaskTypesFile(string path)
+	{
+		userTaskTypesFileWatch_ = iNotify.add(path, INotify.Mask.closeWrite,
+			(in char[] name, INotify.Mask mask, uint cookie)
+			{
+				host_.onUserTaskTypesChanged();
+			}
+		);
+		userTaskTypesFileWatchActive_ = true;
 	}
 }
