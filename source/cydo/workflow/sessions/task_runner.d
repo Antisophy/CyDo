@@ -596,7 +596,10 @@ public:
 		sessionConfig.handoffs = formatCompactHandoffToolSummary(taskTypes, td.taskType);
 		if (typeDef !is null)
 		{
-			auto spec = taskAgent.resolveModelSpec(typeDef.model_class);
+			import cydo.domain.task_types.definition : resolveModelClass;
+			auto modelClass = resolveModelClass(typeDef.model_class, td.workspace,
+				td.agentName);
+			auto spec = taskAgent.resolveModelSpec(modelClass);
 			sessionConfig.model = spec.model;
 			sessionConfig.effort = spec.effort;
 			if (taskAgent.supportsDeveloperPrompt)

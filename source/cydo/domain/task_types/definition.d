@@ -33,6 +33,51 @@ enum WorktreeMode : string
 /// Default agent expression — pass the parent's agent type through unchanged.
 enum string defaultAgentExpr = "{{ parent_agent_type }}";
 
+/// A Djinja template loaded from a YAML scalar. Keeping it distinct from
+/// `string` forces every runtime consumer to render it explicitly.
+struct DjinjaTemplate
+{
+private:
+	string source_;
+
+public:
+	this(string source)
+	{
+		source_ = source;
+	}
+
+	static DjinjaTemplate fromString(string source)
+	{
+		return DjinjaTemplate(source);
+	}
+
+	void opAssign(string source)
+	{
+		source_ = source;
+	}
+
+	string render(string[string] vars) const
+	{
+		return substituteVars(source_, vars);
+	}
+
+	bool empty() const pure nothrow @safe @nogc
+	{
+		return source_.length == 0;
+	}
+
+	bool dynamic() const
+	{
+		return source_.canFind("{{");
+	}
+
+	/// Raw template source for validation, diagnostics, and configuration UI.
+	string source() const pure nothrow @safe @nogc
+	{
+		return source_;
+	}
+}
+
 struct ContinuationDef
 {
 	string task_type;
@@ -86,7 +131,7 @@ struct TaskTypeDef
 	@Optional string system_prompt_template;
 
 	// Capabilities
-	string model_class = "large";
+	DjinjaTemplate model_class = DjinjaTemplate("large");
 	@Optional bool read_only;
 	@Optional OutputType[] output_type;
 	@Optional bool allow_native_subagents;
@@ -99,7 +144,7 @@ struct TaskTypeDef
 	// Execution
 	@Optional bool serial;
 	@Optional uint max_turns;
-	string agent = defaultAgentExpr; // Jinja expression
+	DjinjaTemplate agent = DjinjaTemplate(defaultAgentExpr);
 
 	// Memory
 	@Optional bool memory;
@@ -222,7 +267,7 @@ TaskTypeConfig loadTaskTypes(string[] paths...)
 		TaskTypeDef blank;
 		blank.name = "blank";
 		blank.icon = "blank";
-		blank.model_class = "large";
+		blank.model_class = DjinjaTemplate("large");
 		blank.allow_native_subagents = true;
 		result.task_types = blank ~ result.task_types;
 	}
@@ -268,14 +313,23 @@ private Node deepMerge(Node base, Node overlay)
 // Agent resolution
 // ---------------------------------------------------------------------------
 
-/// Render an `agent:` expression against the parent agent type.
+/// Render an `agent:` expression against the task creation context.
 /// Returns empty string when the substitution produces nothing — caller decides
 /// how to surface that.
-string resolveAgent(string expr, string parentAgentType)
+string resolveAgent(DjinjaTemplate expr, string parentAgentType, string workspace = "")
 {
-	if (expr.length == 0)
-		expr = defaultAgentExpr;
-	return substituteVars(expr, ["parent_agent_type": parentAgentType]).strip;
+	if (expr.empty)
+		expr = DjinjaTemplate(defaultAgentExpr);
+	return expr.render([
+		"parent_agent_type": parentAgentType,
+		"workspace": workspace,
+	]).strip;
+}
+
+/// Render a `model_class:` expression after the task's agent has been resolved.
+string resolveModelClass(DjinjaTemplate expr, string workspace, string agent)
+{
+	return expr.render(["workspace": workspace, "agent": agent]).strip;
 }
 
 // ---------------------------------------------------------------------------
@@ -590,8 +644,9 @@ string[] validateTaskTypes(TaskTypeDef[] types, UserEntryPointDef[] entryPoints,
 	// 1. Literal-agent check: hardcoded values (no '{{') must name a configured agent.
 	foreach (ref def; types)
 	{
-		if (!def.agent.canFind("{{") && !isConfiguredAgentName(def.agent))
-			errors ~= format("%s: agent '%s' is not a configured agent", def.name, def.agent);
+		if (!def.agent.dynamic && !isConfiguredAgentName(def.agent.source))
+			errors ~= format("%s: agent '%s' is not a configured agent", def.name,
+				def.agent.source);
 	}
 
 	// 2. keep_context cluster-agreement check (union-find on undirected edges).
@@ -649,8 +704,8 @@ string[] validateTaskTypes(TaskTypeDef[] types, UserEntryPointDef[] entryPoints,
 			foreach (m; members)
 			{
 				auto dp = types.byName(m);
-				if (dp !is null && !dp.agent.canFind("{{"))
-					hardcodedAgents[m] = dp.agent;
+				if (dp !is null && !dp.agent.dynamic)
+					hardcodedAgents[m] = dp.agent.source;
 			}
 
 			// Check for disagreement
@@ -674,11 +729,11 @@ string[] validateTaskTypes(TaskTypeDef[] types, UserEntryPointDef[] entryPoints,
 	foreach (ref ep; entryPoints)
 	{
 		auto targetDef = types.byName(ep.resolvedType);
-		if (targetDef !is null && targetDef.agent != defaultAgentExpr)
+		if (targetDef !is null && targetDef.agent.source != defaultAgentExpr)
 			errors ~= format("entry_point '%s': target type '%s' has non-default agent '%s'"
 				~ " which is ignored at root creation — set default_agent in config"
 				~ " or move the override to a sub-task type",
-				ep.name, ep.resolvedType, targetDef.agent);
+				ep.name, ep.resolvedType, targetDef.agent.source);
 	}
 
 	return errors;
@@ -1104,18 +1159,27 @@ unittest // 1. loadTaskTypes injects defaultAgentExpr when no agent: field is pr
 
 	auto foo = config.types.byName("foo");
 	assert(foo !is null);
-	assert(foo.agent == defaultAgentExpr, foo.agent);
+	assert(foo.agent.source == defaultAgentExpr, foo.agent.source);
 
 	auto blank = config.types.byName("blank");
 	assert(blank !is null);
-	assert(blank.agent == defaultAgentExpr, blank.agent);
+	assert(blank.agent.source == defaultAgentExpr, blank.agent.source);
 }
 
 unittest // 2. resolveAgent substitutes parent_agent_type correctly
 {
-	assert(resolveAgent(defaultAgentExpr, "claude") == "claude");
-	assert(resolveAgent(defaultAgentExpr, "") == "");
-	assert(resolveAgent("codex", "claude") == "codex");
+	assert(resolveAgent(DjinjaTemplate(defaultAgentExpr), "claude") == "claude");
+	assert(resolveAgent(DjinjaTemplate(defaultAgentExpr), "") == "");
+	assert(resolveAgent(DjinjaTemplate("codex"), "claude") == "codex");
+	assert(resolveAgent(DjinjaTemplate("{{ workspace }}-{{ parent_agent_type }}"),
+		"codex", "work")
+		== "work-codex");
+	assert(resolveModelClass(DjinjaTemplate(
+		"{{ 'best' if agent == 'claude-personal' else 'large' }}"),
+		"work", "claude-personal") == "best");
+	assert(resolveModelClass(DjinjaTemplate(
+		"{{ 'best' if agent == 'claude-personal' else 'large' }}"),
+		"work", "codex") == "large");
 }
 
 unittest // 3. Validator emits error for unconfigured hardcoded literal

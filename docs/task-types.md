@@ -14,7 +14,8 @@ description: string                   # human-readable comment
 agent_description: string             # LLM-visible; explains when to use this type
 prompt_template: string | path        # template used to wrap the task description in the rendered task prompt
 system_prompt_template: string | path # optional startup system/developer prompt for agents that support it
-model_class: string                   # open-ended label; small/medium/large have per-driver defaults,
+model_class: string                   # Djinja expression; workspace and resolved agent are available;
+                                      # the rendered open-ended label uses small/medium/large per-driver defaults,
                                       # any other label resolves to itself unless mapped in the
                                       # agent's model_aliases (see README.md)
 read_only: bool                   # sandbox mounts project dir as ro (default false)
@@ -31,6 +32,7 @@ continuations:                        # successors on completion (exec-style)
 # Execution
 serial: bool                          # one at a time, queued (steward pattern)
 max_turns: int?                       # resource limit
+agent: string                         # Djinja expression; parent_agent_type and workspace are available
 
 # Visibility
 user_visible: bool                    # can users create this type directly

@@ -294,6 +294,7 @@ export interface TaskTypesListMessage {
     task_type: string;
     description: string;
     model_class: string;
+    model_classes?: Record<string, string>;
     read_only: boolean;
     icon?: string;
   }[];
@@ -311,6 +312,7 @@ export interface ProjectTaskTypesListMessage {
     task_type: string;
     description: string;
     model_class: string;
+    model_classes?: Record<string, string>;
     read_only: boolean;
     icon?: string;
   }[];

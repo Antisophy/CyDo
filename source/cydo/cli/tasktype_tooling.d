@@ -27,7 +27,7 @@ void printTypes(TaskTypeDef[] types, UserEntryPointDef[] entryPoints)
 			: def.output_type.map!(o => cast(string) o).join("+");
 		writefln("  %-20s  model: %-6s  output: %-14s%s%s%s%s",
 			def.name,
-			def.model_class,
+			def.model_class.source,
 			outputStr,
 			def.read_only ? "  [ro]" : "",
 			def.steward ? "  [steward]" : "",
@@ -139,7 +139,7 @@ void simulateWorkflow(TaskTypeDef[] types, UserEntryPointDef[] entryPoints)
 		auto outputStr = def.output_type.length == 0 ? "—"
 			: def.output_type.map!(o => cast(string) o).join("+");
 		writefln("    model: %s | output: %s%s",
-			def.model_class, outputStr,
+			def.model_class.source, outputStr,
 			def.read_only ? " (read-only)" : "");
 
 		if (def.creatable_tasks.length > 0)
@@ -407,7 +407,7 @@ void generateDot(TaskTypeDef[] types, UserEntryPointDef[] entryPoints)
 		}
 
 		style = "filled,rounded";
-		auto label = format("%s\\n%s%s", def.name, def.model_class,
+		auto label = format("%s\\n%s%s", def.name, def.model_class.source,
 			def.read_only ? " ro" : "");
 		writefln("    %s [label=\"%s\" shape=%s style=\"%s\" fillcolor=\"%s\"];",
 			def.name, label, shape, style, fillcolor);

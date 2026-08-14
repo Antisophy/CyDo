@@ -1028,7 +1028,8 @@ struct EntryPointEntry
 	string name;         // entry point name (used as display name in UI)
 	string task_type;    // resolved type name
 	string description;  // from entry point
-	string model_class;  // from task type
+	string model_class;  // rendered for the effective default agent
+	string[string] model_classes; // rendered per configured agent
 	bool read_only;      // from task type
 	string icon;         // from task type
 }

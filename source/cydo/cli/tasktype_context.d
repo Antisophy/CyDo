@@ -72,7 +72,7 @@ void runDumpContext(string path, string typeName, bool delegate(string) isConfig
 			? def.agent_description.strip.lineSplitter.front.to!string : "—";
 		writefln("Description:    %s", firstLine);
 	}
-	writefln("Model:          %s", def.model_class);
+	writefln("Model:          %s", def.model_class.source);
 	writefln("Output:         %s", def.output_type.length == 0 ? "—"
 		: def.output_type.map!(o => cast(string) o).join("+"));
 	writefln("Read-only:      %s", def.read_only);

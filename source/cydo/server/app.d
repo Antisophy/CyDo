@@ -81,7 +81,7 @@ import cydo.domain.storage.persistence : LoadedHistory, Persistence, openDatabas
 import cydo.server.config_resolution : loadRuntimeConfig, reloadRuntimeConfig;
 import cydo.runtime.launch.sandbox : cleanup, resolveExecutablePath, runtimeDir, sharedTmpBaseDir;
 import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule;
-import cydo.domain.task_types.definition : TaskTypeDef, OutputType, WorktreeMode, byName, loadTaskTypes,
+import cydo.domain.task_types.definition : DjinjaTemplate, TaskTypeDef, OutputType, WorktreeMode, byName, loadTaskTypes,
 	loadTaskTypeSystemPrompt, renderPrompt, substituteVars,
 	loadProjectMemory, resolveAgent;
 import cydo.foundation.system.framing : prependTaskFraming, validateTemplateSource;
@@ -363,8 +363,8 @@ class App
 			treeReadOnlyForProject: (string projectPath) {
 				return taskTypeCatalog.treeReadOnlyFor(projectPath);
 			},
-			resolveTaskAgent: (string requestedAgent, string parentAgent) {
-				return resolveAgent(requestedAgent, parentAgent);
+			resolveTaskAgent: (DjinjaTemplate requestedAgent, string parentAgent, string workspace) {
+				return resolveAgent(requestedAgent, parentAgent, workspace);
 			},
 			isConfiguredAgentName: (string agentName) {
 				return isConfiguredAgentName(config, agentName);
@@ -1070,6 +1070,9 @@ class App
 			taskTypeCatalog.getTaskTypes(),
 			taskTypeCatalog.getEntryPoints(),
 			config.default_task_type,
+			"",
+			defaultAgentName(""),
+			configuredAgentNames(),
 		).representation));
 		ws.send(Data(buildAgentsList(snapshotAgentEntries(), config.default_agent).representation));
 		ws.send(Data(buildCurrentTasksList().representation));
@@ -1182,6 +1185,15 @@ class App
 			break;
 		}
 		return false;
+	}
+
+	private string workspaceNameForProjectPath(string projectPath)
+	{
+		foreach (ref wi; discoveryService.workspacesInfo)
+			foreach (ref project; wi.projects)
+				if (project.path == projectPath)
+					return wi.name;
+		return "";
 	}
 
 	private void discoveredWorkspacesForProjectPath(string projectPath, ref bool[string] names)
@@ -2900,6 +2912,15 @@ class App
 		return effectiveDefaultAgentName(config, workspaceName);
 	}
 
+	private string[] configuredAgentNames()
+	{
+		string[] names;
+		foreach (name; config.agents.byKey)
+			names ~= name;
+		names.sort;
+		return names;
+	}
+
 	private string defaultTaskType(string workspaceName)
 	{
 		foreach (ref ws; config.workspaces)
@@ -3340,6 +3361,9 @@ class App
 			projectPath,
 			taskTypeCatalog.getTaskTypesForProject(projectPath),
 			taskTypeCatalog.getEntryPointsForProject(projectPath),
+			workspaceNameForProjectPath(projectPath),
+			defaultAgentName(workspaceNameForProjectPath(projectPath)),
+			configuredAgentNames(),
 		));
 	}
 
@@ -3495,6 +3519,9 @@ class App
 				taskTypeCatalog.getTaskTypes(),
 				taskTypeCatalog.getEntryPoints(),
 				config.default_task_type,
+				json.workspace,
+				defaultAgentName(json.workspace),
+				configuredAgentNames(),
 			).representation));
 		else
 		{
@@ -3508,10 +3535,14 @@ class App
 				return;
 			}
 			configWatcher.ensureProjectWatch(projectPath);
+			auto workspace = workspaceNameForProjectPath(projectPath);
 			ws.send(Data(buildTaskTypesListForProject(
 				projectPath,
 				taskTypeCatalog.getTaskTypesForProject(projectPath),
 				taskTypeCatalog.getEntryPointsForProject(projectPath),
+				workspace,
+				defaultAgentName(workspace),
+				configuredAgentNames(),
 			).representation));
 		}
 	}

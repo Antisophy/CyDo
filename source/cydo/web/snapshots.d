@@ -11,7 +11,8 @@ import cydo.domain.tasks.model : AgentInfoEntry, AgentsListMessage, EntryPointEn
 	ServerStatusMessage, TaskListEntry, TaskTypesListMessage,
 	TasksListMessage, TaskData, TypeInfoEntry, WorkspaceInfo,
 	WorkspacesListMessage, stdTimeToUnixMillis;
-import cydo.domain.task_types.definition : TaskTypeDef, UserEntryPointDef, byName;
+import cydo.domain.task_types.definition : TaskTypeDef, UserEntryPointDef, byName,
+	resolveModelClass;
 
 TaskListEntry buildTaskEntry(ref TaskData td, bool alive, bool canStop, string driver)
 {
@@ -37,12 +38,15 @@ string buildTaskTypesList(
 	TaskTypeDef[] types,
 	UserEntryPointDef[] entryPoints,
 	string defaultTaskType,
+	string workspace = "",
+	string defaultAgent = "",
+	string[] agents = null,
 )
 {
 	TypeInfoEntry[] typeInfo;
 	return toJson(TaskTypesListMessage(
 		"task_types_list",
-		buildEntryPointEntries(types, entryPoints, typeInfo),
+		buildEntryPointEntries(types, entryPoints, workspace, defaultAgent, agents, typeInfo),
 		typeInfo,
 		defaultTaskType,
 	));
@@ -52,13 +56,16 @@ string buildTaskTypesListForProject(
 	string projectPath,
 	TaskTypeDef[] types,
 	UserEntryPointDef[] entryPoints,
+	string workspace = "",
+	string defaultAgent = "",
+	string[] agents = null,
 )
 {
 	TypeInfoEntry[] typeInfo;
 	return toJson(ProjectTaskTypesListMessage(
 		"project_task_types_list",
 		projectPath,
-		buildEntryPointEntries(types, entryPoints, typeInfo),
+		buildEntryPointEntries(types, entryPoints, workspace, defaultAgent, agents, typeInfo),
 		typeInfo,
 	));
 }
@@ -101,6 +108,9 @@ string buildNoticesList(Notice[string] activeNotices)
 private EntryPointEntry[] buildEntryPointEntries(
 	TaskTypeDef[] types,
 	UserEntryPointDef[] entryPoints,
+	string workspace,
+	string defaultAgent,
+	string[] agents,
 	out TypeInfoEntry[] typeInfo,
 )
 {
@@ -114,7 +124,10 @@ private EntryPointEntry[] buildEntryPointEntries(
 		entry.description = ep.description;
 		if (typeDef !is null)
 		{
-			entry.model_class = typeDef.model_class;
+			entry.model_class = resolveModelClass(typeDef.model_class, workspace, defaultAgent);
+			foreach (agent; agents)
+				entry.model_classes[agent] = resolveModelClass(typeDef.model_class,
+					workspace, agent);
 			entry.read_only = typeDef.read_only;
 			entry.icon = typeDef.icon;
 		}
@@ -123,4 +136,26 @@ private EntryPointEntry[] buildEntryPointEntries(
 	foreach (ref def; types)
 		typeInfo ~= TypeInfoEntry(def.name, def.icon);
 	return entries;
+}
+
+unittest
+{
+	import std.algorithm : canFind;
+
+	TaskTypeDef type;
+	type.name = "conversation";
+	type.model_class = "{{ 'best' if agent == 'claude-personal' else 'large' }}";
+	UserEntryPointDef entryPoint;
+	entryPoint.name = "agentic";
+	entryPoint.task_type = type.name;
+	entryPoint.description = "Agentic";
+
+	auto personal = buildTaskTypesList([type], [entryPoint], "agentic", "home",
+		"claude-personal", ["claude-personal", "codex"]);
+	assert(personal.canFind(`"model_class":"best"`), personal);
+	assert(personal.canFind(`"model_classes":{"claude-personal":"best","codex":"large"}`)
+		|| personal.canFind(`"model_classes":{"codex":"large","claude-personal":"best"}`),
+		personal);
+	auto codex = buildTaskTypesList([type], [entryPoint], "agentic", "work", "codex");
+	assert(codex.canFind(`"model_class":"large"`), codex);
 }

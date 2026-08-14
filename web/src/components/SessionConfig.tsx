@@ -5,6 +5,7 @@ import { ensureIconStyles } from "./TaskTypeIcon";
 interface Props {
   entryPoints: EntryPointInfo[];
   selected: string;
+  selectedAgent?: string;
   onEntryPointChange: (entryPoint: string) => void;
   disabled?: boolean;
   pickerRef?: RefObject<HTMLDivElement>;
@@ -15,6 +16,7 @@ interface Props {
 export function SessionConfig({
   entryPoints,
   selected,
+  selectedAgent = "",
   onEntryPointChange,
   disabled = false,
   pickerRef,
@@ -76,7 +78,9 @@ export function SessionConfig({
             )}
             <span class="task-type-name">{t.name}</span>
             <span class="task-type-badges">
-              <span class="config-badge">{t.model_class}</span>
+              <span class="config-badge">
+                {t.model_classes?.[selectedAgent] ?? t.model_class}
+              </span>
               {t.read_only && <span class="config-badge">ro</span>}
             </span>
           </div>

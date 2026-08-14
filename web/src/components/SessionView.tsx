@@ -657,6 +657,7 @@ export function DraftSessionView({
           <SessionConfig
             entryPoints={entryPoints}
             selected={draftView.entryPoint}
+            selectedAgent={draftView.agent || defaultAgent}
             onEntryPointChange={changeEntryPoint}
             disabled={disabled}
             pickerRef={entryPointPickerRef}

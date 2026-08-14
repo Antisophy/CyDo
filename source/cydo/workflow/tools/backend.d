@@ -13,7 +13,7 @@ import cydo.agent.contract : Agent;
 import cydo.agent.terminal : TerminalProcess;
 import cydo.domain.policy.permissions : evaluatePermissionPolicy,
 	makePermissionAllowJson, makePermissionDenyJson;
-import cydo.domain.task_types.definition : ContinuationDef, CreatableTaskDef, TaskTypeDef,
+import cydo.domain.task_types.definition : ContinuationDef, CreatableTaskDef, DjinjaTemplate, TaskTypeDef,
 	UserEntryPointDef, WorktreeMode, byName, isInteractive,
 	loadProjectMemory, renderContinuationPrompt, renderPrompt, resolveAgent,
 	substituteVars;
@@ -61,7 +61,7 @@ struct WorkflowToolsHost
 	UserEntryPointDef[] delegate(string projectPath) entryPointsForProject;
 	string[] delegate(string projectPath) promptSearchPath;
 	bool[string] delegate(string projectPath) treeReadOnlyForProject;
-	string delegate(string requestedAgent, string parentAgent) resolveTaskAgent;
+	string delegate(DjinjaTemplate requestedAgent, string parentAgent, string workspace) resolveTaskAgent;
 	bool delegate(string agentName) isConfiguredAgentName;
 	Agent delegate(int tid) agentForTask;
 	string delegate(int tid, TaskTypeDef* typeDef) taskSystemPromptForMessage;
@@ -189,7 +189,7 @@ unittest
 		entryPointsForProject: (string projectPath) => cast(UserEntryPointDef[]) null,
 		promptSearchPath: (string projectPath) => cast(string[]) null,
 		treeReadOnlyForProject: (string projectPath) => cast(bool[string]) null,
-		resolveTaskAgent: (string requestedAgent, string parentAgent) => "fake",
+		resolveTaskAgent: (DjinjaTemplate requestedAgent, string parentAgent, string workspace) => "fake",
 		isConfiguredAgentName: (string agentName) => agentName == "fake",
 		agentForTask: (int tid) { assert(0); return cast(Agent) null; },
 		taskSystemPromptForMessage: (int tid, TaskTypeDef* typeDef) => "",
@@ -388,7 +388,7 @@ public:
 				"Unknown task type: " ~ resolvedTaskType));
 
 		auto childAgent = host_.resolveTaskAgent(childTypeDef.agent,
-			parentTd.agentName);
+			parentTd.agentName, parentTd.workspace);
 		if (childAgent.length == 0 || !host_.isConfiguredAgentName(childAgent))
 		{
 			return ValidatedTask(structuredTaskError(format(
@@ -1519,7 +1519,7 @@ private:
 		else
 		{
 			auto contAgent = host_.resolveTaskAgent(newTypeDef.agent,
-				td.agentName);
+				td.agentName, td.workspace);
 			if (contAgent.length == 0
 				|| !host_.isConfiguredAgentName(contAgent))
 			{
@@ -1727,7 +1727,7 @@ unittest
 		entryPointsForProject: (string projectPath) => cast(UserEntryPointDef[]) null,
 		promptSearchPath: (string projectPath) => cast(string[]) null,
 		treeReadOnlyForProject: (string projectPath) => cast(bool[string]) null,
-		resolveTaskAgent: (string requestedAgent, string parentAgent) => "fake",
+		resolveTaskAgent: (DjinjaTemplate requestedAgent, string parentAgent, string workspace) => "fake",
 		isConfiguredAgentName: (string agentName) => agentName == "fake",
 		agentForTask: (int tid) {
 			assert(0, "agentForTask should not be needed for this test");
@@ -1893,8 +1893,8 @@ unittest
 		return task is null ? null : &tasks[tid];
 	};
 	host.taskTypesForProject = (string projectPath) => [parent, child];
-	host.resolveTaskAgent = (string requestedAgent, string parentAgent) {
-		return resolveAgent(requestedAgent, parentAgent);
+	host.resolveTaskAgent = (DjinjaTemplate requestedAgent, string parentAgent, string workspace) {
+		return resolveAgent(requestedAgent, parentAgent, workspace);
 	};
 	host.isConfiguredAgentName = (string agentName) => agentName == "work-claude";
 
@@ -2004,7 +2004,7 @@ unittest
 				entryPointsForProject: (string projectPath) => cast(UserEntryPointDef[]) null,
 				promptSearchPath: (string projectPath) => cast(string[]) null,
 				treeReadOnlyForProject: (string projectPath) => cast(bool[string]) null,
-				resolveTaskAgent: (string requestedAgent, string parentAgent) => "fake",
+				resolveTaskAgent: (DjinjaTemplate requestedAgent, string parentAgent, string workspace) => "fake",
 				isConfiguredAgentName: (string agentName) => agentName == "fake",
 				taskSystemPromptForMessage: (int tid, TaskTypeDef* typeDef) => "",
 				tasksShareWorkspace: (int aTid, int bTid) => true,
