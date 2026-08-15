@@ -149,7 +149,7 @@ private bool parseRolloutValue(string line, out RolloutValue result)
 		parser.skipWhitespace();
 		return parser.eof;
 	}
-	catch (Throwable)
+	catch (Exception)
 		return false;
 }
 

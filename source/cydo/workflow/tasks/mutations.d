@@ -528,7 +528,7 @@ public:
 							host_.startJsonlWatch(tid);
 							host_.broadcastTaskUpdate(tid);
 						}
-						catch (Throwable e)
+						catch (Exception e)
 						{
 							completed.markCodexNativeUndoUnverified();
 							ws.send(Data(toJson(ErrorMessage("error",
@@ -548,7 +548,7 @@ public:
 								~ e.msg, tid)).representation));
 					}).ignoreResult();
 				}
-				catch (Throwable e)
+				catch (Exception e)
 				{
 					current.markCodexNativeUndoUnverified();
 					ws.send(Data(toJson(ErrorMessage("error",

@@ -2048,7 +2048,7 @@ unittest
 	{
 		bool linkExists;
 		try linkExists = isSymlink(rolloutPath);
-		catch (Throwable) linkExists = false;
+		catch (Exception) linkExists = false;
 		if (!exists(rolloutPath) && !linkExists)
 			return;
 		if (linkExists || !isDir(rolloutPath))
@@ -2981,7 +2981,7 @@ class CodexSession : AgentSession
 			rolloutFileId_ = getFileID(path);
 			rolloutFileIdentityKnown_ = true;
 		}
-		catch (Throwable) {}
+		catch (Exception) {}
 	}
 
 	/// Bind the identity of the exact provider-returned rollout file the first
@@ -3012,7 +3012,7 @@ class CodexSession : AgentSession
 			rolloutFileId_ = getFileID(observedPath);
 			rolloutFileIdentityKnown_ = true;
 		}
-		catch (Throwable) {}
+		catch (Exception) {}
 	}
 
 	protected Promise!JsonRpcResponse sendCodexRequest(string method, string params)
@@ -3430,7 +3430,7 @@ class CodexSession : AgentSession
 					NativeUndoPreparationRefusalCategory.rolloutUnavailable,
 					"retained Codex rollout path no longer identifies the original regular file");
 		}
-		catch (Throwable e)
+		catch (Exception e)
 			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.rolloutUnavailable,
 				"unable to identify retained Codex rollout path: " ~ e.msg);
 		string rollout;
@@ -3451,7 +3451,7 @@ class CodexSession : AgentSession
 					NativeUndoPreparationRefusalCategory.rolloutUnavailable,
 					"retained Codex rollout path changed while reading");
 		}
-		catch (Throwable e)
+		catch (Exception e)
 			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.rolloutUnavailable,
 				"unable to identify retained Codex rollout path after reading: " ~ e.msg);
 
@@ -3481,7 +3481,7 @@ class CodexSession : AgentSession
 			}
 			catch (NativeUndoPreparationRefusal e)
 				result.reject(e);
-			catch (Throwable e)
+			catch (Exception e)
 				result.reject(new NativeUndoPreparationRefusal(
 					NativeUndoPreparationRefusalCategory.threadReadFailed,
 					"thread/read did not yield an admissible native ledger: " ~ e.msg));
@@ -3491,7 +3491,7 @@ class CodexSession : AgentSession
 				"thread/read request failed: " ~ e.msg));
 			}).ignoreResult();
 		}
-		catch (Throwable e)
+		catch (Exception e)
 		{
 			return refusedNativeUndoPreparation(NativeUndoPreparationRefusalCategory.threadReadFailed,
 				"thread/read request could not be sent: " ~ e.msg);
@@ -3609,7 +3609,7 @@ class CodexSession : AgentSession
 				return result;
 			}
 		}
-		catch (Throwable e)
+		catch (Exception e)
 		{
 			refuse("unable to verify retained Codex rollout path before dispatch: " ~ e.msg);
 			return result;
@@ -3618,7 +3618,7 @@ class CodexSession : AgentSession
 		auto liveThreadId = threadId;
 		try
 			pointOfNoReturn();
-		catch (Throwable e)
+		catch (Exception e)
 		{
 			unverifiable("native undo point-of-no-return callback failed: " ~ e.msg);
 			return result;
@@ -3656,7 +3656,7 @@ class CodexSession : AgentSession
 						break;
 				}
 			}
-			catch (Throwable e)
+			catch (Exception e)
 			{
 				unverifiable("unable to read retained Codex rollout after rollback dispatch: "
 					~ e.msg);
@@ -3670,7 +3670,7 @@ class CodexSession : AgentSession
 			try
 				setTimeout({ waitForRollbackMarker(attemptsRemaining - 1); },
 					nativeUndoMarkerPollInterval());
-			catch (Throwable e)
+			catch (Exception e)
 				unverifiable("unable to schedule Codex rollback marker verification: " ~ e.msg);
 		}
 
@@ -3692,13 +3692,13 @@ class CodexSession : AgentSession
 					}
 					waitForRollbackMarker(nativeUndoMarkerAttempts());
 				}
-				catch (Throwable e)
+				catch (Exception e)
 					unverifiable("thread/rollback response could not be verified: " ~ e.msg);
 			}).except((Exception e) {
 				unverifiable("thread/rollback request failed after dispatch: " ~ e.msg);
 			}).ignoreResult();
 		}
-		catch (Throwable e)
+		catch (Exception e)
 			unverifiable("thread/rollback request could not be sent after dispatch: " ~ e.msg);
 		return result;
 	}

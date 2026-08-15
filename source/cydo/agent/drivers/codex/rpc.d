@@ -474,7 +474,7 @@ struct ThreadReadResult
 			decodeThreadResult(raw, result.thread, result.rawThread, result.rawTurns);
 			return result;
 		}
-		catch (Throwable e)
+		catch (Exception e)
 			throw new Exception("Invalid Codex thread/read result: " ~ e.msg);
 	}
 }
@@ -495,7 +495,7 @@ struct ThreadRollbackResult
 			decodeThreadResult(raw, result.thread, result.rawThread, result.rawTurns);
 			return result;
 		}
-		catch (Throwable e)
+		catch (Exception e)
 			throw new Exception("Invalid Codex thread/rollback result: " ~ e.msg);
 	}
 }

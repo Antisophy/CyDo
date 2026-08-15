@@ -1012,7 +1012,7 @@ private bool sameExtras(const ref JSONExtras left, const ref JSONExtras right)
 			if (!sameSO(jsonParse!SO(leftValue.json), jsonParse!SO((*rightValue).json)))
 				return false;
 		}
-		catch (Throwable)
+		catch (Exception)
 			return false;
 	}
 	return true;
