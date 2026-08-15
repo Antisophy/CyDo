@@ -1,3 +1,6 @@
+/// Resolves profile-qualified ACCESS ownership for a task's native history:
+/// agent, profile, session, effective CWD, and path. Codex DISPLAY
+/// reconstruction and native ROLLBACK admission are deliberately separate.
 module cydo.workflow.history.native_history;
 
 import std.exception : enforce;

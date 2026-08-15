@@ -1,3 +1,6 @@
+/// Supplies the lossless, exact-shape evidence required for fail-closed
+/// Codex ROLLBACK admission. Do not reuse rollout.d's tolerant DISPLAY
+/// projection here: doing so would weaken admission.
 module cydo.agent.drivers.codex.ledger;
 
 import std.conv : to;

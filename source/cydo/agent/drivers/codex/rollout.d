@@ -1,3 +1,6 @@
+/// Reconstructs useful Codex DISPLAY history from rollout JSONL. This
+/// projection is deliberately tolerant and must not authorize native
+/// ROLLBACK; ledger.d supplies the lossless exact-shape evidence for that.
 module cydo.agent.drivers.codex.rollout;
 
 import std.conv : to;
