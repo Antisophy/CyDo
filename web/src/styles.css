@@ -3579,6 +3579,19 @@ pre.extra-field-value {
   text-align: left;
 }
 
+.session-empty-inner a,
+.not-found a {
+  display: block;
+  margin-top: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.session-empty-inner a:hover,
+.not-found a:hover {
+  text-decoration: underline;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 8px;
