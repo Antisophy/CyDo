@@ -91,6 +91,7 @@ function makeRichState(): TaskState {
     error: "stderr line",
     undoPending: {
       afterUuid: "u-1",
+      kind: "history_entries",
       messagesRemoved: 1,
       canRevertFiles: false,
       retainsPrompt: false,

@@ -239,6 +239,24 @@ export type TaskStatus =
   | "failed"
   | "importable";
 
+interface UndoPendingBase {
+  afterUuid: string;
+  canRevertFiles: boolean;
+  retainsPrompt: boolean;
+  supportsFileRevert?: boolean;
+}
+
+export type UndoPending =
+  | (UndoPendingBase & { kind: "requesting" })
+  | (UndoPendingBase & {
+      kind: "history_entries";
+      messagesRemoved: number;
+    })
+  | (UndoPendingBase & {
+      kind: "codex_turns";
+      messagesRemoved: number;
+    });
+
 export interface TaskState {
   uuid: string;
   tid: number | null;
@@ -301,14 +319,7 @@ export interface TaskState {
   /** Last activity timestamp (unix millis), undefined if not set. */
   lastActive?: number;
   /** Pending undo confirmation (set by dry_run preview, cleared on confirm/dismiss). */
-  undoPending?: {
-    afterUuid: string;
-    messagesRemoved: number;
-    countUnit?: import("./protocol").UndoCountUnit;
-    canRevertFiles: boolean;
-    retainsPrompt: boolean;
-    supportsFileRevert?: boolean;
-  } | null;
+  undoPending?: UndoPending | null;
   /** Undo result output to display as a transient banner (null when not showing). */
   undoResult?: string | null;
   /** Auto-generated reply suggestions, shown when it's the user's turn. */

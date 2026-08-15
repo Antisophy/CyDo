@@ -23,7 +23,7 @@ import type {
   Notice,
   TasksListMessage,
 } from "./protocol";
-import type { CydoMeta, TaskState } from "./types";
+import type { CydoMeta, TaskState, UndoPending } from "./types";
 import { makeTaskState } from "./types";
 import {
   reduceAgentAck,
@@ -1784,16 +1784,17 @@ export function useTaskManager(
           const { tid, messages_removed, count_unit } = msg;
           const t = findByTid(tid);
           if (!t) break;
+          const undoPending: UndoPending = {
+            afterUuid: t.undoPending?.afterUuid ?? "",
+            kind: count_unit,
+            messagesRemoved: messages_removed,
+            canRevertFiles: t.undoPending?.canRevertFiles ?? false,
+            retainsPrompt: t.undoPending?.retainsPrompt ?? false,
+            supportsFileRevert: t.undoPending?.supportsFileRevert ?? true,
+          };
           const updated = {
             ...t,
-            undoPending: {
-              afterUuid: t.undoPending?.afterUuid ?? "",
-              messagesRemoved: messages_removed,
-              countUnit: count_unit,
-              canRevertFiles: t.undoPending?.canRevertFiles ?? false,
-              retainsPrompt: t.undoPending?.retainsPrompt ?? false,
-              supportsFileRevert: t.undoPending?.supportsFileRevert ?? true,
-            },
+            undoPending,
           };
           liveStates.set(t.uuid, updated);
           setTasks((prev) => {
@@ -2798,16 +2799,16 @@ export function useTaskManager(
           }
         | undefined;
       const canRevertFiles = !!boundary?.history_boundary?.checkpoint_uuid;
+      const undoPending: UndoPending = {
+        afterUuid,
+        kind: "requesting",
+        canRevertFiles,
+        retainsPrompt: boundary?.history_boundary?.kind === "agent_turn",
+        supportsFileRevert: t.sessionInfo?.supports_file_revert !== false,
+      };
       const updated = {
         ...t,
-        undoPending: {
-          afterUuid,
-          messagesRemoved: -1,
-          countUnit: undefined,
-          canRevertFiles,
-          retainsPrompt: boundary?.history_boundary?.kind === "agent_turn",
-          supportsFileRevert: t.sessionInfo?.supports_file_revert !== false,
-        },
+        undoPending,
       };
       liveStates.set(t.uuid, updated);
       setTasks((prev) => {
@@ -2823,15 +2824,14 @@ export function useTaskManager(
     (tid: number, revertConversation: boolean, revertFiles: boolean) => {
       const t = findByTid(tid);
       if (!t?.undoPending) return;
+      const pending = t.undoPending;
       connRef.current?.undoTask(
         tid,
-        t.undoPending.afterUuid,
+        pending.afterUuid,
         false,
         revertConversation,
-        revertFilesForUndo(t.undoPending.canRevertFiles, revertFiles),
-        t.undoPending.countUnit === "codex_turns"
-          ? t.undoPending.messagesRemoved
-          : undefined,
+        revertFilesForUndo(pending.canRevertFiles, revertFiles),
+        pending.kind === "codex_turns" ? pending.messagesRemoved : undefined,
       );
       // Clear undoPending
       const updated = { ...t, undoPending: null };

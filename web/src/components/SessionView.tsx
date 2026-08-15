@@ -101,6 +101,10 @@ function SessionViewInner({
   const resumeRef = useRef<HTMLButtonElement>(null);
 
   const tid = task.tid as number;
+  const undoPreview =
+    task.undoPending && task.undoPending.kind !== "requesting"
+      ? task.undoPending
+      : null;
 
   const handleSend = useCallback(
     (text: string, images?: ImageAttachment[]) => {
@@ -432,12 +436,12 @@ function SessionViewInner({
           getTaskHref={getTaskHref}
         />
       )}
-      {task.undoPending && task.undoPending.messagesRemoved >= 0 && (
+      {undoPreview && undoPreview.messagesRemoved >= 0 && (
         <UndoConfirmDialog
-          messagesRemoved={task.undoPending.messagesRemoved}
-          canRevertFiles={task.undoPending.canRevertFiles}
-          retainsPrompt={task.undoPending.retainsPrompt}
-          supportsFileRevert={task.undoPending.supportsFileRevert ?? true}
+          messagesRemoved={undoPreview.messagesRemoved}
+          canRevertFiles={undoPreview.canRevertFiles}
+          retainsPrompt={undoPreview.retainsPrompt}
+          supportsFileRevert={undoPreview.supportsFileRevert ?? true}
           onConfirm={handleUndoConfirm}
           onDismiss={handleUndoDismiss}
         />

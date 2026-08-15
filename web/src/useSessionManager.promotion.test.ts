@@ -168,6 +168,20 @@ describe("task promotion", () => {
     const currentManager = await renderManager();
 
     currentManager.undoPreview(42, "boundary-42");
+    expect((await renderManager()).getByTid(42)?.undoPending).toEqual({
+      afterUuid: "boundary-42",
+      kind: "requesting",
+      canRevertFiles: false,
+      retainsPrompt: false,
+      supportsFileRevert: true,
+    });
+    expect(connection.undoTask).toHaveBeenLastCalledWith(
+      42,
+      "boundary-42",
+      true,
+      false,
+      false,
+    );
     await act(() => {
       connection.onControlMessage?.({
         type: "undo_preview",
@@ -177,10 +191,13 @@ describe("task promotion", () => {
       } satisfies ControlMessage);
     });
 
-    expect((await renderManager()).getByTid(42)?.undoPending).toMatchObject({
+    expect((await renderManager()).getByTid(42)?.undoPending).toEqual({
       afterUuid: "boundary-42",
+      kind: "codex_turns",
       messagesRemoved: 3,
-      countUnit: "codex_turns",
+      canRevertFiles: false,
+      retainsPrompt: false,
+      supportsFileRevert: true,
     });
 
     manager!.undoConfirm(42, true, false);
@@ -207,6 +224,15 @@ describe("task promotion", () => {
         messages_removed: 4,
         count_unit: "history_entries",
       } satisfies ControlMessage);
+    });
+
+    expect((await renderManager()).getByTid(42)?.undoPending).toEqual({
+      afterUuid: "boundary-42",
+      kind: "history_entries",
+      messagesRemoved: 4,
+      canRevertFiles: false,
+      retainsPrompt: false,
+      supportsFileRevert: true,
     });
 
     manager!.undoConfirm(42, true, false);
