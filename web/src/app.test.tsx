@@ -26,6 +26,7 @@ const state = vi.hoisted(() => ({
   entryPoints: [] as TaskManager["entryPoints"],
   agents: [] as TaskManager["agents"],
   connected: true,
+  tasksLoaded: true,
   getByTid: vi.fn(),
 }));
 
@@ -58,6 +59,7 @@ vi.mock("./useSessionManager", () => ({
       activeTaskIdRef: { current: state.activeTaskId },
       setActiveTaskId: vi.fn(),
       connected: state.connected,
+      tasksLoaded: state.tasksLoaded,
       send: vi.fn(),
       interrupt: vi.fn(),
       stop: vi.fn(),
@@ -168,6 +170,7 @@ beforeEach(() => {
   state.entryPoints = [];
   state.agents = [];
   state.connected = true;
+  state.tasksLoaded = true;
   state.getByTid.mockReset();
   state.getByTid.mockImplementation((tid: number) =>
     Array.from(state.tasks.values()).find((task) => task.tid === tid),
@@ -1105,7 +1108,7 @@ describe("server command errors", () => {
 describe("missing numeric tasks", () => {
   const tid = 123;
 
-  it("shows a not-found message after connecting", () => {
+  it("shows a not-found message once the tasks list has loaded", () => {
     state.activeTaskId = String(tid);
 
     const html = renderToString(h(App, {}));
@@ -1114,9 +1117,22 @@ describe("missing numeric tasks", () => {
     expect(html).not.toContain("Loading task…");
   });
 
+  it("keeps loading while the tasks list has not loaded yet, even if connected", () => {
+    state.activeTaskId = String(tid);
+    state.connected = true;
+    state.tasksLoaded = false;
+
+    const html = renderToString(h(App, {}));
+
+    expect(html).toContain("Loading task…");
+    expect(html).not.toContain(`Task ${tid} not found`);
+  });
+
   it("keeps loading while disconnected", () => {
+    // A real disconnect resets tasksListEpoch, so tasksLoaded goes false too.
     state.activeTaskId = String(tid);
     state.connected = false;
+    state.tasksLoaded = false;
 
     expect(renderToString(h(App, {}))).toContain("Loading task…");
   });

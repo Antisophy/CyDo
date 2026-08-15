@@ -193,6 +193,7 @@ export interface TaskManager {
   activeTaskIdRef: { current: string | null };
   setActiveTaskId: (id: string) => void;
   connected: boolean;
+  tasksLoaded: boolean;
   send: (uuid: string, text: string, images?: ImageAttachment[]) => void;
   interrupt: (uuid: string) => void;
   stop: (uuid: string) => void;
@@ -3196,12 +3197,19 @@ export function useTaskManager(
     return findByTid(tid);
   }, []);
 
+  const tasksLoaded =
+    tasksListEpoch !== null &&
+    tasksListEpoch === renderedConnectionEpoch &&
+    tasksListEpochRef.current === renderedConnectionEpoch &&
+    isCurrentOpenEpoch(renderedConnectionEpoch);
+
   return {
     tasks,
     activeTaskId,
     activeTaskIdRef,
     setActiveTaskId,
     connected,
+    tasksLoaded,
     send,
     interrupt,
     stop,

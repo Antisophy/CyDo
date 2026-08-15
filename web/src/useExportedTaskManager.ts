@@ -220,6 +220,7 @@ export function useExportedTaskManager(): TaskManager {
     activeTaskIdRef,
     setActiveTaskId,
     connected: false,
+    tasksLoaded: true,
     send: noop,
     interrupt: noop,
     stop: noop,

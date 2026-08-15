@@ -39,6 +39,7 @@ function AppContent() {
     activeTaskIdRef,
     setActiveTaskId,
     connected,
+    tasksLoaded,
     send,
     interrupt,
     stop,
@@ -537,7 +538,7 @@ function AppContent() {
                   <span class="archive-placeholder">Importable sessions</span>
                 </div>
               </div>
-            ) : connected && activeTaskId !== null && active === null ? (
+            ) : tasksLoaded && activeTaskId !== null && active === null ? (
               <div class="session-empty">
                 <div class="session-empty-inner">
                   <span>Task {activeTaskId} not found</span>
