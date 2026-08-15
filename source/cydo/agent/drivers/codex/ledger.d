@@ -1919,14 +1919,16 @@ private bool hasRollbackMarkerPayloadShape(const ref RolloutLineEvidence evidenc
 {
 	if (!evidence.parsed || evidence.raw.type != RolloutValueType.object)
 		return false;
-	size_t payloadCount;
-	auto payload = rolloutField(evidence.raw, "payload", payloadCount);
-	if (payloadCount != 1 || payload is null || payload.type != RolloutValueType.object)
-		return false;
-	foreach (i, key; payload.keys)
-		if (key == "type" && payload.values[i].type == RolloutValueType.string_
-			&& payload.values[i].text == "thread_rolled_back")
-			return true;
+	foreach (i, key; evidence.raw.keys)
+	{
+		if (key != "payload" || evidence.raw.values[i].type != RolloutValueType.object)
+			continue;
+		foreach (j, payloadKey; evidence.raw.values[i].keys)
+			if (payloadKey == "type"
+				&& evidence.raw.values[i].values[j].type == RolloutValueType.string_
+				&& evidence.raw.values[i].values[j].text == "thread_rolled_back")
+				return true;
+	}
 	return false;
 }
 
@@ -1950,6 +1952,20 @@ package NativeRollbackMarker classifyNativeRollbackMarker(string line)
 		? NativeRollbackMarkerStatus.valid
 		: NativeRollbackMarkerStatus.malformed;
 	return result;
+}
+
+unittest
+{
+	foreach (duplicateRollbackMarker; [
+		`{"timestamp":"first","timestamp":"second","type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`,
+		`{"type":"event_msg","type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}`,
+		`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1},"payload":{"type":"task_complete"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete"},"payload":{"type":"thread_rolled_back","num_turns":1}}`,
+		`{"type":"event_msg","payload":{"type":"thread_rolled_back","type":"thread_rolled_back","num_turns":1}}`,
+		`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1,"num_turns":1}}`,
+	])
+		assert(classifyNativeRollbackMarker(duplicateRollbackMarker).status
+			== NativeRollbackMarkerStatus.malformed);
 }
 
 unittest

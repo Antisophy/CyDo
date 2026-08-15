@@ -1415,6 +1415,9 @@ unittest
 
 	enum nativeThreadId = "native-undo-test-thread";
 	enum v1AbortWrapper = nativeV1AbortWrapper;
+	assert(verifyNativeUndoMarkerWindow(
+		`{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1},"payload":{"type":"task_complete"}}`,
+		0, 1).status == NativeUndoMarkerVerificationStatus.failure);
 	assert(checkedNativeUndoCount(1, 0) == 1);
 	int parsedLine;
 	assert(parseLineAnchor("line:1", parsedLine) && parsedLine == 1);
@@ -2009,6 +2012,8 @@ unittest
 	]);
 	auto malformedMarkerRollout = simpleRollout("U1", "client-one", "prompt", "answer")
 		~ "\n" ~ `{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":"bad"}}`;
+	auto duplicatePayloadMarkerRollout = simpleRollout("U1", "client-one", "prompt", "answer")
+		~ "\n" ~ `{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1},"payload":{"type":"task_complete"}}`;
 	auto malformedCandidateLineRollout = simpleRollout("U1", "client-one", "prompt", "answer")
 		~ "\n" ~ `{"type":"event_msg","payload":`;
 	auto unknownCandidateLineRollout = simpleRollout("U1", "client-one", "prompt", "answer")
@@ -2096,6 +2101,8 @@ unittest
 			oneTurnLedger, NativeUndoPreparationRefusalCategory.unsupportedSuffix),
 		RefusalCase("malformed rollback marker", malformedMarkerRollout, oneTurnLedger,
 			NativeUndoPreparationRefusalCategory.association),
+		RefusalCase("duplicate payload rollback marker", duplicatePayloadMarkerRollout,
+			oneTurnLedger, NativeUndoPreparationRefusalCategory.unsupportedSuffix),
 		RefusalCase("malformed candidate physical line", malformedCandidateLineRollout,
 			oneTurnLedger, NativeUndoPreparationRefusalCategory.unsupportedSuffix),
 		RefusalCase("unknown candidate top-level record", unknownCandidateLineRollout,
