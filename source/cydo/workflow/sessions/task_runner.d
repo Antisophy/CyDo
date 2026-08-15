@@ -784,6 +784,12 @@ public:
 		td = requireTask(tid, "Task disappeared before session creation");
 		auto session = taskAgent.createSession(tid, td.agentSessionId,
 			launch.processLaunch, launch.sessionConfig);
+		if (auto binding = tid in liveHistoryBindings_)
+		{
+			auto previous = tid in sessions_;
+			if (previous is null || (*binding).owner is *previous)
+				liveHistoryBindings_.remove(tid);
+		}
 		sessions_[tid] = session;
 		host_.clearLastActive(tid);
 		session.onNativeSessionStarted = (string sessionId) {
