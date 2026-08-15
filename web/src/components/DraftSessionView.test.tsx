@@ -104,7 +104,7 @@ function mockImageReader() {
   };
 }
 
-describe("DraftSessionView disabled drafts", () => {
+describe("DraftSessionView draft availability", () => {
   let container: HTMLDivElement;
 
   const mount = (draftView: DraftView) => {
@@ -134,7 +134,7 @@ describe("DraftSessionView disabled drafts", () => {
     send: container.querySelector<HTMLButtonElement>(".btn-send")!,
   });
 
-  const expectControlsDisabled = () => {
+  const expectFullyDisabledControls = () => {
     const { taskTypePicker, taskTypeButtons, agentPicker, textarea, send } =
       controls();
 
@@ -170,13 +170,14 @@ describe("DraftSessionView disabled drafts", () => {
       agent: "",
       lifecycle: "idle",
       disabled: true,
+      metadataReady: false,
       composerResetToken: 0,
     };
 
     try {
       mount(draftView);
 
-      expectControlsDisabled();
+      expectFullyDisabledControls();
       pasteImage(controls().textarea);
       imageReader.complete();
       await flush();
@@ -185,6 +186,57 @@ describe("DraftSessionView disabled drafts", () => {
     } finally {
       imageReader.restore();
     }
+  });
+
+  it("keeps the composer enabled while metadata blocks configuration and send", async () => {
+    const onTextChange = vi.fn();
+    const onEntryPointChange = vi.fn();
+    const onAgentChange = vi.fn();
+    const onSubmit = vi.fn();
+    const draftView = {
+      kind: "resolved",
+      projectKey: "workspace\0/project",
+      viewKey: "workspace\0/project",
+      workspace: "workspace",
+      projectName: "project",
+      projectPath: "/project",
+      remoteTid: null,
+      text: "typing before metadata",
+      entryPoint: "",
+      agent: "",
+      lifecycle: "idle",
+      disabled: false,
+      metadataReady: false,
+      composerResetToken: 0,
+      onTextChange,
+      onEntryPointChange,
+      onAgentChange,
+      onBlur: vi.fn(),
+      onSubmit,
+    } satisfies DraftViewSnapshot;
+
+    mount(draftView);
+
+    const { taskTypePicker, taskTypeButtons, agentPicker, textarea, send } =
+      controls();
+    expect(taskTypePicker.tabIndex).toBe(-1);
+    for (const button of taskTypeButtons) expect(button.disabled).toBe(true);
+    expect(agentPicker.disabled).toBe(true);
+    expect(textarea.disabled).toBe(false);
+    expect(send.disabled).toBe(true);
+
+    textarea.value = "updated before metadata";
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    expect(onTextChange).toHaveBeenCalledWith("updated before metadata");
+
+    taskTypeButtons[1]!.click();
+    agentPicker.value = "claude";
+    agentPicker.dispatchEvent(new Event("change", { bubbles: true }));
+    send.click();
+    expect(onEntryPointChange).not.toHaveBeenCalled();
+    expect(onAgentChange).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
   });
 
   it("rejects dropped attachments while a resolved draft is submitting", async () => {
@@ -203,6 +255,7 @@ describe("DraftSessionView disabled drafts", () => {
       agent: "codex",
       lifecycle: "submitting",
       disabled: true,
+      metadataReady: true,
       composerResetToken: 0,
       onTextChange: vi.fn(),
       onEntryPointChange,
@@ -213,7 +266,7 @@ describe("DraftSessionView disabled drafts", () => {
 
     try {
       mount(draftView);
-      expectControlsDisabled();
+      expectFullyDisabledControls();
 
       const { taskTypePicker, taskTypeButtons } = controls();
       taskTypePicker.dispatchEvent(

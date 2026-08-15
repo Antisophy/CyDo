@@ -41,8 +41,8 @@ interface ControlledProps extends CommonProps {
   onChange: (value: string) => void;
   onBlur: () => void;
   onSubmit: (text: string, images: ImageAttachment[]) => void;
+  submitDisabled?: boolean;
   composerResetToken: number;
-  preserveImagesWhenDisabled?: boolean;
   imageStore?: ControlledImageStore;
   imageKey?: string;
 }
@@ -135,15 +135,12 @@ function publishImages(entry: ControlledImageEntry, images: ImageAttachment[]) {
 function useImageAttachments(
   enabled = true,
   resetToken?: number,
-  preserveImagesWhenDisabled = false,
   imageStore?: ControlledImageStore,
   imageKey?: string,
 ) {
   const imageEntry =
     imageStore && imageKey !== undefined && resetToken !== undefined
-      ? enabled ||
-        preserveImagesWhenDisabled ||
-        imageStore.entries.has(imageKey)
+      ? enabled || imageStore.entries.has(imageKey)
         ? controlledImageEntry(imageStore, imageKey, resetToken)
         : null
       : null;
@@ -156,21 +153,12 @@ function useImageAttachments(
   const [isDragging, setIsDragging] = useState(false);
   const enabledRef = useRef(enabled);
   const resetTokenRef = useRef(resetToken);
-  const preserveImagesWhenDisabledRef = useRef(preserveImagesWhenDisabled);
   const generationRef = useRef(imageEntry?.generation ?? 0);
   const imagesRef = useRef(images);
   const invalidatedRef = useRef(false);
 
   const wasEnabled = enabledRef.current;
-  const wasPreservingDisabled =
-    !wasEnabled && preserveImagesWhenDisabledRef.current;
-  if (
-    resetTokenRef.current !== resetToken ||
-    (!enabled && !preserveImagesWhenDisabled && wasPreservingDisabled) ||
-    (wasEnabled !== enabled &&
-      !(!enabled && preserveImagesWhenDisabled) &&
-      !(enabled && wasPreservingDisabled))
-  ) {
+  if (resetTokenRef.current !== resetToken || wasEnabled !== enabled) {
     generationRef.current =
       (imageEntry?.generation ?? generationRef.current) + 1;
     if (imageEntry) {
@@ -181,7 +169,6 @@ function useImageAttachments(
   }
   enabledRef.current = enabled;
   resetTokenRef.current = resetToken;
-  preserveImagesWhenDisabledRef.current = preserveImagesWhenDisabled;
 
   useLayoutEffect(() => {
     if (!imageEntry) return;
@@ -210,7 +197,7 @@ function useImageAttachments(
     else setImagesState(next);
     setImagesGeneration(generationRef.current);
     setIsDragging(false);
-  }, [enabled, imageEntry, preserveImagesWhenDisabled, resetToken]);
+  }, [enabled, imageEntry, resetToken]);
 
   const setImages = (
     next:
@@ -307,11 +294,7 @@ function useImageAttachments(
   };
 
   return {
-    images:
-      (enabled || preserveImagesWhenDisabled) &&
-      imagesGeneration === generationRef.current
-        ? images
-        : [],
+    images: enabled && imagesGeneration === generationRef.current ? images : [],
     setImages,
     isDragging: enabled && isDragging,
     onPaste,
@@ -630,8 +613,8 @@ function ControlledInputBox({
   onChange,
   onBlur,
   onSubmit,
+  submitDisabled = false,
   composerResetToken,
-  preserveImagesWhenDisabled = false,
   imageStore,
   imageKey,
   inputRef,
@@ -647,13 +630,7 @@ function ControlledInputBox({
     onDragOver,
     onDragLeave,
     onDrop,
-  } = useImageAttachments(
-    !disabled,
-    composerResetToken,
-    preserveImagesWhenDisabled,
-    imageStore,
-    imageKey,
-  );
+  } = useImageAttachments(!disabled, composerResetToken, imageStore, imageKey);
   const internalRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = inputRef ?? internalRef;
   const valueRef = useRef(value);
@@ -719,7 +696,7 @@ function ControlledInputBox({
   }, [value]);
 
   const submit = () => {
-    if (disabled) return;
+    if (disabled || submitDisabled) return;
     const text = valueRef.current.trim();
     if (!text && images.length === 0) return;
     const attachments = images;
@@ -777,7 +754,10 @@ function ControlledInputBox({
         class="btn btn-send"
         onClick={submit}
         disabled={
-          disabled || !!stdinClosed || (!value.trim() && images.length === 0)
+          disabled ||
+          submitDisabled ||
+          !!stdinClosed ||
+          (!value.trim() && images.length === 0)
         }
       >
         Send

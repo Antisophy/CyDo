@@ -253,6 +253,7 @@ describe("server command errors", () => {
       agent: "agent",
       lifecycle: "present",
       disabled: false,
+      metadataReady: true,
       composerResetToken: 0,
       onTextChange: vi.fn(),
       onEntryPointChange: vi.fn(),
@@ -339,6 +340,7 @@ describe("server command errors", () => {
       agent: "agent",
       lifecycle: "creating",
       disabled: false,
+      metadataReady: true,
       composerResetToken: 11,
       onTextChange: vi.fn(),
       onEntryPointChange: vi.fn(),
@@ -413,7 +415,7 @@ describe("server command errors", () => {
     }
   });
 
-  it("keeps the project composer through temporary metadata loss", async () => {
+  it("keeps the project composer editable through temporary metadata loss", async () => {
     const readers: FileReader[] = [];
     const readAsDataURL = vi
       .spyOn(FileReader.prototype, "readAsDataURL")
@@ -456,6 +458,7 @@ describe("server command errors", () => {
       agent: "agent",
       lifecycle: "creating" as const,
       disabled: false,
+      metadataReady: true,
       composerResetToken: 15,
       onTextChange: vi.fn(),
       onEntryPointChange: vi.fn(),
@@ -497,8 +500,7 @@ describe("server command errors", () => {
 
       state.draftView = {
         ...projectDraft,
-        disabled: true,
-        preserveImagesWhenDisabled: true,
+        metadataReady: false,
       };
       await act(() => {
         render(h(App, {}), container!);
@@ -507,7 +509,13 @@ describe("server command errors", () => {
       expect(container.querySelector(".input-box")).toBe(beforeInputBox);
       expect(container.querySelector("textarea")).toBe(beforeTextarea);
       expect(container.querySelectorAll("textarea")).toHaveLength(1);
-      expect(beforeTextarea.disabled).toBe(true);
+      expect(beforeTextarea.disabled).toBe(false);
+      expect(
+        container.querySelector<HTMLButtonElement>(".btn-send")?.disabled,
+      ).toBe(true);
+      expect(
+        container.querySelector<HTMLSelectElement>(".agent-picker")?.disabled,
+      ).toBe(true);
       expect(container.querySelector(".session-empty")).toBeNull();
       expect(container.textContent).not.toContain("Loading task…");
       expect(
@@ -578,8 +586,8 @@ describe("server command errors", () => {
       entryPoint: "entry A",
       agent: "agent A",
       lifecycle: "creating" as const,
-      disabled: true,
-      preserveImagesWhenDisabled: true,
+      disabled: false,
+      metadataReady: false,
       composerResetToken: 19,
       onTextChange: vi.fn(),
       onEntryPointChange: vi.fn(),
@@ -632,7 +640,7 @@ describe("server command errors", () => {
         },
       ];
       state.agents = [{ name: "agent A", driver: "claude" }];
-      state.draftView = { ...cachedDraft, disabled: false };
+      state.draftView = cachedDraft;
       container = document.createElement("div");
       document.body.appendChild(container);
       await act(() => {
@@ -695,12 +703,15 @@ describe("server command errors", () => {
       ).toBe("agent A");
       expect(
         container.querySelector<HTMLTextAreaElement>("textarea")?.disabled,
+      ).toBe(false);
+      expect(
+        container.querySelector<HTMLButtonElement>(".btn-send")?.disabled,
       ).toBe(true);
 
       state.draftView = {
         ...cachedDraft,
         disabled: false,
-        preserveImagesWhenDisabled: false,
+        metadataReady: true,
       };
       await act(() => {
         render(h(App, {}), container!);
@@ -758,6 +769,7 @@ describe("server command errors", () => {
       agent: "agent",
       lifecycle: "creating" as const,
       disabled: false,
+      metadataReady: true,
       composerResetToken: 0,
       onTextChange: vi.fn(),
       onEntryPointChange: vi.fn(),
@@ -998,6 +1010,7 @@ describe("server command errors", () => {
       projectPath: "/project",
       lifecycle: "present" as const,
       disabled: false,
+      metadataReady: true,
       onTextChange: vi.fn(),
       onEntryPointChange: vi.fn(),
       onAgentChange: vi.fn(),

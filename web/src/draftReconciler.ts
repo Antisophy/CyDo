@@ -20,12 +20,17 @@ export interface ProjectIdentity {
 }
 
 export interface FormDefaults {
-  entryPoint: string;
-  agent: string;
+  entryPoint: string | null;
+  agent: string | null;
 }
 
 export interface DraftForm extends FormDefaults {
   text: string;
+}
+
+export interface ResolvedDraftForm extends DraftForm {
+  entryPoint: string;
+  agent: string;
 }
 
 export interface ImageAttachment {
@@ -88,7 +93,7 @@ export interface SlotInit {
   defaults: FormDefaults;
 }
 
-export interface TaskSnapshot extends DraftForm {
+export interface TaskSnapshot extends ResolvedDraftForm {
   tid: number;
   active: boolean;
   processing: boolean;
@@ -161,7 +166,7 @@ export type DraftEffect =
       type: "project-draft";
       projectKey: ProjectKey;
       tid: number;
-      form: DraftForm;
+      form: ResolvedDraftForm;
       formVersion: number;
     }
   | { type: "delete-task"; projectKey: ProjectKey; tid: number }
@@ -189,6 +194,12 @@ export type DraftEvent =
       type: "initialize-slot";
       project: ProjectIdentity;
       defaults: FormDefaults;
+    }
+  | {
+      type: "resolve-metadata";
+      projectKey: ProjectKey;
+      entryPoint: string;
+      agent: string;
     }
   | {
       type: "edit-text";
@@ -327,6 +338,9 @@ export function reduceDraft(state: DraftState, event: DraftEvent): DraftResult {
     case "initialize-slot":
       return initializeSlot(state, event.project, event.defaults);
 
+    case "resolve-metadata":
+      return resolveMetadata(state, event);
+
     case "edit-text":
       return editText(state, event);
 
@@ -378,6 +392,17 @@ export function assertNever(value: never): never {
   throw new Error("Unexpected value: " + JSON.stringify(value));
 }
 
+export function assertResolvedDraftForm<T extends DraftForm>(
+  form: T,
+): asserts form is T & ResolvedDraftForm {
+  if (form.entryPoint === null) {
+    throw new Error("Draft create/sync requires a resolved entry point");
+  }
+  if (form.agent === null) {
+    throw new Error("Draft create/sync requires a resolved agent");
+  }
+}
+
 function initializeSlot(
   state: DraftState,
   project: ProjectIdentity,
@@ -396,6 +421,67 @@ function initializeSlot(
     },
     effects: [],
   };
+}
+
+function resolveMetadata(
+  state: DraftState,
+  event: Extract<DraftEvent, { type: "resolve-metadata" }>,
+): DraftResult {
+  const current = getSlot(state, event.projectKey);
+  const defaults: FormDefaults = {
+    entryPoint:
+      current.defaults.entryPoint === null
+        ? event.entryPoint
+        : current.defaults.entryPoint,
+    agent:
+      current.defaults.agent === null ? event.agent : current.defaults.agent,
+  };
+  const observed: DraftForm = {
+    ...current.observed,
+    entryPoint:
+      current.defaults.entryPoint === null
+        ? event.entryPoint
+        : current.observed.entryPoint,
+    agent:
+      current.defaults.agent === null ? event.agent : current.observed.agent,
+  };
+
+  if (current.desired.kind === "none") {
+    return {
+      state: replaceSlot(state, event.projectKey, {
+        ...current,
+        defaults,
+        observed,
+      }),
+      effects: [],
+    };
+  }
+
+  const next = replaceSlot(state, event.projectKey, {
+    ...current,
+    defaults,
+    observed,
+    desired: {
+      ...current.desired,
+      entryPoint:
+        current.defaults.entryPoint === null
+          ? acceptsObservedValue(
+              current.desired.entryPoint,
+              current.observed.entryPoint,
+              event.entryPoint,
+            )
+          : current.desired.entryPoint,
+      agent:
+        current.defaults.agent === null
+          ? acceptsObservedValue(
+              current.desired.agent,
+              current.observed.agent,
+              event.agent,
+            )
+          : current.desired.agent,
+    },
+  });
+  return reconcileCore(next, event.projectKey);
 }
 
 function editText(
@@ -669,6 +755,7 @@ function createTimerDue(
   ) {
     return { state, effects: [] };
   }
+  assertResolvedDraftForm(current.desired);
 
   const next = replaceSlot(state, event.projectKey, {
     ...current,
@@ -758,6 +845,7 @@ function taskCreated(
     slot.remote.generation === event.correlationId &&
     slot.desired.uuid === event.correlationId
   ) {
+    assertResolvedDraftForm(slot.desired);
     return {
       state: reconciled.state,
       effects: [
@@ -992,6 +1080,7 @@ function switchPersisted(
   if (current.remote.tid === event.snapshot.tid) {
     throw new Error("A persisted draft cannot switch to itself");
   }
+  assertResolvedDraftForm(current.desired);
   assertTidUnowned(state, event.projectKey, event.snapshot.tid);
   const withPersistedUuid = bindPersistedUuid(
     state,
@@ -1053,6 +1142,7 @@ function afterLocalFormChange(
   const reconciled = reconcileCore(state, projectKey);
   const current = getSlot(reconciled.state, projectKey);
   if (!isCurrentPresentEditing(current)) return reconciled;
+  assertResolvedDraftForm(current.desired);
 
   const effects: DraftEffect[] = [...reconciled.effects];
   if (changed.entryPoint) {
@@ -1090,6 +1180,9 @@ function reconcileCore(state: DraftState, projectKey: ProjectKey): DraftResult {
           return { state, effects: [] };
 
         case "editing":
+          if (current.desired.entryPoint === null) {
+            return { state, effects: [] };
+          }
           if (current.createSchedule === current.desired.uuid) {
             return { state, effects: [] };
           }
@@ -1114,6 +1207,7 @@ function reconcileCore(state: DraftState, projectKey: ProjectKey): DraftResult {
           };
 
         case "submitting": {
+          assertResolvedDraftForm(current.desired);
           if (current.desired.delivery !== "atomic-create") {
             throw new Error("send-when-present cannot target an absent task");
           }
@@ -1228,7 +1322,9 @@ function submitPresent(
     };
   }
 
-  const clearedForm: DraftForm = {
+  assertResolvedDraftForm(current.desired);
+
+  const clearedForm: ResolvedDraftForm = {
     text: "",
     entryPoint: current.desired.entryPoint,
     agent: current.desired.agent,
@@ -1366,14 +1462,16 @@ function projectEffect(
   tid: number,
   current: DraftSlotState,
 ): DraftEffect {
+  const form = selectDraftForm(
+    { slots: { [projectKey]: current }, uuidBindings: [] },
+    projectKey,
+  );
+  assertResolvedDraftForm(form);
   return {
     type: "project-draft",
     projectKey,
     tid,
-    form: selectDraftForm(
-      { slots: { [projectKey]: current }, uuidBindings: [] },
-      projectKey,
-    ),
+    form,
     formVersion: current.formVersion,
   };
 }
@@ -1521,11 +1619,11 @@ function hasOwnProperty(value: object, field: PropertyKey): boolean {
   return Object.prototype.hasOwnProperty.call(value, field);
 }
 
-function acceptsObservedValue(
-  local: string,
-  observed: string,
+function acceptsObservedValue<T extends string | null>(
+  local: T,
+  observed: T,
   incoming: string,
-): string {
+): T | string {
   return local === "" || local === observed ? incoming : local;
 }
 

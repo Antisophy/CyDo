@@ -546,6 +546,7 @@ export function DraftSessionView({
   const entryPointPickerRef = useRef<HTMLDivElement>(null);
   const lastFocusTargetRef = useRef<HTMLElement | null>(null);
   const disabled = draftView.disabled;
+  const configurationDisabled = disabled || !draftView.metadataReady;
 
   const focusInput = useCallback(() => {
     inputRef.current?.focus();
@@ -559,13 +560,14 @@ export function DraftSessionView({
       lastFocusTargetRef.current = null;
       return;
     }
-    const target = draftView.text.trim()
-      ? inputRef.current
-      : entryPointPickerRef.current;
+    const target =
+      draftView.text.trim() || configurationDisabled
+        ? inputRef.current
+        : entryPointPickerRef.current;
     if (!target || target === lastFocusTargetRef.current) return;
     target.focus();
     lastFocusTargetRef.current = target;
-  }, [disabled, draftView.text, draftView.viewKey]);
+  }, [configurationDisabled, disabled, draftView.text, draftView.viewKey]);
 
   useLayoutEffect(() => {
     if (disabled) return;
@@ -663,7 +665,7 @@ export function DraftSessionView({
             selected={draftView.entryPoint}
             selectedAgent={draftView.agent || defaultAgent}
             onEntryPointChange={changeEntryPoint}
-            disabled={disabled}
+            disabled={configurationDisabled}
             pickerRef={entryPointPickerRef}
             onConfirm={focusInput}
             onType={focusInput}
@@ -672,7 +674,7 @@ export function DraftSessionView({
             agents={agents}
             selected={draftView.agent || defaultAgent}
             onChange={changeAgent}
-            disabled={disabled}
+            disabled={configurationDisabled}
           />
           <InputBox
             mode="controlled"
@@ -680,13 +682,11 @@ export function DraftSessionView({
             onChange={changeText}
             onBlur={flush}
             onSubmit={submit}
+            submitDisabled={!draftView.metadataReady}
             composerResetToken={draftView.composerResetToken}
             imageStore={imageStore}
             imageKey={
               draftView.kind === "resolved" ? draftView.projectKey : undefined
-            }
-            preserveImagesWhenDisabled={
-              draftView.preserveImagesWhenDisabled ?? false
             }
             onInterrupt={() => {}}
             isProcessing={false}

@@ -450,9 +450,34 @@ function persistedSnapshot(
     workspace: "source",
     project_path: "/source-project",
     draft,
+    task_type: "blank",
     entry_point: "entry",
     agent_name: "agent",
   };
+}
+
+async function preparePreCatalogPersistedDraft(
+  snapshot: TaskSnapshotEntry,
+): Promise<DraftViewSnapshot> {
+  testState.route.tid = String(snapshot.tid);
+  await renderManager();
+  const connection = testState.connection!;
+  await act(() => {
+    connection.onControlMessage?.(workspaceCatalog());
+    connection.onControlMessage?.(globalTaskTypes("entry", "global-type"));
+    connection.onControlMessage?.(agents("agent"));
+    testState.uuid = `pre-catalog-${snapshot.tid}-uuid`;
+    connection.onControlMessage?.({
+      type: "tasks_list",
+      tasks: [snapshot],
+    } satisfies ControlMessage);
+    testState.uuid = "submission-uuid";
+  });
+  const draftView = (await renderManager()).draftView;
+  if (!draftView || draftView.kind !== "resolved") {
+    throw new Error("Pre-catalog persisted draft did not attach");
+  }
+  return draftView;
 }
 
 function acknowledgeSubmission(tid: number) {
@@ -942,7 +967,7 @@ describe("submission acknowledgement routing", () => {
     expect(testState.navigate).toHaveBeenCalledWith("/source/project/task/74");
   });
 
-  it("retains an initialized slot while workspace metadata is temporarily absent", async () => {
+  it("keeps an initialized slot editable while workspace metadata is temporarily absent", async () => {
     await bootstrapProject();
     const initial = (await renderManager()).draftView;
     if (!initial || initial.kind !== "resolved") {
@@ -984,7 +1009,8 @@ describe("submission acknowledgement routing", () => {
       text: "retain this draft through metadata loss",
       entryPoint: "entry",
       agent: "agent",
-      disabled: true,
+      disabled: false,
+      metadataReady: false,
       composerResetToken,
     });
     await act(() => {
@@ -999,6 +1025,11 @@ describe("submission acknowledgement routing", () => {
       ]);
     });
     expect(connection.createTask).not.toHaveBeenCalled();
+    expect((await renderManager()).draftView).toMatchObject({
+      text: "must not create while metadata is unavailable",
+      disabled: false,
+      metadataReady: false,
+    });
 
     await act(() => {
       connection.onControlMessage?.(workspaceCatalog());
@@ -1011,10 +1042,11 @@ describe("submission acknowledgement routing", () => {
     expect(restored).toMatchObject({
       projectKey: "source\0/source-project",
       viewKey: "source\0/source-project",
-      text: "retain this draft through metadata loss",
+      text: "must not create while metadata is unavailable",
       entryPoint: "entry",
       agent: "agent",
       disabled: false,
+      metadataReady: true,
       composerResetToken,
     });
   });
@@ -1092,7 +1124,8 @@ describe("submission acknowledgement routing", () => {
       text: "retain A while visiting unrelated routes",
       entryPoint: "entry",
       agent: "agent",
-      disabled: true,
+      disabled: false,
+      metadataReady: false,
       composerResetToken,
     });
     expect(connection.createTask).not.toHaveBeenCalled();
@@ -1137,6 +1170,7 @@ describe("submission acknowledgement routing", () => {
         type: "task_updated",
         task: {
           ...persistedSnapshot(92, "persisted B"),
+          task_type: "blank-b",
           entry_point: "entry-b",
           agent_name: "agent-b",
         },
@@ -1345,6 +1379,291 @@ describe("submission acknowledgement routing", () => {
     }
   });
 
+  it("keeps the canonical project composer available until project metadata resolves", async () => {
+    await renderManager();
+    const connection = testState.connection!;
+    await act(() => {
+      connection.onControlMessage?.(workspaceCatalog());
+      connection.onControlMessage?.(globalTaskTypes("entry", "blank"));
+      connection.onControlMessage?.(agents("agent"));
+    });
+
+    await renderManager();
+    expect(connection.requestTaskTypes).toHaveBeenCalledWith("/source-project");
+
+    const waitingForMetadata = (await renderManager()).draftView;
+    if (!waitingForMetadata || waitingForMetadata.kind !== "resolved") {
+      throw new Error("Canonical project draft did not initialize");
+    }
+    expect(waitingForMetadata).toMatchObject({
+      projectKey: "source\0/source-project",
+      text: "",
+      entryPoint: "",
+      agent: "",
+      disabled: false,
+      metadataReady: false,
+    });
+
+    await act(() => {
+      waitingForMetadata.onTextChange("type before project metadata");
+      waitingForMetadata.onEntryPointChange("must-not-be-used");
+      waitingForMetadata.onAgentChange("must-not-be-used");
+      waitingForMetadata.onSubmit("type before project metadata", []);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 32));
+    expect(connection.createTask).not.toHaveBeenCalled();
+    expect((await renderManager()).draftView).toMatchObject({
+      text: "type before project metadata",
+      entryPoint: "",
+      agent: "",
+      disabled: false,
+      metadataReady: false,
+    });
+
+    await act(() => {
+      connection.onControlMessage?.(projectTaskTypes("project-entry", "blank"));
+    });
+    await vi.waitFor(() => {
+      expect(connection.createTask).toHaveBeenCalledTimes(1);
+    });
+
+    expect(connection.createTask).toHaveBeenCalledWith(
+      "source",
+      "/source-project",
+      "project-entry",
+      undefined,
+      "agent",
+      "submission-uuid",
+    );
+    expect((await renderManager()).draftView).toMatchObject({
+      entryPoint: "project-entry",
+      agent: "agent",
+      metadataReady: true,
+    });
+  });
+
+  it("keeps a canonical draft's metadata gate closed until passive resolution", async () => {
+    await renderManager();
+    const connection = testState.connection!;
+    await act(() => {
+      connection.onControlMessage?.(workspaceCatalog());
+      connection.onControlMessage?.(globalTaskTypes("entry", "blank"));
+      connection.onControlMessage?.(agents("agent"));
+    });
+
+    const waitingForMetadata = (await renderManager()).draftView;
+    if (!waitingForMetadata || waitingForMetadata.kind !== "resolved") {
+      throw new Error("Canonical project draft did not initialize");
+    }
+    expect(waitingForMetadata).toMatchObject({
+      text: "",
+      entryPoint: "",
+      agent: "",
+      disabled: false,
+      metadataReady: false,
+    });
+
+    const text = "type before passive metadata resolution";
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await act(() => {
+      waitingForMetadata.onTextChange(text);
+    });
+
+    connection.onControlMessage?.(projectTaskTypes("project-entry", "blank"));
+    const beforePassive = commitRouteWithoutPassiveEffects().draftView;
+    if (!beforePassive || beforePassive.kind !== "resolved") {
+      throw new Error(
+        "Canonical project draft did not commit before metadata resolution",
+      );
+    }
+    expect(beforePassive).toMatchObject({
+      text,
+      entryPoint: "",
+      agent: "",
+      disabled: false,
+      metadataReady: false,
+    });
+
+    beforePassive.onSubmit(text, []);
+    expect(connection.createTask).not.toHaveBeenCalled();
+
+    await act(() => {});
+    const resolved = (await renderManager()).draftView;
+    if (!resolved || resolved.kind !== "resolved") {
+      throw new Error("Canonical project draft did not resolve metadata");
+    }
+    expect(resolved).toMatchObject({
+      text,
+      entryPoint: "project-entry",
+      agent: "agent",
+      disabled: false,
+      metadataReady: true,
+    });
+
+    await act(() => {
+      resolved.onSubmit(text, []);
+    });
+    expect(connection.createTask).toHaveBeenCalledTimes(1);
+    expect(connection.createTask).toHaveBeenCalledWith(
+      "source",
+      "/source-project",
+      "project-entry",
+      [{ type: "text", text }],
+      "agent",
+      "submission-uuid",
+    );
+  });
+
+  it("projects a pre-catalog persisted edit from its snapshot task type", async () => {
+    const draftView = await preparePreCatalogPersistedDraft({
+      ...persistedSnapshot(91, "persisted before catalog"),
+      task_type: "snapshot-type",
+    });
+    const connection = testState.connection!;
+
+    expect(draftView.metadataReady).toBe(false);
+    await act(() => {
+      draftView.onTextChange("edited before catalog");
+      draftView.onBlur();
+    });
+
+    expect(connection.saveDraft).toHaveBeenCalledWith(
+      91,
+      "edited before catalog",
+    );
+    expect(manager!.getByTid(91)).toMatchObject({
+      entryPoint: "entry",
+      agentName: "agent",
+      taskType: "snapshot-type",
+      serverDraft: "edited before catalog",
+    });
+  });
+
+  it("fails fast when a pre-catalog persisted task lacks its snapshot task type", async () => {
+    const draftView = await preparePreCatalogPersistedDraft({
+      ...persistedSnapshot(92),
+      task_type: undefined,
+    });
+
+    expect(() => {
+      draftView.onBlur();
+    }).toThrow("Draft projection requires task type 92");
+  });
+
+  it("fails fast when a pre-catalog persisted task entry point diverges from its form", async () => {
+    const draftView = await preparePreCatalogPersistedDraft(
+      persistedSnapshot(93),
+    );
+    const task = manager!.getByTid(93);
+    if (!task)
+      throw new Error("Pre-catalog persisted task did not materialize");
+    task.entryPoint = "different-entry";
+
+    expect(() => {
+      draftView.onBlur();
+    }).toThrow("Draft projection entry point does not match task 93");
+  });
+
+  it("validates a persisted task against an arrived catalog without rewriting it", async () => {
+    await preparePreCatalogPersistedDraft({
+      ...persistedSnapshot(94),
+      task_type: "snapshot-type",
+    });
+    const connection = testState.connection!;
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "project_task_types_list",
+        project_path: "/source-project",
+        entry_points: [
+          {
+            name: "catalog-entry",
+            task_type: "catalog-type",
+            description: "",
+            model_class: "",
+            read_only: false,
+          },
+          {
+            name: "entry",
+            task_type: "persisted-catalog-type",
+            description: "",
+            model_class: "",
+            read_only: false,
+          },
+          {
+            name: "entry-b",
+            task_type: "type-b",
+            description: "",
+            model_class: "",
+            read_only: false,
+          },
+        ],
+        type_info: [],
+      } satisfies ControlMessage);
+    });
+    await renderManager();
+
+    const resolvedDraftView = (await renderManager()).draftView;
+    expect(resolvedDraftView).toMatchObject({
+      entryPoint: "entry",
+      agent: "agent",
+      metadataReady: true,
+    });
+    if (!resolvedDraftView || resolvedDraftView.kind !== "resolved") {
+      throw new Error(
+        "Catalog resolution did not keep the persisted draft attached",
+      );
+    }
+    await act(() => {
+      resolvedDraftView.onTextChange("edited with catalog");
+    });
+    expect(manager!.getByTid(94)).toMatchObject({
+      entryPoint: "entry",
+      taskType: "persisted-catalog-type",
+    });
+
+    await act(() => {
+      testState.uuid = "pre-catalog-switch-b-uuid";
+      connection.onControlMessage?.({
+        type: "task_updated",
+        task: {
+          ...persistedSnapshot(95, "persisted B"),
+          task_type: "type-b",
+          entry_point: "entry-b",
+          agent_name: "agent-b",
+        },
+      } satisfies ControlMessage);
+      testState.uuid = "submission-uuid";
+    });
+    testState.route.tid = "95";
+    const switchedDraftView = (await renderManager()).draftView;
+    expect(switchedDraftView).toMatchObject({
+      remoteTid: 95,
+      entryPoint: "entry-b",
+      agent: "agent-b",
+      metadataReady: true,
+    });
+  });
+
+  it("keeps an empty arrived project catalog authoritative", async () => {
+    const draftView = await preparePreCatalogPersistedDraft({
+      ...persistedSnapshot(95),
+      task_type: "snapshot-type",
+    });
+    const connection = testState.connection!;
+    await act(() => {
+      connection.onControlMessage?.({
+        type: "project_task_types_list",
+        project_path: "/source-project",
+        entry_points: [],
+        type_info: [],
+      } satisfies ControlMessage);
+    });
+
+    expect(() => {
+      draftView.onBlur();
+    }).toThrow("Unknown entry point: entry");
+  });
+
   it("waits for project types and the global default on a direct route", async () => {
     await renderManager();
     await act(() => {
@@ -1365,7 +1684,11 @@ describe("submission acknowledgement routing", () => {
       } satisfies ControlMessage);
     });
 
-    expect((await renderManager()).draftView?.kind).toBe("unresolved");
+    expect((await renderManager()).draftView).toMatchObject({
+      kind: "resolved",
+      disabled: false,
+      metadataReady: false,
+    });
     await vi.waitFor(() => {
       expect(testState.connection!.requestTaskTypes).toHaveBeenCalledWith(
         "/source-project",
@@ -1396,7 +1719,11 @@ describe("submission acknowledgement routing", () => {
       } satisfies ControlMessage);
     });
 
-    expect((await renderManager()).draftView?.kind).toBe("unresolved");
+    expect((await renderManager()).draftView).toMatchObject({
+      kind: "resolved",
+      disabled: false,
+      metadataReady: false,
+    });
     await act(() => {
       testState.connection!.onControlMessage?.({
         type: "task_types_list",

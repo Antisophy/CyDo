@@ -18,6 +18,7 @@ import {
   type ImageAttachment,
   type ProjectIdentity,
   type ProjectKey,
+  type ResolvedDraftForm,
   type TaskObservation,
   type TaskSnapshot,
   type UuidBinding,
@@ -34,26 +35,30 @@ const PROJECT_B: ProjectIdentity = {
 const KEY_A = createProjectKey(PROJECT_A.workspace, PROJECT_A.projectPath);
 const KEY_B = createProjectKey(PROJECT_B.workspace, PROJECT_B.projectPath);
 
-const DEFAULTS_A: FormDefaults = {
+const DEFAULTS_A = {
   entryPoint: "entry-alpha",
   agent: "agent-alpha",
-};
-const DEFAULTS_B: FormDefaults = {
+} satisfies FormDefaults;
+const DEFAULTS_B = {
   entryPoint: "entry-bravo",
   agent: "agent-bravo",
-};
-const CUSTOM_DEFAULTS_A: FormDefaults = {
+} satisfies FormDefaults;
+const CUSTOM_DEFAULTS_A = {
   entryPoint: "entry-alpha-custom",
   agent: "agent-alpha-custom",
-};
-const PERSISTED_DEFAULTS_A: FormDefaults = {
+} satisfies FormDefaults;
+const PERSISTED_DEFAULTS_A = {
   entryPoint: "entry-persisted-alpha",
   agent: "agent-persisted-alpha",
-};
-const PERSISTED_DEFAULTS_B: FormDefaults = {
+} satisfies FormDefaults;
+const PERSISTED_DEFAULTS_B = {
   entryPoint: "entry-persisted-bravo",
   agent: "agent-persisted-bravo",
-};
+} satisfies FormDefaults;
+const UNRESOLVED_DEFAULTS_A = {
+  entryPoint: null,
+  agent: null,
+} satisfies FormDefaults;
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
 const UUID_B = "22222222-2222-4222-8222-222222222222";
@@ -99,8 +104,24 @@ interface TraceStep {
   assert?: (state: DraftState, effects: readonly DraftEffect[]) => void;
 }
 
+function form(
+  text: string,
+  defaults?: { entryPoint: string; agent: string },
+): ResolvedDraftForm;
+function form(text: string, defaults: FormDefaults): DraftForm;
 function form(text: string, defaults: FormDefaults = DEFAULTS_A): DraftForm {
   return { text, ...defaults };
+}
+
+function resolvedForm(form: DraftForm): ResolvedDraftForm {
+  if (form.entryPoint === null || form.agent === null) {
+    throw new Error("Expected a resolved draft form");
+  }
+  return {
+    text: form.text,
+    entryPoint: form.entryPoint,
+    agent: form.agent,
+  };
 }
 
 function editing(uuid: string, draft: DraftForm): Editing {
@@ -214,7 +235,7 @@ function pendingSnapshot(
 ): TaskSnapshot {
   return {
     tid,
-    ...draft,
+    ...resolvedForm(draft),
     active: false,
     processing: false,
     hasMessages: false,
@@ -325,7 +346,13 @@ function projectDraft(
   draft: DraftForm,
   formVersion: number,
 ): Effect<"project-draft"> {
-  return { type: "project-draft", projectKey, tid, form: draft, formVersion };
+  return {
+    type: "project-draft",
+    projectKey,
+    tid,
+    form: resolvedForm(draft),
+    formVersion,
+  };
 }
 
 function deleteTask(
@@ -562,6 +589,521 @@ describe("draft reconciler slot initialization", () => {
           },
           state: initialA(),
           effects: [],
+        },
+      ],
+    );
+  });
+});
+
+describe("draft reconciler metadata resolution", () => {
+  it("waits to create a typed draft until metadata resolves", () => {
+    const text = "typed before project metadata";
+
+    trace(
+      createDraftState([
+        { project: PROJECT_A, defaults: UNRESOLVED_DEFAULTS_A },
+      ]),
+      [
+        {
+          label: "typing without entry point or agent metadata",
+          event: {
+            type: "edit-text",
+            projectKey: KEY_A,
+            text,
+            uuid: UUID_A,
+          },
+          state: stateA(
+            {
+              desired: editing(UUID_A, form(text, UNRESOLVED_DEFAULTS_A)),
+              formVersion: 1,
+              historicalGeneration: UUID_A,
+            },
+            UNRESOLVED_DEFAULTS_A,
+          ),
+          effects: [],
+        },
+        {
+          label: "manually delivered timer before scheduling",
+          event: {
+            type: "create-timer-due",
+            projectKey: KEY_A,
+            generation: UUID_A,
+          },
+          state: stateA(
+            {
+              desired: editing(UUID_A, form(text, UNRESOLVED_DEFAULTS_A)),
+              formVersion: 1,
+              historicalGeneration: UUID_A,
+            },
+            UNRESOLVED_DEFAULTS_A,
+          ),
+          effects: [],
+        },
+        {
+          label: "metadata resolves the existing editing generation",
+          event: {
+            type: "resolve-metadata",
+            projectKey: KEY_A,
+            entryPoint: DEFAULTS_A.entryPoint,
+            agent: DEFAULTS_A.agent,
+          },
+          state: stateA({
+            observed: form(""),
+            desired: editing(UUID_A, form(text)),
+            formVersion: 1,
+            createSchedule: UUID_A,
+            historicalGeneration: UUID_A,
+          }),
+          effects: [scheduleCreate(KEY_A, UUID_A)],
+        },
+        {
+          label: "repeated metadata does not schedule the generation again",
+          event: {
+            type: "resolve-metadata",
+            projectKey: KEY_A,
+            entryPoint: DEFAULTS_A.entryPoint,
+            agent: DEFAULTS_A.agent,
+          },
+          state: stateA({
+            observed: form(""),
+            desired: editing(UUID_A, form(text)),
+            formVersion: 1,
+            createSchedule: UUID_A,
+            historicalGeneration: UUID_A,
+          }),
+          effects: [],
+        },
+        {
+          label: "resolved metadata timer creates the draft once",
+          event: {
+            type: "create-timer-due",
+            projectKey: KEY_A,
+            generation: UUID_A,
+          },
+          state: stateA({
+            observed: form(""),
+            desired: editing(UUID_A, form(text)),
+            remote: { kind: "creating", correlationId: UUID_A },
+            formVersion: 1,
+            historicalGeneration: UUID_A,
+          }),
+          effects: [
+            createTask(
+              KEY_A,
+              UUID_A,
+              DEFAULTS_A.entryPoint,
+              DEFAULTS_A.agent,
+              null,
+            ),
+          ],
+        },
+      ],
+    );
+  });
+
+  it("fills only metadata fields that remain unresolved", () => {
+    const partialDefaults = {
+      entryPoint: PERSISTED_DEFAULTS_A.entryPoint,
+      agent: null,
+    } satisfies FormDefaults;
+    const observed = form("persisted text", partialDefaults);
+    const desired = {
+      text: "persisted text",
+      entryPoint: "entry-local",
+      agent: null,
+    } satisfies DraftForm;
+    const expectedDefaults = {
+      entryPoint: PERSISTED_DEFAULTS_A.entryPoint,
+      agent: DEFAULTS_A.agent,
+    } satisfies FormDefaults;
+    const expectedObserved = form("persisted text", expectedDefaults);
+    const expectedDesired = {
+      text: "persisted text",
+      entryPoint: "entry-local",
+      agent: DEFAULTS_A.agent,
+    } satisfies ResolvedDraftForm;
+
+    trace(
+      stateA(
+        {
+          observed,
+          desired: editing(UUID_A, desired),
+          remote: { kind: "present", tid: 400, generation: UUID_A },
+          formVersion: 1,
+          historicalGeneration: UUID_A,
+        },
+        partialDefaults,
+      ),
+      [
+        {
+          label: "resolve only the unresolved agent field",
+          event: {
+            type: "resolve-metadata",
+            projectKey: KEY_A,
+            entryPoint: DEFAULTS_A.entryPoint,
+            agent: DEFAULTS_A.agent,
+          },
+          state: stateA(
+            {
+              observed: expectedObserved,
+              desired: editing(UUID_A, expectedDesired),
+              remote: { kind: "present", tid: 400, generation: UUID_A },
+              formVersion: 1,
+              historicalGeneration: UUID_A,
+            },
+            expectedDefaults,
+          ),
+          effects: [],
+        },
+      ],
+    );
+  });
+
+  it("retains adopted persisted fields when metadata arrives", () => {
+    const persisted = form("persisted A", PERSISTED_DEFAULTS_A);
+
+    trace(
+      createDraftState([
+        { project: PROJECT_A, defaults: UNRESOLVED_DEFAULTS_A },
+      ]),
+      [
+        {
+          label: "adopt a persisted task before metadata",
+          event: {
+            type: "adopt-persisted",
+            projectKey: KEY_A,
+            uuid: UUID_PERSISTED_A,
+            snapshot: pendingSnapshot(401, persisted),
+          },
+          state: stateA(
+            {
+              observed: persisted,
+              desired: editing(UUID_PERSISTED_A, persisted),
+              remote: { kind: "present", tid: 401, generation: null },
+              formVersion: 1,
+              historicalGeneration: UUID_PERSISTED_A,
+            },
+            PERSISTED_DEFAULTS_A,
+          ),
+          effects: [],
+        },
+        {
+          label: "resolve route metadata without replacing the adopted form",
+          event: {
+            type: "resolve-metadata",
+            projectKey: KEY_A,
+            entryPoint: DEFAULTS_A.entryPoint,
+            agent: DEFAULTS_A.agent,
+          },
+          state: stateA(
+            {
+              observed: persisted,
+              desired: editing(UUID_PERSISTED_A, persisted),
+              remote: { kind: "present", tid: 401, generation: null },
+              formVersion: 1,
+              historicalGeneration: UUID_PERSISTED_A,
+            },
+            PERSISTED_DEFAULTS_A,
+          ),
+          effects: [],
+          assert: (state) => {
+            const slot = state.slots[KEY_A]!;
+            expect(slot.defaults).toEqual(PERSISTED_DEFAULTS_A);
+            expect(slot.observed).toEqual(persisted);
+            expect(slot.desired).toEqual(editing(UUID_PERSISTED_A, persisted));
+            expect(slot.remote).toEqual({
+              kind: "present",
+              tid: 401,
+              generation: null,
+            });
+          },
+        },
+      ],
+    );
+  });
+
+  it("retains switched persisted fields when metadata arrives", () => {
+    const persistedA = form("persisted A", PERSISTED_DEFAULTS_A);
+    const persistedB = form("persisted B", PERSISTED_DEFAULTS_B);
+
+    trace(
+      stateA(
+        {
+          observed: persistedA,
+          desired: editing(UUID_PERSISTED_A, persistedA),
+          remote: { kind: "present", tid: 501, generation: null },
+          formVersion: 1,
+          historicalGeneration: UUID_PERSISTED_A,
+        },
+        PERSISTED_DEFAULTS_A,
+      ),
+      [
+        {
+          label: "switch to persisted B before metadata",
+          event: {
+            type: "switch-persisted",
+            projectKey: KEY_A,
+            uuid: UUID_PERSISTED_B,
+            snapshot: pendingSnapshot(502, persistedB),
+          },
+          state: stateA(
+            {
+              observed: persistedB,
+              desired: editing(UUID_PERSISTED_B, persistedB),
+              remote: { kind: "present", tid: 502, generation: null },
+              formVersion: 2,
+              historicalGeneration: UUID_PERSISTED_B,
+            },
+            PERSISTED_DEFAULTS_B,
+          ),
+          effects: [
+            setEntryPoint(KEY_A, 501, PERSISTED_DEFAULTS_A.entryPoint),
+            setAgent(KEY_A, 501, PERSISTED_DEFAULTS_A.agent),
+            setDraft(KEY_A, 501, persistedA.text, 1),
+            projectDraft(KEY_A, 501, persistedA, 1),
+            releaseTask(KEY_A, 501),
+          ],
+        },
+        {
+          label: "resolve route metadata without replacing the switched form",
+          event: {
+            type: "resolve-metadata",
+            projectKey: KEY_A,
+            entryPoint: DEFAULTS_A.entryPoint,
+            agent: DEFAULTS_A.agent,
+          },
+          state: stateA(
+            {
+              observed: persistedB,
+              desired: editing(UUID_PERSISTED_B, persistedB),
+              remote: { kind: "present", tid: 502, generation: null },
+              formVersion: 2,
+              historicalGeneration: UUID_PERSISTED_B,
+            },
+            PERSISTED_DEFAULTS_B,
+          ),
+          effects: [],
+          assert: (state) => {
+            const slot = state.slots[KEY_A]!;
+            expect(slot.defaults).toEqual(PERSISTED_DEFAULTS_B);
+            expect(slot.observed).toEqual(persistedB);
+            expect(slot.desired).toEqual(editing(UUID_PERSISTED_B, persistedB));
+            expect(slot.remote).toEqual({
+              kind: "present",
+              tid: 502,
+              generation: null,
+            });
+          },
+        },
+      ],
+    );
+  });
+
+  it("does not create after a draft is cleared before metadata arrives", () => {
+    trace(
+      createDraftState([
+        { project: PROJECT_A, defaults: UNRESOLVED_DEFAULTS_A },
+      ]),
+      [
+        {
+          label: "type before metadata",
+          event: {
+            type: "edit-text",
+            projectKey: KEY_A,
+            text: "clear before metadata",
+            uuid: UUID_A,
+          },
+          state: stateA(
+            {
+              desired: editing(
+                UUID_A,
+                form("clear before metadata", UNRESOLVED_DEFAULTS_A),
+              ),
+              formVersion: 1,
+              historicalGeneration: UUID_A,
+            },
+            UNRESOLVED_DEFAULTS_A,
+          ),
+          effects: [],
+        },
+        {
+          label: "clear while metadata remains unavailable",
+          event: { type: "clear", projectKey: KEY_A },
+          state: stateA(
+            { formVersion: 2, historicalGeneration: UUID_A },
+            UNRESOLVED_DEFAULTS_A,
+          ),
+          effects: [],
+        },
+        {
+          label: "metadata resolves an empty slot",
+          event: {
+            type: "resolve-metadata",
+            projectKey: KEY_A,
+            entryPoint: DEFAULTS_A.entryPoint,
+            agent: DEFAULTS_A.agent,
+          },
+          state: stateA({ formVersion: 2, historicalGeneration: UUID_A }),
+          effects: [],
+        },
+        {
+          label: "stale timer cannot create a cleared generation",
+          event: {
+            type: "create-timer-due",
+            projectKey: KEY_A,
+            generation: UUID_A,
+          },
+          state: stateA({ formVersion: 2, historicalGeneration: UUID_A }),
+          effects: [],
+        },
+      ],
+    );
+  });
+
+  it("keeps unresolved and resolved project slots independent", () => {
+    const bindingA = { uuid: UUID_A, projectKey: KEY_A, tid: null };
+    const bindingB = { uuid: UUID_B, projectKey: KEY_B, tid: null };
+    const unresolvedA = expectedSlot(PROJECT_A, UNRESOLVED_DEFAULTS_A);
+    const resolvedB = expectedSlot(PROJECT_B, DEFAULTS_B);
+
+    trace(
+      stateOf([
+        [KEY_A, unresolvedA],
+        [KEY_B, resolvedB],
+      ]),
+      [
+        {
+          label: "type in unresolved project A",
+          event: {
+            type: "edit-text",
+            projectKey: KEY_A,
+            text: "A waits for metadata",
+            uuid: UUID_A,
+          },
+          state: stateOf(
+            [
+              [
+                KEY_A,
+                expectedSlot(PROJECT_A, UNRESOLVED_DEFAULTS_A, {
+                  desired: editing(
+                    UUID_A,
+                    form("A waits for metadata", UNRESOLVED_DEFAULTS_A),
+                  ),
+                  formVersion: 1,
+                }),
+              ],
+              [KEY_B, resolvedB],
+            ],
+            [bindingA],
+          ),
+          effects: [],
+        },
+        {
+          label: "type in independently resolved project B",
+          event: {
+            type: "edit-text",
+            projectKey: KEY_B,
+            text: "B can create",
+            uuid: UUID_B,
+          },
+          state: stateOf(
+            [
+              [
+                KEY_A,
+                expectedSlot(PROJECT_A, UNRESOLVED_DEFAULTS_A, {
+                  desired: editing(
+                    UUID_A,
+                    form("A waits for metadata", UNRESOLVED_DEFAULTS_A),
+                  ),
+                  formVersion: 1,
+                }),
+              ],
+              [
+                KEY_B,
+                expectedSlot(PROJECT_B, DEFAULTS_B, {
+                  desired: editing(UUID_B, form("B can create", DEFAULTS_B)),
+                  formVersion: 1,
+                  createSchedule: UUID_B,
+                }),
+              ],
+            ],
+            [bindingA, bindingB],
+          ),
+          effects: [scheduleCreate(KEY_B, UUID_B)],
+        },
+        {
+          label: "B creates without waiting for A metadata",
+          event: {
+            type: "create-timer-due",
+            projectKey: KEY_B,
+            generation: UUID_B,
+          },
+          state: stateOf(
+            [
+              [
+                KEY_A,
+                expectedSlot(PROJECT_A, UNRESOLVED_DEFAULTS_A, {
+                  desired: editing(
+                    UUID_A,
+                    form("A waits for metadata", UNRESOLVED_DEFAULTS_A),
+                  ),
+                  formVersion: 1,
+                }),
+              ],
+              [
+                KEY_B,
+                expectedSlot(PROJECT_B, DEFAULTS_B, {
+                  observed: form("", DEFAULTS_B),
+                  desired: editing(UUID_B, form("B can create", DEFAULTS_B)),
+                  remote: { kind: "creating", correlationId: UUID_B },
+                  formVersion: 1,
+                }),
+              ],
+            ],
+            [bindingA, bindingB],
+          ),
+          effects: [
+            createTask(
+              KEY_B,
+              UUID_B,
+              DEFAULTS_B.entryPoint,
+              DEFAULTS_B.agent,
+              null,
+            ),
+          ],
+        },
+        {
+          label: "A metadata resolution schedules only A",
+          event: {
+            type: "resolve-metadata",
+            projectKey: KEY_A,
+            entryPoint: DEFAULTS_A.entryPoint,
+            agent: DEFAULTS_A.agent,
+          },
+          state: stateOf(
+            [
+              [
+                KEY_A,
+                expectedSlot(PROJECT_A, DEFAULTS_A, {
+                  observed: form(""),
+                  desired: editing(UUID_A, form("A waits for metadata")),
+                  formVersion: 1,
+                  createSchedule: UUID_A,
+                }),
+              ],
+              [
+                KEY_B,
+                expectedSlot(PROJECT_B, DEFAULTS_B, {
+                  observed: form("", DEFAULTS_B),
+                  desired: editing(UUID_B, form("B can create", DEFAULTS_B)),
+                  remote: { kind: "creating", correlationId: UUID_B },
+                  formVersion: 1,
+                }),
+              ],
+            ],
+            [bindingA, bindingB],
+          ),
+          effects: [scheduleCreate(KEY_A, UUID_A)],
         },
       ],
     );
@@ -1395,39 +1937,39 @@ describe("draft reconciler acknowledgement, synchronization, and saves", () => {
   });
 
   it("merges peer observations field-wise, advances their baseline, and saves the resulting form", () => {
-    const priorObserved: DraftForm = {
+    const priorObserved: ResolvedDraftForm = {
       text: "baseline text",
       entryPoint: "entry-observed",
       agent: "agent-observed",
     };
-    const locallyDiverged: DraftForm = {
+    const locallyDiverged: ResolvedDraftForm = {
       text: "baseline text",
       entryPoint: "entry-observed",
       agent: "agent-local",
     };
-    const peerSnapshot: DraftForm = {
+    const peerSnapshot: ResolvedDraftForm = {
       text: "peer text",
       entryPoint: "entry-peer",
       agent: "agent-peer",
     };
-    const merged: DraftForm = {
+    const merged: ResolvedDraftForm = {
       text: "peer text",
       entryPoint: "entry-peer",
       agent: "agent-local",
     };
-    const mergedDefaults: FormDefaults = {
+    const mergedDefaults = {
       entryPoint: "entry-peer",
       agent: "agent-local",
-    };
-    const finalDefaults: FormDefaults = {
+    } satisfies FormDefaults;
+    const finalDefaults = {
       entryPoint: "entry-peer",
       agent: "agent-final",
-    };
-    const afterLocalConfig: DraftForm = {
+    } satisfies FormDefaults;
+    const afterLocalConfig: ResolvedDraftForm = {
       text: "peer text",
       ...finalDefaults,
     };
-    const afterLocalText: DraftForm = {
+    const afterLocalText: ResolvedDraftForm = {
       text: "local final text",
       ...finalDefaults,
     };
@@ -1806,7 +2348,7 @@ describe("draft reconciler acknowledgement, synchronization, and saves", () => {
       entryPoint: "entry-default",
       agent: "agent-default",
     };
-    const observed: DraftForm = {
+    const observed: ResolvedDraftForm = {
       text: "observed text",
       entryPoint: "entry-observed",
       agent: "agent-observed",
@@ -1855,15 +2397,15 @@ describe("draft reconciler acknowledgement, synchronization, and saves", () => {
       entryPoint: "entry-observed",
       agent: "agent-observed",
     };
-    const peer: DraftForm = {
+    const peer: ResolvedDraftForm = {
       text: "peer text",
       entryPoint: "entry-peer",
       agent: "agent-peer",
     };
     const cases: readonly {
       label: string;
-      desired: DraftForm;
-      merged: DraftForm;
+      desired: ResolvedDraftForm;
+      merged: ResolvedDraftForm;
     }[] = [
       {
         label: "text",

@@ -19,6 +19,7 @@ type ControlFrame = {
   content?: unknown;
   entry_point?: string;
   agent_name?: string;
+  entry_points?: unknown;
 };
 
 type CreateRequest = {
@@ -67,6 +68,11 @@ type HeldServerFrames =
       kind: "delete";
       tid: number;
       frames: SocketMessage[];
+    }
+  | {
+      kind: "project-types";
+      frame: ControlFrame;
+      frames: SocketMessage[];
     };
 
 interface DraftRaceProxy {
@@ -83,8 +89,12 @@ interface DraftRaceProxy {
   rawMessages(): readonly RawMessage[];
   isCreateAckHeld(correlationId: string): boolean;
   isDeleteAckHeld(tid: number): boolean;
+  isProjectTypesResponseHeld(): boolean;
+  heldProjectTypesResponse(): ControlFrame | null;
   wasServerControlDelivered(type: string, tid?: number): boolean;
+  armProjectTypesResponseHold(): void;
   armDeleteAckHold(tid: number): void;
+  releaseProjectTypesResponse(): void;
   releaseCreateAck(): void;
   releaseDeleteAck(tid: number): void;
 }
@@ -120,9 +130,13 @@ async function installDraftRaceProxy(page: Page): Promise<DraftRaceProxy> {
   let createCorrelation: string | null = null;
   let heldServerFrames: HeldServerFrames | null = null;
   let armedDeleteTid: number | null = null;
+  let projectTypesResponseHoldArmed = false;
   let replayingServerFrames = false;
   let nextObservationOrder = 0;
   let armDeletionAck: (tid: number) => void = () => {
+    throw new Error("WebSocket route was not installed");
+  };
+  let releaseProjectTypesResponse = () => {
     throw new Error("WebSocket route was not installed");
   };
   let releaseCreationAck = () => {
@@ -179,6 +193,19 @@ async function installDraftRaceProxy(page: Page): Promise<DraftRaceProxy> {
 
       if (heldServerFrames) {
         heldServerFrames.frames.push(message);
+        return;
+      }
+
+      if (
+        projectTypesResponseHoldArmed &&
+        frame?.type === "project_task_types_list"
+      ) {
+        heldServerFrames = {
+          kind: "project-types",
+          frame,
+          frames: [message],
+        };
+        projectTypesResponseHoldArmed = false;
         return;
       }
 
@@ -278,6 +305,15 @@ async function installDraftRaceProxy(page: Page): Promise<DraftRaceProxy> {
       heldServerFrames = null;
       replayHeldFrames(frames);
     };
+    releaseProjectTypesResponse = () => {
+      if (heldServerFrames?.kind !== "project-types")
+        throw new Error(
+          "project_task_types_list was not being held before release",
+        );
+      const { frames } = heldServerFrames;
+      heldServerFrames = null;
+      replayHeldFrames(frames);
+    };
     armDeletionAck = (tid: number) => {
       if (armedDeleteTid !== null || heldServerFrames?.kind === "delete")
         throw new Error(
@@ -326,6 +362,12 @@ async function installDraftRaceProxy(page: Page): Promise<DraftRaceProxy> {
       heldServerFrames.correlationId === correlationId,
     isDeleteAckHeld: (tid) =>
       heldServerFrames?.kind === "delete" && heldServerFrames.tid === tid,
+    isProjectTypesResponseHeld: () =>
+      heldServerFrames?.kind === "project-types",
+    heldProjectTypesResponse: () =>
+      heldServerFrames?.kind === "project-types"
+        ? heldServerFrames.frame
+        : null,
     wasServerControlDelivered: (type, tid) =>
       observations.some(
         (observation) =>
@@ -333,7 +375,18 @@ async function installDraftRaceProxy(page: Page): Promise<DraftRaceProxy> {
           observation.frame.type === type &&
           (tid === undefined || controlTargetsTid(observation.frame, tid)),
       ),
+    armProjectTypesResponseHold: () => {
+      if (
+        projectTypesResponseHoldArmed ||
+        heldServerFrames?.kind === "project-types"
+      )
+        throw new Error(
+          "project_task_types_list response is already armed or held",
+        );
+      projectTypesResponseHoldArmed = true;
+    },
     armDeleteAckHold: (tid) => armDeletionAck(tid),
+    releaseProjectTypesResponse: () => releaseProjectTypesResponse(),
     releaseCreateAck: () => releaseCreationAck(),
     releaseDeleteAck: (tid) => releaseDeletionAck(tid),
   };
@@ -903,6 +956,95 @@ async function expectNoStaleProjection(page: Page, tid: number) {
     )
     .toEqual({ sawRoute: false, sawSidebar: false });
 }
+
+test("typing before held project metadata creates once after resolution", async ({
+  page,
+}) => {
+  const proxy = await installDraftRaceProxy(page);
+  proxy.armProjectTypesResponseHold();
+  await enterSession(page);
+
+  await expect.poll(() => proxy.isProjectTypesResponseHeld()).toBe(true);
+  const metadata = proxy.heldProjectTypesResponse();
+  if (!metadata || !Array.isArray(metadata.entry_points)) {
+    throw new Error("Held project metadata did not contain entry points");
+  }
+  const validEntryPoints = metadata.entry_points.flatMap((entry) => {
+    if (typeof entry !== "object" || entry === null) return [];
+    const name = (entry as { name?: unknown }).name;
+    return typeof name === "string" ? [name] : [];
+  });
+  if (validEntryPoints.length === 0) {
+    throw new Error(
+      "Held project metadata did not expose a usable entry point",
+    );
+  }
+
+  const input = page.locator(".input-textarea:visible");
+  await expect(input).toBeEnabled();
+  await expect(page.locator(".task-type-row:visible").first()).toBeDisabled();
+  await expect(page.locator(".agent-picker:visible")).toBeDisabled();
+  const prompt = "typed while project metadata is held";
+  await input.fill(prompt);
+  await expect(input).toHaveValue(prompt);
+  await expect(page.locator(".btn-send:visible")).toBeDisabled();
+  await page.waitForTimeout(50);
+  expect(
+    proxy.controls("create_task", { direction: "browser-to-server" }),
+  ).toHaveLength(0);
+
+  proxy.releaseProjectTypesResponse();
+
+  await expect
+    .poll(
+      () =>
+        proxy.controls("create_task", { direction: "browser-to-server" })
+          .length,
+    )
+    .toBe(1);
+  const createControl = proxy.controls("create_task", {
+    direction: "browser-to-server",
+  })[0]!;
+  const entryPoint = createControl.frame.entry_point;
+  if (typeof entryPoint !== "string") {
+    throw new Error("Resolved create_task did not carry an entry point");
+  }
+  expect(validEntryPoints).toContain(entryPoint);
+  const correlationId =
+    typeof createControl.frame.correlation_id === "string"
+      ? createControl.frame.correlation_id
+      : null;
+  if (!correlationId) {
+    throw new Error("Resolved create_task did not carry a correlation_id");
+  }
+  const tid = await waitForCreatedTid(proxy, correlationId);
+  expect(proxy.isCreateAckHeld(correlationId)).toBe(true);
+
+  proxy.releaseCreateAck();
+  await waitForServerDelivery(proxy, "task_created", tid);
+  await waitForServerDelivery(proxy, "focus_hint", tid);
+  await expect
+    .poll(
+      () =>
+        proxy.controls("set_draft", {
+          tid,
+          direction: "browser-to-server",
+        }).length,
+    )
+    .toBe(1);
+  expect(
+    proxy.controls("set_draft", {
+      tid,
+      direction: "browser-to-server",
+    })[0]!.frame.content,
+  ).toBe(prompt);
+  await expect(page).toHaveURL(new RegExp(`/task/${tid}(?:/|$)`));
+  await expectControlledTextarea(page, prompt);
+  await expect(page.locator(`.sidebar-item[data-tid="${tid}"]`)).toHaveCount(1);
+  expect(
+    proxy.controls("create_task", { direction: "browser-to-server" }),
+  ).toHaveLength(1);
+});
 
 test("clear and retype waits for stale draft deletion before creating a replacement", async ({
   page,

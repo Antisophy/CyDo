@@ -411,40 +411,6 @@ describe("controlled InputBox", () => {
     }
   });
 
-  it("retains owned images through a metadata-disabled interval", async () => {
-    const imageReader = mockImageReader();
-    try {
-      mount("replacement B", 7);
-      pasteImage(textarea());
-      imageReader.completeNext();
-      await flush();
-      pasteImage(textarea());
-
-      mount("replacement B", 7, {
-        disabled: true,
-        preserveImagesWhenDisabled: true,
-      });
-      expect(textarea().disabled).toBe(true);
-      expect(container.querySelectorAll(".image-preview")).toHaveLength(1);
-      const remove = container.querySelector<HTMLButtonElement>(
-        ".image-preview-remove",
-      );
-      expect(remove?.disabled).toBe(true);
-      remove?.click();
-      expect(container.querySelectorAll(".image-preview")).toHaveLength(1);
-      imageReader.completeNext();
-      await flush();
-      expect(container.querySelectorAll(".image-preview")).toHaveLength(2);
-
-      mount("replacement B", 7);
-      await flush();
-      expect(textarea().disabled).toBe(false);
-      expect(container.querySelectorAll(".image-preview")).toHaveLength(2);
-    } finally {
-      imageReader.restore();
-    }
-  });
-
   it("keeps ordinary image reads enabled", async () => {
     const imageReader = mockImageReader();
     const sent: Array<{ text: string; images?: ImageAttachment[] }> = [];

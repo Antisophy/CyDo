@@ -39,16 +39,17 @@ import {
   snapshotUserDrafts,
 } from "./historyReplayReset";
 import {
+  assertResolvedDraftForm,
   createDraftState,
   createProjectKey,
   getSlot,
   reduceDraft,
   type DraftEffect,
   type DraftEvent,
-  type DraftForm,
   type DraftSlotState,
   type DraftState,
   type ProjectKey,
+  type ResolvedDraftForm,
   type TaskObservation,
   type TaskSnapshot,
 } from "./draftReconciler";
@@ -167,7 +168,7 @@ interface DraftViewBase {
   agent: string;
   lifecycle: DraftLifecycle;
   disabled: boolean;
-  preserveImagesWhenDisabled?: boolean;
+  metadataReady: boolean;
   composerResetToken: number;
 }
 
@@ -268,8 +269,8 @@ function makeDraftViewSnapshot(
   slot: DraftSlotState,
   projectKey: ProjectKey,
   projectName: string,
-  metadataDisabled: boolean,
-  preserveImagesWhenDisabled: boolean,
+  composerDisabled: boolean,
+  metadataReady: boolean,
   composerResetToken: number,
   editText: (projectKey: ProjectKey, text: string) => void,
   dispatch: (event: DraftEvent) => void,
@@ -283,6 +284,8 @@ function makeDraftViewSnapshot(
           entryPoint: slot.desired.entryPoint,
           agent: slot.desired.agent,
         };
+  const resolvedMetadata =
+    metadataReady && form.entryPoint !== null && form.agent !== null;
   const lifecycle: DraftLifecycle =
     slot.desired.kind === "submitting"
       ? "submitting"
@@ -293,7 +296,7 @@ function makeDraftViewSnapshot(
           : slot.remote.kind === "deleting"
             ? "deleting"
             : "idle";
-  const disabled = metadataDisabled || slot.desired.kind === "submitting";
+  const disabled = composerDisabled || slot.desired.kind === "submitting";
   return {
     kind: "resolved",
     projectKey,
@@ -306,23 +309,22 @@ function makeDraftViewSnapshot(
         ? slot.remote.tid
         : null,
     text: form.text,
-    entryPoint: form.entryPoint,
-    agent: form.agent,
+    entryPoint: form.entryPoint ?? "",
+    agent: form.agent ?? "",
     lifecycle,
     disabled,
-    preserveImagesWhenDisabled:
-      preserveImagesWhenDisabled && slot.desired.kind !== "submitting",
+    metadataReady: resolvedMetadata,
     composerResetToken,
     onTextChange: (text) => {
       if (disabled) return;
       editText(projectKey, text);
     },
     onEntryPointChange: (entryPoint) => {
-      if (disabled) return;
+      if (disabled || !resolvedMetadata) return;
       dispatch({ type: "change-entry-point", projectKey, entryPoint });
     },
     onAgentChange: (agent) => {
-      if (disabled) return;
+      if (disabled || !resolvedMetadata) return;
       dispatch({ type: "change-agent", projectKey, agent });
     },
     onBlur: () => {
@@ -330,7 +332,7 @@ function makeDraftViewSnapshot(
       dispatch({ type: "flush", projectKey });
     },
     onSubmit: (_text, images) => {
-      if (disabled) return;
+      if (disabled || !resolvedMetadata) return;
       submit(projectKey, images);
     },
   };
@@ -719,6 +721,7 @@ export function useTaskManager(
   const draftStateRef = useRef<DraftState>(createDraftState());
   const [draftRevision, setDraftRevision] = useState(0);
   const requestedProjectTypesRef = useRef(new Map<string, number>());
+  const readyDraftMetadataProjectsRef = useRef(new Set<ProjectKey>());
   const createRuntimeRef = useRef(
     new Map<
       ProjectKey,
@@ -753,10 +756,6 @@ export function useTaskManager(
     workspace: string;
     projectName: string;
     projectPath: string;
-  } | null>(null);
-  const deferredDraftAttachmentRef = useRef<{
-    projectKey: ProjectKey;
-    tid: number;
   } | null>(null);
   const composerResetSequenceRef = useRef(0);
   const composerResetEpochRef = useRef(0);
@@ -819,37 +818,45 @@ export function useTaskManager(
     [],
   );
 
-  const projectDraft = useCallback(
-    (
-      tid: number,
-      text: string,
-      form?: Pick<DraftForm, "entryPoint" | "agent">,
-    ) => {
-      const task = findByTid(tid);
-      if (!task) throw new Error(`Draft projection requires task ${tid}`);
-      const title = text.trim().split("\n")[0]?.slice(0, 100) || undefined;
-      let updated: TaskState = {
-        ...task,
-        serverDraft: text || undefined,
-        title,
-      };
-      if (form) {
-        const projectPath = task.projectPath;
-        if (!projectPath)
-          throw new Error(`Draft projection requires project ${tid}`);
-        const entryPoint = entryPointFor(projectPath, form.entryPoint);
-        updated = {
-          ...updated,
-          entryPoint: form.entryPoint,
-          agentName: form.agent,
-          taskType: entryPoint.task_type,
-        };
+  const projectDraft = useCallback((tid: number, form: ResolvedDraftForm) => {
+    const task = findByTid(tid);
+    if (!task) throw new Error(`Draft projection requires task ${tid}`);
+    const projectPath = task.projectPath;
+    if (!projectPath)
+      throw new Error(`Draft projection requires project ${tid}`);
+    const candidates = projectEntryPointsRef.current.get(projectPath);
+    let taskType: string;
+    if (candidates !== undefined) {
+      const entryPoint = candidates.find(
+        (candidate) => candidate.name === form.entryPoint,
+      );
+      if (!entryPoint) {
+        throw new Error(`Unknown entry point: ${form.entryPoint}`);
       }
-      liveStates.set(task.uuid, updated);
-      setTasks((previous) => new Map(previous).set(task.uuid, updated));
-    },
-    [entryPointFor],
-  );
+      taskType = entryPoint.task_type;
+    } else {
+      if (task.entryPoint !== form.entryPoint) {
+        throw new Error(
+          `Draft projection entry point does not match task ${tid}`,
+        );
+      }
+      if (!task.taskType) {
+        throw new Error(`Draft projection requires task type ${tid}`);
+      }
+      taskType = task.taskType;
+    }
+    const title = form.text.trim().split("\n")[0]?.slice(0, 100) || undefined;
+    const updated: TaskState = {
+      ...task,
+      serverDraft: form.text || undefined,
+      title,
+      entryPoint: form.entryPoint,
+      agentName: form.agent,
+      taskType,
+    };
+    liveStates.set(task.uuid, updated);
+    setTasks((previous) => new Map(previous).set(task.uuid, updated));
+  }, []);
 
   const sendRealTask = useCallback(
     (uuid: string, text: string, images?: readonly ImageAttachment[]) => {
@@ -1031,7 +1038,7 @@ export function useTaskManager(
             break;
 
           case "project-draft":
-            projectDraft(effect.tid, effect.form.text, effect.form);
+            projectDraft(effect.tid, effect.form);
             break;
 
           case "delete-task": {
@@ -1106,6 +1113,7 @@ export function useTaskManager(
       relationType: string | undefined,
       desired: Exclude<ReturnType<typeof getSlot>["desired"], { kind: "none" }>,
     ) => {
+      assertResolvedDraftForm(desired);
       const entryPoint = entryPointFor(projectPath, desired.entryPoint);
       const submitting = desired.kind === "submitting";
       const title = submitting
@@ -2153,9 +2161,9 @@ export function useTaskManager(
         applyDraftEvent({ type: "connection-reset" });
         expectedFocusRef.current.clear();
         draftAttachmentRef.current = null;
-        deferredDraftAttachmentRef.current = null;
         routeProjectCacheRef.current = null;
         requestedProjectTypesRef.current.clear();
+        readyDraftMetadataProjectsRef.current.clear();
         workspacesRef.current = [];
         projectEntryPointsRef.current = new Map();
         defaultAgentRef.current = "";
@@ -2445,19 +2453,6 @@ export function useTaskManager(
     [refreshDraftView],
   );
 
-  const setDeferredDraftAttachment = useCallback(
-    (next: { projectKey: ProjectKey; tid: number } | null) => {
-      const previous = deferredDraftAttachmentRef.current;
-      if (
-        previous?.projectKey === next?.projectKey &&
-        previous?.tid === next?.tid
-      )
-        return;
-      deferredDraftAttachmentRef.current = next;
-    },
-    [],
-  );
-
   const dispatchDraftIntent = useCallback(
     (event: DraftEvent) => {
       const result = applyDraftEvent(event);
@@ -2555,7 +2550,6 @@ export function useTaskManager(
   useEffect(() => {
     if (!isCurrentOpenEpoch(renderedConnectionEpoch)) return;
     if (!connected || !routeDraftMetadata?.projectPath) {
-      setDeferredDraftAttachment(null);
       setDraftAttachment(null);
       return;
     }
@@ -2563,37 +2557,53 @@ export function useTaskManager(
       routeDraftMetadata.workspace,
       routeDraftMetadata.projectPath,
     );
-    if (!routeDraftMetadata.metadataReady || !routeDraftMetadata.entryPoint) {
-      const slot = draftStateRef.current.slots[projectKey];
-      const routeTid = activeTaskId === null ? null : parseTaskId(activeTaskId);
-      const ownsCurrentRoute =
-        activeTaskId === null ||
-        (routeTid !== null &&
-          (slot?.remote.kind === "present" ||
-            slot?.remote.kind === "deleting") &&
-          slot.remote.tid === routeTid);
-      if (!slot || !ownsCurrentRoute) {
-        setDeferredDraftAttachment(null);
-        setDraftAttachment(null);
-      } else {
-        setDeferredDraftAttachment(null);
-        setDraftAttachment({ projectKey, routeTid });
+    const existingSlot = draftStateRef.current.slots[projectKey];
+    if (routeDraftMetadata.metadataReady) {
+      const entryPoint = routeDraftMetadata.entryPoint;
+      if (!entryPoint) {
+        throw new Error("Resolved draft metadata lacks an entry point");
       }
-      return;
-    }
-    if (!draftStateRef.current.slots[projectKey]) {
-      const initialized = applyDraftEvent({
-        type: "initialize-slot",
-        project: {
-          workspace: routeDraftMetadata.workspace,
-          projectPath: routeDraftMetadata.projectPath,
-        },
-        defaults: {
-          entryPoint: routeDraftMetadata.entryPoint.name,
+      const metadataWasReady =
+        readyDraftMetadataProjectsRef.current.has(projectKey);
+      readyDraftMetadataProjectsRef.current.add(projectKey);
+      if (!existingSlot) {
+        const initialized = applyDraftEvent({
+          type: "initialize-slot",
+          project: {
+            workspace: routeDraftMetadata.workspace,
+            projectPath: routeDraftMetadata.projectPath,
+          },
+          defaults: {
+            entryPoint: entryPoint.name,
+            agent: routeDraftMetadata.agent,
+          },
+        });
+        executeDraftEffects(initialized.effects);
+      } else if (!metadataWasReady) {
+        const resolved = applyDraftEvent({
+          type: "resolve-metadata",
+          projectKey,
+          entryPoint: entryPoint.name,
           agent: routeDraftMetadata.agent,
-        },
-      });
-      executeDraftEffects(initialized.effects);
+        });
+        executeDraftEffects(resolved.effects);
+      }
+    } else {
+      readyDraftMetadataProjectsRef.current.delete(projectKey);
+      if (!existingSlot) {
+        const initialized = applyDraftEvent({
+          type: "initialize-slot",
+          project: {
+            workspace: routeDraftMetadata.workspace,
+            projectPath: routeDraftMetadata.projectPath,
+          },
+          defaults: {
+            entryPoint: null,
+            agent: null,
+          },
+        });
+        executeDraftEffects(initialized.effects);
+      }
     }
     routeProjectCacheRef.current = {
       epoch: renderedConnectionEpoch,
@@ -2603,14 +2613,12 @@ export function useTaskManager(
     };
 
     if (activeTaskId === null) {
-      setDeferredDraftAttachment(null);
       setDraftAttachment({ projectKey, routeTid: null });
       return;
     }
 
     const tid = parseTaskId(activeTaskId);
     if (tid === null) {
-      setDeferredDraftAttachment(null);
       setDraftAttachment(null);
       return;
     }
@@ -2620,7 +2628,6 @@ export function useTaskManager(
       task.workspace !== routeDraftMetadata.workspace ||
       task.projectPath !== routeDraftMetadata.projectPath
     ) {
-      setDeferredDraftAttachment(null);
       setDraftAttachment(null);
       return;
     }
@@ -2629,28 +2636,19 @@ export function useTaskManager(
       (slot.remote.kind === "present" || slot.remote.kind === "deleting") &&
       slot.remote.tid === tid
     ) {
-      setDeferredDraftAttachment(null);
       setDraftAttachment({ projectKey, routeTid: tid });
       return;
     }
     const snapshot = persistedSnapshot(task, routeDraftMetadata.agent);
     if (!snapshot) {
-      setDeferredDraftAttachment(null);
       setDraftAttachment(null);
       return;
     }
-    const deferred = deferredDraftAttachmentRef.current;
-    if (
-      deferred &&
-      (deferred.projectKey !== projectKey || deferred.tid !== tid)
-    )
-      setDeferredDraftAttachment(null);
     if (
       slot.remote.kind === "creating" ||
       slot.remote.kind === "deleting" ||
       slot.desired.kind === "submitting"
     ) {
-      setDeferredDraftAttachment({ projectKey, tid });
       setDraftAttachment(null);
       return;
     }
@@ -2662,16 +2660,13 @@ export function useTaskManager(
         snapshot,
       });
       executeDraftEffects(adopted.effects);
-      setDeferredDraftAttachment(null);
       setDraftAttachment({ projectKey, routeTid: tid });
       return;
     }
     if (switchStablePersistedRoute(projectKey, task, snapshot)) {
-      setDeferredDraftAttachment(null);
       setDraftAttachment({ projectKey, routeTid: tid });
       return;
     }
-    setDeferredDraftAttachment(null);
     setDraftAttachment(null);
   }, [
     activeTaskId,
@@ -2684,7 +2679,6 @@ export function useTaskManager(
     renderedConnectionEpoch,
     isCurrentOpenEpoch,
     setDraftAttachment,
-    setDeferredDraftAttachment,
     switchStablePersistedRoute,
     tasks,
   ]);
@@ -3007,6 +3001,7 @@ export function useTaskManager(
         agent: "",
         lifecycle: "idle",
         disabled: true,
+        metadataReady: false,
         composerResetToken: 0,
       };
     }
@@ -3015,9 +3010,7 @@ export function useTaskManager(
       routeDraftMetadata.projectPath,
     );
     const slot = draftStateRef.current.slots[projectKey];
-    const metadataDisabled = !connected || !routeDraftMetadata.metadataReady;
-    const preserveImagesWhenDisabled =
-      connected && !routeDraftMetadata.metadataReady;
+    const composerDisabled = !connected;
     if (activeTaskId === null) {
       if (!slot) {
         return {
@@ -3032,6 +3025,7 @@ export function useTaskManager(
           agent: "",
           lifecycle: "idle",
           disabled: true,
+          metadataReady: false,
           composerResetToken: 0,
         };
       }
@@ -3039,8 +3033,8 @@ export function useTaskManager(
         slot,
         projectKey,
         routeDraftMetadata.projectName,
-        metadataDisabled,
-        preserveImagesWhenDisabled,
+        composerDisabled,
+        routeDraftMetadata.metadataReady,
         composerResetTokenFor(projectKey),
         editDraftText,
         dispatchDraftIntent,
@@ -3058,8 +3052,8 @@ export function useTaskManager(
         slot,
         projectKey,
         routeDraftMetadata.projectName,
-        metadataDisabled,
-        preserveImagesWhenDisabled,
+        composerDisabled,
+        routeDraftMetadata.metadataReady,
         composerResetTokenFor(projectKey),
         editDraftText,
         dispatchDraftIntent,
@@ -3087,7 +3081,7 @@ export function useTaskManager(
       projectKey,
       routeDraftMetadata.projectName,
       true,
-      false,
+      true,
       composerResetTokenFor(projectKey),
       editDraftText,
       dispatchDraftIntent,
