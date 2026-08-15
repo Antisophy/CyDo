@@ -12,7 +12,7 @@ import { outbox, type OutboxEntry } from "../outbox";
 import { hasAnsi, renderAnsi } from "../ansi";
 import { AssistantMessage } from "./AssistantMessage";
 import { UserMessage } from "./UserMessage";
-import { CopyButton } from "./CopyButton";
+import { CopyButton, CodePre } from "./CopyButton";
 import { useDevMode } from "../devMode";
 import { Markdown } from "./Markdown";
 import { TaskDiagnosticView } from "./TaskDiagnosticView";
@@ -303,7 +303,10 @@ function SystemUserMessage({ message }: { message: DisplayMessage }) {
           {meta.bodyMarkdown ? (
             <Markdown text={bodyValue} />
           ) : (
-            <div class="user-text">{bodyValue}</div>
+            <>
+              <CopyButton text={bodyValue} />
+              <div class="user-text">{bodyValue}</div>
+            </>
           )}
         </div>
       )}
@@ -324,7 +327,7 @@ function SystemUserMessage({ message }: { message: DisplayMessage }) {
         }}
       >
         <summary>Full message</summary>
-        <pre>{text}</pre>
+        <CodePre copyText={text}>{text}</CodePre>
       </details>
     </div>
   );

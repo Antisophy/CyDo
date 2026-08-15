@@ -500,6 +500,34 @@ describe("MessageList task diagnostics", () => {
     expect(html).toContain("btn-copy");
   });
 
+  it("renders copy buttons for a wrapped message body and full text", () => {
+    const wrapped: DisplayMessage = {
+      id: "s",
+      type: "user",
+      content: [{ type: "text", text: "[SYSTEM]...hello there...[/SYSTEM]" }],
+      cydoMeta: {
+        label: "Session start: direct",
+        vars: { task_description: "hello there" },
+        bodyVar: "task_description",
+      },
+    };
+    const html = renderToString(
+      <MessageList
+        taskTid={1}
+        messages={[wrapped]}
+        blocks={new Map()}
+        replacementEvents={new Map()}
+        isProcessing={false}
+        bandStatus=""
+      />,
+    );
+    const bodyCopies = html.match(/btn-copy/g) ?? [];
+    // One button beside the body, one on the "Full message" pre block.
+    expect(bodyCopies.length).toBeGreaterThanOrEqual(2);
+    expect(html).toContain("system-user-body");
+    expect(html).toContain("code-pre-wrap");
+  });
+
   it("renders no copy button for image-only user messages", () => {
     const user: DisplayMessage = {
       id: "u",

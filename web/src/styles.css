@@ -4333,7 +4333,17 @@ pre.extra-field-value {
 }
 
 .system-user-body {
+  position: relative;
   margin-bottom: 8px;
+}
+
+.system-user-body > .btn-copy {
+  top: 0;
+}
+
+.system-user-message:hover .system-user-body > .btn-copy,
+.system-user-body:focus-within > .btn-copy {
+  opacity: 1;
 }
 
 .system-user-vars {
