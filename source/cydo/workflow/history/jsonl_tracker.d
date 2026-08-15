@@ -681,6 +681,11 @@ unittest
 	TaskData task = TaskData(1, "", "");
 	task.history.reset(Watermark.none());
 	JsonlTracker tracker;
+	scope(exit)
+	{
+		tracker.stopJsonlWatch(1);
+		remove(path);
+	}
 	tracker.getTask = (int) => &task;
 	tracker.historyGeneration = (int) => task.history.generation;
 	auto agent = new CodexAgent();
@@ -717,9 +722,6 @@ unittest
 		assert(entry.startsWith("line:") || entry.startsWith("boundary:"));
 	assert(log[1 .. $].canFind("line:1"));
 	assert(log[1 .. $].canFind("boundary:line:2"));
-
-	tracker.stopJsonlWatch(1);
-	remove(path);
 }
 
 unittest
