@@ -175,6 +175,16 @@ struct LiveHistoryWatchTarget
 {
 	LiveHistoryContext context;
 	string path;
+
+	package(cydo) bool matchesExactly(
+		scope const LiveHistoryWatchTarget other) const
+	{
+		return context.agent is other.context.agent
+			&& context.profile == other.context.profile
+			&& context.sessionId == other.context.sessionId
+			&& context.effectiveCwd == other.context.effectiveCwd
+			&& path == other.path;
+	}
 }
 
 struct LiveHistoryWatchResolution
@@ -229,6 +239,56 @@ public:
 			"Live history watch resolution does not contain a target");
 		return cast(LiveHistoryWatchTarget) target_;
 	}
+}
+
+unittest
+{
+	import cydo.agent.drivers.codex : CodexAgent;
+	import cydo.runtime.config : AgentDriver;
+
+	auto agent = new CodexAgent;
+	auto baseline = LiveHistoryWatchTarget(
+		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
+			"/tmp/cydo-live-history-watch-profile"), "sid-a",
+			"/tmp/cydo-live-history-watch-cwd"),
+		"/tmp/cydo-live-history-watch.jsonl");
+	assert(baseline.matchesExactly(LiveHistoryWatchTarget(
+		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
+			"/tmp/cydo-live-history-watch-profile"), "sid-a",
+			"/tmp/cydo-live-history-watch-cwd"),
+		"/tmp/cydo-live-history-watch.jsonl")));
+
+	auto secondAgent = new CodexAgent;
+	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
+		LiveHistoryContext(secondAgent, NativeHistoryProfile(AgentDriver.codex,
+			"/tmp/cydo-live-history-watch-profile"), "sid-a",
+			"/tmp/cydo-live-history-watch-cwd"),
+		"/tmp/cydo-live-history-watch.jsonl")));
+	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
+		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.claude,
+			"/tmp/cydo-live-history-watch-profile"), "sid-a",
+			"/tmp/cydo-live-history-watch-cwd"),
+		"/tmp/cydo-live-history-watch.jsonl")));
+	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
+		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
+			"/tmp/cydo-live-history-watch-other-profile"), "sid-a",
+			"/tmp/cydo-live-history-watch-cwd"),
+		"/tmp/cydo-live-history-watch.jsonl")));
+	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
+		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
+			"/tmp/cydo-live-history-watch-profile"), "sid-b",
+			"/tmp/cydo-live-history-watch-cwd"),
+		"/tmp/cydo-live-history-watch.jsonl")));
+	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
+		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
+			"/tmp/cydo-live-history-watch-profile"), "sid-a",
+			"/tmp/cydo-live-history-watch-other-cwd"),
+		"/tmp/cydo-live-history-watch.jsonl")));
+	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
+		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
+			"/tmp/cydo-live-history-watch-profile"), "sid-a",
+			"/tmp/cydo-live-history-watch-cwd"),
+		"/tmp/cydo-live-history-watch-other.jsonl")));
 }
 
 private void validateLiveHistoryContext(ref LiveHistoryContext value)

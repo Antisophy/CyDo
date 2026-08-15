@@ -795,12 +795,7 @@ class App
 			if (resolution.kind != LiveHistoryWatchResolutionKind.target)
 				return;
 			auto currentTarget = resolution.requireTarget();
-			if (currentTarget.context.agent !is watchedTarget.context.agent
-				|| currentTarget.context.profile.driver != watchedTarget.context.profile.driver
-				|| currentTarget.context.profile.root != watchedTarget.context.profile.root
-				|| currentTarget.context.sessionId != watchedTarget.context.sessionId
-				|| currentTarget.context.effectiveCwd != watchedTarget.context.effectiveCwd
-				|| currentTarget.path != watchedTarget.path)
+			if (!currentTarget.matchesExactly(watchedTarget))
 				return;
 			auto codex = cast(CodexSession) sessionForTask(tid);
 			if (codex is null)
