@@ -1070,8 +1070,19 @@ private:
 
 				write(jsonlPathSnap, jsonlSnap);
 			}
-			performUndoExecution(ws, tid, json, boundary, mechanism, access,
-				liveLaunch, false);
+			// the promise chain ends in ignoreResult, so a throw out of the
+			// undo would vanish; report it instead of dying silently with the
+			// session already stopped
+			try
+				performUndoExecution(ws, tid, json, boundary, mechanism, access,
+					liveLaunch, false);
+			catch (Exception e)
+			{
+				import std.logger : warningf;
+				warningf("undo: execution failed for task %d: %s", tid, e.msg);
+				ws.send(Data(toJson(ErrorMessage("error",
+					"Undo failed: " ~ e.msg, tid)).representation));
+			}
 		}).ignoreResult();
 		host_.stopTask(tid);
 	}
@@ -1136,44 +1147,65 @@ private:
 					});
 					return;
 				}
-				auto destination = host_.prepareHistoryForkDestination(tid);
-				auto backup = forkTask(*host_.persistence(), tid, access,
-					lastForkId, td.projectPath, td.workspace, td.title, destination,
-					&ta.rewriteSessionId, &ta.forkIdMatchesLine,
-					td.description, td.taskType, td.agentName);
-				if (backup.tid >= 0)
+				// The pre-undo backup is auxiliary: a driver that cannot
+				// provide a generic fork destination (Codex routes generic
+				// forks through the native thread RPC, which a busy live
+				// session cannot serve) skips the backup rather than aborting
+				// the undo.
+				HistoryForkDestination destination;
+				bool haveDestination;
+				try
 				{
-					if (td.worktreeTid > 0)
-						host_.persistence().setWorktreeTid(backup.tid, td.worktreeTid);
-					auto bTd = TaskData(backup.tid, td.workspace, td.projectPath);
-					bTd.title = td.title.length > 0 ? td.title ~ " (pre-undo)" : "(pre-undo)";
-					bTd.agentSessionId = backup.agentSessionId;
-					bTd.parentTid = tid;
-					bTd.relationType = "undo-backup";
-					bTd.status = TaskStatus.completed;
-					bTd.agentName = td.agentName;
-					bTd.description = td.description;
-					bTd.taskType = td.taskType;
-					bTd.worktreeTid = td.worktreeTid;
-					bTd.createdAt = Clock.currStdTime;
-					bTd.lastActive = bTd.createdAt;
-					host_.setRelationType(backup.tid, "undo-backup");
-					host_.setTitle(backup.tid, bTd.title);
-					host_.putTask(backup.tid, move(bTd));
-					auto backupTd = host_.getTask(backup.tid);
-					assert(backupTd !is null,
-						"Undo backup task must exist after insertion");
-					backupTd.processQueue = new StateQueue!ProcessState(
-						host_.makeProcessQueueSF(backup.tid),
-						ProcessState.Dead,
-					);
-					backupTd.archiveQueue = new StateQueue!ArchiveState(
-						host_.makeArchiveQueueSF(backup.tid),
-						ArchiveState.Unarchived,
-					);
-					backupTd.history.reset(watermarkFromPath(backup.destinationPath));
-					host_.broadcastTaskCreated(TaskCreatedMessage("task_created",
-						backup.tid, td.workspace, td.projectPath, tid, "undo-backup"));
+					destination = host_.prepareHistoryForkDestination(tid);
+					haveDestination = true;
+				}
+				catch (Exception e)
+				{
+					import std.logger : warningf;
+					warningf("undo: skipping pre-undo backup for task %d: %s",
+						tid, e.msg);
+				}
+				if (haveDestination)
+				{
+					auto backup = forkTask(*host_.persistence(), tid, access,
+						lastForkId, td.projectPath, td.workspace, td.title, destination,
+						&ta.rewriteSessionId, &ta.forkIdMatchesLine,
+						td.description, td.taskType, td.agentName);
+					if (backup.tid >= 0)
+					{
+						if (td.worktreeTid > 0)
+							host_.persistence().setWorktreeTid(backup.tid, td.worktreeTid);
+						auto bTd = TaskData(backup.tid, td.workspace, td.projectPath);
+						bTd.title = td.title.length > 0 ? td.title ~ " (pre-undo)" : "(pre-undo)";
+						bTd.agentSessionId = backup.agentSessionId;
+						bTd.parentTid = tid;
+						bTd.relationType = "undo-backup";
+						bTd.status = TaskStatus.completed;
+						bTd.agentName = td.agentName;
+						bTd.description = td.description;
+						bTd.taskType = td.taskType;
+						bTd.worktreeTid = td.worktreeTid;
+						bTd.createdAt = Clock.currStdTime;
+						bTd.lastActive = bTd.createdAt;
+						host_.setRelationType(backup.tid, "undo-backup");
+						host_.setTitle(backup.tid, bTd.title);
+						host_.putTask(backup.tid, move(bTd));
+						auto backupTd = host_.getTask(backup.tid);
+						assert(backupTd !is null,
+							"Undo backup task must exist after insertion");
+						backupTd.processQueue = new StateQueue!ProcessState(
+							host_.makeProcessQueueSF(backup.tid),
+							ProcessState.Dead,
+						);
+						backupTd.archiveQueue = new StateQueue!ArchiveState(
+							host_.makeArchiveQueueSF(backup.tid),
+							ArchiveState.Unarchived,
+						);
+						backupTd.history.reset(watermarkFromPath(backup.destinationPath));
+						host_.broadcastTaskCreated(TaskCreatedMessage("task_created",
+							backup.tid, td.workspace, td.projectPath, tid, "undo-backup"));
+
+				}
 					host_.broadcastTaskUpdate(backup.tid);
 				}
 			}

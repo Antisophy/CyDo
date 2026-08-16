@@ -784,6 +784,14 @@ public:
 		td = requireTask(tid, "Task disappeared before session creation");
 		auto session = taskAgent.createSession(tid, td.agentSessionId,
 			launch.processLaunch, launch.sessionConfig);
+		// A binding belongs to whichever session is currently mapped. Replacing
+		// the session (a pre-send respawn, a resume racing a still-exiting
+		// process) drops the old one here: the exiting session's onExit sees
+		// itself superseded and returns without cleaning up, which would
+		// otherwise leave a binding whose owner no longer matches and make
+		// every later history resolution throw. The new session installs its
+		// own once it announces its native session id.
+		liveHistoryBindings_.remove(tid);
 		sessions_[tid] = session;
 		host_.clearLastActive(tid);
 		session.onNativeSessionStarted = (string sessionId) {
