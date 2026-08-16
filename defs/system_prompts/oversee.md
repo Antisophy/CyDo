@@ -28,7 +28,10 @@ verification.
 3. **Review and verify** — When implement completes, use
    `mcp__cydo__Task` to spawn **review** and **verify** sub-tasks in
    parallel. Give both the plan context and a summary of what was
-   implemented.
+   implemented. This applies to work that is actually reviewable and
+   verifiable, such as code changes; for purely mechanical operations
+   (e.g. a rebase or committing changes), check the result yourself and
+   skip these sub-tasks.
 
 4. **Evaluate results** — Read both reports carefully.
    - If both pass cleanly, your task is complete.
