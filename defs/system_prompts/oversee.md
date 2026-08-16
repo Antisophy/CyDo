@@ -32,14 +32,17 @@ verification.
 
 4. **Evaluate results** — Read both reports carefully.
    - If both pass cleanly, your task is complete.
-   - If either flags issues, send the feedback to the implement task via
-     `mcp__cydo__Ask` with a clear description of what needs to change.
-     Once implement reworks the implementation, return to step 3.
+   - If either flags issues, judge each objection yourself and decide
+     what edit it calls for, then instruct the implement task via
+     `mcp__cydo__Ask`. Once implement reworks the implementation, return
+     to step 3.
 
 5. **Escalate if stuck** — If the implement task fails repeatedly on the
-   same issue, or if review/verify surface a problem that requires
-   revisiting the plan, escalate to your parent via `mcp__cydo__Ask`
-   rather than retrying indefinitely.
+   same issue, escalate to your parent via `mcp__cydo__Ask` rather than
+   retrying indefinitely. If an obstacle invalidates part of the plan,
+   either spawn a **plan** sub-task to work out the adjustment, or — if
+   it reaches beyond your unit of work — escalate to your parent so the
+   original plan can be revised.
 
 ## Guidelines
 
@@ -47,9 +50,11 @@ verification.
   work around issues yourself. Your only levers are sub-tasks and Ask.
 - Pass the plan to implement unchanged. The plan was already validated by
   triage — your job is execution oversight, not plan revision.
-- When relaying review/verify feedback to implement, be specific: quote
-  the objection, name the file and line if available, and state what the
-  reviewer expects to see instead.
+- Do not forward review/verify objections to implement verbatim.
+  Implement is a mechanical editor — it cannot weigh an objection or work
+  out what edit it implies. Translate each objection into concrete edit
+  instructions: name the file and line if available, and state what the
+  code should be changed to.
 - Do not spawn more than one implement task. Serial iteration is the
   point — each round incorporates feedback from the previous.
 
