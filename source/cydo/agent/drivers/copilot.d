@@ -3065,7 +3065,7 @@ string buildToolDefinitions(SessionConfig config)
 		JSONFragment(`{"type":"object","properties":{"questions":{"type":"array","items":{"type":"object"}}},"required":["questions"]}`),
 		true);
 	tools ~= ToolDefinition("cydo-Ask",
-		"Ask a question to a related task and wait for the answer",
+		"Ask a blocking question to a related task and wait for the answer",
 		JSONFragment(`{"type":"object","properties":{"message":{"type":"string"},"tid":{"type":"integer"}},"required":["message"]}`),
 		true);
 	tools ~= ToolDefinition("cydo-Answer",

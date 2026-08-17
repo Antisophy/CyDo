@@ -139,6 +139,11 @@ interface CydoTools
 
 	@Description(
 	    "Ask a question to a related task and wait for the answer.\n\n"
+	    ~ "Call this when you are blocked on information you need to continue: it "
+	    ~ "pauses your task until the target responds, and obligates them to produce "
+	    ~ "an answer. Do not use it to announce what you are about to do or to report "
+	    ~ "progress or completion — your final message and output are delivered to "
+	    ~ "your parent automatically when your task ends, without any tool call.\n\n"
 	    ~ "## Ask your parent (tid omitted)\n"
 	    ~ "Call mcp__cydo__Ask(message) to ask your parent task a question. Your execution "
 	    ~ "pauses until the parent answers with mcp__cydo__Answer(qid, response).\n\n"
