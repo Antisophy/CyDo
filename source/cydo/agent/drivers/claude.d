@@ -87,6 +87,19 @@ class ClaudeCodeAgent : Agent
 	private string lastMcpConfigPath_;
 	@property string lastMcpConfigPath() { return lastMcpConfigPath_; }
 
+	// Claude names its per-project history directory after the CLI process's
+	// own observed CWD. Sandbox path rewriting can spell that CWD differently
+	// from any path CyDo derives (a symlink kept literal inside the sandbox
+	// resolves on the host), so sessions are located by ID, never derived
+	// from a CWD. registeredHistoryPaths_ holds exact locations CyDo learned
+	// first-hand (live session init, fork creation, discovery import);
+	// scannedHistoryPaths_ is a once-per-profile disk snapshot. The snapshot
+	// is authoritative for its root: a miss never rescans, so a profile is
+	// scanned exactly once per process no matter how many absent sessions
+	// are looked up.
+	private string[string][string] registeredHistoryPaths_; // root → session ID → path
+	private string[string][string] scannedHistoryPaths_;    // root → session ID → path
+
 	AgentSession createSession(int tid, string resumeSessionId, ProcessLaunch launch,
 		SessionConfig config = SessionConfig.init)
 	{
@@ -97,8 +110,20 @@ class ClaudeCodeAgent : Agent
 		auto claudeBin = launch.executablePath.length > 0
 			? launch.executablePath
 			: executableName(launch.sandbox.env);
+		auto profile = launch.nativeHistoryProfile;
 		return new ClaudeCodeSession(claudeBin, resumeSessionId, launch.cmdPrefix,
-			lastMcpConfigPath_, config);
+			lastMcpConfigPath_, config,
+			(string sessionId, string cwd) {
+				import std.path : buildPath;
+				// The init event's cwd is the CLI's own observed CWD — the
+				// one Claude mangles into its project directory name.
+				enforce(cwd.length > 0,
+					"Claude session initialization did not provide a CWD");
+				registerHistoryPath(sessionId,
+					buildPath(profile.root, "projects", mangleProjectPath(cwd),
+						sessionId ~ ".jsonl"),
+					profile);
+			});
 	}
 
 	string extractResultText(string line)
@@ -358,24 +383,139 @@ class ClaudeCodeAgent : Agent
 		assert(agent.resolveModelSpec("").model == "");
 	}
 
-	string historyPath(string sessionId, string effectiveCwd,
-		const ref NativeHistoryProfile profile)
+	string historyPath(string sessionId, const ref NativeHistoryProfile profile)
 	{
-		import std.path : buildPath;
 		enforce(profile.driver == driver,
 			"Claude history profile driver does not match Claude");
 		enforce(sessionId.length > 0,
 			"Claude history path requires a session ID");
-		enforce(effectiveCwd.length > 0,
-			"Claude history path requires an effective CWD");
-		return buildPath(profile.root, "projects", mangleProjectPath(effectiveCwd),
-			sessionId ~ ".jsonl");
+		if (auto registered = profile.root in registeredHistoryPaths_)
+			if (auto path = sessionId in *registered)
+				return *path;
+		if (auto scanned = profile.root in scannedHistoryPaths_)
+		{
+			if (auto path = sessionId in *scanned)
+				return *path;
+			return null;
+		}
+		// First lookup for this root: take the one snapshot. Sessions that
+		// appear later are registered at their point of creation, so an
+		// absent session cannot trigger repeated scans.
+		string[string] paths;
+		long[string] mtimes;
+		foreach (ref session; enumerateAllSessions(profile))
+		{
+			// The same session ID in two project directories (e.g. a CWD
+			// respelled across sandbox changes): the newest file wins.
+			if (auto mtime = session.sessionId in mtimes)
+				if (*mtime >= session.mtime)
+					continue;
+			paths[session.sessionId] = session.exactHistoryPath;
+			mtimes[session.sessionId] = session.mtime;
+		}
+		scannedHistoryPaths_[profile.root] = paths;
+		if (auto path = sessionId in paths)
+			return *path;
+		return null;
 	}
 
-	string createHistoryForkDestination(string sessionId, string effectiveCwd,
+	void registerHistoryPath(string sessionId, string path,
 		const ref NativeHistoryProfile profile)
 	{
-		return historyPath(sessionId, effectiveCwd, profile);
+		import std.algorithm.searching : startsWith;
+		import std.path : buildPath, isAbsolute;
+		enforce(profile.driver == driver,
+			"Claude history profile driver does not match Claude");
+		enforce(sessionId.length > 0,
+			"Claude history registration requires a session ID");
+		auto projectsDir = buildPath(profile.root, "projects");
+		enforce(path.length > 0 && isAbsolute(path)
+			&& path.startsWith(projectsDir ~ "/"),
+			"Claude history path is not inside the supplied profile projects directory");
+		if (auto registered = profile.root in registeredHistoryPaths_)
+			if (auto existing = sessionId in *registered)
+			{
+				enforce(*existing == path,
+					"Claude session " ~ sessionId
+					~ " is already registered at a different history path");
+				return;
+			}
+		registeredHistoryPaths_[profile.root][sessionId] = path;
+	}
+
+	string createHistoryForkDestination(string sessionId, string sourceHistoryPath,
+		const ref NativeHistoryProfile profile)
+	{
+		import std.path : buildPath, dirName, isAbsolute;
+		enforce(sourceHistoryPath.length > 0 && isAbsolute(sourceHistoryPath),
+			"Claude history forks require an absolute source history path");
+		auto destination = buildPath(dirName(sourceHistoryPath),
+			sessionId ~ ".jsonl");
+		registerHistoryPath(sessionId, destination, profile);
+		return destination;
+	}
+
+	// historyPath locates sessions by ID: the file may sit in a project
+	// directory whose name CyDo cannot derive, because Claude mangles the
+	// CLI's own observed CWD. The scan snapshot is taken once and misses
+	// settle; paths learned afterwards arrive via registerHistoryPath.
+	unittest
+	{
+		import std.datetime.systime : SysTime;
+		import std.exception : assertThrown;
+		import std.file : exists, mkdirRecurse, rmdirRecurse, setTimes, write;
+		import std.path : buildPath;
+
+		auto root = buildPath("/tmp", "cydo-claude-history-path-cache");
+		if (exists(root))
+			rmdirRecurse(root);
+		scope (exit)
+			if (exists(root))
+				rmdirRecurse(root);
+		auto logicalDir = buildPath(root, "projects", "-home-user-proj");
+		auto sandboxDir = buildPath(root, "projects", "-mnt-scratch-home-user-proj");
+		mkdirRecurse(logicalDir);
+		mkdirRecurse(sandboxDir);
+		enum idA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+		enum idB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+		enum idC = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+		enum idD = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+		auto pathA = buildPath(sandboxDir, idA ~ ".jsonl");
+		write(pathA, "");
+		auto dupOld = buildPath(logicalDir, idD ~ ".jsonl");
+		auto dupNew = buildPath(sandboxDir, idD ~ ".jsonl");
+		write(dupOld, "");
+		write(dupNew, "");
+		auto older = SysTime.fromUnixTime(1_000_000);
+		auto newer = SysTime.fromUnixTime(2_000_000);
+		setTimes(dupOld, older, older);
+		setTimes(dupNew, newer, newer);
+
+		auto agent = new ClaudeCodeAgent();
+		auto profile = NativeHistoryProfile(AgentDriver.claude, root);
+
+		// 19. the session is found by ID in whichever project directory
+		// holds it, and a duplicated ID resolves to the newest file
+		assert(agent.historyPath(idA, profile) == pathA);
+		assert(agent.historyPath(idD, profile) == dupNew);
+
+		// 20. the snapshot is authoritative: a file written after the scan
+		// stays unknown rather than triggering a rescan
+		auto pathB = buildPath(logicalDir, idB ~ ".jsonl");
+		write(pathB, "");
+		assert(agent.historyPath(idB, profile) is null);
+
+		// 21. registration resolves it without a rescan, and re-registering
+		// must agree with the recorded location
+		agent.registerHistoryPath(idB, pathB, profile);
+		assert(agent.historyPath(idB, profile) == pathB);
+		agent.registerHistoryPath(idB, pathB, profile);
+		assertThrown(agent.registerHistoryPath(idB, pathA, profile));
+
+		// 22. a fork destination lands beside its source and is registered
+		auto destination = agent.createHistoryForkDestination(idC, pathA, profile);
+		assert(destination == buildPath(sandboxDir, idC ~ ".jsonl"));
+		assert(agent.historyPath(idC, profile) == destination);
 	}
 
 	TranslatedEvent[] translateHistoryLine(string line, int lineNum)
@@ -1057,6 +1197,7 @@ class ClaudeCodeSession : AgentSession
 	private AgentProcess process;
 	private string nativeSessionId_;
 	private void delegate(string sessionId) nativeSessionStartedHandler_;
+	private void delegate(string sessionId, string cwd) historyPathRegistrar_;
 	private void delegate(TranslatedEvent) outputHandler;
 	private void delegate(string line) stderrHandler;
 	private void delegate(int status) exitHandler;
@@ -1152,10 +1293,12 @@ class ClaudeCodeSession : AgentSession
 	}
 
 	this(string executablePath, string resumeSessionId = null, string[] cmdPrefix = null,
-		string mcpConfigPath = null, SessionConfig config = SessionConfig.init)
+		string mcpConfigPath = null, SessionConfig config = SessionConfig.init,
+		void delegate(string sessionId, string cwd) historyPathRegistrar = null)
 	{
 		executablePath_ = executablePath;
 		agentName_ = config.agentName;
+		historyPathRegistrar_ = historyPathRegistrar;
 
 		auto args = buildSessionArgs(executablePath, resumeSessionId, cmdPrefix,
 			mcpConfigPath, config);
@@ -1324,16 +1467,25 @@ class ClaudeCodeSession : AgentSession
 
 		if (probe.type == "system" && probe.subtype == "init")
 		{
-			@JSONPartial static struct InitProbe { @JSONOptional string session_id; }
-			string sessionId;
+			@JSONPartial static struct InitProbe
+			{
+				@JSONOptional string session_id;
+				@JSONOptional string cwd;
+			}
+			InitProbe init;
 			try
-				sessionId = jsonParse!InitProbe(rawLine).session_id;
+				init = jsonParse!InitProbe(rawLine);
 			catch (Exception e)
 			{
 				tracef("Claude native session init parse error: %s", e.msg);
 				return;
 			}
-			notifyNativeSessionStarted(sessionId);
+			// Register before the native-ID notification so the live binding
+			// and JSONL watch set up by that callback can already resolve
+			// this session's history path.
+			if (historyPathRegistrar_)
+				historyPathRegistrar_(init.session_id, init.cwd);
+			notifyNativeSessionStarted(init.session_id);
 		}
 
 		switch (probe.type)
@@ -1850,6 +2002,26 @@ unittest
 	string delivered;
 	lateSession.onNativeSessionStarted = (string sessionId) { delivered = sessionId; };
 	assert(delivered == "claude-late-id");
+}
+
+// The history path registrar receives the init event's session ID and cwd
+// before the native-ID callback fires, so the live binding created in that
+// callback can already resolve the session's history path.
+unittest
+{
+	string[] order;
+	auto session = new ClaudeCodeSession("true", null, null, null, SessionConfig.init,
+		(string sessionId, string cwd) { order ~= "register:" ~ sessionId ~ ":" ~ cwd; });
+	scope(exit) session.stop();
+	session.onNativeSessionStarted = (string sessionId) {
+		order ~= "native:" ~ sessionId;
+	};
+	session.translateLiveLine(
+		`{"type":"system","subtype":"init","session_id":"reg-id","cwd":"/mnt/scratch/proj"}`);
+	assert(order.length >= 2
+		&& order[0] == "register:reg-id:/mnt/scratch/proj"
+		&& order[1] == "native:reg-id",
+		"Claude must register the history path before delivering its native ID");
 }
 
 unittest

@@ -2510,10 +2510,12 @@ class App
 		auto context = ConfiguredNativeHistoryContext(td.agentName, td.workspace,
 			td.repoPath, typeDef !is null && typeDef.read_only);
 		auto resolved = resolveNativeHistoryContext(config, agent, context);
+		enforce(resolved.profile.root == sourceAccess.profile.root,
+			"Generic history forks cannot move between native history profiles");
 		auto sessionId = randomUUID().toString();
 		return HistoryForkDestination(sessionId,
-			agent.createHistoryForkDestination(sessionId,
-				taskPathResolver.effectiveCwd(td), resolved.profile));
+			agent.createHistoryForkDestination(sessionId, sourceAccess.path,
+				resolved.profile));
 	}
 
 	/// Return the Agent instance for a task's agent name, creating it on demand.
@@ -3289,26 +3291,6 @@ class App
 				~ (*record).key.profileRoot);
 			return;
 		}
-		string selectedHistoryPath;
-		try
-		{
-			selectedHistoryPath = selectedContext.agent.historyPath(
-				(*record).key.sessionId, taskPathResolver.effectiveCwd(td),
-				selectedContext.profile);
-		}
-		catch (Exception e)
-		{
-			rejectPromotion(e.msg);
-			return;
-		}
-		if (selectedHistoryPath != (*record).discovered.exactHistoryPath)
-		{
-			rejectPromotion("Cannot import session " ~ (*record).key.sessionId
-				~ " into workspace '" ~ json.workspace ~ "': the derived locator under "
-				~ selectedContext.profile.root ~ " differs from the scanned locator under "
-				~ (*record).key.profileRoot);
-			return;
-		}
 		bool producingContextCurrent;
 		foreach (ref context; (*record).producingContexts)
 		{
@@ -3338,6 +3320,23 @@ class App
 		if (history.kind != TaskHistoryResolutionKind.access)
 		{
 			rejectPromotion("The imported session history is no longer available");
+			return;
+		}
+		auto taskAgent = tryAgentForTask(tid);
+		if (taskAgent is null)
+		{
+			rejectPromotion("The agent configured for this imported session is unavailable");
+			return;
+		}
+		try
+			// Teach the persistent agent instance the scanned locator, so
+			// post-import history resolution finds the session even when it
+			// appeared after the agent's profile scan.
+			taskAgent.registerHistoryPath((*record).key.sessionId,
+				(*record).discovered.exactHistoryPath, selectedContext.profile);
+		catch (Exception e)
+		{
+			rejectPromotion(e.msg);
 			return;
 		}
 		persistence.promoteImportableTask(tid, json.workspace);

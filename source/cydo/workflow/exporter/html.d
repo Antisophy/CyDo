@@ -131,8 +131,7 @@ string exportTaskData(Persistence.TaskRow[] taskRows, ref CydoConfig config,
 		auto context = ConfiguredNativeHistoryContext(t.agentName, t.workspace,
 			(*td).repoPath, false);
 		auto resolved = resolveNativeHistoryContext(config, agent, context);
-		auto jsonlPath = agent.historyPath(t.agentSessionId,
-			taskPathResolver.effectiveCwd(td), resolved.profile);
+		auto jsonlPath = agent.historyPath(t.agentSessionId, resolved.profile);
 		import std.file : exists, isFile;
 		import std.path : isAbsolute;
 		import std.stdio : File;

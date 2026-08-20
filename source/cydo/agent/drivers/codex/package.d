@@ -728,8 +728,7 @@ class CodexAgent : Agent
 		assert(agent.resolveModelSpec("").model == "");
 	}
 
-	string historyPath(string sessionId, string effectiveCwd,
-		const ref NativeHistoryProfile profile)
+	string historyPath(string sessionId, const ref NativeHistoryProfile profile)
 	{
 		enforce(sessionId.length > 0,
 			"Codex history path requires a session ID");
@@ -775,25 +774,37 @@ class CodexAgent : Agent
 		auto profile = NativeHistoryProfile(AgentDriver.codex, root);
 
 		// 19. the first lookup scans and finds the existing rollout
-		assert(agent.historyPath(idA, "", profile) == pathA);
+		assert(agent.historyPath(idA, profile) == pathA);
 
 		// 20. a rollout written after that scan is found via the miss rescan
 		auto pathB = buildPath(day, "rollout-2026-08-20T11-00-00-" ~ idB ~ ".jsonl");
 		write(pathB, "");
-		assert(agent.historyPath(idB, "", profile) == pathB);
+		assert(agent.historyPath(idB, profile) == pathB);
 
 		// 21. hits are served from the snapshot without revalidation;
 		// callers own the existence check on the returned path
 		remove(pathA);
-		assert(agent.historyPath(idA, "", profile) == pathA);
+		assert(agent.historyPath(idA, profile) == pathA);
 
 		// 22. an unknown session rescans once and reports it absent; the
 		// fresh snapshot also drops the deleted rollout
-		assert(agent.historyPath(idC, "", profile) is null);
-		assert(agent.historyPath(idA, "", profile) is null);
+		assert(agent.historyPath(idC, profile) is null);
+		assert(agent.historyPath(idA, profile) is null);
 	}
 
-	string createHistoryForkDestination(string sessionId, string effectiveCwd,
+	void registerHistoryPath(string sessionId, string path,
+		const ref NativeHistoryProfile profile)
+	{
+		validateProfile(profile);
+		enforce(sessionId.length > 0,
+			"Codex history registration requires a session ID");
+		validateProfilePath(profile, path);
+		// Rollouts never move and historyPath rescans on a miss, so this
+		// only spares that rescan for a locator learned from discovery.
+		scannedHistoryPaths_[profile.root][sessionId] = path;
+	}
+
+	string createHistoryForkDestination(string sessionId, string sourceHistoryPath,
 		const ref NativeHistoryProfile profile)
 	{
 		enforce(false,

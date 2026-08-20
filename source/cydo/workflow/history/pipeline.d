@@ -1053,7 +1053,7 @@ unittest
 	auto projectPath = buildPath(dir, "project");
 	mkdirRecurse(projectPath);
 
-	// Point ClaudeCodeAgent.historyPath at a writable temp location.
+	// Keep any Claude profile resolution inside the temp location.
 	auto oldConfigDir = environment.get("CLAUDE_CONFIG_DIR");
 	environment["CLAUDE_CONFIG_DIR"] = buildPath(dir, "claude");
 	scope(exit)
@@ -1076,7 +1076,8 @@ unittest
 	// enqueue, dequeue, then a type:"user" line carrying a tool_result. The
 	// toolUseResult sidecar makes the translated item/result include a
 	// tool_result field — exactly the field the old strict parse choked on.
-	auto jsonlPath = agent.historyPath(td.agentSessionId, projectPath, profile);
+	auto jsonlPath = buildPath(profile.root, "projects", "project",
+		td.agentSessionId ~ ".jsonl");
 	mkdirRecurse(dirName(jsonlPath));
 	auto jsonl = [
 		`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-11T06:00:00Z","sessionId":"S","content":"are you under control?"}`,
@@ -1162,7 +1163,8 @@ unittest
 
 	Agent agent = new ClaudeCodeAgent();
 	auto profile = NativeHistoryProfile(agent.driver, buildPath(dir, "claude"));
-	auto jsonlPath = agent.historyPath(td.agentSessionId, projectPath, profile);
+	auto jsonlPath = buildPath(profile.root, "projects", "project",
+		td.agentSessionId ~ ".jsonl");
 	mkdirRecurse(dirName(jsonlPath));
 
 	auto enqueueLine = `{"type":"queue-operation","operation":"enqueue","timestamp":"2026-06-11T06:00:00Z","sessionId":"S","content":"queued steering"}`;
@@ -1446,7 +1448,8 @@ unittest
 
 	Agent agent = new ClaudeCodeAgent();
 	auto profile = NativeHistoryProfile(agent.driver, buildPath(dir, "claude"));
-	auto jsonlPath = agent.historyPath(td.agentSessionId, projectPath, profile);
+	auto jsonlPath = buildPath(profile.root, "projects", "project",
+		td.agentSessionId ~ ".jsonl");
 	mkdirRecurse(dirName(jsonlPath));
 
 	auto jsonl = [

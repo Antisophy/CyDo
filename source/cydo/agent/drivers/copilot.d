@@ -353,8 +353,7 @@ class CopilotAgent : Agent
 
 	// ---- History / fork ----
 
-	string historyPath(string sessionId, string effectiveCwd,
-		const ref NativeHistoryProfile profile)
+	string historyPath(string sessionId, const ref NativeHistoryProfile profile)
 	{
 		enforce(profile.driver == driver,
 			"Copilot history profile driver does not match Copilot");
@@ -363,10 +362,19 @@ class CopilotAgent : Agent
 		return buildPath(profile.root, "session-state", sessionId, "events.jsonl");
 	}
 
-	string createHistoryForkDestination(string sessionId, string effectiveCwd,
+	void registerHistoryPath(string sessionId, string path,
 		const ref NativeHistoryProfile profile)
 	{
-		return historyPath(sessionId, effectiveCwd, profile);
+		// Copilot session paths are fully derivable, so a locator learned
+		// elsewhere must agree with the derivation.
+		enforce(path == historyPath(sessionId, profile),
+			"Copilot history registration does not match its derived path");
+	}
+
+	string createHistoryForkDestination(string sessionId, string sourceHistoryPath,
+		const ref NativeHistoryProfile profile)
+	{
+		return historyPath(sessionId, profile);
 	}
 
 	void resetHistoryReplay() {} // no state to reset for Copilot

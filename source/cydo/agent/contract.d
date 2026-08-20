@@ -133,13 +133,22 @@ interface Agent
 	/// label resolves to itself unless overridden.
 	ModelSpec resolveModelSpec(string modelClass);
 
-	/// Compute the path to the agent's history file in an exact configured profile.
-	string historyPath(string sessionId, string effectiveCwd,
+	/// Locate the agent's history file for a session in an exact configured
+	/// profile. Returns null when the session cannot be found there; callers
+	/// own the existence check on the returned path.
+	string historyPath(string sessionId, const ref NativeHistoryProfile profile);
+
+	/// Record a session's exact history locator that CyDo learned outside the
+	/// driver's own lookup (live session start, fork creation, discovery
+	/// import), so subsequent historyPath calls resolve it without rescanning.
+	void registerHistoryPath(string sessionId, string path,
 		const ref NativeHistoryProfile profile);
 
-	/// Compute the deterministic destination for a generic JSONL history fork.
+	/// Compute the destination for a generic JSONL history fork, next to the
+	/// fork's source history file so the agent resolves the forked session the
+	/// same way it resolved the source.
 	/// Codex native forks obtain their path from the thread RPC instead.
-	string createHistoryForkDestination(string sessionId, string effectiveCwd,
+	string createHistoryForkDestination(string sessionId, string sourceHistoryPath,
 		const ref NativeHistoryProfile profile);
 
 	/// Reset internal history-replay state (e.g. task_started sentinel).

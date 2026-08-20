@@ -434,7 +434,7 @@ class TaskSessionRunner
 		if (cwd.length == 0)
 			return TaskHistoryResolution.unavailable(UnavailableHistory(
 				UnavailableHistoryKind.context, td.agentName, td.agentSessionId,
-				"The task has no effective CWD to derive a history path from",
+				"The task has no effective CWD for its history context",
 				NativeHistoryRule.init, NativeHistoryProfile.init));
 		return resolveHistoryAccess(resolved.agent, resolved.profile,
 			td.agentSessionId, cwd, td.agentName, resolved.rule);
@@ -462,7 +462,7 @@ class TaskSessionRunner
 			return LiveHistoryWatchResolution.target(LiveHistoryWatchTarget(context, path));
 		}
 		auto path = (*binding).agent.historyPath((*binding).sessionId,
-			(*binding).effectiveCwd, (*binding).profile);
+			(*binding).profile);
 		return LiveHistoryWatchResolution.target(LiveHistoryWatchTarget(context, path));
 	}
 
@@ -493,7 +493,7 @@ private:
 		const ref NativeHistoryProfile profile, string sessionId, string effectiveCwd,
 		string agentName, NativeHistoryRule rule)
 	{
-		auto path = agent.historyPath(sessionId, effectiveCwd, profile);
+		auto path = agent.historyPath(sessionId, profile);
 		if (path.length == 0 || !isAbsolute(path))
 			return TaskHistoryResolution.unavailable(UnavailableHistory(
 				UnavailableHistoryKind.profilePath, agentName, sessionId,
@@ -1434,8 +1434,7 @@ private:
 		}
 
 		pc.repairedInterruptionUuid = repairInterruptedToolCallFile(
-			(*binding).agent.historyPath((*binding).sessionId,
-				(*binding).effectiveCwd, (*binding).profile),
+			(*binding).agent.historyPath((*binding).sessionId, (*binding).profile),
 			&(*binding).agent.repairInterruptedToolCall, toolName, pc.resultText);
 	}
 
