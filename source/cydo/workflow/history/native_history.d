@@ -46,7 +46,6 @@ struct HistoryAccess
 	Agent agent;
 	NativeHistoryProfile profile;
 	string sessionId;
-	string effectiveCwd;
 	string path;
 }
 
@@ -164,7 +163,6 @@ struct LiveHistoryContext
 	Agent agent;
 	NativeHistoryProfile profile;
 	string sessionId;
-	string effectiveCwd;
 }
 
 enum LiveHistoryWatchResolutionKind
@@ -185,7 +183,6 @@ struct LiveHistoryWatchTarget
 		return context.agent is other.context.agent
 			&& context.profile == other.context.profile
 			&& context.sessionId == other.context.sessionId
-			&& context.effectiveCwd == other.context.effectiveCwd
 			&& path == other.path;
 	}
 }
@@ -252,45 +249,33 @@ unittest
 	auto agent = new CodexAgent;
 	auto baseline = LiveHistoryWatchTarget(
 		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
-			"/tmp/cydo-live-history-watch-profile"), "sid-a",
-			"/tmp/cydo-live-history-watch-cwd"),
+			"/tmp/cydo-live-history-watch-profile"), "sid-a"),
 		"/tmp/cydo-live-history-watch.jsonl");
 	assert(baseline.matchesExactly(LiveHistoryWatchTarget(
 		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
-			"/tmp/cydo-live-history-watch-profile"), "sid-a",
-			"/tmp/cydo-live-history-watch-cwd"),
+			"/tmp/cydo-live-history-watch-profile"), "sid-a"),
 		"/tmp/cydo-live-history-watch.jsonl")));
 
 	auto secondAgent = new CodexAgent;
 	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
 		LiveHistoryContext(secondAgent, NativeHistoryProfile(AgentDriver.codex,
-			"/tmp/cydo-live-history-watch-profile"), "sid-a",
-			"/tmp/cydo-live-history-watch-cwd"),
+			"/tmp/cydo-live-history-watch-profile"), "sid-a"),
 		"/tmp/cydo-live-history-watch.jsonl")));
 	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
 		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.claude,
-			"/tmp/cydo-live-history-watch-profile"), "sid-a",
-			"/tmp/cydo-live-history-watch-cwd"),
+			"/tmp/cydo-live-history-watch-profile"), "sid-a"),
 		"/tmp/cydo-live-history-watch.jsonl")));
 	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
 		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
-			"/tmp/cydo-live-history-watch-other-profile"), "sid-a",
-			"/tmp/cydo-live-history-watch-cwd"),
+			"/tmp/cydo-live-history-watch-other-profile"), "sid-a"),
 		"/tmp/cydo-live-history-watch.jsonl")));
 	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
 		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
-			"/tmp/cydo-live-history-watch-profile"), "sid-b",
-			"/tmp/cydo-live-history-watch-cwd"),
+			"/tmp/cydo-live-history-watch-profile"), "sid-b"),
 		"/tmp/cydo-live-history-watch.jsonl")));
 	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
 		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
-			"/tmp/cydo-live-history-watch-profile"), "sid-a",
-			"/tmp/cydo-live-history-watch-other-cwd"),
-		"/tmp/cydo-live-history-watch.jsonl")));
-	assert(!baseline.matchesExactly(LiveHistoryWatchTarget(
-		LiveHistoryContext(agent, NativeHistoryProfile(AgentDriver.codex,
-			"/tmp/cydo-live-history-watch-profile"), "sid-a",
-			"/tmp/cydo-live-history-watch-cwd"),
+			"/tmp/cydo-live-history-watch-profile"), "sid-a"),
 		"/tmp/cydo-live-history-watch-other.jsonl")));
 }
 
@@ -304,8 +289,6 @@ private void validateLiveHistoryContext(ref LiveHistoryContext value)
 		"Live history context requires an absolute profile root");
 	enforce(value.sessionId.length > 0,
 		"Live history context requires a session ID");
-	enforce(value.effectiveCwd.length > 0,
-		"Live history context requires an effective CWD");
 }
 
 private bool isReadableRegularFile(string path)
@@ -323,8 +306,7 @@ private bool isReadableRegularFile(string path)
 
 private void validateHistoryAccess(ref HistoryAccess value)
 {
-	auto context = LiveHistoryContext(value.agent, value.profile, value.sessionId,
-		value.effectiveCwd);
+	auto context = LiveHistoryContext(value.agent, value.profile, value.sessionId);
 	validateLiveHistoryContext(context);
 	enforce(value.path.length > 0 && isAbsolute(value.path),
 		"History access requires an absolute path");

@@ -1021,8 +1021,7 @@ class CodexAgent : Agent
 	// must be delivered via normal user input instead.
 	@property bool supportsDeveloperPrompt() { return false; }
 
-	RewindResult rewindFiles(string sessionId, string afterUuid, string cwd,
-		ProcessLaunch launch)
+	RewindResult rewindFiles(string sessionId, string afterUuid, ProcessLaunch launch)
 	{
 		return RewindResult(false, "File revert is not supported for Codex sessions");
 	}

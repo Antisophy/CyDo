@@ -1093,7 +1093,7 @@ unittest
 	HistoryEventPipelineHost host;
 	host.getTask = (int t) => t == tid ? &td : null;
 	host.resolveTaskHistory = (int t) => TaskHistoryResolution.access(
-		HistoryAccess(agent, profile, td.agentSessionId, projectPath, jsonlPath));
+		HistoryAccess(agent, profile, td.agentSessionId, jsonlPath));
 	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
 	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
 	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";
@@ -1182,7 +1182,7 @@ unittest
 	HistoryEventPipelineHost host;
 	host.getTask = (int t) => t == tid ? &td : null;
 	host.resolveTaskHistory = (int t) => TaskHistoryResolution.access(
-		HistoryAccess(agent, profile, td.agentSessionId, projectPath, jsonlPath));
+		HistoryAccess(agent, profile, td.agentSessionId, jsonlPath));
 	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
 	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
 	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";
@@ -1475,7 +1475,7 @@ unittest
 	HistoryEventPipelineHost host;
 	host.getTask = (int t) => t == tid ? &td : null;
 	host.resolveTaskHistory = (int t) => TaskHistoryResolution.access(
-		HistoryAccess(agent, profile, td.agentSessionId, projectPath, jsonlPath));
+		HistoryAccess(agent, profile, td.agentSessionId, jsonlPath));
 	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
 	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
 	host.makeTaskDiagnosticEventJson = (string subject, string body) => "";

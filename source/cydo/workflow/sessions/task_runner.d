@@ -239,7 +239,6 @@ private struct LiveHistoryBinding
 	Agent agent;
 	NativeHistoryProfile profile;
 	string sessionId;
-	string effectiveCwd;
 }
 
 private enum LaunchOwnership { task, operation }
@@ -408,7 +407,7 @@ class TaskSessionRunner
 			enforce(owner !is null && *owner is (*binding).owner,
 				"Live history binding does not match the mapped session owner");
 			return resolveHistoryAccess((*binding).agent, (*binding).profile,
-				(*binding).sessionId, (*binding).effectiveCwd, td.agentName,
+				(*binding).sessionId, td.agentName,
 				(*binding).agent.nativeHistoryRule);
 		}
 
@@ -430,14 +429,8 @@ class TaskSessionRunner
 				UnavailableHistoryKind.context, td.agentName, td.agentSessionId,
 				e.msg, NativeHistoryRule.init, NativeHistoryProfile.init));
 		}
-		auto cwd = host_.effectiveCwd(td);
-		if (cwd.length == 0)
-			return TaskHistoryResolution.unavailable(UnavailableHistory(
-				UnavailableHistoryKind.context, td.agentName, td.agentSessionId,
-				"The task has no effective CWD for its history context",
-				NativeHistoryRule.init, NativeHistoryProfile.init));
 		return resolveHistoryAccess(resolved.agent, resolved.profile,
-			td.agentSessionId, cwd, td.agentName, resolved.rule);
+			td.agentSessionId, td.agentName, resolved.rule);
 	}
 
 	LiveHistoryWatchResolution resolveLiveHistoryWatch(int tid)
@@ -449,7 +442,7 @@ class TaskSessionRunner
 		enforce(owner !is null && *owner is (*binding).owner,
 			"Live history watch binding does not match the mapped session owner");
 		auto context = LiveHistoryContext((*binding).agent, (*binding).profile,
-			(*binding).sessionId, (*binding).effectiveCwd);
+			(*binding).sessionId);
 		if (auto codex = cast(CodexAgent) (*binding).agent)
 		{
 			auto codexOwner = cast(CodexSession) (*binding).owner;
@@ -479,8 +472,7 @@ class TaskSessionRunner
 		enforce(access.agent is (*binding).agent
 			&& access.profile.driver == (*binding).profile.driver
 			&& access.profile.root == (*binding).profile.root
-			&& access.sessionId == (*binding).sessionId
-			&& access.effectiveCwd == (*binding).effectiveCwd,
+			&& access.sessionId == (*binding).sessionId,
 			"Live history access does not match its live binding");
 		enforce(td.launch.nativeHistoryProfile.driver == (*binding).profile.driver
 			&& td.launch.nativeHistoryProfile.root == (*binding).profile.root,
@@ -490,7 +482,7 @@ class TaskSessionRunner
 
 private:
 	TaskHistoryResolution resolveHistoryAccess(Agent agent,
-		const ref NativeHistoryProfile profile, string sessionId, string effectiveCwd,
+		const ref NativeHistoryProfile profile, string sessionId,
 		string agentName, NativeHistoryRule rule)
 	{
 		auto path = agent.historyPath(sessionId, profile);
@@ -517,7 +509,7 @@ private:
 				rule, profile));
 		}
 		return TaskHistoryResolution.access(HistoryAccess(agent, profile, sessionId,
-			effectiveCwd, path));
+			path));
 	}
 
 public:
@@ -784,7 +776,6 @@ public:
 
 		auto taskAgent = host_.agentForTask(tid);
 		auto typeDef = currentTaskTypeDef(td);
-		auto taskEffectiveCwd = host_.effectiveCwd(td);
 		auto launch = prepareTaskSessionLaunch(tid, taskAgent, typeDef);
 		td = requireTask(tid, "Task disappeared before session creation");
 		auto session = taskAgent.createSession(tid, td.agentSessionId,
@@ -817,7 +808,7 @@ public:
 			enforce(launch.processLaunch.nativeHistoryProfile.driver == taskAgent.driver,
 				"Native session launch profile does not match the launch Agent");
 			liveHistoryBindings_[tid] = LiveHistoryBinding(session, taskAgent,
-				launch.processLaunch.nativeHistoryProfile, sessionId, taskEffectiveCwd);
+				launch.processLaunch.nativeHistoryProfile, sessionId);
 			if (!host_.shuttingDown())
 				host_.startJsonlWatch(tid);
 		};
@@ -1845,8 +1836,8 @@ unittest
 }
 
 // A legacy task that has an agent session but no project path (and no
-// worktree) has no effective CWD; history resolution must report the
-// history as unavailable instead of throwing out of Agent.historyPath.
+// worktree) has no effective CWD; history resolution must still locate the
+// session by ID via the profile scan.
 unittest
 {
 	import std.file : exists, mkdirRecurse, rmdirRecurse, write;
@@ -1884,6 +1875,13 @@ unittest
 	tasks[1].agentName = "claude";
 	tasks[1].agentSessionId = "faafb5bd-2017-4d88-9ce7-03e1dcce30c9";
 
+	auto projectDir = buildPath(root, "claude-profile", "projects",
+		"-some-legacy-project");
+	mkdirRecurse(projectDir);
+	auto historyFile = buildPath(projectDir,
+		tasks[1].agentSessionId ~ ".jsonl");
+	write(historyFile, "{\"type\":\"user\"}\n");
+
 	Agent agent = new ClaudeCodeAgent();
 	auto runner = new TaskSessionRunner(TaskSessionRunnerHost(
 		getTask: (int tid) {
@@ -1897,10 +1895,10 @@ unittest
 	));
 
 	auto resolution = runner.resolveTaskHistory(1);
-	assert(resolution.kind == TaskHistoryResolutionKind.unavailable);
-	auto unavailable = resolution.requireUnavailable();
-	assert(unavailable.kind == UnavailableHistoryKind.context);
-	assert(unavailable.sessionId == tasks[1].agentSessionId);
+	assert(resolution.kind == TaskHistoryResolutionKind.access);
+	auto access = resolution.requireAccess();
+	assert(access.sessionId == tasks[1].agentSessionId);
+	assert(access.path == historyFile);
 }
 
 version (unittest) private void assertRunnerMcpConfigCleanup(

@@ -659,8 +659,7 @@ class ClaudeCodeAgent : Agent
 	@property bool supportsFileRevert() { return true; }
 	@property bool supportsDeveloperPrompt() { return true; }
 
-	RewindResult rewindFiles(string sessionId, string afterUuid, string cwd,
-		ProcessLaunch launch)
+	RewindResult rewindFiles(string sessionId, string afterUuid, ProcessLaunch launch)
 	{
 		import std.process : Config, execute;
 
@@ -692,7 +691,7 @@ class ClaudeCodeAgent : Agent
 			// Regenerate a fresh command prefix with new temp files,
 			// since the original ones were cleaned up after session exit.
 			freshSandbox = launch.sandbox;
-			args = buildCommandPrefix(freshSandbox, cwd) ~ shArgs;
+			args = buildCommandPrefix(freshSandbox, launch.workDir) ~ shArgs;
 		}
 		else
 		{
@@ -702,7 +701,7 @@ class ClaudeCodeAgent : Agent
 		}
 
 		auto result = execute(args, procEnv, Config.none, size_t.max,
-			cwd.length > 0 ? cwd : null);
+			launch.workDir.length > 0 ? launch.workDir : null);
 
 		// Clean up temp files created by buildCommandPrefix above.
 		if (freshSandbox.tempFiles.length > 0)

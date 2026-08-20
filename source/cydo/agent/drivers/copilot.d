@@ -672,8 +672,7 @@ class CopilotAgent : Agent
 	@property bool supportsFileRevert() { return false; }
 	@property bool supportsDeveloperPrompt() { return true; }
 
-	RewindResult rewindFiles(string sessionId, string afterUuid, string cwd,
-		ProcessLaunch launch)
+	RewindResult rewindFiles(string sessionId, string afterUuid, ProcessLaunch launch)
 	{
 		return RewindResult(false, "File revert is not supported for Copilot sessions");
 	}

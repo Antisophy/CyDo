@@ -222,8 +222,8 @@ interface Agent
 
 	/// Revert files to the state after a given message UUID.
 	/// Only called when supportsFileRevert is true.
-	RewindResult rewindFiles(string sessionId, string afterUuid, string effectiveCwd,
-		ProcessLaunch launch);
+	/// The rewind subprocess runs in launch.workDir.
+	RewindResult rewindFiles(string sessionId, string afterUuid, ProcessLaunch launch);
 
 	/// Extract user message text from a raw event line.
 	string extractUserText(string line);

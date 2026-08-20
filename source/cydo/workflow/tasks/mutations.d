@@ -1317,7 +1317,7 @@ private:
 		if (json.revert_files)
 		{
 			auto rewindResult = ta.rewindFiles(access.sessionId,
-				boundary.checkpoint_uuid, access.effectiveCwd, rewindLaunch);
+				boundary.checkpoint_uuid, rewindLaunch);
 			if (rewindResult.success)
 				rewindOutput = rewindResult.output;
 			else if (!rewindResult.output.canFind("No file checkpoint found"))
@@ -1500,7 +1500,7 @@ unittest
 	host.stopTask = (int) { sideEffects++; assert(false); };
 	host.resolveTaskHistory = (int) => TaskHistoryResolution.access(HistoryAccess(
 		agent, NativeHistoryProfile(agent.driver, "/tmp"), task.agentSessionId,
-		"/tmp", historyPath));
+		historyPath));
 	host.clearUndoJsonl = (int) { sideEffects++; assert(false); };
 	host.invalidateJsonlLineage = (int) { sideEffects++; assert(false); };
 	host.startJsonlWatch = (int) { sideEffects++; assert(false); };
@@ -1655,7 +1655,7 @@ unittest
 		historyAccessCalls++;
 		return TaskHistoryResolution.access(HistoryAccess(
 			taskAgent, NativeHistoryProfile(taskAgent.driver, "/tmp"), task.agentSessionId,
-			"/tmp", rolloutPath));
+			rolloutPath));
 	};
 	host.codexForkSourceState = (int) {
 		selectedSourceState = !taskIsAlive ? CodexForkSourceState.dead

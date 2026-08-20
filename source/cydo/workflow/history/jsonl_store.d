@@ -341,8 +341,7 @@ unittest
 		"source-session.jsonl");
 	mkdirRecurse(buildPath(profile.root, "projects", "-tmp-fork-project"));
 	write(sourcePath, "source-session first\nsource-session second\n");
-	auto source = HistoryAccess(agent, profile, "source-session", "/tmp/fork-project",
-		sourcePath);
+	auto source = HistoryAccess(agent, profile, "source-session", sourcePath);
 	auto destination = HistoryForkDestination("child-session",
 		buildPath(root, "explicit", "nested", "child.jsonl"));
 

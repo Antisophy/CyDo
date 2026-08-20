@@ -533,7 +533,7 @@ private void setTestLiveContext(ref JsonlTracker tracker, int tid,
 	import cydo.runtime.launch.types : NativeHistoryProfile;
 
 	tracker.liveContexts[tid] = LiveHistoryContext(agent,
-		NativeHistoryProfile(agent.driver, "/tmp"), "session", "/tmp");
+		NativeHistoryProfile(agent.driver, "/tmp"), "session");
 }
 
 unittest
@@ -691,7 +691,7 @@ unittest
 	auto agent = new CodexAgent();
 	auto target = LiveHistoryWatchTarget(LiveHistoryContext(agent,
 		NativeHistoryProfile(agent.driver, "/tmp/cydo-jsonl-tracker-profile"),
-		"sid-a", "/tmp/cydo-jsonl-tracker-cwd"), path);
+		"sid-a"), path);
 	tracker.attachLiveContext(1, target.context);
 	tracker.boundaryState[1] = JsonlTracker.BoundaryReconcileState.init;
 	tracker.boundaryState[1].liveByKind[PersistedHistoryBoundaryKind.user] ~=
@@ -704,7 +704,7 @@ unittest
 		log ~= "attach:" ~ to!string(tid) ~ ":"
 			~ to!string(attached.context.profile.driver) ~ ":"
 			~ attached.context.profile.root ~ ":" ~ attached.context.sessionId ~ ":"
-			~ attached.context.effectiveCwd ~ ":" ~ attached.path;
+			~ attached.path;
 	};
 	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary b, bool, ulong) {
 		log ~= "boundary:" ~ b.anchor;
@@ -716,8 +716,7 @@ unittest
 	tracker.watchJsonlFile(1, target);
 	assert(log.length >= 2);
 	assert(attachedExpectedAgent);
-	assert(log[0] == "attach:1:codex:/tmp/cydo-jsonl-tracker-profile:sid-a:"
-		~ "/tmp/cydo-jsonl-tracker-cwd:" ~ path);
+	assert(log[0] == "attach:1:codex:/tmp/cydo-jsonl-tracker-profile:sid-a:" ~ path);
 	foreach (entry; log[1 .. $])
 		assert(entry.startsWith("line:") || entry.startsWith("boundary:"));
 	assert(log[1 .. $].canFind("line:1"));
@@ -759,7 +758,7 @@ unittest
 	tracker.historyGeneration = (int) => task.history.generation;
 	tracker.resolveTaskHistory = (int) => TaskHistoryResolution.access(
 		HistoryAccess(agent, NativeHistoryProfile(agent.driver, "/tmp"), "session",
-			"/tmp", path));
+			path));
 	string[] resolved;
 	tracker.onBoundaryResolved = (int, size_t seq, HistoryBoundary boundary, bool, ulong) {
 		resolved ~= boundary.anchor ~ ":" ~ to!string(seq);

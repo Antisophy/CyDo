@@ -2293,7 +2293,7 @@ class App
 		HistoryAccess[] acceptedAccess;
 		foreach (ref spec; desired)
 		{
-			auto resolution = resolveImportableScanRecord(spec.scanRecord, spec.projectPath);
+			auto resolution = resolveImportableScanRecord(spec.scanRecord);
 			if (resolution.kind != TaskHistoryResolutionKind.access)
 				continue;
 			accepted ~= spec;
@@ -2409,17 +2409,12 @@ class App
 				UnavailableHistoryKind.context, td.agentName, td.agentSessionId,
 				"The importable session offer is no longer part of the current scan",
 				NativeHistoryRule.init, NativeHistoryProfile.init));
-		return resolveImportableScanRecord(*record, td.projectPath);
+		return resolveImportableScanRecord(*record);
 	}
 
 	private TaskHistoryResolution resolveImportableScanRecord(
-		const ref ImportableScanRecord record, string projectPath)
+		const ref ImportableScanRecord record)
 	{
-		if (projectPath.length == 0)
-			return TaskHistoryResolution.unavailable(UnavailableHistory(
-				UnavailableHistoryKind.context, record.agentName, record.key.sessionId,
-				"The importable session offer has no project path",
-				NativeHistoryRule.init, NativeHistoryProfile.init));
 		string failure = "No current configured profile produces this importable session";
 		foreach (ref context; record.producingContexts)
 		{
@@ -2453,7 +2448,7 @@ class App
 					UnavailableHistoryKind.profilePath, record.agentName,
 					record.key.sessionId, e.msg, resolved.rule, resolved.profile));
 			return TaskHistoryResolution.access(HistoryAccess(resolved.agent,
-				resolved.profile, record.key.sessionId, projectPath,
+				resolved.profile, record.key.sessionId,
 				record.discovered.exactHistoryPath));
 		}
 		return TaskHistoryResolution.unavailable(UnavailableHistory(
@@ -3316,7 +3311,7 @@ class App
 			rejectPromotion("This importable session offer is no longer produced by current configuration");
 			return;
 		}
-		auto history = resolveImportableScanRecord(*record, td.projectPath);
+		auto history = resolveImportableScanRecord(*record);
 		if (history.kind != TaskHistoryResolutionKind.access)
 		{
 			rejectPromotion("The imported session history is no longer available");
