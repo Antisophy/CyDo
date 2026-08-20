@@ -431,6 +431,11 @@ class TaskSessionRunner
 				e.msg, NativeHistoryRule.init, NativeHistoryProfile.init));
 		}
 		auto cwd = host_.effectiveCwd(td);
+		if (cwd.length == 0)
+			return TaskHistoryResolution.unavailable(UnavailableHistory(
+				UnavailableHistoryKind.context, td.agentName, td.agentSessionId,
+				"The task has no effective CWD to derive a history path from",
+				NativeHistoryRule.init, NativeHistoryProfile.init));
 		return resolveHistoryAccess(resolved.agent, resolved.profile,
 			td.agentSessionId, cwd, td.agentName, resolved.rule);
 	}
@@ -1838,6 +1843,65 @@ unittest
 			assert(launch.processLaunch.nativeHistoryProfile.root.length > 0);
 			launchSandbox.cleanup(launch.processLaunch.sandbox);
 		});
+}
+
+// A legacy task that has an agent session but no project path (and no
+// worktree) has no effective CWD; history resolution must report the
+// history as unavailable instead of throwing out of Agent.historyPath.
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, write;
+	import configy.attributes : SetInfo;
+	import cydo.runtime.config : AgentConfig;
+
+	auto root = buildPath("/tmp", "cydo-task-runner-legacy-no-cwd");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+	auto defsDir = buildPath(root, "defs");
+	mkdirRecurse(buildPath(defsDir, "prompts"));
+	write(buildPath(defsDir, "prompts", "blank.md"), "Blank prompt\n");
+	write(buildPath(defsDir, "task-types.yaml"),
+		"task_types:\n  conversation:\n    model_class: large\n");
+	auto catalog = new TaskTypeCatalog(defsDir, buildPath(defsDir, "task-types.yaml"),
+		(string name) => name == "claude");
+
+	auto config = new CydoConfig;
+	config.sandbox = unrestrictedLaunchTestSandbox();
+	AgentConfig configuredAgent;
+	configuredAgent.driver = SetInfo!AgentDriver(AgentDriver.claude, true);
+	configuredAgent.sandbox = unrestrictedLaunchTestSandbox();
+	configuredAgent.sandbox.env = [
+		"HOME": buildPath(root, "home"),
+		"CLAUDE_CONFIG_DIR": buildPath(root, "claude-profile"),
+	];
+	config.agents["claude"] = configuredAgent;
+
+	TaskData[int] tasks;
+	tasks[1] = TaskData(1, "", "");
+	tasks[1].taskType = "conversation";
+	tasks[1].agentName = "claude";
+	tasks[1].agentSessionId = "faafb5bd-2017-4d88-9ce7-03e1dcce30c9";
+
+	Agent agent = new ClaudeCodeAgent();
+	auto runner = new TaskSessionRunner(TaskSessionRunnerHost(
+		getTask: (int tid) {
+			auto task = tid in tasks;
+			return task is null ? null : &tasks[tid];
+		},
+		effectiveCwd: (const TaskData* td) => td.effectiveCwd(""),
+		currentConfig: () => config,
+		tryAgentForTask: (int tid) => agent,
+		taskTypeCatalog: catalog,
+	));
+
+	auto resolution = runner.resolveTaskHistory(1);
+	assert(resolution.kind == TaskHistoryResolutionKind.unavailable);
+	auto unavailable = resolution.requireUnavailable();
+	assert(unavailable.kind == UnavailableHistoryKind.context);
+	assert(unavailable.sessionId == tasks[1].agentSessionId);
 }
 
 version (unittest) private void assertRunnerMcpConfigCleanup(
