@@ -202,6 +202,10 @@ class CodexAgent : Agent
 	private ModelSpec[string] modelAliasOverrides;
 	private string lastMcpConfigPath_;
 	private CodexLiveHistoryPath[CodexHistoryKey] liveHistoryPaths_;
+	// profile root -> session ID -> rollout path, snapshot of the last
+	// scanSessions walk. Read and written only on the event-loop thread;
+	// enumerateAllSessions (discovery worker thread) bypasses it.
+	private string[string][string] scannedHistoryPaths_;
 	// History replay state: tracks whether task_started has been seen in the current replay.
 	private bool histSeenTaskStarted_;
 
@@ -729,10 +733,64 @@ class CodexAgent : Agent
 	{
 		enforce(sessionId.length > 0,
 			"Codex history path requires a session ID");
+		if (auto cached = profile.root in scannedHistoryPaths_)
+			if (auto path = sessionId in *cached)
+				return *path;
+		// Unknown session: either this profile was never scanned, or the
+		// rollout appeared after the last scan (e.g. a session that just
+		// started). Rescan once and settle on that snapshot's answer.
+		// A rollout never moves once written, so cache hits need no
+		// revalidation; callers check file existence themselves.
+		string[string] paths;
 		foreach (ref session; scanSessions(profile))
-			if (session.sessionId == sessionId)
-				return session.exactHistoryPath;
+			paths[session.sessionId] = session.exactHistoryPath;
+		scannedHistoryPaths_[profile.root] = paths;
+		if (auto path = sessionId in paths)
+			return *path;
 		return null;
+	}
+
+	// historyPath resolves via a per-profile scan snapshot: hits are O(1)
+	// and an unknown session triggers exactly one rescan, so rollouts
+	// written after the previous scan are still found.
+	unittest
+	{
+		import std.file : exists, mkdirRecurse, remove, rmdirRecurse, write;
+
+		auto root = buildPath("/tmp", "cydo-codex-history-path-cache");
+		if (exists(root))
+			rmdirRecurse(root);
+		scope (exit)
+			if (exists(root))
+				rmdirRecurse(root);
+		auto day = buildPath(root, "sessions", "2026", "08", "20");
+		mkdirRecurse(day);
+		enum idA = "11111111-1111-1111-1111-111111111111";
+		enum idB = "22222222-2222-2222-2222-222222222222";
+		enum idC = "33333333-3333-3333-3333-333333333333";
+		auto pathA = buildPath(day, "rollout-2026-08-20T10-00-00-" ~ idA ~ ".jsonl");
+		write(pathA, "");
+
+		auto agent = new CodexAgent();
+		auto profile = NativeHistoryProfile(AgentDriver.codex, root);
+
+		// 19. the first lookup scans and finds the existing rollout
+		assert(agent.historyPath(idA, "", profile) == pathA);
+
+		// 20. a rollout written after that scan is found via the miss rescan
+		auto pathB = buildPath(day, "rollout-2026-08-20T11-00-00-" ~ idB ~ ".jsonl");
+		write(pathB, "");
+		assert(agent.historyPath(idB, "", profile) == pathB);
+
+		// 21. hits are served from the snapshot without revalidation;
+		// callers own the existence check on the returned path
+		remove(pathA);
+		assert(agent.historyPath(idA, "", profile) == pathA);
+
+		// 22. an unknown session rescans once and reports it absent; the
+		// fresh snapshot also drops the deleted rollout
+		assert(agent.historyPath(idC, "", profile) is null);
+		assert(agent.historyPath(idA, "", profile) is null);
 	}
 
 	string createHistoryForkDestination(string sessionId, string effectiveCwd,
