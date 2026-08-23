@@ -19,79 +19,23 @@ type ItemResultEventLike = {
   tool_result?: unknown;
   content?: unknown;
 };
-
-type ParentAnswerEvent =
-  { kind: "status"; status: string } | { kind: "output"; eventType: string };
-
-async function installParentAnswerObserver(page: Page) {
-  await page.evaluate(() => {
-    const state = window as typeof window & {
-      __cydoUiEvents?: ParentAnswerEvent[];
-    };
-    state.__cydoUiEvents = [];
-    let parentStatus = "";
-    const capture = (records: MutationRecord[] = []) => {
-      const icon = document.querySelector(
-        '.sidebar-item[data-tid="1"] .task-type-icon',
-      );
-      const leftWaiting = records.some(
-        (record) =>
-          record.type === "attributes" &&
-          record.target instanceof Element &&
-          record.target.matches(".task-type-icon") &&
-          record.oldValue?.includes("waiting") &&
-          !record.target.classList.contains("waiting"),
-      );
-      const status = icon?.classList.contains("waiting")
-        ? "waiting"
-        : icon?.classList.contains("processing") ||
-            icon?.classList.contains("alive") ||
-              leftWaiting
-          ? "active"
-          : "";
-      if (status && status !== parentStatus) {
-        state.__cydoUiEvents!.push({ kind: "status", status });
-        parentStatus = status;
-      }
-      const addedAssistantMessage = records.some((record) =>
-        [...record.addedNodes].some((node) => {
-          if (!(node instanceof Element)) return false;
-          const assistantMessage = node.matches(".message.assistant-message")
-            ? node
-            : node.querySelector(".message.assistant-message");
-          // Other tasks' views stay mounted after being loaded, and a
-          // focus_hint can transiently make the child's view the visible
-          // one while the parent is still hidden — so scope by the
-          // parent's own task container (data-tid="1"), not by visibility,
-          // to avoid counting the child's own output as the parent's.
-          return (
-            assistantMessage !== null &&
-            assistantMessage.closest('[data-tid="1"]') !== null
-          );
-        }),
-      );
-      if (addedAssistantMessage) {
-        state.__cydoUiEvents!.push({ kind: "output", eventType: "assistant" });
-      }
-    };
-    new MutationObserver(capture).observe(document.body, {
-      attributes: true,
-      attributeFilter: ["class"],
-      attributeOldValue: true,
-      childList: true,
-      subtree: true,
-    });
-    capture();
-  });
-}
-
-async function parentAnswerEvents(page: Page): Promise<ParentAnswerEvent[]> {
-  return page.evaluate(
-    () =>
-      (window as typeof window & { __cydoUiEvents?: ParentAnswerEvent[] })
-        .__cydoUiEvents ?? [],
-  );
-}
+type TaskEventLike = ItemResultEventLike & {
+  item_id?: string;
+  item_type?: string;
+  name?: string;
+  tool_server?: string;
+  is_replay?: boolean;
+  is_synthetic?: boolean;
+  is_meta?: boolean;
+  correlation_id?: string;
+};
+type ObservedTaskEvent = {
+  index: number;
+  tid: number;
+  seq?: number;
+  ts?: number;
+  event: TaskEventLike;
+};
 
 function currentMessageList(page: Page): Locator {
   return page.locator('[style*="display: contents"] .message-list');
@@ -176,6 +120,55 @@ function eventText(event: ItemResultEventLike): string {
     }
   }
   return parts.join("\n");
+}
+
+function observeTaskEvents(page: Page): ObservedTaskEvent[] {
+  const taskEvents: ObservedTaskEvent[] = [];
+  page.on("websocket", (ws) => {
+    ws.on("framereceived", (frame) => {
+      try {
+        const data = JSON.parse(frame.payload.toString()) as {
+          tid?: number;
+          seq?: number;
+          ts?: number;
+          event?: TaskEventLike;
+        };
+        if (typeof data.tid === "number" && data.event?.type) {
+          taskEvents.push({
+            index: taskEvents.length,
+            tid: data.tid,
+            seq: data.seq,
+            ts: data.ts,
+            event: data.event,
+          });
+        }
+      } catch {
+        // Ignore non-JSON frames and unrelated events.
+      }
+    });
+  });
+  return taskEvents;
+}
+
+async function waitForTaskEvent(
+  observed: ObservedTaskEvent[],
+  predicate: (event: ObservedTaskEvent) => boolean,
+  options: { sinceIndex?: number; timeout?: number } = {},
+): Promise<ObservedTaskEvent> {
+  const { sinceIndex = 0, timeout = 90_000 } = options;
+  let matchedEvent: ObservedTaskEvent | undefined;
+  await expect
+    .poll(
+      () => {
+        matchedEvent = observed.find(
+          (event) => event.index >= sinceIndex && predicate(event),
+        );
+        return matchedEvent !== undefined;
+      },
+      { timeout },
+    )
+    .toBe(true);
+  return matchedEvent!;
 }
 
 function observeTaskResultEvents(page: Page, tid = 1): ItemResultEventLike[] {
@@ -391,6 +384,7 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
   agentType,
 }) => {
   test.setTimeout(TALK_TIMEOUT);
+  const observedTaskEvents = observeTaskEvents(page);
   const taskCreatedEvents = observeTaskCreatedEvents(page);
   const reloadEvents = observeTaskReloadEvents(page);
   await enterSession(page);
@@ -439,63 +433,97 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
     .getByText("Done.", { exact: true })
     .count();
   const reloadCountBeforeFollowUpAsk = reloadEvents.length;
-  await installParentAnswerObserver(page);
-  const answerStart = (await parentAnswerEvents(page)).length;
+  const followUpStart = observedTaskEvents.length;
 
   // Parent calls Ask on the completed child with a follow-up question.
   await sendMessage(page, `call ask ${childTid} any follow-up?`);
 
-  // The child is resumed, receives "[Follow-up question from parent task (qid=1)]",
-  // and responds with Answer(1, "follow-up-answered"). That answer is returned as the Ask result.
+  const parentAskStarted = await waitForTaskEvent(
+    observedTaskEvents,
+    ({ tid, event }) =>
+      tid === 1 &&
+      event.type === "item/started" &&
+      event.item_type === "tool_use" &&
+      event.name === "Ask" &&
+      event.tool_server === "cydo",
+    { sinceIndex: followUpStart },
+  );
+  const parentAskItemId = parentAskStarted.event.item_id;
+  expect(parentAskItemId).toEqual(expect.any(String));
+  expect(parentAskItemId).not.toBe("");
+
+  const childFollowUp = await waitForTaskEvent(
+    observedTaskEvents,
+    ({ tid, event }) =>
+      tid === childTid &&
+      event.type === "item/started" &&
+      event.item_type === "user_message" &&
+      // Claude labels its live resumed user echo replay; the high-water
+      // boundary still excludes historical events for that driver.
+      (agentType === "claude" || !event.is_replay) &&
+      !event.is_synthetic &&
+      !event.is_meta &&
+      eventText(event).includes(
+        "[SYSTEM: Follow-up question from parent task (qid=",
+      ) &&
+      eventText(event).includes("any follow-up?"),
+    { sinceIndex: parentAskStarted.index + 1 },
+  );
+  const childFollowUpText = eventText(childFollowUp.event);
+  const qid = childFollowUpText.match(/qid=(\d+)/)?.[1];
+  expect(qid).toBeDefined();
+  if (agentType !== "claude") {
+    expect(childFollowUp.event.correlation_id).toBe(`follow-up:${qid}`);
+  }
+
+  const childAnswerStarted = await waitForTaskEvent(
+    observedTaskEvents,
+    ({ tid, event }) =>
+      tid === childTid &&
+      event.type === "item/started" &&
+      event.item_type === "tool_use" &&
+      event.name === "Answer" &&
+      event.tool_server === "cydo",
+    { sinceIndex: childFollowUp.index + 1 },
+  );
+
+  const parentAskResult = await waitForTaskEvent(
+    observedTaskEvents,
+    ({ tid, event }) =>
+      tid === 1 &&
+      event.type === "item/result" &&
+      event.item_id === parentAskItemId,
+    { sinceIndex: childAnswerStarted.index + 1 },
+  );
+  expect(parseTaskResultItems(parentAskResult.event)).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        status: "answered",
+        tid: childTid,
+        message: "follow-up-answered",
+      }),
+    ]),
+  );
+
+  await waitForTaskEvent(
+    observedTaskEvents,
+    ({ tid, event }) =>
+      tid === 1 &&
+      event.type === "item/started" &&
+      event.item_type === "text" &&
+      !event.is_replay &&
+      !event.is_synthetic &&
+      !event.is_meta,
+    { sinceIndex: parentAskResult.index + 1 },
+  );
+
+  // Keep the rendered result assertion separate from the protocol evidence.
   await expect(
     page
       .locator('[style*="display: contents"] .message-list')
       .getByText("follow-up-answered", { exact: true })
       .last(),
   ).toBeVisible({ timeout: 90_000 });
-
-  await expect
-    .poll(
-      async () =>
-        (await parentAnswerEvents(page))
-          .slice(answerStart)
-          .some((event) => event.kind === "output"),
-      { timeout: 90_000 },
-    )
-    .toBe(true);
-
-  await expect
-    .poll(
-      async () => {
-        const answerRouteEvents = (await parentAnswerEvents(page)).slice(
-          answerStart,
-        );
-        const waitingIndex = answerRouteEvents.findIndex(
-          (event) => event.kind === "status" && event.status === "waiting",
-        );
-        const activeIndex = answerRouteEvents.findIndex(
-          (event, index) =>
-            index > waitingIndex &&
-            event.kind === "status" &&
-            event.status === "active",
-        );
-        // The parent's own turn that issues the Ask tool call (its text +
-        // tool_use) can render as an "output" event right around the
-        // waiting transition — before the child's answer resumes it. Only
-        // an output strictly after activeIndex is evidence of the parent
-        // actually resuming and producing new output.
-        const firstResumedOutput = answerRouteEvents.findIndex(
-          (event, index) => index > activeIndex && event.kind === "output",
-        );
-        return (
-          waitingIndex >= 0 &&
-          activeIndex > waitingIndex &&
-          firstResumedOutput > activeIndex
-        );
-      },
-      { timeout: 90_000 },
-    )
-    .toBe(true);
 
   if (agentType === "claude") {
     await expect
