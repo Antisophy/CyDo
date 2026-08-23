@@ -90,13 +90,23 @@ export function resetControlledImageStore(store: ControlledImageStore) {
 function debounce<A extends unknown[]>(
   fn: (...args: A) => void,
   ms: number,
-): ((...args: A) => void) & { cancel: () => void } {
+): ((...args: A) => void) & { cancel: () => void; flush: () => void } {
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let pendingArgs: A | null = null;
+
+  const invoke = () => {
+    const args = pendingArgs;
+    timer = null;
+    pendingArgs = null;
+    if (args === null) throw new Error("Debounced call is missing arguments");
+    fn(...args);
+  };
+
   const debounced = (...args: A) => {
     if (timer !== null) clearTimeout(timer);
+    pendingArgs = args;
     timer = setTimeout(() => {
-      timer = null;
-      fn(...args);
+      invoke();
     }, ms);
   };
   debounced.cancel = () => {
@@ -104,6 +114,12 @@ function debounce<A extends unknown[]>(
       clearTimeout(timer);
       timer = null;
     }
+    pendingArgs = null;
+  };
+  debounced.flush = () => {
+    if (timer === null) return;
+    clearTimeout(timer);
+    invoke();
   };
   return debounced;
 }
@@ -412,8 +428,12 @@ function OrdinaryInputBox({
   } = useImageAttachments();
 
   const saveDraftDebounced = useMemo(
-    () => debounce((draft: string) => onSaveDraft?.(draft), 500),
-    [onSaveDraft],
+    () =>
+      debounce(() => {
+        const draft = ordinaryDraftStore.read(sessionId);
+        if (draft !== undefined) onSaveDraft?.(draft);
+      }, 500),
+    [onSaveDraft, ordinaryDraftStore, sessionId],
   );
   const previousOnSaveDraft = useRef(onSaveDraft);
 
@@ -430,15 +450,23 @@ function OrdinaryInputBox({
     if (initial === undefined)
       throw new Error(`Missing ordinary draft: ${sessionId}`);
     applyText(initial);
-    if (initial) saveDraftDebounced(initial);
-    return () => {
-      saveDraftDebounced.cancel();
-    };
+    if (initial) saveDraftDebounced();
   }, [sessionId]);
+
+  useEffect(() => {
+    const flushDraft = () => {
+      saveDraftDebounced.flush();
+    };
+    window.addEventListener("pagehide", flushDraft);
+    return () => {
+      window.removeEventListener("pagehide", flushDraft);
+      saveDraftDebounced.flush();
+    };
+  }, [saveDraftDebounced]);
 
   const handleChange = (next: string) => {
     writeText(next);
-    saveDraftDebounced(next);
+    saveDraftDebounced();
   };
 
   useEffect(() => {

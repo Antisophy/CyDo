@@ -36,6 +36,7 @@ interface MountOptions {
   sessionId?: string;
   serverDraft?: string;
   inputDraft?: string;
+  onSaveDraft?: (draft: string) => void;
 }
 
 function ordinaryInput(
@@ -56,6 +57,7 @@ function ordinaryInput(
       inputDraft={options.inputDraft}
       onInputDraftConsumed={() => {}}
       ordinaryDraftStore={store}
+      onSaveDraft={options.onSaveDraft}
     />
   );
 }
@@ -111,6 +113,8 @@ describe("ordinary draft scalar delivery", () => {
   };
   const textarea = () =>
     container.querySelector<HTMLTextAreaElement>("textarea")!;
+  const sendButton = () =>
+    container.querySelector<HTMLButtonElement>(".btn-send")!;
 
   beforeEach(() => {
     store = createOrdinaryDraftStore();
@@ -167,6 +171,43 @@ describe("ordinary draft scalar delivery", () => {
 
     expect(store.read(SESSION)).toBe("local text");
     expect(textarea().value).toBe("local text");
+  });
+
+  it("flushes the current draft on pagehide", async () => {
+    const saved: string[] = [];
+    render(
+      ordinaryInput(store, sent, {
+        onSaveDraft: (draft) => {
+          saved.push(draft);
+        },
+      }),
+      container,
+    );
+    await flushPaintEffects();
+    fill(textarea(), "draft typed before reload");
+    window.dispatchEvent(new window.Event("pagehide"));
+
+    expect(saved).toEqual(["draft typed before reload"]);
+  });
+
+  it("does not resurrect a submitted draft on pagehide", async () => {
+    const saved: string[] = [];
+    render(
+      ordinaryInput(store, sent, {
+        onSaveDraft: (draft) => {
+          saved.push(draft);
+        },
+      }),
+      container,
+    );
+    await flushPaintEffects();
+    fill(textarea(), "submitted draft");
+    await flushRenderQueue();
+    sendButton().click();
+    await flushRenderQueue();
+    window.dispatchEvent(new window.Event("pagehide"));
+
+    expect(saved).toEqual([""]);
   });
 
   it("preserves absent-composer compare-and-swap results across remount", () => {

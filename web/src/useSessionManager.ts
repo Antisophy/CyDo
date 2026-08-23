@@ -2287,6 +2287,18 @@ export function useTaskManager(
     };
     document.addEventListener("visibilitychange", onVisibilityChange);
 
+    const flushPendingDraftSaves = () => {
+      for (const runtime of saveRuntimeRef.current.values()) {
+        const result = applyDraftEvent({
+          type: "flush",
+          projectKey: runtime.projectKey,
+        });
+        executeDraftEffects(result.effects);
+      }
+    };
+    if (typeof window !== "undefined")
+      window.addEventListener("pagehide", flushPendingDraftSaves);
+
     conn.onStatusChange = (connected) => {
       if (!connected) {
         connectionEpochRef.current++;
@@ -2385,6 +2397,9 @@ export function useTaskManager(
     return () => {
       cancelPendingFlush();
       document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (typeof window !== "undefined")
+        window.removeEventListener("pagehide", flushPendingDraftSaves);
+      flushPendingDraftSaves();
       ordinaryDraftStore.clear();
       conn.disconnect();
     };

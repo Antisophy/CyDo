@@ -6,9 +6,13 @@ import {
   killSession,
   responseTimeout,
   assistantText,
+  currentTaskTid,
 } from "./fixtures";
 
-test("draft persists across page reload", async ({ page, agentType }) => {
+test("ordinary draft persists across an immediate page reload", async ({
+  page,
+  agentType,
+}) => {
   await enterSession(page);
 
   // Send a message to establish the session and generate a title
@@ -17,13 +21,11 @@ test("draft persists across page reload", async ({ page, agentType }) => {
     timeout: responseTimeout(agentType),
   });
 
-  // Type a draft without sending
+  // Reload immediately after typing, before OrdinaryInputBox's 500 ms save
+  // debounce can run.
   const input = page.locator(".input-textarea:visible").first();
   await input.click();
   await input.fill("my unsent draft");
-
-  // Wait for debounce to fire (500ms) + server round-trip
-  await page.waitForTimeout(1000);
 
   // Reload the page and navigate back to the task via sidebar
   await page.reload();
@@ -35,6 +37,37 @@ test("draft persists across page reload", async ({ page, agentType }) => {
   const restoredInput = page.locator(".input-textarea:visible").first();
   await expect(restoredInput).toBeVisible();
   await expect(restoredInput).toHaveValue("my unsent draft");
+});
+
+test("controlled pending draft persists across an immediate page reload", async ({
+  page,
+}) => {
+  await enterSession(page);
+
+  const input = page.locator(".input-textarea:visible").first();
+  await input.fill("pending draft before its final edit");
+
+  // Wait only for the new task to exist. Its task-type picker confirms this
+  // remains the controlled pending-task composer rather than OrdinaryInputBox.
+  await expect(page).toHaveURL(/\/task\/\d+/, { timeout: 15_000 });
+  await expect(page.locator(".task-type-row.selected")).toBeVisible({
+    timeout: 15_000,
+  });
+  const tid = currentTaskTid(page);
+
+  // This edit schedules the controlled draft save for 500 ms later. Reload
+  // straight away so the assertion requires an unload-time flush.
+  await input.fill("pending draft typed immediately before reload");
+  await page.reload();
+  await page.locator(`.sidebar-item[data-tid="${tid}"]`).click({
+    timeout: 15_000,
+  });
+
+  const restoredInput = page.locator(".input-textarea:visible").first();
+  await expect(restoredInput).toBeVisible({ timeout: 15_000 });
+  await expect(restoredInput).toHaveValue(
+    "pending draft typed immediately before reload",
+  );
 });
 
 test("draft clears after sending message", async ({ page, agentType }) => {
