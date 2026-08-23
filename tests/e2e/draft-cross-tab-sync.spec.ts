@@ -1,5 +1,13 @@
 import { Buffer } from "node:buffer";
-import { test, expect, enterSession } from "./fixtures";
+import {
+  test,
+  expect,
+  enterSession,
+  sendMessage,
+  responseTimeout,
+  assistantText,
+  currentTaskTid,
+} from "./fixtures";
 import type { Page } from "./fixtures";
 
 type SocketMessage = string | Buffer;
@@ -17,6 +25,7 @@ type ControlFrame = {
   content?: unknown;
   entry_point?: string;
   agent_name?: string;
+  old_draft?: string;
   new_draft?: string;
   task?: TaskFrame;
 };
@@ -280,6 +289,32 @@ async function expectControlledForm(
   await expect(page.locator(".agent-picker:visible")).toHaveValue(agent);
 }
 
+async function expectDraftPropagation(
+  sender: PageObserver,
+  receiver: PageObserver,
+  tid: number,
+  oldText: string,
+  text: string,
+  senderSince: number,
+  receiverSince: number,
+): Promise<void> {
+  await expect
+    .poll(() => {
+      const draftWasSent = sender
+        .outbound("set_draft", { tid, since: senderSince })
+        .some((control) => control.frame.content === text);
+      const draftWasReceived = receiver
+        .inbound("draft_updated", { tid, since: receiverSince })
+        .some(
+          (control) =>
+            control.frame.old_draft === oldText &&
+            control.frame.new_draft === text,
+        );
+      return draftWasSent && draftWasReceived;
+    })
+    .toBe(true);
+}
+
 function pendingTaskFlush(
   observer: PageObserver,
   tid: number,
@@ -370,6 +405,71 @@ test("draft creation syncs title and body to another tab", async ({
   await expect(
     page.locator(`.sidebar-item[data-tid="${draftTid}"]`),
   ).toHaveCount(0);
+});
+
+test("a pending draft sender adopts a later peer update", async ({
+  page,
+  browser,
+  baseURL,
+}) => {
+  const observerA = installPassiveObserver(page);
+  const contextB = await browser.newContext({ baseURL });
+  const pageB = await contextB.newPage();
+  const observerB = installPassiveObserver(pageB);
+
+  await enterSession(page);
+  await enterSession(pageB);
+
+  const textA = "pending sender draft";
+  const initialSenderStart = observerA.mark();
+  const initialReceiverStart = observerB.mark();
+  const tid = await createPersistedDraft(page, observerA, textA);
+  await expectDraftPropagation(
+    observerA,
+    observerB,
+    tid,
+    "",
+    textA,
+    initialSenderStart,
+    initialReceiverStart,
+  );
+
+  await selectPersistedDraft(pageB, tid);
+  const inputA = page.locator(".input-textarea:visible");
+  const inputB = pageB.locator(".input-textarea:visible");
+  await expect(inputA).toHaveValue(textA);
+  await expect(inputB).toHaveValue(textA);
+
+  const textB = "pending peer replacement";
+  const peerSenderStart = observerB.mark();
+  const peerReceiverStart = observerA.mark();
+  await inputB.fill(textB);
+  await expectDraftPropagation(
+    observerB,
+    observerA,
+    tid,
+    textA,
+    textB,
+    peerSenderStart,
+    peerReceiverStart,
+  );
+  await expect(inputA).toHaveValue(textB);
+
+  const finalSenderStart = observerA.mark();
+  const finalReceiverStart = observerB.mark();
+  await inputA.fill(textA);
+  await expectDraftPropagation(
+    observerA,
+    observerB,
+    tid,
+    textB,
+    textA,
+    finalSenderStart,
+    finalReceiverStart,
+  );
+  await expect(inputB).toHaveValue(textA);
+
+  await contextB.close();
 });
 
 test("a pristine adopted draft accepts peer text and configuration", async ({
@@ -881,4 +981,77 @@ test("stable persisted drafts switch A to B and back without lifecycle RPCs", as
   await expect(page.locator(`.sidebar-item[data-tid="${tidA}"]`)).toHaveCount(
     0,
   );
+});
+
+test("an active task sender adopts a later peer update", async ({
+  page,
+  browser,
+  baseURL,
+  agentType,
+}) => {
+  const observerA = installPassiveObserver(page);
+  const contextB = await browser.newContext({ baseURL });
+  const pageB = await contextB.newPage();
+  const observerB = installPassiveObserver(pageB);
+
+  await enterSession(page);
+  await sendMessage(page, 'Please reply with "ordinary-draft-cross-tab"');
+  await expect(assistantText(page, "ordinary-draft-cross-tab")).toBeVisible({
+    timeout: responseTimeout(agentType),
+  });
+
+  const tid = currentTaskTid(page);
+
+  await pageB.goto(page.url());
+  await selectPersistedDraft(pageB, tid);
+  const inputA = page.locator(".input-textarea:visible");
+  const inputB = pageB.locator(".input-textarea:visible");
+  await expect(inputA).toHaveValue("");
+  await expect(inputB).toHaveValue("");
+
+  const textA = "ordinary sender draft";
+  const initialSenderStart = observerA.mark();
+  const initialReceiverStart = observerB.mark();
+  await inputA.fill(textA);
+  await expectDraftPropagation(
+    observerA,
+    observerB,
+    tid,
+    "",
+    textA,
+    initialSenderStart,
+    initialReceiverStart,
+  );
+  await expect(inputB).toHaveValue(textA);
+
+  const textB = "ordinary peer replacement";
+  const peerSenderStart = observerB.mark();
+  const peerReceiverStart = observerA.mark();
+  await inputB.fill(textB);
+  await expectDraftPropagation(
+    observerB,
+    observerA,
+    tid,
+    textA,
+    textB,
+    peerSenderStart,
+    peerReceiverStart,
+  );
+  await expect(inputA).toHaveValue(textB);
+
+  const finalSenderStart = observerA.mark();
+  const finalReceiverStart = observerB.mark();
+  await inputA.fill(textA);
+  await expectDraftPropagation(
+    observerA,
+    observerB,
+    tid,
+    textB,
+    textA,
+    finalSenderStart,
+    finalReceiverStart,
+  );
+  await expect(inputB).toHaveValue(textA);
+
+  await contextB.close();
 });

@@ -9,9 +9,9 @@ import {
   createControlledImageStore,
   InputBox,
   resetControlledImageStore,
-  drafts,
 } from "./InputBox";
 import type { ImageAttachment } from "../useSessionManager";
+import { createOrdinaryDraftStore } from "../ordinaryDraftStore";
 
 const animationFrames = vi.hoisted(() => {
   let nextId = 0;
@@ -154,7 +154,6 @@ describe("controlled InputBox", () => {
   const send = () => container.querySelector<HTMLButtonElement>(".btn-send")!;
 
   beforeEach(() => {
-    drafts.clear();
     changes = [];
     submits = [];
     container = document.createElement("div");
@@ -183,11 +182,13 @@ describe("controlled InputBox", () => {
   });
 
   it("does not consult or mutate the ordinary draft cache", async () => {
-    drafts.set("ordinary-session", "ordinary cached text");
+    const ordinaryDraftStore = createOrdinaryDraftStore();
+    ordinaryDraftStore.ensure("ordinary-session", "ordinary cached text");
     mount("controlled text", 0, {
       sessionId: "ordinary-session",
       serverDraft: "ordinary server text",
       inputDraft: "ordinary recovered text",
+      ordinaryDraftStore,
     });
 
     expect(textarea().value).toBe("controlled text");
@@ -196,14 +197,17 @@ describe("controlled InputBox", () => {
     await flush();
 
     expect(changes).toEqual(["new controlled text"]);
-    expect(drafts.get("ordinary-session")).toBe("ordinary cached text");
+    expect(ordinaryDraftStore.read("ordinary-session")).toBe(
+      "ordinary cached text",
+    );
   });
 
   it("restores only the supplied snapshot after unmount and remount", () => {
-    drafts.set("ordinary-session", "stale cache");
-    mount("slot snapshot");
+    const ordinaryDraftStore = createOrdinaryDraftStore();
+    ordinaryDraftStore.ensure("ordinary-session", "stale cache");
+    mount("slot snapshot", 0, { ordinaryDraftStore });
     render(null, container);
-    mount("slot snapshot");
+    mount("slot snapshot", 0, { ordinaryDraftStore });
 
     expect(textarea().value).toBe("slot snapshot");
   });
@@ -424,6 +428,7 @@ describe("controlled InputBox", () => {
           isProcessing={false}
           disabled={false}
           sessionId="ordinary-image-session"
+          ordinaryDraftStore={createOrdinaryDraftStore()}
         />,
         container,
       );

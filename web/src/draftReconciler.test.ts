@@ -2343,6 +2343,89 @@ describe("draft reconciler acknowledgement, synchronization, and saves", () => {
     );
   });
 
+  it("uses old text for draft update compare-and-swap", () => {
+    const defaults: FormDefaults = {
+      entryPoint: "entry-cas",
+      agent: "agent-cas",
+    };
+    const cases: readonly {
+      label: string;
+      observed: string;
+      local: string;
+      oldText: string;
+      incoming: string;
+      expected: string;
+    }[] = [
+      {
+        label: "accepts a peer update matching the local sender value",
+        observed: "stale observed text",
+        local: "sender text",
+        oldText: "sender text",
+        incoming: "peer text",
+        expected: "peer text",
+      },
+      {
+        label: "keeps divergent local text",
+        observed: "observed text",
+        local: "local divergence",
+        oldText: "peer baseline",
+        incoming: "peer text",
+        expected: "local divergence",
+      },
+      {
+        label: "accepts a peer update into blank local text",
+        observed: "observed text",
+        local: "",
+        oldText: "peer baseline",
+        incoming: "peer text",
+        expected: "peer text",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const changed = testCase.expected !== testCase.local;
+      const formVersion = changed ? 5 : 4;
+      const observed = form(testCase.observed, defaults);
+      const expected = form(testCase.expected, defaults);
+      trace(
+        stateA(
+          {
+            observed,
+            desired: editing(UUID_PEER, form(testCase.local, defaults)),
+            remote: { kind: "present", tid: 210, generation: UUID_PEER },
+            formVersion: 4,
+            historicalGeneration: UUID_PEER,
+          },
+          defaults,
+        ),
+        [
+          {
+            label: testCase.label,
+            event: {
+              type: "task-observed",
+              projectKey: KEY_A,
+              observation: taskObservation(210, {
+                text: testCase.incoming,
+                oldText: testCase.oldText,
+              }),
+            },
+            state: stateA(
+              {
+                observed: form(testCase.incoming, defaults),
+                desired: editing(UUID_PEER, expected),
+                remote: { kind: "present", tid: 210, generation: UUID_PEER },
+                formVersion,
+                historicalGeneration: UUID_PEER,
+              },
+              defaults,
+            ),
+            effects: [projectDraft(KEY_A, 210, expected, formVersion)],
+          },
+        ],
+      );
+    }
+  });
+
   it("projects a pending observation without form fields without changing state", () => {
     const defaults: FormDefaults = {
       entryPoint: "entry-default",
@@ -3629,9 +3712,11 @@ describe("draft reconciler failure boundaries", () => {
     );
     const malformedObservations: readonly TaskObservation[] = [
       { tid: 811, text: undefined } as never,
+      { tid: 811, oldText: undefined } as never,
       { tid: 811, entryPoint: undefined } as never,
       { tid: 811, agent: undefined } as never,
       { tid: 811, text: 1 } as never,
+      { tid: 811, oldText: 1 } as never,
       { tid: 811, entryPoint: null } as never,
       { tid: 811, agent: false } as never,
     ];

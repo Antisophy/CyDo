@@ -5,11 +5,11 @@ import {
   useEffect,
   useLayoutEffect,
   useMemo,
+  useCallback,
 } from "preact/hooks";
 import type { ImageAttachment } from "../useSessionManager";
+import type { OrdinaryDraftStore } from "../ordinaryDraftStore";
 import { applyRecoveredInputDraft } from "./inputDraft";
-
-export const drafts = new Map<string, string>();
 
 const supportsFieldSizing = CSS.supports("field-sizing", "content");
 
@@ -31,6 +31,7 @@ interface OrdinaryProps extends CommonProps {
   inputDraft?: string;
   onInputDraftConsumed?: () => void;
   serverDraft?: string;
+  ordinaryDraftStore: OrdinaryDraftStore;
   onSaveDraft?: (text: string) => void;
   suggestions?: string[];
 }
@@ -368,6 +369,7 @@ function OrdinaryInputBox({
   inputDraft,
   onInputDraftConsumed,
   serverDraft,
+  ordinaryDraftStore,
   onSaveDraft,
   inputRef,
   insertTextRef,
@@ -375,11 +377,30 @@ function OrdinaryInputBox({
   onEscape,
   suggestions,
 }: OrdinaryProps) {
-  const [text, setText] = useState(() => {
-    const memoryDraft = drafts.get(sessionId);
-    if (memoryDraft !== undefined) return memoryDraft;
-    return serverDraft ?? "";
-  });
+  const initialText = ordinaryDraftStore.ensure(sessionId, serverDraft ?? "");
+  const [text, setText] = useState(initialText);
+  const internalRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = inputRef ?? internalRef;
+  const textRef = useRef(text);
+
+  const applyText = useCallback((next: string) => {
+    textRef.current = next;
+    setText(next);
+  }, []);
+
+  const writeText = useCallback(
+    (next: string) => {
+      ordinaryDraftStore.write(sessionId, next);
+      applyText(next);
+    },
+    [applyText, ordinaryDraftStore, sessionId],
+  );
+
+  useLayoutEffect(
+    () => ordinaryDraftStore.register(sessionId, applyText),
+    [applyText, ordinaryDraftStore, sessionId],
+  );
+
   const {
     images,
     setImages,
@@ -389,15 +410,6 @@ function OrdinaryInputBox({
     onDragLeave,
     onDrop,
   } = useImageAttachments();
-  const internalRef = useRef<HTMLTextAreaElement>(null);
-  const textareaRef = inputRef ?? internalRef;
-  const textRef = useRef(text);
-  const lastServerDraftRef = useRef<string>(serverDraft ?? "");
-
-  const applyText = (next: string) => {
-    textRef.current = next;
-    setText(next);
-  };
 
   const saveDraftDebounced = useMemo(
     () => debounce((draft: string) => onSaveDraft?.(draft), 500),
@@ -414,31 +426,18 @@ function OrdinaryInputBox({
   }, [onSaveDraft]);
 
   useEffect(() => {
-    const memoryDraft = drafts.get(sessionId);
-    const initial =
-      memoryDraft !== undefined ? memoryDraft : (serverDraft ?? "");
+    const initial = ordinaryDraftStore.read(sessionId);
+    if (initial === undefined)
+      throw new Error(`Missing ordinary draft: ${sessionId}`);
     applyText(initial);
-    lastServerDraftRef.current = serverDraft ?? "";
     if (initial) saveDraftDebounced(initial);
     return () => {
-      drafts.set(sessionId, textRef.current);
       saveDraftDebounced.cancel();
     };
   }, [sessionId]);
 
-  useEffect(() => {
-    const incoming = serverDraft ?? "";
-    const localText = textRef.current;
-    if (localText === "" || localText === lastServerDraftRef.current) {
-      applyText(incoming);
-      drafts.set(sessionId, incoming);
-    }
-    lastServerDraftRef.current = incoming;
-  }, [serverDraft]);
-
   const handleChange = (next: string) => {
-    applyText(next);
-    drafts.set(sessionId, next);
+    writeText(next);
     saveDraftDebounced(next);
   };
 
@@ -497,8 +496,7 @@ function OrdinaryInputBox({
     if (!inputDraft) return;
     const next = applyRecoveredInputDraft(inputDraft, textRef.current);
     if (next !== textRef.current) {
-      applyText(next);
-      drafts.set(sessionId, next);
+      writeText(next);
     }
     onInputDraftConsumed?.();
   }, [inputDraft, onInputDraftConsumed, sessionId]);
@@ -506,9 +504,8 @@ function OrdinaryInputBox({
   const send = () => {
     const trimmed = text.trim();
     if (!trimmed && images.length === 0) return;
-    applyText("");
+    writeText("");
     setImages([]);
-    drafts.set(sessionId, "");
     saveDraftDebounced.cancel();
     onSaveDraft?.("");
     onSend(trimmed, images.length > 0 ? images : undefined);

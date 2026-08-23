@@ -19,10 +19,15 @@ import type {
   AgnosticEvent,
   ControlMessage,
   ContentBlock,
+  DraftUpdatedMessage,
   HistoryBoundary,
   Notice,
   TaskListEntry,
 } from "./protocol";
+import {
+  createOrdinaryDraftStore,
+  type OrdinaryDraftStore,
+} from "./ordinaryDraftStore";
 import type { CydoMeta, TaskState, UndoPending } from "./types";
 import { makeTaskState } from "./types";
 import {
@@ -46,6 +51,7 @@ import {
   reduceDraft,
   type DraftEffect,
   type DraftEvent,
+  type DraftId,
   type DraftSlotState,
   type DraftState,
   type ProjectKey,
@@ -190,6 +196,7 @@ export type DraftView = UnresolvedDraftView | DraftViewSnapshot;
 
 export interface TaskManager {
   tasks: Map<string, TaskState>;
+  ordinaryDraftStore: OrdinaryDraftStore;
   activeTaskId: string | null;
   activeTaskIdRef: { current: string | null };
   setActiveTaskId: (id: string) => void;
@@ -264,6 +271,27 @@ export interface TaskManager {
   getByTid: (tid: number) => TaskState | undefined;
   refreshWorkspaces: () => void;
   scanState: "idle" | "requested" | "scanning";
+}
+
+interface ControlledDraftOwner {
+  readonly projectKey: ProjectKey;
+  readonly desiredUuid: DraftId | null;
+  readonly generation: number;
+}
+
+type DraftUpdatedReceipt =
+  | { readonly kind: "ordinary" }
+  | { readonly kind: "controlled"; readonly owner: ControlledDraftOwner };
+
+function sameControlledDraftOwner(
+  left: ControlledDraftOwner,
+  right: ControlledDraftOwner,
+) {
+  return (
+    left.projectKey === right.projectKey &&
+    left.desiredUuid === right.desiredUuid &&
+    left.generation === right.generation
+  );
 }
 
 function makeDraftViewSnapshot(
@@ -540,6 +568,7 @@ export function useTaskManager(
 ): TaskManager {
   const [connected, setConnected] = useState(false);
   const [tasks, setTasks] = useState<Map<string, TaskState>>(new Map());
+  const [ordinaryDraftStore] = useState(createOrdinaryDraftStore);
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
   const [scanState, setScanState] = useState<"idle" | "requested" | "scanning">(
     "idle",
@@ -751,7 +780,10 @@ export function useTaskManager(
   );
   const createTokenRef = useRef(0);
   const correlationToProjectRef = useRef(new Map<string, ProjectKey>());
-  const ownedTidToProjectRef = useRef(new Map<number, ProjectKey>());
+  const controlledOwnerByTidRef = useRef(
+    new Map<number, ControlledDraftOwner>(),
+  );
+  const nextControlledOwnerGenerationRef = useRef(0);
   const tombstoneTidToProjectRef = useRef(new Map<number, ProjectKey>());
   const expectedFocusRef = useRef(new Set<string>());
   const draftAttachmentRef = useRef<{
@@ -777,25 +809,69 @@ export function useTaskManager(
     setDraftRevision((revision) => revision + 1);
   }, []);
 
-  const rebuildDraftIndexes = useCallback((state: DraftState) => {
-    correlationToProjectRef.current.clear();
-    ownedTidToProjectRef.current.clear();
-    tombstoneTidToProjectRef.current.clear();
-    for (const [projectKey, slot] of Object.entries(state.slots)) {
-      if (slot.remote.kind === "creating") {
-        correlationToProjectRef.current.set(
-          slot.remote.correlationId,
-          projectKey,
-        );
+  const rebuildDraftIndexes = useCallback(
+    (state: DraftState) => {
+      const previousOwners = controlledOwnerByTidRef.current;
+      const nextOwners = new Map<number, ControlledDraftOwner>();
+      correlationToProjectRef.current.clear();
+      tombstoneTidToProjectRef.current.clear();
+      for (const [projectKey, slot] of Object.entries(state.slots)) {
+        if (slot.remote.kind === "creating") {
+          correlationToProjectRef.current.set(
+            slot.remote.correlationId,
+            projectKey,
+          );
+        }
+        if (slot.remote.kind === "present" || slot.remote.kind === "deleting") {
+          const desiredUuid =
+            slot.desired.kind === "none" ? null : slot.desired.uuid;
+          const previous = previousOwners.get(slot.remote.tid);
+          const owner =
+            previous &&
+            previous.projectKey === projectKey &&
+            previous.desiredUuid === desiredUuid
+              ? previous
+              : {
+                  projectKey,
+                  desiredUuid,
+                  generation: ++nextControlledOwnerGenerationRef.current,
+                };
+          nextOwners.set(slot.remote.tid, owner);
+          const uuid = tidToUuid.get(slot.remote.tid);
+          if (uuid) ordinaryDraftStore.retire(uuid);
+        }
+        if (slot.remote.kind === "deleting") {
+          tombstoneTidToProjectRef.current.set(slot.remote.tid, projectKey);
+        }
       }
-      if (slot.remote.kind === "present" || slot.remote.kind === "deleting") {
-        ownedTidToProjectRef.current.set(slot.remote.tid, projectKey);
-      }
-      if (slot.remote.kind === "deleting") {
-        tombstoneTidToProjectRef.current.set(slot.remote.tid, projectKey);
-      }
-    }
-  }, []);
+      controlledOwnerByTidRef.current = nextOwners;
+    },
+    [ordinaryDraftStore],
+  );
+
+  const bindTaskUuid = useCallback(
+    (tid: number, uuid: string) => {
+      const previousUuid = tidToUuid.get(tid);
+      if (previousUuid !== undefined && previousUuid !== uuid)
+        ordinaryDraftStore.retire(previousUuid);
+      tidToUuid.set(tid, uuid);
+      if (controlledOwnerByTidRef.current.has(tid))
+        ordinaryDraftStore.retire(uuid);
+    },
+    [ordinaryDraftStore],
+  );
+
+  const removeTaskIdentity = useCallback(
+    (tid: number) => {
+      const uuid = tidToUuid.get(tid);
+      if (uuid === undefined) return;
+      ordinaryDraftStore.retire(uuid);
+      liveStates.delete(uuid);
+      tidToUuid.delete(tid);
+      requestedHistoryRef.current.delete(uuid);
+    },
+    [ordinaryDraftStore],
+  );
 
   const applyDraftEvent = useCallback(
     (event: DraftEvent) => {
@@ -1155,10 +1231,10 @@ export function useTaskManager(
         everLoaded: submitting,
       };
       liveStates.set(task.uuid, task);
-      tidToUuid.set(tid, task.uuid);
+      bindTaskUuid(tid, task.uuid);
       setTasks((previous) => new Map(previous).set(task.uuid, task));
     },
-    [entryPointFor],
+    [bindTaskUuid, entryPointFor],
   );
 
   const requestTaskHistory = useCallback((tid: number) => {
@@ -1193,7 +1269,7 @@ export function useTaskManager(
   const handleUnconfirmedUserMessage = useCallback(
     (tid: number, msg: AgnosticEvent, correlationId?: string) => {
       if (tombstoneTidToProjectRef.current.has(tid)) return;
-      const projectKey = ownedTidToProjectRef.current.get(tid);
+      const projectKey = controlledOwnerByTidRef.current.get(tid)?.projectKey;
       const effects = projectKey
         ? applyDraftEvent({
             type: "task-observed",
@@ -1281,7 +1357,7 @@ export function useTaskManager(
   const handleTaskMessage = useCallback(
     (tid: number, msg: AgnosticEvent, seq?: number, ts?: number) => {
       if (tombstoneTidToProjectRef.current.has(tid)) return;
-      const projectKey = ownedTidToProjectRef.current.get(tid);
+      const projectKey = controlledOwnerByTidRef.current.get(tid)?.projectKey;
       const effects = projectKey
         ? applyDraftEvent({
             type: "task-observed",
@@ -1319,8 +1395,49 @@ export function useTaskManager(
     [applyDraftEvent],
   );
 
+  const handleDraftUpdatedMessage = useCallback(
+    (msg: DraftUpdatedMessage, receipt: DraftUpdatedReceipt) => {
+      const { tid, old_draft, new_draft } = msg;
+      const ownerAtDrain = controlledOwnerByTidRef.current.get(tid);
+      if (
+        receipt.kind === "controlled" &&
+        (!ownerAtDrain ||
+          !sameControlledDraftOwner(ownerAtDrain, receipt.owner))
+      )
+        return;
+      const result = ownerAtDrain
+        ? applyDraftEvent({
+            type: "task-observed",
+            projectKey: ownerAtDrain.projectKey,
+            observation: { tid, text: new_draft, oldText: old_draft },
+          })
+        : null;
+      const task = findByTid(tid);
+      if (task) {
+        const updated = {
+          ...task,
+          serverDraft: new_draft || undefined,
+        };
+        liveStates.set(task.uuid, updated);
+        setTasks((previous) => {
+          if (!previous.has(task.uuid)) return previous;
+          const next = new Map(previous);
+          next.set(task.uuid, updated);
+          return next;
+        });
+        if (receipt.kind === "ordinary" && !ownerAtDrain)
+          ordinaryDraftStore.applyRemote(task.uuid, {
+            old_draft,
+            new_draft,
+          });
+      }
+      if (result) executeDraftEffects(result.effects);
+    },
+    [applyDraftEvent, executeDraftEffects, ordinaryDraftStore],
+  );
+
   const handleControlMessage = useCallback(
-    (msg: ControlMessage) => {
+    (msg: Exclude<ControlMessage, DraftUpdatedMessage>) => {
       const controlledTid =
         msg.type === "task_updated"
           ? msg.task.tid
@@ -1456,7 +1573,7 @@ export function useTaskManager(
             "pending",
           );
           liveStates.set(t.uuid, t);
-          tidToUuid.set(tid, t.uuid);
+          bindTaskUuid(tid, t.uuid);
           setTasks((prev) => {
             const next = new Map(prev);
             next.set(t.uuid, t);
@@ -1520,7 +1637,9 @@ export function useTaskManager(
               if (!released) continue;
               effects.push(...released);
             }
-            const projectKey = ownedTidToProjectRef.current.get(entry.tid);
+            const projectKey = controlledOwnerByTidRef.current.get(
+              entry.tid,
+            )?.projectKey;
             const result = projectKey
               ? applyDraftEvent({
                   type: "task-observed",
@@ -1534,7 +1653,7 @@ export function useTaskManager(
               : undefined;
             const state = taskStateFromEntry(entry, existing, existingUuid);
             liveStates.set(state.uuid, state);
-            tidToUuid.set(entry.tid, state.uuid);
+            bindTaskUuid(entry.tid, state.uuid);
             updates.set(state.uuid, state);
             if (result) effects.push(...result.effects);
           }
@@ -1573,7 +1692,9 @@ export function useTaskManager(
             if (!released) break;
             effects.push(...released);
           }
-          const projectKey = ownedTidToProjectRef.current.get(entry.tid);
+          const projectKey = controlledOwnerByTidRef.current.get(
+            entry.tid,
+          )?.projectKey;
           const result = projectKey
             ? applyDraftEvent({
                 type: "task-observed",
@@ -1587,7 +1708,7 @@ export function useTaskManager(
             : undefined;
           const taskUpdated = taskStateFromEntry(entry, existing, existingUuid);
           liveStates.set(taskUpdated.uuid, taskUpdated);
-          tidToUuid.set(entry.tid, taskUpdated.uuid);
+          bindTaskUuid(entry.tid, taskUpdated.uuid);
           setTasks((prev) => {
             const next = new Map(prev);
             next.set(taskUpdated.uuid, taskUpdated);
@@ -1760,33 +1881,10 @@ export function useTaskManager(
           });
           break;
         }
-        case "draft_updated": {
-          const { tid, new_draft } = msg;
-          const projectKey = ownedTidToProjectRef.current.get(tid);
-          const result = projectKey
-            ? applyDraftEvent({
-                type: "task-observed",
-                projectKey,
-                observation: { tid, text: new_draft },
-              })
-            : null;
-          const t = findByTid(tid);
-          if (t) {
-            const updated = { ...t, serverDraft: new_draft || undefined };
-            liveStates.set(t.uuid, updated);
-            setTasks((prev) => {
-              if (!prev.has(t.uuid)) return prev;
-              const next = new Map(prev);
-              next.set(t.uuid, updated);
-              return next;
-            });
-          }
-          if (result) executeDraftEffects(result.effects);
-          break;
-        }
         case "task_deleted": {
           const { tid } = msg;
-          const projectKey = ownedTidToProjectRef.current.get(tid);
+          const projectKey =
+            controlledOwnerByTidRef.current.get(tid)?.projectKey;
           const deletedSlot = projectKey
             ? getSlot(draftStateRef.current, projectKey)
             : null;
@@ -1797,11 +1895,7 @@ export function useTaskManager(
             : null;
           const uuid = tidToUuid.get(tid);
           outbox.removeForTask(tid);
-          if (uuid) {
-            liveStates.delete(uuid);
-            tidToUuid.delete(tid);
-            requestedHistoryRef.current.delete(uuid);
-          }
+          removeTaskIdentity(tid);
           setTasks((prev) => {
             if (!uuid || !prev.has(uuid)) return prev;
             const next = new Map(prev);
@@ -1989,9 +2083,11 @@ export function useTaskManager(
     },
     [
       applyDraftEvent,
+      bindTaskUuid,
       currentRouteProjectName,
       executeDraftEffects,
       materializeDraftTask,
+      removeTaskIdentity,
       releaseTombstonedActivity,
       requestTaskHistory,
       isCurrentOpenEpoch,
@@ -2025,7 +2121,15 @@ export function useTaskManager(
           correlationId?: string;
         }
       | { kind: "agentAck"; tid: number; nonce: string }
-      | { kind: "control"; msg: ControlMessage };
+      | {
+          kind: "draftUpdated";
+          msg: DraftUpdatedMessage;
+          receipt: DraftUpdatedReceipt;
+        }
+      | {
+          kind: "control";
+          msg: Exclude<ControlMessage, DraftUpdatedMessage>;
+        };
     type BufferedMsg = BufferedPayload & { epoch: number };
     let buffer: BufferedMsg[] = [];
     const pendingHistoryBoundaries = new Map<
@@ -2037,7 +2141,7 @@ export function useTaskManager(
 
     const handleAgentAck = (tid: number, nonce: string) => {
       if (tombstoneTidToProjectRef.current.has(tid)) return;
-      const projectKey = ownedTidToProjectRef.current.get(tid);
+      const projectKey = controlledOwnerByTidRef.current.get(tid)?.projectKey;
       const effects = projectKey
         ? applyDraftEvent({
             type: "task-observed",
@@ -2077,7 +2181,9 @@ export function useTaskManager(
       buffer = [];
       for (const item of batch) {
         if (!isCurrentOpenEpoch(item.epoch)) continue;
-        if (item.kind === "control") handleControlMessage(item.msg);
+        if (item.kind === "draftUpdated")
+          handleDraftUpdatedMessage(item.msg, item.receipt);
+        else if (item.kind === "control") handleControlMessage(item.msg);
         else if (item.kind === "unconfirmed")
           handleUnconfirmedUserMessage(item.tid, item.msg, item.correlationId);
         else if (item.kind === "agentAck") handleAgentAck(item.tid, item.nonce);
@@ -2191,6 +2297,7 @@ export function useTaskManager(
         setConnected(false);
         liveStates.clear();
         tidToUuid.clear();
+        ordinaryDraftStore.clear();
         requestedHistoryRef.current.clear();
         outboxReplayedEpochRef.current = null;
         outboxAttemptedNoncesRef.current.clear();
@@ -2258,6 +2365,17 @@ export function useTaskManager(
       enqueue({ kind: "agentAck", tid, nonce });
     };
     conn.onControlMessage = (msg) => {
+      if (msg.type === "draft_updated") {
+        const owner = controlledOwnerByTidRef.current.get(msg.tid);
+        enqueue({
+          kind: "draftUpdated",
+          msg,
+          receipt: owner
+            ? { kind: "controlled", owner: { ...owner } }
+            : { kind: "ordinary" },
+        });
+        return;
+      }
       enqueue({ kind: "control", msg });
     };
     conn.onClientError = (message) => {
@@ -2267,13 +2385,16 @@ export function useTaskManager(
     return () => {
       cancelPendingFlush();
       document.removeEventListener("visibilitychange", onVisibilityChange);
+      ordinaryDraftStore.clear();
       conn.disconnect();
     };
   }, [
     handleTaskMessage,
+    handleDraftUpdatedMessage,
     handleControlMessage,
     handleUnconfirmedUserMessage,
     isCurrentOpenEpoch,
+    ordinaryDraftStore,
   ]);
 
   // The workspace/project segments of a task URL are derived from the task; enforce
@@ -2312,7 +2433,7 @@ export function useTaskManager(
     const tid = parseTaskId(activeTaskId);
     if (tid === null) return;
     if (tombstoneTidToProjectRef.current.has(tid)) return;
-    if (ownedTidToProjectRef.current.has(tid)) return;
+    if (controlledOwnerByTidRef.current.has(tid)) return;
     const t = findByTid(tid);
     if (!t) return;
     if (requestedHistoryRef.current.has(t.uuid)) return;
@@ -3251,6 +3372,7 @@ export function useTaskManager(
 
   return {
     tasks,
+    ordinaryDraftStore,
     activeTaskId,
     activeTaskIdRef,
     setActiveTaskId,

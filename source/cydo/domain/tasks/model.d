@@ -587,7 +587,7 @@ struct TaskData
 		return effectiveCwdForTask(projectPath, repoPath, worktreePath, worktreeTid);
 	}
 
-	string draft;
+	string draft = "";
 
 	// Runtime state (not persisted)
 	/// Nonces of messages accepted in this session lifetime; cleared on exit.
@@ -1264,6 +1264,7 @@ struct DraftUpdatedMessage
 {
 	string type = "draft_updated";
 	int tid;
+	string old_draft;
 	string new_draft;
 }
 

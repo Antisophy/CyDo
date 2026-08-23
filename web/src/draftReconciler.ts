@@ -106,6 +106,7 @@ export interface TaskObservation {
   processing?: boolean;
   hasMessages?: boolean;
   text?: string;
+  oldText?: string;
   entryPoint?: string;
   agent?: string;
 }
@@ -1526,7 +1527,13 @@ function mergeObservedForm(
 ): DraftForm {
   return {
     text: hasOwnProperty(observation, "text")
-      ? acceptsObservedValue(desired.text, observed.text, observation.text!)
+      ? acceptsObservedValue(
+          desired.text,
+          hasOwnProperty(observation, "oldText")
+            ? observation.oldText!
+            : observed.text,
+          observation.text!,
+        )
       : desired.text,
     entryPoint: hasOwnProperty(observation, "entryPoint")
       ? acceptsObservedValue(
@@ -1581,13 +1588,14 @@ function hasObservedFormFields(observation: TaskObservation): boolean {
 
 function assertObservedFormFieldTypes(observation: TaskObservation): void {
   assertObservedFormFieldType(observation, "text");
+  assertObservedFormFieldType(observation, "oldText");
   assertObservedFormFieldType(observation, "entryPoint");
   assertObservedFormFieldType(observation, "agent");
 }
 
 function assertObservedFormFieldType(
   observation: TaskObservation,
-  field: keyof DraftForm,
+  field: keyof DraftForm | "oldText",
 ): void {
   if (
     hasOwnProperty(observation, field) &&

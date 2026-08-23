@@ -16,6 +16,7 @@ import type {
   DraftView,
 } from "../useSessionManager";
 import type { AgentUsageMessage, Notice } from "../protocol";
+import type { OrdinaryDraftStore } from "../ordinaryDraftStore";
 import { NoticeBar } from "./NoticeBar";
 import { SystemBanner, normalizeSessionStatus } from "./SystemBanner";
 import { deriveBandStatus } from "./StatusBand";
@@ -50,6 +51,7 @@ interface Props {
   ) => void;
   onUndoDismiss: (tid: number) => void;
   onClearInputDraft: (tid: number) => void;
+  ordinaryDraftStore: OrdinaryDraftStore;
   onSaveDraft?: (tid: number, draft: string) => void;
   onAskUserResponse: (tid: number, content: string) => void;
   onPermissionPromptResponse: (tid: number, content: string) => void;
@@ -82,6 +84,7 @@ function SessionViewInner({
   onUndoConfirm,
   onUndoDismiss,
   onClearInputDraft,
+  ordinaryDraftStore,
   onSaveDraft,
   onAskUserResponse,
   onPermissionPromptResponse,
@@ -502,6 +505,7 @@ function SessionViewInner({
             inputDraft={task.inputDraft}
             onInputDraftConsumed={handleInputDraftConsumed}
             serverDraft={task.serverDraft}
+            ordinaryDraftStore={ordinaryDraftStore}
             onSaveDraft={onSaveDraft ? handleSaveDraft : undefined}
             inputRef={inputRef}
             insertTextRef={insertTextRef}

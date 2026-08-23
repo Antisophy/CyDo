@@ -143,7 +143,7 @@ test("draft broadcasts live to subscribed clients", async ({
   await context2.close();
 });
 
-test("draft broadcast does not overwrite local typing", async ({
+test("draft broadcast accepts a peer update after its local text saves", async ({
   page,
   browser,
   agentType,
@@ -173,7 +173,8 @@ test("draft broadcast does not overwrite local typing", async ({
   await input2.click();
   await input2.fill("page2 is typing");
 
-  // Page 1 types something different
+  // Focusing page 1 blurs page 2 and saves its local text before page 1
+  // replaces it.
   const input1 = page.locator(".input-textarea:visible").first();
   await input1.click();
   await input1.fill("page1 draft");
@@ -181,8 +182,8 @@ test("draft broadcast does not overwrite local typing", async ({
   // Wait for debounce + broadcast
   await page.waitForTimeout(1500);
 
-  // Page 2 should NOT have its text overwritten — it diverged from the server draft
-  await expect(input2).toHaveValue("page2 is typing");
+  // Page 2's local text matches old_draft, so it accepts the replacement.
+  await expect(input2).toHaveValue("page1 draft");
 
   await context2.close();
 });

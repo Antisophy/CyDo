@@ -1740,9 +1740,10 @@ class App
 			}
 			if (draftAtSubmission.length > 0 && accepted.draft == draftAtSubmission)
 			{
+				auto oldDraft = accepted.draft;
 				accepted.draft = "";
 				persistence.setDraft(tid, "");
-				auto draftData = Data(toJson(DraftUpdatedMessage("draft_updated", tid, "")).representation);
+				auto draftData = Data(toJson(DraftUpdatedMessage("draft_updated", tid, oldDraft, "")).representation);
 				clientHub.sendToSubscribed(tid, draftData);
 			}
 		}
@@ -1894,11 +1895,12 @@ class App
 			return;
 		auto td = &tasks[tid];
 		string draft = json.content.json !is null ? jsonParse!string(json.content.json) : "";
+		auto oldDraft = td.draft;
 		td.draft = draft;
 		persistence.setDraft(tid, draft);
 		// Broadcast to every other client (not the sender): draft text is task metadata,
 		// not history-subscription-only state.
-		auto data = Data(toJson(DraftUpdatedMessage("draft_updated", tid, draft)).representation);
+		auto data = Data(toJson(DraftUpdatedMessage("draft_updated", tid, oldDraft, draft)).representation);
 		clientHub.broadcastExcept(senderWs, data);
 	}
 
@@ -4495,6 +4497,20 @@ unittest
 
 	auto fixture = new GatedSubmissionFixture(dbPath);
 	auto td = &fixture.app.tasks[fixture.tid];
+	auto draftSender = new SubmissionCaptureWebSocket;
+	fixture.app.clientHub.add(draftSender);
+	assert(td.draft == "");
+	WsMessage setDraft;
+	setDraft.type = "set_draft";
+	setDraft.tid = fixture.tid;
+	setDraft.content = JSONFragment(toJson("first draft"));
+	fixture.app.handleSetDraftMsg(draftSender, setDraft);
+	assert(draftSender.sent.length == 0);
+	assert(fixture.socket.sent.length == 1
+		&& fixture.socket.sent[0].canFind(`"old_draft":""`)
+		&& fixture.socket.sent[0].canFind(`"new_draft":"first draft"`));
+	fixture.socket.sent = null;
+	fixture.publicationOrder = null;
 	td.status = TaskStatus.waiting;
 	td.description = "";
 	td.title = "";
@@ -4588,6 +4604,15 @@ unittest
 	assert(readPersistedDraft().length == 0);
 	assert(fixture.publicationOrder == ["title_update", "draft_updated",
 		"unconfirmed", "task_update", "agent_ack"]);
+	bool sentDraftClear;
+	foreach (payload; fixture.socket.sent)
+		if (payload.canFind(`"type":"draft_updated"`))
+		{
+			assert(payload.canFind(`"old_draft":"saved retry draft"`));
+			assert(payload.canFind(`"new_draft":""`));
+			sentDraftClear = true;
+		}
+	assert(sentDraftClear);
 }
 
 unittest

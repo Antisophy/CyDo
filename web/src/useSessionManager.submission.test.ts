@@ -467,6 +467,31 @@ function tasksList(
   return { type: "tasks_list", complete, tasks };
 }
 
+async function seedOrdinaryTask(
+  tid = 42,
+  draft = "A",
+): Promise<{
+  connection: NonNullable<typeof testState.connection>;
+  task: NonNullable<ReturnType<TaskManager["getByTid"]>>;
+}> {
+  await renderManager();
+  const connection = testState.connection!;
+  await act(() => {
+    connection.onControlMessage?.(
+      tasksList([
+        {
+          ...activeSnapshot(tid),
+          isProcessing: false,
+          draft,
+        },
+      ]),
+    );
+  });
+  const task = manager!.getByTid(tid);
+  if (!task) throw new Error("Expected seeded ordinary task");
+  return { connection, task };
+}
+
 async function preparePreCatalogPersistedDraft(
   snapshot: TaskSnapshotEntry,
 ): Promise<DraftViewSnapshot> {
@@ -3283,5 +3308,249 @@ describe("submission acknowledgement routing", () => {
       "source-b-correlation",
       "other-d-correlation",
     ]);
+  });
+
+  it("CAS-reduces same-rAF ordinary A to B to C updates", async () => {
+    const { connection, task } = await seedOrdinaryTask();
+    manager!.ordinaryDraftStore.ensure(task.uuid, "A");
+    const received: string[] = [];
+    const unregister = manager!.ordinaryDraftStore.register(
+      task.uuid,
+      (text) => {
+        received.push(text);
+      },
+    );
+    received.length = 0;
+
+    testState.hidden = false;
+    connection.onControlMessage?.({
+      type: "draft_updated",
+      tid: 42,
+      old_draft: "A",
+      new_draft: "B",
+    } satisfies ControlMessage);
+    connection.onControlMessage?.({
+      type: "draft_updated",
+      tid: 42,
+      old_draft: "B",
+      new_draft: "C",
+    } satisfies ControlMessage);
+    await flushAnimationFrames();
+
+    expect(received).toEqual(["B", "C"]);
+    expect(manager!.ordinaryDraftStore.read(task.uuid)).toBe("C");
+    expect(manager!.getByTid(42)?.serverDraft).toBe("C");
+    unregister();
+  });
+
+  it("CAS-reduces a same-rAF ordinary A to B to clear sequence", async () => {
+    const { connection, task } = await seedOrdinaryTask();
+    manager!.ordinaryDraftStore.ensure(task.uuid, "A");
+
+    testState.hidden = false;
+    connection.onControlMessage?.({
+      type: "draft_updated",
+      tid: 42,
+      old_draft: "A",
+      new_draft: "B",
+    } satisfies ControlMessage);
+    connection.onControlMessage?.({
+      type: "draft_updated",
+      tid: 42,
+      old_draft: "B",
+      new_draft: "",
+    } satisfies ControlMessage);
+    await flushAnimationFrames();
+
+    expect(manager!.ordinaryDraftStore.read(task.uuid)).toBe("");
+    expect(manager!.getByTid(42)?.serverDraft).toBeUndefined();
+  });
+
+  it("keeps absent ordinary blank, equal, and divergent local scalars distinct", async () => {
+    const { connection, task } = await seedOrdinaryTask();
+    manager!.ordinaryDraftStore.ensure(task.uuid, "");
+
+    testState.hidden = false;
+    connection.onControlMessage?.({
+      type: "draft_updated",
+      tid: 42,
+      old_draft: "A",
+      new_draft: "B",
+    } satisfies ControlMessage);
+    await flushAnimationFrames();
+    expect(manager!.ordinaryDraftStore.read(task.uuid)).toBe("B");
+
+    manager!.ordinaryDraftStore.retire(task.uuid);
+    manager!.ordinaryDraftStore.ensure(task.uuid, "B");
+    connection.onControlMessage?.({
+      type: "draft_updated",
+      tid: 42,
+      old_draft: "B",
+      new_draft: "C",
+    } satisfies ControlMessage);
+    await flushAnimationFrames();
+    expect(manager!.ordinaryDraftStore.read(task.uuid)).toBe("C");
+
+    manager!.ordinaryDraftStore.retire(task.uuid);
+    manager!.ordinaryDraftStore.ensure(task.uuid, "local");
+    connection.onControlMessage?.({
+      type: "draft_updated",
+      tid: 42,
+      old_draft: "C",
+      new_draft: "D",
+    } satisfies ControlMessage);
+    await flushAnimationFrames();
+    expect(manager!.ordinaryDraftStore.read(task.uuid)).toBe("local");
+  });
+
+  it("retires ordinary scalars on UUID replacement, definitive deletion, and disconnect", async () => {
+    const { connection, task } = await seedOrdinaryTask();
+    manager!.ordinaryDraftStore.ensure(task.uuid, "local A");
+
+    testState.uuid = "replacement-uuid";
+    connection.onControlMessage?.({
+      type: "task_created",
+      tid: 42,
+      workspace: "source",
+      project_path: "/source-project",
+      correlation_id: "unowned-replacement",
+    } satisfies ControlMessage);
+    const replacement = manager!.getByTid(42);
+    if (!replacement) throw new Error("Expected replacement task");
+    expect(manager!.ordinaryDraftStore.read(task.uuid)).toBeUndefined();
+
+    manager!.ordinaryDraftStore.ensure(replacement.uuid, "local B");
+    connection.onControlMessage?.({
+      type: "task_deleted",
+      tid: 42,
+    } satisfies ControlMessage);
+    expect(manager!.ordinaryDraftStore.read(replacement.uuid)).toBeUndefined();
+
+    connection.onControlMessage?.({
+      type: "task_updated",
+      task: { ...activeSnapshot(43), isProcessing: false },
+    } satisfies ControlMessage);
+    const fresh = manager!.getByTid(43);
+    if (!fresh) throw new Error("Expected fresh ordinary task");
+    manager!.ordinaryDraftStore.ensure(fresh.uuid, "local C");
+    connection.onStatusChange?.(false);
+    expect(manager!.ordinaryDraftStore.read(fresh.uuid)).toBeUndefined();
+  });
+
+  it("retires an ordinary scalar when controlled ownership takes its task", async () => {
+    const { task } = await seedOrdinaryTask(71, "ordinary A");
+    manager!.ordinaryDraftStore.ensure(task.uuid, "ordinary local");
+
+    await prepareCreatingDraft();
+    await act(() => {
+      acknowledgeSubmission(71);
+    });
+
+    expect(manager!.ordinaryDraftStore.read(task.uuid)).toBeUndefined();
+  });
+
+  it("does not resurrect an accepted controlled peer draft after submit and remount", async () => {
+    await prepareEditableDraft();
+    const connection = testState.connection!;
+
+    testState.hidden = false;
+    connection.onControlMessage?.({
+      type: "draft_updated",
+      tid: 71,
+      old_draft: "draft to delete",
+      new_draft: "peer B",
+    } satisfies ControlMessage);
+    await flushAnimationFrames();
+
+    const accepted = (await renderManager()).draftView;
+    if (!accepted || accepted.kind !== "resolved")
+      throw new Error("Expected controlled draft after accepted update");
+    expect(accepted.text).toBe("peer B");
+
+    await act(() => {
+      accepted.onSubmit("peer B", []);
+    });
+    const released = (await renderManager()).getByTid(71);
+    if (!released) throw new Error("Expected released ordinary task");
+    expect(manager!.ordinaryDraftStore.read(released.uuid)).toBeUndefined();
+    expect(
+      manager!.ordinaryDraftStore.ensure(
+        released.uuid,
+        released.serverDraft ?? "",
+      ),
+    ).toBe("");
+    expect(manager!.ordinaryDraftStore.read(released.uuid)).toBe("");
+  });
+
+  it("discards a controlled receipt drained after its owner generation releases", async () => {
+    const attached = await prepareEditableDraft();
+    const connection = testState.connection!;
+
+    testState.hidden = false;
+    connection.onControlMessage?.({
+      type: "draft_updated",
+      tid: 71,
+      old_draft: "draft to delete",
+      new_draft: "peer B",
+    } satisfies ControlMessage);
+
+    await act(() => {
+      attached.onSubmit("draft to delete", []);
+    });
+    const released = (await renderManager()).getByTid(71);
+    if (!released) throw new Error("Expected submitted task");
+
+    await flushAnimationFrames();
+
+    expect(manager!.ordinaryDraftStore.read(released.uuid)).toBeUndefined();
+    expect(manager!.getByTid(71)?.serverDraft).toBeUndefined();
+    expect(
+      manager!.ordinaryDraftStore.ensure(
+        released.uuid,
+        manager!.getByTid(71)?.serverDraft ?? "",
+      ),
+    ).toBe("");
+  });
+
+  it("routes an ordinary receipt to controlled ownership created earlier in the same rAF", async () => {
+    await prepareCreatingDraft();
+    const connection = testState.connection!;
+
+    testState.uuid = "ordinary-71-uuid";
+    connection.onControlMessage?.(
+      tasksList([persistedSnapshot(71, "ordinary A")]),
+    );
+    testState.uuid = "submission-uuid";
+    const ordinary = manager!.getByTid(71);
+    if (!ordinary) throw new Error("Expected ordinary task");
+    manager!.ordinaryDraftStore.ensure(ordinary.uuid, "ordinary A");
+    const received: string[] = [];
+    manager!.ordinaryDraftStore.register(ordinary.uuid, (text) => {
+      received.push(text);
+    });
+    received.length = 0;
+
+    testState.hidden = false;
+    connection.onControlMessage?.({
+      type: "task_created",
+      tid: 71,
+      workspace: "source",
+      project_path: "/source-project",
+      correlation_id: "submission-uuid",
+    } satisfies ControlMessage);
+    connection.onControlMessage?.({
+      type: "draft_updated",
+      tid: 71,
+      old_draft: "editing create before acknowledgement",
+      new_draft: "controlled B",
+    } satisfies ControlMessage);
+    await flushAnimationFrames();
+
+    testState.route.tid = "71";
+    const controlled = (await renderManager()).draftView;
+    if (!controlled || controlled.kind !== "resolved")
+      throw new Error("Expected task_created to own the draft");
+    expect(received).toEqual([]);
+    expect(controlled.text).toBe("controlled B");
   });
 });

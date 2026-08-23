@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ControlledImageStore } from "./components/InputBox";
 import type { DraftViewSnapshot, TaskManager } from "./useSessionManager";
 import { makeTaskState, type TaskState } from "./types";
+import { createOrdinaryDraftStore } from "./ordinaryDraftStore";
 
 const state = vi.hoisted(() => ({
   serverError: null as TaskManager["serverError"],
@@ -28,6 +29,9 @@ const state = vi.hoisted(() => ({
   connected: true,
   tasksLoaded: true,
   getByTid: vi.fn(),
+  ordinaryDraftStore: null as
+    | import("./ordinaryDraftStore").OrdinaryDraftStore
+    | null,
 }));
 
 const componentProps = vi.hoisted(() => ({
@@ -63,6 +67,8 @@ vi.mock("./useSessionManager", () => ({
   useTaskManager: () =>
     ({
       tasks: state.tasks,
+      ordinaryDraftStore: (state.ordinaryDraftStore ??=
+        createOrdinaryDraftStore()),
       activeTaskId: state.activeTaskId,
       activeTaskIdRef: { current: state.activeTaskId },
       setActiveTaskId: vi.fn(),
@@ -232,6 +238,7 @@ beforeEach(() => {
   componentProps.draftSessionView.length = 0;
   componentProps.searchPopup.length = 0;
   componentProps.welcomePage.length = 0;
+  state.ordinaryDraftStore?.clear();
 });
 
 function latest<T>(calls: T[]): T {
@@ -353,6 +360,96 @@ describe("server command errors", () => {
     expect(html).toContain(">controlled draft</textarea>");
     expect(html).not.toContain("Loading task");
     expect(html.match(/input-textarea/g) ?? []).toHaveLength(1);
+  });
+
+  it("does not hydrate an ordinary composer from a submitted controlled peer update", async () => {
+    const controlledSubmit = vi.fn();
+    const controlledTask = {
+      ...makeTaskState(
+        71,
+        false,
+        false,
+        undefined,
+        false,
+        "workspace",
+        "/project",
+      ),
+      uuid: "controlled-task",
+      status: "pending" as const,
+      serverDraft: "peer B",
+      entryPoint: "entry",
+      agentName: "agent",
+    };
+    state.tasks = new Map([[controlledTask.uuid, controlledTask]]);
+    state.activeTaskId = "71";
+    state.activeWorkspace = "workspace";
+    state.activeProject = "project";
+    state.draftView = {
+      kind: "resolved",
+      projectKey: "workspace\0/project",
+      viewKey: "workspace\0/project",
+      workspace: "workspace",
+      projectName: "project",
+      projectPath: "/project",
+      remoteTid: 71,
+      text: "peer B",
+      entryPoint: "entry",
+      agent: "agent",
+      lifecycle: "present",
+      disabled: false,
+      metadataReady: true,
+      composerResetToken: 0,
+      onTextChange: vi.fn(),
+      onEntryPointChange: vi.fn(),
+      onAgentChange: vi.fn(),
+      onBlur: vi.fn(),
+      onSubmit: controlledSubmit,
+    } satisfies DraftViewSnapshot;
+    container = document.createElement("div");
+    document.body.appendChild(container);
+
+    await act(() => {
+      render(h(App, {}), container!);
+    });
+    expect(
+      container.querySelector<HTMLTextAreaElement>("textarea")?.value,
+    ).toBe("peer B");
+    await act(() => {
+      container!.querySelector<HTMLButtonElement>(".btn-send")!.click();
+    });
+    expect(controlledSubmit).toHaveBeenCalledWith("peer B", []);
+
+    const ordinaryTask = {
+      ...makeTaskState(
+        71,
+        true,
+        false,
+        undefined,
+        true,
+        "workspace",
+        "/project",
+        undefined,
+        undefined,
+        "active",
+      ),
+      uuid: "ordinary-task",
+    };
+    state.tasks = new Map([[ordinaryTask.uuid, ordinaryTask]]);
+    state.draftView = null;
+    await act(() => {
+      render(h(App, {}), container!);
+    });
+    expect(
+      container.querySelector<HTMLTextAreaElement>("textarea")?.value,
+    ).toBe("");
+
+    await act(() => {
+      render(null, container!);
+      render(h(App, {}), container!);
+    });
+    expect(
+      container.querySelector<HTMLTextAreaElement>("textarea")?.value,
+    ).toBe("");
   });
 
   it("shows numeric loading while a known pending task is not renderable", () => {

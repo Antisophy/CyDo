@@ -1,283 +1,240 @@
 /**
  * @vitest-environment jsdom
  * @vitest-environment-options { "pretendToBeVisual": true }
- *
- * Deterministic reproduction of the recovered-draft race: an intermittent
- * failure where a just-typed composer message gets silently overwritten by
- * a stale recovered draft.
- *
- * Preact flushes a component's pending `useEffect` callbacks synchronously at
- * the START of its next render (preact/hooks `options._render`, the
- * `previousComponent !== currentComponent` branch), i.e. BEFORE the component
- * function body runs and therefore before the composer text ref is
- * re-assigned.
- *
- * So a recovery effect scheduled by render N, but not yet flushed by
- * `afterPaint`, runs at the top of render N+1 — the very render that carries
- * the text the user just typed — and reads render N's (empty) `textRef`.
- * `applyRecoveredInputDraft` therefore sees an empty composer and overwrites
- * the freshly typed text with the recovered (just-undone) prompt.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "preact";
+import { InputBox } from "./InputBox";
+import {
+  createOrdinaryDraftStore,
+  type OrdinaryDraftStore,
+} from "../ordinaryDraftStore";
 
 vi.hoisted(() => {
   vi.stubGlobal("CSS", { supports: () => false });
 });
-
-import { InputBox, drafts } from "./InputBox";
 
 const SESSION = "session-uuid";
 const RECOVERED = 'Please reply with "CODEX_ROLLBACK_DEAD"';
 const TYPED =
   "Reply exactly with CODEX_FALLBACK_RESPONSE. CODEX_FALLBACK_PROMPT";
 
-/** Let preact's `afterPaint` (rAF + setTimeout) flush pending useEffects. */
-const flushPaintEffects = () => new Promise((r) => setTimeout(r, 80));
-/** Let preact's `debounceRendering` (microtask) process the re-render queue. */
+const flushPaintEffects = () =>
+  new Promise((resolve) => setTimeout(resolve, 80));
 const flushRenderQueue = async () => {
   await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
 };
 
+function fill(textarea: HTMLTextAreaElement, value: string) {
+  textarea.value = value;
+  textarea.dispatchEvent(new window.Event("input", { bubbles: true }));
+}
+
+interface MountOptions {
+  sessionId?: string;
+  serverDraft?: string;
+  inputDraft?: string;
+}
+
+function ordinaryInput(
+  store: OrdinaryDraftStore,
+  sent: string[],
+  options: MountOptions = {},
+) {
+  return (
+    <InputBox
+      onSend={(text) => {
+        sent.push(text);
+      }}
+      onInterrupt={() => {}}
+      isProcessing={false}
+      disabled={false}
+      sessionId={options.sessionId ?? SESSION}
+      serverDraft={options.serverDraft}
+      inputDraft={options.inputDraft}
+      onInputDraftConsumed={() => {}}
+      ordinaryDraftStore={store}
+    />
+  );
+}
+
 describe("recovered input draft vs. a concurrently typed message", () => {
   let container: HTMLDivElement;
   let sent: string[];
+  let store: OrdinaryDraftStore;
 
   const mount = (inputDraft?: string) => {
-    render(
-      <InputBox
-        onSend={(text) => {
-          sent.push(text);
-        }}
-        onInterrupt={() => {}}
-        isProcessing={false}
-        disabled={false}
-        sessionId={SESSION}
-        inputDraft={inputDraft}
-        onInputDraftConsumed={() => {}}
-      />,
-      container,
-    );
+    render(ordinaryInput(store, sent, { inputDraft }), container);
   };
-
-  const textarea = () => container.querySelector("textarea")!;
+  const textarea = () =>
+    container.querySelector<HTMLTextAreaElement>("textarea")!;
   const sendButton = () =>
     container.querySelector<HTMLButtonElement>(".btn-send")!;
 
-  /** What Playwright's `locator.fill()` does: set value, fire one input event. */
-  const fill = (value: string) => {
-    const ta = textarea();
-    ta.value = value;
-    ta.dispatchEvent(new window.Event("input", { bubbles: true }));
-  };
-
   beforeEach(() => {
-    drafts.clear();
+    store = createOrdinaryDraftStore();
     sent = [];
     container = document.createElement("div");
     document.body.appendChild(container);
   });
 
-  it("keeps the typed text when the recovery effect flushes before typing", async () => {
-    mount(undefined);
-    await flushPaintEffects();
+  afterEach(() => {
+    render(null, container);
+    container.remove();
+  });
 
-    // task_history_end delivers the undone prompt as a recovered draft…
+  it("keeps typed text when recovery and input arrive in the same frame", async () => {
+    mount();
+    await flushPaintEffects();
     mount(RECOVERED);
-    // …and the browser gets a frame, so the effect flushes normally.
-    await flushPaintEffects();
-    expect(textarea().value).toBe(RECOVERED);
-
-    // The user (Playwright) now types over it.
-    fill(TYPED);
+    fill(textarea(), TYPED);
     await flushRenderQueue();
     await flushPaintEffects();
 
     expect(textarea().value).toBe(TYPED);
+    expect(store.read(SESSION)).toBe(TYPED);
     sendButton().click();
     await flushRenderQueue();
     expect(sent).toEqual([TYPED]);
   });
-
-  it("REPRO: recovered draft overwrites text typed in the same frame", async () => {
-    mount(undefined);
-    await flushPaintEffects();
-    expect(textarea().value).toBe("");
-
-    // task_history_end delivers the undone prompt. The recovery effect is now
-    // PENDING — `afterPaint` has not fired yet.
-    mount(RECOVERED);
-    expect(textarea().value).toBe(""); // effect not flushed yet
-
-    // Within the same frame, the user types the new message.
-    fill(TYPED);
-    await flushRenderQueue();
-    const afterTyping = textarea().value;
-
-    await flushPaintEffects();
-    const afterPaint = textarea().value;
-    const draftsAfterPaint = drafts.get(SESSION);
-
-    // The send button is enabled (the composer is non-empty), so the test/user
-    // clicks it and the wrong text goes out.
-    expect(sendButton().disabled).toBe(false);
-    sendButton().click();
-    await flushRenderQueue();
-
-    expect({ afterTyping, afterPaint, draftsAfterPaint, sent }).toEqual({
-      afterTyping: TYPED,
-      afterPaint: TYPED,
-      draftsAfterPaint: TYPED,
-      sent: [TYPED],
-    });
-  });
 });
 
-/**
- * The `serverDraft` effect (InputBox.tsx, "Apply incoming draft_updated from
- * other clients") has the identical shape as the `inputDraft` recovery
- * effect above — it decides whether to overwrite `text` by reading
- * `textRef.current`, gated on the same render/effect-flush timing. Same
- * cause, same fix (`applyText` as sole writer): this describe block adapts
- * the repro above to a cross-client `draft_updated` push instead of a
- * post-reload recovery, to prove that path is covered too, not just
- * "fixed for free" by assertion.
- */
-describe("serverDraft push vs. a concurrently typed message", () => {
+describe("ordinary draft scalar delivery", () => {
   let container: HTMLDivElement;
   let sent: string[];
+  let store: OrdinaryDraftStore;
 
-  const mount = (serverDraft?: string) => {
-    render(
-      <InputBox
-        onSend={(text) => {
-          sent.push(text);
-        }}
-        onInterrupt={() => {}}
-        isProcessing={false}
-        disabled={false}
-        sessionId={SESSION}
-        serverDraft={serverDraft}
-      />,
-      container,
-    );
+  const mount = (serverDraft?: string, sessionId = SESSION) => {
+    render(ordinaryInput(store, sent, { serverDraft, sessionId }), container);
   };
-
-  const textarea = () => container.querySelector("textarea")!;
-  const sendButton = () =>
-    container.querySelector<HTMLButtonElement>(".btn-send")!;
-
-  const fill = (value: string) => {
-    const ta = textarea();
-    ta.value = value;
-    ta.dispatchEvent(new window.Event("input", { bubbles: true }));
-  };
+  const textarea = () =>
+    container.querySelector<HTMLTextAreaElement>("textarea")!;
 
   beforeEach(() => {
-    drafts.clear();
+    store = createOrdinaryDraftStore();
     sent = [];
     container = document.createElement("div");
     document.body.appendChild(container);
   });
 
-  it("keeps the typed text when the serverDraft effect flushes before typing", async () => {
-    mount(undefined);
-    await flushPaintEffects();
-
-    mount(RECOVERED);
-    await flushPaintEffects();
-    expect(textarea().value).toBe(RECOVERED);
-
-    fill(TYPED);
-    await flushRenderQueue();
-    await flushPaintEffects();
-
-    expect(textarea().value).toBe(TYPED);
-    sendButton().click();
-    await flushRenderQueue();
-    expect(sent).toEqual([TYPED]);
+  afterEach(() => {
+    render(null, container);
+    container.remove();
   });
 
-  it("REPRO(serverDraft): a same-frame draft_updated push must not overwrite text typed in the same frame", async () => {
-    mount(undefined);
-    await flushPaintEffects();
+  it("applies same-frame A to B to C transitions in order", async () => {
+    mount("A");
+    store.applyRemote(SESSION, { old_draft: "A", new_draft: "B" });
+    store.applyRemote(SESSION, { old_draft: "B", new_draft: "C" });
+    await flushRenderQueue();
+
+    expect(store.read(SESSION)).toBe("C");
+    expect(textarea().value).toBe("C");
+  });
+
+  it("applies a same-frame clear after an accepted peer update", async () => {
+    mount("A");
+    store.applyRemote(SESSION, { old_draft: "A", new_draft: "B" });
+    store.applyRemote(SESSION, { old_draft: "B", new_draft: "" });
+    await flushRenderQueue();
+
+    expect(store.read(SESSION)).toBe("");
     expect(textarea().value).toBe("");
+  });
 
-    // A draft_updated arrives from another client. The serverDraft effect is
-    // now PENDING — afterPaint has not fired yet.
-    mount(RECOVERED);
-    expect(textarea().value).toBe(""); // effect not flushed yet
-
-    // Within the same frame, the user types locally.
-    fill(TYPED);
-    await flushRenderQueue();
-    const afterTyping = textarea().value;
-
-    await flushPaintEffects();
-    const afterPaint = textarea().value;
-    const draftsAfterPaint = drafts.get(SESSION);
-
-    expect(sendButton().disabled).toBe(false);
-    sendButton().click();
+  it("accepts sender-excluded non-contiguous compare-and-swap updates", async () => {
+    mount("A");
+    store.write(SESSION, "A");
+    store.applyRemote(SESSION, { old_draft: "A", new_draft: "B" });
+    store.write(SESSION, "B");
+    store.applyRemote(SESSION, { old_draft: "B", new_draft: "C" });
     await flushRenderQueue();
 
-    expect({ afterTyping, afterPaint, draftsAfterPaint, sent }).toEqual({
-      afterTyping: TYPED,
-      afterPaint: TYPED,
-      draftsAfterPaint: TYPED,
-      sent: [TYPED],
+    expect(textarea().value).toBe("C");
+  });
+
+  it("preserves a locally divergent draft", async () => {
+    mount("server text");
+    fill(textarea(), "local text");
+    await flushRenderQueue();
+    store.applyRemote(SESSION, {
+      old_draft: "server text",
+      new_draft: "peer text",
     });
-  });
-
-  it("clears a pristine local draft when the server clears it", async () => {
-    mount(RECOVERED);
-    await flushPaintEffects();
-    expect(textarea().value).toBe(RECOVERED);
-    expect(drafts.get(SESSION)).toBe(RECOVERED);
-
-    mount(undefined);
-    await flushPaintEffects();
-
-    expect(textarea().value).toBe("");
-    expect(drafts.get(SESSION)).toBe("");
-  });
-
-  it("preserves a diverged draft across a server clear and advances its baseline", async () => {
-    const initialServerDraft = "server draft before clear";
-    const localDraft = "locally diverged draft";
-    const laterServerDraft = "server draft after clear";
-
-    mount(initialServerDraft);
-    await flushPaintEffects();
-    fill(localDraft);
     await flushRenderQueue();
 
-    mount(undefined);
-    await flushPaintEffects();
-
-    expect(textarea().value).toBe(localDraft);
-    expect(drafts.get(SESSION)).toBe(localDraft);
-
-    // This was the old server value, but is a local edit after its clear. A
-    // later server update must therefore leave it intact.
-    fill(initialServerDraft);
-    await flushRenderQueue();
-    mount(laterServerDraft);
-    await flushPaintEffects();
-
-    expect(textarea().value).toBe(initialServerDraft);
-    expect(drafts.get(SESSION)).toBe(initialServerDraft);
+    expect(store.read(SESSION)).toBe("local text");
+    expect(textarea().value).toBe("local text");
   });
 
-  it("keeps an in-memory ordinary draft on an initial undefined server draft", async () => {
-    drafts.set(SESSION, RECOVERED);
+  it("preserves absent-composer compare-and-swap results across remount", () => {
+    store.ensure("blank", "");
+    store.ensure("equal", "A");
+    store.ensure("divergent", "local");
+    store.applyRemote("blank", { old_draft: "A", new_draft: "B" });
+    store.applyRemote("equal", { old_draft: "A", new_draft: "B" });
+    store.applyRemote("divergent", { old_draft: "A", new_draft: "B" });
 
-    mount(undefined);
-    await flushPaintEffects();
+    mount(undefined, "blank");
+    expect(textarea().value).toBe("B");
+    render(null, container);
+    mount(undefined, "equal");
+    expect(textarea().value).toBe("B");
+    render(null, container);
+    mount(undefined, "divergent");
+    expect(textarea().value).toBe("local");
+  });
 
-    expect(textarea().value).toBe(RECOVERED);
-    expect(drafts.get(SESSION)).toBe(RECOVERED);
+  it("reflects controls before render, between render and layout, and after registration", async () => {
+    store.applyRemote("before", { old_draft: "A", new_draft: "B" });
+    mount(undefined, "before");
+    expect(textarea().value).toBe("B");
+
+    render(null, container);
+    const betweenStore = createOrdinaryDraftStore();
+    render(
+      <>
+        {ordinaryInput(betweenStore, sent, {
+          sessionId: "between",
+          serverDraft: "A",
+        })}
+        <RemoteUpdate
+          store={betweenStore}
+          sessionId="between"
+          oldDraft="A"
+          newDraft="B"
+        />
+      </>,
+      container,
+    );
+    await flushRenderQueue();
+    expect(textarea().value).toBe("B");
+
+    render(null, container);
+    const afterStore = createOrdinaryDraftStore();
+    render(
+      ordinaryInput(afterStore, sent, { sessionId: "after", serverDraft: "A" }),
+      container,
+    );
+    afterStore.applyRemote("after", { old_draft: "A", new_draft: "B" });
+    await flushRenderQueue();
+    expect(textarea().value).toBe("B");
   });
 });
+
+function RemoteUpdate({
+  store,
+  sessionId,
+  oldDraft,
+  newDraft,
+}: {
+  store: OrdinaryDraftStore;
+  sessionId: string;
+  oldDraft: string;
+  newDraft: string;
+}) {
+  store.applyRemote(sessionId, { old_draft: oldDraft, new_draft: newDraft });
+  return null;
+}

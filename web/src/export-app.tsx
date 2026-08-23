@@ -17,6 +17,7 @@ export function ExportApp() {
     getTaskHref,
     getByTid,
     exportLoadError,
+    ordinaryDraftStore,
   } = useExportedTaskManager();
 
   const { theme, toggleTheme } = useTheme();
@@ -74,6 +75,7 @@ export function ExportApp() {
             onUndoConfirm={noop}
             onUndoDismiss={noop}
             onClearInputDraft={noop}
+            ordinaryDraftStore={ordinaryDraftStore}
             onAskUserResponse={noop}
             onPermissionPromptResponse={noop}
             theme={theme}

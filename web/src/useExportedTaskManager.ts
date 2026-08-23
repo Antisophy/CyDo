@@ -12,6 +12,7 @@ import type { AgnosticEvent } from "./protocol";
 import { makeTaskState } from "./types";
 import type { TaskState, TaskStatus } from "./types";
 import { reduceMessage } from "./sessionReducer";
+import { createOrdinaryDraftStore } from "./ordinaryDraftStore";
 
 interface ExportTaskEntry {
   tid: number;
@@ -116,6 +117,7 @@ const noop = () => {
 
 export function useExportedTaskManager(): TaskManager {
   const [tasks, setTasks] = useState<Map<string, TaskState>>(new Map());
+  const [ordinaryDraftStore] = useState(createOrdinaryDraftStore);
   const [activeTaskId, setActiveTaskIdState] = useState<string | null>(null);
   const activeTaskIdRef = useRef<string | null>(null);
   const [typeInfo, setTypeInfo] = useState<TypeInfo[]>([]);
@@ -217,6 +219,7 @@ export function useExportedTaskManager(): TaskManager {
 
   return {
     tasks,
+    ordinaryDraftStore,
     activeTaskId,
     activeTaskIdRef,
     setActiveTaskId,

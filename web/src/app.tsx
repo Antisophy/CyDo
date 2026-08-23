@@ -53,6 +53,7 @@ function AppContent() {
     undoDismiss,
     dismissAttention,
     clearInputDraft,
+    ordinaryDraftStore,
     setArchived,
     saveDraft,
     sendAskUserResponse,
@@ -513,6 +514,7 @@ function AppContent() {
                     onUndoConfirm={undoConfirm}
                     onUndoDismiss={undoDismiss}
                     onClearInputDraft={clearInputDraft}
+                    ordinaryDraftStore={ordinaryDraftStore}
                     onSaveDraft={saveDraft}
                     theme={theme}
                     onToggleTheme={toggleTheme}

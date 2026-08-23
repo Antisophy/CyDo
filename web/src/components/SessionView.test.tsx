@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import renderToString from "preact-render-to-string";
 import { makeTaskState, type TaskState } from "../types";
+import { createOrdinaryDraftStore } from "../ordinaryDraftStore";
 
 vi.hoisted(() => {
   vi.stubGlobal("CSS", { supports: () => false });
@@ -25,6 +26,7 @@ function renderSession(undoPending: TaskState["undoPending"]) {
       onUndoConfirm={() => {}}
       onUndoDismiss={() => {}}
       onClearInputDraft={() => {}}
+      ordinaryDraftStore={createOrdinaryDraftStore()}
       onAskUserResponse={() => {}}
       onPermissionPromptResponse={() => {}}
       theme="dark"

@@ -42,8 +42,6 @@ vi.mock("preact-iso", () => ({
   }),
 }));
 
-vi.mock("./components/InputBox", () => ({ drafts: new Map() }));
-
 vi.mock("./connection", () => {
   class MockConnection {
     onTaskMessage: ((...args: unknown[]) => void) | null = null;
