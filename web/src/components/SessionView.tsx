@@ -33,6 +33,7 @@ import { isMarkdownPath } from "../lib/fileFormats";
 interface Props {
   task: TaskState;
   connected: boolean;
+  tasksLoading: boolean;
   isActive: boolean;
   onSend: (uuid: string, text: string, images?: ImageAttachment[]) => void;
   onInterrupt: (uuid: string) => void;
@@ -68,6 +69,7 @@ interface Props {
 function SessionViewInner({
   task,
   connected,
+  tasksLoading,
   isActive,
   onSend,
   onInterrupt,
@@ -349,6 +351,7 @@ function SessionViewInner({
         defaultAgent={defaultAgent}
         sessionStatus={task.sessionStatus}
         connected={connected}
+        tasksLoading={tasksLoading}
         totalCost={task.totalCost}
         isProcessing={task.isProcessing}
         stdinClosed={task.stdinClosed}
@@ -516,6 +519,7 @@ export const SessionView = memo(SessionViewInner);
 interface DraftSessionViewProps {
   draftView: DraftView;
   connected: boolean;
+  tasksLoading: boolean;
   entryPoints: EntryPointInfo[];
   agents: AgentInfo[];
   defaultAgent: string;
@@ -530,6 +534,7 @@ interface DraftSessionViewProps {
 export function DraftSessionView({
   draftView,
   connected,
+  tasksLoading,
   entryPoints,
   agents,
   defaultAgent,
@@ -641,6 +646,7 @@ export function DraftSessionView({
         sessionInfo={null}
         defaultAgent={defaultAgent}
         connected={connected}
+        tasksLoading={tasksLoading}
         totalCost={0}
         isProcessing={false}
         stdinClosed={false}

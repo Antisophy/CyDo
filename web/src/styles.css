@@ -419,6 +419,18 @@ body,
   text-decoration: none;
 }
 
+.sidebar-loading-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 31px;
+  padding: 0 16px;
+  border-left: 3px solid transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-style: italic;
+}
+
 .tree-connectors {
   display: flex;
   flex-shrink: 0;
@@ -805,6 +817,11 @@ body,
 .banner-status.disconnected {
   background: #b71c1c;
   color: #ef9a9a;
+}
+
+.banner-status.loading {
+  background: #6d4c00;
+  color: #ffe082;
 }
 
 /* Message list */

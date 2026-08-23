@@ -49,6 +49,7 @@ export function ExportApp() {
         )}
         <Sidebar
           tasks={sidebarTasks}
+          tasksLoading={false}
           activeTaskId={activeTaskId}
           attention={new Set()}
           onSelectTask={handleSidebarSelect}
@@ -61,6 +62,7 @@ export function ExportApp() {
           <SessionView
             task={active}
             connected={false}
+            tasksLoading={false}
             isActive={true}
             onSend={noop}
             onInterrupt={noop}

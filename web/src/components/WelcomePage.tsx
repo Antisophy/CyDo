@@ -11,6 +11,7 @@ import { LogoBanner } from "./LogoBanner";
 interface Props {
   workspaces: WorkspaceInfo[];
   tasks: Map<string, TaskState>;
+  tasksLoaded: boolean;
   attention: Set<number>;
   onSelectTask: (tid: number) => void;
   onNavigateToProject: (workspace: string, projectName: string) => void;
@@ -246,6 +247,7 @@ function ActiveSessions({
 export function WelcomePage({
   workspaces,
   tasks,
+  tasksLoaded,
   attention,
   onSelectTask,
   onNavigateToProject,
@@ -582,7 +584,9 @@ export function WelcomePage({
                       </div>
                       <div class="project-card-sessions">
                         {projTasks.length === 0 ? (
-                          <div class="project-card-empty">No tasks yet</div>
+                          <div class="project-card-empty">
+                            {tasksLoaded ? "No tasks yet" : "Loading tasks…"}
+                          </div>
                         ) : (
                           projTasks.map((t) => (
                             <a

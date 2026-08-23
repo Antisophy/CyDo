@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { sortFilteredWorkspaceGroups } from "./WelcomePage";
+/** @vitest-environment jsdom */
+
+import { h, render } from "preact";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { makeTaskState, type TaskState } from "../types";
+import type { WorkspaceInfo } from "../useSessionManager";
+import { sortFilteredWorkspaceGroups, WelcomePage } from "./WelcomePage";
 
 type FilteredWorkspaceGroups = Parameters<
   typeof sortFilteredWorkspaceGroups
@@ -123,5 +128,79 @@ describe("sortFilteredWorkspaceGroups", () => {
       "Zulu Workspace",
       "Bravo Workspace",
     ]);
+  });
+});
+
+describe("WelcomePage task loading", () => {
+  let container: HTMLDivElement;
+  const workspace: WorkspaceInfo = {
+    name: "Workspace",
+    projects: [{ name: "Project", path: "/project" }],
+  };
+
+  const mount = (tasks: Map<string, TaskState>, tasksLoaded: boolean) => {
+    render(
+      h(WelcomePage, {
+        workspaces: [workspace],
+        tasks,
+        tasksLoaded,
+        attention: new Set<number>(),
+        onSelectTask: () => {},
+        onNavigateToProject: () => {},
+        getProjectHref: () => "/workspace/project",
+        getTaskHref: (id: string) => `/task/${id}`,
+        taskTypes: [],
+        notices: {},
+        onRefreshWorkspaces: () => {},
+        scanState: "idle",
+      }),
+      container,
+    );
+  };
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+  });
+
+  afterEach(() => {
+    render(null, container);
+    container.remove();
+  });
+
+  it("labels an empty project as loading while task discovery is partial", () => {
+    mount(new Map(), false);
+
+    expect(container.querySelector(".project-card-empty")?.textContent).toBe(
+      "Loading tasks…",
+    );
+  });
+
+  it("labels an empty project as empty after task discovery is complete", () => {
+    mount(new Map(), true);
+
+    expect(container.querySelector(".project-card-empty")?.textContent).toBe(
+      "No tasks yet",
+    );
+  });
+
+  it("shows known tasks immediately while discovery is still partial", () => {
+    const knownTask = makeTaskState(
+      7,
+      false,
+      false,
+      "Known partial task",
+      false,
+      "Workspace",
+      "/project",
+    );
+    mount(new Map([[knownTask.uuid, knownTask]]), false);
+    const taskLink = container.querySelector<HTMLAnchorElement>(
+      ".project-card-sessions .sidebar-item",
+    );
+
+    expect(taskLink?.textContent).toContain("Known partial task");
+    expect(taskLink?.getAttribute("href")).toBe("/workspace/project/task/7");
+    expect(container.querySelector(".project-card-empty")).toBeNull();
   });
 });

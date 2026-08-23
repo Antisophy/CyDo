@@ -11,11 +11,22 @@ import {
   usageFillColor,
 } from "./SystemBanner";
 
-function renderSystemBanner(claudeUsage?: AgentUsageMessage): string {
+function renderSystemBanner({
+  claudeUsage,
+  connected = true,
+  tasksLoading = false,
+  exportMode = false,
+}: {
+  claudeUsage?: AgentUsageMessage;
+  connected?: boolean;
+  tasksLoading?: boolean;
+  exportMode?: boolean;
+} = {}): string {
   return renderToString(
     h(SystemBanner, {
       sessionInfo: null,
-      connected: true,
+      connected,
+      tasksLoading,
       totalCost: 0,
       isProcessing: false,
       stdinClosed: false,
@@ -26,6 +37,7 @@ function renderSystemBanner(claudeUsage?: AgentUsageMessage): string {
       onStop: () => {},
       onCloseStdin: () => {},
       claudeUsage,
+      exportMode,
     }),
   );
 }
@@ -93,14 +105,52 @@ describe("SystemBanner status helpers", () => {
   });
 });
 
+describe("SystemBanner connection status", () => {
+  it("renders the disconnected status before task loading state", () => {
+    const html = renderSystemBanner({ connected: false, tasksLoading: true });
+
+    expect(html).toContain(
+      '<span class="banner-status disconnected">Disconnected</span>',
+    );
+  });
+
+  it("renders the loading status while a connected task list is partial", () => {
+    const html = renderSystemBanner({ connected: true, tasksLoading: true });
+
+    expect(html).toContain(
+      '<span class="banner-status loading">Loading…</span>',
+    );
+  });
+
+  it("renders the connected status after task loading completes", () => {
+    const html = renderSystemBanner({ connected: true, tasksLoading: false });
+
+    expect(html).toContain(
+      '<span class="banner-status connected">Connected</span>',
+    );
+  });
+
+  it("gives export mode priority over the live connection status", () => {
+    const html = renderSystemBanner({
+      connected: false,
+      tasksLoading: true,
+      exportMode: true,
+    });
+
+    expect(html).toContain(
+      '<span class="banner-status disconnected">Exported</span>',
+    );
+  });
+});
+
 describe("SystemBanner Claude usage", () => {
   it("does not render usage when no Claude window has utilization", () => {
-    const html = renderSystemBanner(
-      usageMessage({
+    const html = renderSystemBanner({
+      claudeUsage: usageMessage({
         five_hour: { resetsAt: 1_700_018_000 },
         seven_day: { resetsAt: 1_700_604_800 },
       }),
-    );
+    });
 
     expect(html).not.toContain("banner-usage");
     expect(html).not.toContain("--");
@@ -108,12 +158,12 @@ describe("SystemBanner Claude usage", () => {
 
   it("renders usage when a Claude window has finite utilization", () => {
     const futureTime = Math.floor(Date.now() / 1000) + 10000;
-    const html = renderSystemBanner(
-      usageMessage({
+    const html = renderSystemBanner({
+      claudeUsage: usageMessage({
         five_hour: { utilization: 0.42, resetsAt: futureTime },
         seven_day: {},
       }),
-    );
+    });
 
     expect(html).toContain("banner-usage");
     expect(html).toContain("42%");
@@ -121,12 +171,12 @@ describe("SystemBanner Claude usage", () => {
 
   it("hides usage widget when all windows are expired", () => {
     const pastTime = Math.floor(Date.now() / 1000) - 100;
-    const html = renderSystemBanner(
-      usageMessage({
+    const html = renderSystemBanner({
+      claudeUsage: usageMessage({
         five_hour: { utilization: 0.5, resetsAt: pastTime },
         seven_day: { utilization: 0.8, resetsAt: pastTime },
       }),
-    );
+    });
 
     expect(html).not.toContain("banner-usage");
   });
@@ -134,12 +184,12 @@ describe("SystemBanner Claude usage", () => {
   it("shows non-expired window when only one window is expired", () => {
     const pastTime = Math.floor(Date.now() / 1000) - 100;
     const futureTime = Math.floor(Date.now() / 1000) + 10000;
-    const html = renderSystemBanner(
-      usageMessage({
+    const html = renderSystemBanner({
+      claudeUsage: usageMessage({
         five_hour: { utilization: 0.3, resetsAt: pastTime },
         seven_day: { utilization: 0.6, resetsAt: futureTime },
       }),
-    );
+    });
 
     expect(html).toContain("banner-usage");
     expect(html).toContain("60%");

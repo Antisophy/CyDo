@@ -5,6 +5,7 @@ import { TaskTypeIcon, hasTaskTypeIcon } from "./TaskTypeIcon";
 
 interface Props {
   tasks: Map<string, TaskState>;
+  tasksLoaded: boolean;
   onSelect: (tid: number) => void;
   onClose: () => void;
   taskTypes: TypeInfo[];
@@ -24,6 +25,7 @@ function isPlainLeftClick(e: MouseEvent): boolean {
 
 export function SearchPopup({
   tasks,
+  tasksLoaded,
   onSelect,
   onClose,
   taskTypes,
@@ -158,7 +160,11 @@ export function SearchPopup({
             );
           })}
           {filtered.length === 0 && (
-            <div class="search-no-results">No matching sessions</div>
+            <div class="search-no-results">
+              {tasksLoaded
+                ? "No matching sessions"
+                : "More sessions are loading…"}
+            </div>
           )}
         </div>
       </div>

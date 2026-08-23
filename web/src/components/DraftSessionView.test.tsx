@@ -112,6 +112,7 @@ describe("DraftSessionView draft availability", () => {
       <DraftSessionView
         draftView={draftView}
         connected={true}
+        tasksLoading={false}
         entryPoints={entryPoints}
         agents={agents}
         defaultAgent="codex"

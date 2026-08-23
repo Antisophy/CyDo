@@ -13,6 +13,7 @@ function renderSession(undoPending: TaskState["undoPending"]) {
     <SessionView
       task={{ ...makeTaskState(7), undoPending }}
       connected={true}
+      tasksLoading={false}
       isActive={true}
       onSend={() => {}}
       onInterrupt={() => {}}

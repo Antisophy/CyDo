@@ -30,6 +30,14 @@ const state = vi.hoisted(() => ({
   getByTid: vi.fn(),
 }));
 
+const componentProps = vi.hoisted(() => ({
+  sidebar: [] as Array<{ tasksLoading: boolean; propNames: string[] }>,
+  sessionView: [] as Array<{ tasksLoading: boolean; tid: number | null }>,
+  draftSessionView: [] as Array<{ tasksLoading: boolean }>,
+  searchPopup: [] as Array<{ tasksLoaded: boolean }>,
+  welcomePage: [] as Array<{ tasksLoaded: boolean }>,
+}));
+
 const controlledImageStore = vi.hoisted(() => ({
   current: null as ControlledImageStore | null,
 }));
@@ -128,8 +136,51 @@ vi.mock("preact-iso", () => ({
 }));
 
 vi.mock("./components/Sidebar", () => ({
-  Sidebar: () => null,
+  Sidebar: (props: { tasksLoading: boolean }) => {
+    componentProps.sidebar.push({
+      tasksLoading: props.tasksLoading,
+      propNames: Object.keys(props),
+    });
+    return null;
+  },
   flatTaskOrder: () => [],
+}));
+
+vi.mock("./components/SessionView", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./components/SessionView")>();
+  return {
+    ...actual,
+    SessionView: (props: Parameters<typeof actual.SessionView>[0]) => {
+      componentProps.sessionView.push({
+        tasksLoading: props.tasksLoading,
+        tid: props.task.tid,
+      });
+      return h(actual.SessionView, props);
+    },
+    DraftSessionView: (
+      props: Parameters<typeof actual.DraftSessionView>[0],
+    ) => {
+      componentProps.draftSessionView.push({
+        tasksLoading: props.tasksLoading,
+      });
+      return h(actual.DraftSessionView, props);
+    },
+  };
+});
+
+vi.mock("./components/SearchPopup", () => ({
+  SearchPopup: (props: { tasksLoaded: boolean }) => {
+    componentProps.searchPopup.push({ tasksLoaded: props.tasksLoaded });
+    return null;
+  },
+}));
+
+vi.mock("./components/WelcomePage", () => ({
+  WelcomePage: (props: { tasksLoaded: boolean }) => {
+    componentProps.welcomePage.push({ tasksLoaded: props.tasksLoaded });
+    return null;
+  },
 }));
 
 vi.mock("./useTheme", () => ({
@@ -176,7 +227,42 @@ beforeEach(() => {
     Array.from(state.tasks.values()).find((task) => task.tid === tid),
   );
   controlledImageStore.current = null;
+  componentProps.sidebar.length = 0;
+  componentProps.sessionView.length = 0;
+  componentProps.draftSessionView.length = 0;
+  componentProps.searchPopup.length = 0;
+  componentProps.welcomePage.length = 0;
 });
+
+function latest<T>(calls: T[]): T {
+  const call = calls.at(-1);
+  if (call === undefined) throw new Error("Expected the component to render");
+  return call;
+}
+
+function makeDraftView(): DraftViewSnapshot {
+  return {
+    kind: "resolved",
+    projectKey: "workspace\0/project",
+    viewKey: "workspace\0/project",
+    workspace: "workspace",
+    projectName: "project",
+    projectPath: "/project",
+    remoteTid: null,
+    text: "",
+    entryPoint: "",
+    agent: "",
+    lifecycle: "idle",
+    disabled: false,
+    metadataReady: true,
+    composerResetToken: 0,
+    onTextChange: vi.fn(),
+    onEntryPointChange: vi.fn(),
+    onAgentChange: vi.fn(),
+    onBlur: vi.fn(),
+    onSubmit: vi.fn(),
+  };
+}
 
 describe("server command errors", () => {
   let container: HTMLDivElement | null = null;
@@ -1161,5 +1247,158 @@ describe("missing numeric tasks", () => {
     expect(html).not.toContain("Loading task…");
     expect(html).not.toContain("Known task 123");
     expect(state.getByTid).not.toHaveBeenCalled();
+  });
+});
+
+describe("completion-aware task loading", () => {
+  let container: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    if (!container) return;
+    render(null, container);
+    container.remove();
+    container = null;
+  });
+
+  it("passes live partial loading to Sidebar and both session view paths", () => {
+    const active = {
+      ...makeTaskState(41, false, false, "Known task"),
+      status: "completed" as const,
+    };
+    state.activeTaskId = "41";
+    state.tasks = new Map([[active.uuid, active]]);
+    state.connected = true;
+    state.tasksLoaded = false;
+
+    renderToString(h(App, {}));
+
+    expect(latest(componentProps.sidebar)).toMatchObject({
+      tasksLoading: true,
+    });
+    expect(latest(componentProps.sidebar).propNames).toContain("tasksLoading");
+    expect(latest(componentProps.sidebar).propNames).not.toContain("loading");
+    expect(latest(componentProps.sessionView)).toEqual({
+      tasksLoading: true,
+      tid: 41,
+    });
+
+    state.tasksLoaded = true;
+    renderToString(h(App, {}));
+
+    expect(latest(componentProps.sidebar).tasksLoading).toBe(false);
+    expect(latest(componentProps.sessionView)).toEqual({
+      tasksLoading: false,
+      tid: 41,
+    });
+
+    state.activeTaskId = null;
+    state.tasks = new Map();
+    state.activeWorkspace = "workspace";
+    state.activeProject = "project";
+    state.draftView = makeDraftView();
+    state.tasksLoaded = false;
+    renderToString(h(App, {}));
+
+    expect(latest(componentProps.sidebar).tasksLoading).toBe(true);
+    expect(latest(componentProps.draftSessionView)).toEqual({
+      tasksLoading: true,
+    });
+
+    state.tasksLoaded = true;
+    renderToString(h(App, {}));
+
+    expect(latest(componentProps.sidebar).tasksLoading).toBe(false);
+    expect(latest(componentProps.draftSessionView)).toEqual({
+      tasksLoading: false,
+    });
+  });
+
+  it("does not call disconnected task state loading while preserving the overlay", () => {
+    const active = {
+      ...makeTaskState(42, false, false, "Disconnected task"),
+      status: "completed" as const,
+    };
+    state.activeTaskId = "42";
+    state.tasks = new Map([[active.uuid, active]]);
+    state.connected = false;
+    state.tasksLoaded = false;
+
+    const html = renderToString(h(App, {}));
+
+    expect(latest(componentProps.sidebar).tasksLoading).toBe(false);
+    expect(latest(componentProps.sessionView)).toEqual({
+      tasksLoading: false,
+      tid: 42,
+    });
+    expect(html).toContain("connection-overlay");
+    expect(html).toContain("Connecting…");
+  });
+
+  it("updates search and welcome components from partial to complete task lists", async () => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    state.connected = true;
+    state.tasksLoaded = false;
+
+    await act(async () => {
+      render(h(App, {}), container!);
+      await Promise.resolve();
+    });
+    expect(latest(componentProps.welcomePage)).toEqual({ tasksLoaded: false });
+
+    await act(async () => {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          bubbles: true,
+          ctrlKey: true,
+          key: "k",
+        }),
+      );
+      await Promise.resolve();
+    });
+    expect(latest(componentProps.searchPopup)).toEqual({ tasksLoaded: false });
+
+    state.tasksLoaded = true;
+    await act(async () => {
+      render(h(App, {}), container!);
+      await Promise.resolve();
+    });
+
+    expect(latest(componentProps.welcomePage)).toEqual({ tasksLoaded: true });
+    expect(latest(componentProps.searchPopup)).toEqual({ tasksLoaded: true });
+  });
+
+  it("keeps a late deep-link loading until it appears or the list completes", () => {
+    const tid = 43;
+    state.activeTaskId = String(tid);
+    state.connected = true;
+    state.tasksLoaded = false;
+
+    expect(renderToString(h(App, {}))).toContain("Loading task…");
+    expect(componentProps.sessionView).toHaveLength(0);
+
+    const appeared = {
+      ...makeTaskState(tid, false, false, "Late task"),
+      status: "completed" as const,
+    };
+    state.tasks = new Map([[appeared.uuid, appeared]]);
+    const partialHtml = renderToString(h(App, {}));
+
+    expect(latest(componentProps.sessionView)).toEqual({
+      tasksLoading: true,
+      tid,
+    });
+    expect(partialHtml).not.toContain("Loading task…");
+    expect(partialHtml).not.toContain(`Task ${tid} not found`);
+
+    state.tasks = new Map();
+    expect(renderToString(h(App, {}))).toContain("Loading task…");
+    expect(renderToString(h(App, {}))).not.toContain(`Task ${tid} not found`);
+
+    state.tasksLoaded = true;
+    const completeHtml = renderToString(h(App, {}));
+
+    expect(completeHtml).toContain(`Task ${tid} not found`);
+    expect(completeHtml).not.toContain("Loading task…");
   });
 });

@@ -11,6 +11,7 @@ interface Props {
   defaultAgent?: string;
   sessionStatus?: string | null;
   connected: boolean;
+  tasksLoading: boolean;
   totalCost: number;
   isProcessing: boolean;
   stdinClosed: boolean;
@@ -123,6 +124,7 @@ export function SystemBanner({
   defaultAgent,
   sessionStatus,
   connected,
+  tasksLoading,
   totalCost,
   isProcessing,
   stdinClosed,
@@ -173,6 +175,16 @@ export function SystemBanner({
   const showClaudeUsage =
     Number.isFinite(fiveHour?.utilization) ||
     Number.isFinite(week?.utilization);
+  const connectionStatus = exportMode
+    ? {
+        className: connected ? "connected" : "disconnected",
+        text: "Exported",
+      }
+    : !connected
+      ? { className: "disconnected", text: "Disconnected" }
+      : tasksLoading
+        ? { className: "loading", text: "Loading…" }
+        : { className: "connected", text: "Connected" };
 
   return (
     <div class="system-banner">
@@ -314,10 +326,8 @@ export function SystemBanner({
         {totalCost > 0 && (
           <span class="banner-cost">${totalCost.toFixed(4)}</span>
         )}
-        <span
-          class={`banner-status ${connected ? "connected" : "disconnected"}`}
-        >
-          {exportMode ? "Exported" : connected ? "Connected" : "Disconnected"}
+        <span class={`banner-status ${connectionStatus.className}`}>
+          {connectionStatus.text}
         </span>
         <button
           class="theme-toggle"

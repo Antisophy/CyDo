@@ -134,6 +134,29 @@ function TreeJunction({
   );
 }
 
+function TreeConnectors({
+  depth,
+  guides,
+  relationType,
+}: {
+  depth: number;
+  guides: number;
+  relationType?: string;
+}) {
+  if (depth === 0) return null;
+  return (
+    <span class="tree-connectors">
+      {Array.from({ length: depth - 1 }, (_, i) => (
+        <TreeGuide key={i} hasLine={(guides & (1 << i)) !== 0} />
+      ))}
+      <TreeJunction
+        isLast={(guides & (1 << (depth - 1))) === 0}
+        relationType={relationType}
+      />
+    </span>
+  );
+}
+
 export interface SidebarTask {
   tid: number;
   alive: boolean;
@@ -158,6 +181,7 @@ interface TreeNode {
   id: string;
   task: SidebarTask;
   children: TreeNode[];
+  knownChildCount: number;
 }
 
 export function flatTaskOrder(tasks: SidebarTask[]): string[] {
@@ -194,6 +218,7 @@ function insertArchiveNodes(nodes: TreeNode[]): TreeNode[] {
         isArchiveNode: true,
       },
       children: archived,
+      knownChildCount: 0,
     };
     return { ...node, children: [archiveNode, ...active] };
   });
@@ -215,11 +240,15 @@ export function buildTree(tasks: SidebarTask[]): TreeNode[] {
   }
 
   function toNodes(list: SidebarTask[]): TreeNode[] {
-    return list.map((t) => ({
-      id: String(t.tid),
-      task: t,
-      children: toNodes(childMap.get(t.tid) || []),
-    }));
+    return list.map((t) => {
+      const children = childMap.get(t.tid) || [];
+      return {
+        id: String(t.tid),
+        task: t,
+        children: toNodes(children),
+        knownChildCount: children.length,
+      };
+    });
   }
 
   let tree = toNodes(roots);
@@ -243,6 +272,7 @@ export function buildTree(tasks: SidebarTask[]): TreeNode[] {
         isArchiveNode: true,
       },
       children: archivedRoots,
+      knownChildCount: 0,
     };
     tree = [archiveRoot, ...activeRoots];
   }
@@ -269,6 +299,7 @@ export function buildTree(tasks: SidebarTask[]): TreeNode[] {
         isArchiveNode: true,
       },
       children: importableRoots,
+      knownChildCount: 0,
     };
     // Array order (sidebar renders reversed):
     //   [groupNodes..., importRoot, regularNonImportable...]
@@ -290,7 +321,8 @@ type EdgeGlow = "none" | "attention" | "asking";
 
 // --- Flattened data item for memoized rendering ---
 
-export interface FlatItem {
+interface OrdinaryFlatItem {
+  kind: "ordinary";
   id: string;
   tid: number;
   depth: number;
@@ -307,6 +339,15 @@ export interface FlatItem {
   selectId?: string;
   attentionTids?: number[];
 }
+
+interface LoadingFlatItem {
+  kind: "loading";
+  key: string;
+  depth: number;
+  guides: number;
+}
+
+export type FlatItem = OrdinaryFlatItem | LoadingFlatItem;
 
 export function computeStatusClass(t: {
   isProcessing: boolean;
@@ -349,15 +390,24 @@ function isCollapsible(t: SidebarTask): boolean {
   );
 }
 
-function subtreeCollapsible(node: TreeNode): boolean {
+function hasIncompleteChildren(node: TreeNode, tasksLoading: boolean): boolean {
+  return tasksLoading && node.task.childCount > node.knownChildCount;
+}
+
+function subtreeCollapsible(node: TreeNode, tasksLoading: boolean): boolean {
   if (node.task.isArchiveNode) return true;
-  return isCollapsible(node.task) && node.children.every(subtreeCollapsible);
+  return (
+    !hasIncompleteChildren(node, tasksLoading) &&
+    isCollapsible(node.task) &&
+    node.children.every((child) => subtreeCollapsible(child, tasksLoading))
+  );
 }
 
 export function flattenTree(
   tree: TreeNode[],
   activeTaskId: string | null,
   taskTypes: TypeInfo[],
+  tasksLoading: boolean,
 ): FlatItem[] {
   const items: FlatItem[] = [];
 
@@ -370,6 +420,7 @@ export function flattenTree(
           ? `Import (${node.children.length})`
           : `Archive (${node.children.length})`;
       items.push({
+        kind: "ordinary",
         id: node.id,
         tid: t.tid,
         depth,
@@ -398,6 +449,7 @@ export function flattenTree(
 
     const typeInfo = taskTypes.find((tt) => tt.name === t.taskType);
     items.push({
+      kind: "ordinary",
       id: node.id,
       tid: t.tid,
       depth,
@@ -411,6 +463,8 @@ export function flattenTree(
       archiving: !!t.archiving,
     });
 
+    const hasLoadingChild = hasIncompleteChildren(node, tasksLoading);
+
     // Collapse the leading run of fully-collapsible subtrees into one summary
     // row, unless the parent itself is selected or the selection is inside
     // that run. Children with running work always stay visible.
@@ -419,7 +473,7 @@ export function flattenTree(
       let end = 0;
       while (
         end < node.children.length &&
-        subtreeCollapsible(node.children[end]!)
+        subtreeCollapsible(node.children[end]!, tasksLoading)
       )
         end++;
       const prefix = node.children.slice(0, end);
@@ -440,8 +494,10 @@ export function flattenTree(
           .flatMap((c) => collectTasks(c, true))
           .map((h) => computeStatusClass(h)),
       );
-      const isLast = collapsed.length === node.children.length;
+      const isLast =
+        collapsed.length === node.children.length && !hasLoadingChild;
       items.push({
+        kind: "ordinary",
         id: `subtasks:${t.tid}`,
         selectId: node.id,
         tid: t.tid,
@@ -457,12 +513,20 @@ export function flattenTree(
       });
     }
     for (let i = collapsed.length; i < node.children.length; i++) {
-      const isLast = i === node.children.length - 1;
+      const isLast = i === node.children.length - 1 && !hasLoadingChild;
       walk(
         node.children[i]!,
         depth + 1,
         isLast ? guides : guides | (1 << depth),
       );
+    }
+    if (hasLoadingChild) {
+      items.push({
+        kind: "loading",
+        key: `loading:${node.id}`,
+        depth: depth + 1,
+        guides,
+      });
     }
   }
 
@@ -507,18 +571,13 @@ const SidebarItem = memo(function SidebarItem({
   onSelect: (id: string) => void;
   onArchive?: (tid: number) => void;
 }) {
-  const treeConnectors =
-    depth > 0 ? (
-      <span class="tree-connectors">
-        {Array.from({ length: depth - 1 }, (_, i) => (
-          <TreeGuide key={i} hasLine={(guides & (1 << i)) !== 0} />
-        ))}
-        <TreeJunction
-          isLast={(guides & (1 << (depth - 1))) === 0}
-          relationType={isArchive ? undefined : relationType}
-        />
-      </span>
-    ) : null;
+  const treeConnectors = (
+    <TreeConnectors
+      depth={depth}
+      guides={guides}
+      relationType={isArchive ? undefined : relationType}
+    />
+  );
 
   if (isArchive) {
     return (
@@ -602,6 +661,7 @@ const SidebarItem = memo(function SidebarItem({
 
 interface Props {
   tasks: SidebarTask[];
+  tasksLoading: boolean;
   activeTaskId: string | null;
   attention: Set<number>;
   onSelectTask: (id: string) => void;
@@ -622,6 +682,7 @@ interface Props {
 
 export const Sidebar = memo(function Sidebar({
   tasks,
+  tasksLoading,
   activeTaskId,
   attention,
   onSelectTask,
@@ -641,8 +702,8 @@ export const Sidebar = memo(function Sidebar({
 }: Props) {
   const tree = useMemo(() => buildTree(tasks), [tasks]);
   const flatItems = useMemo(
-    () => flattenTree(tree, activeTaskId, taskTypes),
-    [tree, activeTaskId, taskTypes],
+    () => flattenTree(tree, activeTaskId, taskTypes, tasksLoading),
+    [tree, activeTaskId, taskTypes, tasksLoading],
   );
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -894,31 +955,41 @@ export const Sidebar = memo(function Sidebar({
             </a>
           )}
           {flatItems
-            .map((item) => (
-              <SidebarItem
-                key={item.id}
-                id={item.id}
-                depth={item.depth}
-                guides={item.guides}
-                relationType={item.relationType}
-                statusClass={item.statusClass}
-                title={item.title}
-                iconName={item.iconName}
-                isArchive={item.isArchive}
-                isActive={item.id === activeTaskId}
-                hasAttention={
-                  item.attentionTids
-                    ? item.attentionTids.some((tid) => attention.has(tid))
-                    : attention.has(item.tid)
-                }
-                hasPendingQuestion={item.hasPendingQuestion}
-                archiving={item.archiving}
-                href={getTaskHref(item.selectId ?? item.id)}
-                selectId={item.selectId}
-                onSelect={handleSelect}
-                onArchive={handleArchive}
-              />
-            ))
+            .map((item) => {
+              if (item.kind === "loading") {
+                return (
+                  <div key={item.key} class="sidebar-loading-item">
+                    <TreeConnectors depth={item.depth} guides={item.guides} />
+                    <span class="sidebar-loading-label">(loading…)</span>
+                  </div>
+                );
+              }
+              return (
+                <SidebarItem
+                  key={item.id}
+                  id={item.id}
+                  depth={item.depth}
+                  guides={item.guides}
+                  relationType={item.relationType}
+                  statusClass={item.statusClass}
+                  title={item.title}
+                  iconName={item.iconName}
+                  isArchive={item.isArchive}
+                  isActive={item.id === activeTaskId}
+                  hasAttention={
+                    item.attentionTids
+                      ? item.attentionTids.some((tid) => attention.has(tid))
+                      : attention.has(item.tid)
+                  }
+                  hasPendingQuestion={item.hasPendingQuestion}
+                  archiving={item.archiving}
+                  href={getTaskHref(item.selectId ?? item.id)}
+                  selectId={item.selectId}
+                  onSelect={handleSelect}
+                  onArchive={handleArchive}
+                />
+              );
+            })
             .reverse()}
         </div>
       </div>

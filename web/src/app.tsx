@@ -82,6 +82,7 @@ function AppContent() {
     refreshWorkspaces,
     scanState,
   } = useTaskManager(addToast);
+  const tasksLoading = connected && !tasksLoaded;
   const previousConnectedRef = useRef(connected);
   useLayoutEffect(() => {
     const wasConnected = previousConnectedRef.current;
@@ -217,6 +218,7 @@ function AppContent() {
   const searchPopup = showSearch && (
     <SearchPopup
       tasks={tasks}
+      tasksLoaded={tasksLoaded}
       taskTypes={typeInfo}
       onSelect={handleSearchSelect}
       onClose={handleSearchClose}
@@ -234,6 +236,7 @@ function AppContent() {
               <WelcomePage
                 workspaces={workspaces}
                 tasks={tasks}
+                tasksLoaded={tasksLoaded}
                 attention={attention}
                 taskTypes={typeInfo}
                 notices={mergedNotices}
@@ -417,6 +420,7 @@ function AppContent() {
           )}
           <Sidebar
             tasks={sidebarTasks}
+            tasksLoading={tasksLoading}
             activeTaskId={activeTaskId}
             attention={attention}
             onSelectTask={handleSidebarSelect}
@@ -447,6 +451,7 @@ function AppContent() {
               <DraftSessionView
                 draftView={draftView}
                 connected={connected}
+                tasksLoading={tasksLoading}
                 entryPoints={entryPoints}
                 agents={agents}
                 defaultAgent={effectiveDefaultAgent}
@@ -495,6 +500,7 @@ function AppContent() {
                   <SessionView
                     task={task}
                     connected={connected}
+                    tasksLoading={tasksLoading}
                     isActive={isActive}
                     onSend={send}
                     onInterrupt={interrupt}
