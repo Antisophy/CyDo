@@ -143,6 +143,7 @@ export interface SidebarTask {
   stdinClosed?: boolean;
   title?: string;
   parentTid?: number;
+  childCount: number;
   relationType?: string;
   status?: string;
   archived?: boolean;
@@ -188,6 +189,7 @@ function insertArchiveNodes(nodes: TreeNode[]): TreeNode[] {
         resumable: false,
         isProcessing: false,
         title: "Archive",
+        childCount: 0,
         status: "completed",
         isArchiveNode: true,
       },
@@ -236,6 +238,7 @@ export function buildTree(tasks: SidebarTask[]): TreeNode[] {
         resumable: false,
         isProcessing: false,
         title: "Archive",
+        childCount: 0,
         status: "completed",
         isArchiveNode: true,
       },
@@ -261,6 +264,7 @@ export function buildTree(tasks: SidebarTask[]): TreeNode[] {
         resumable: false,
         isProcessing: false,
         title: "Import",
+        childCount: 0,
         status: "completed",
         isArchiveNode: true,
       },

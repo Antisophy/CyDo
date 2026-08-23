@@ -29,6 +29,7 @@ function asEvent(event: object): Parameters<typeof reduceMessage>[1] {
 
 const BASE_ENTRY: TaskSnapshotEntry = {
   tid: 42,
+  child_count: 0,
   alive: false,
   resumable: true,
   isProcessing: false,

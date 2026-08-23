@@ -92,7 +92,7 @@ test("archive node expands when selected", async ({ page, agentType }) => {
 
   // Wait for server to confirm archived state before navigating away.
   // The button only changes to "Unarchive" after the server processes set_archived
-  // and broadcasts tasks_list — this ensures the DB is updated before page reload.
+  // and broadcasts task_updated — this ensures the DB is updated before page reload.
   await expect(page.locator(".btn-banner-archive")).toHaveText("Unarchive");
 
   // Navigate away so archive collapses
@@ -128,7 +128,7 @@ test("unarchiving a task removes it from Archive", async ({
 
   // Wait for server confirmation before navigating away — prevents the race
   // condition where page.goto closes the WebSocket before set_archived is processed.
-  // The button changes to "Unarchive" only after the server broadcasts tasks_list.
+  // The button changes to "Unarchive" only after the server broadcasts task_updated.
   await expect(page.locator(".btn-banner-archive")).toHaveText("Unarchive");
 
   // Navigate away so archive collapses

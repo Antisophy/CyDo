@@ -97,6 +97,7 @@ describe("receiveServerError", () => {
 describe("taskStateFromEntry draft merge", () => {
   const entry = (draft?: string) => ({
     tid: 11,
+    child_count: 0,
     alive: false,
     resumable: false,
     isProcessing: false,
@@ -128,6 +129,7 @@ describe("task observation adapter", () => {
   const entry = (fields: Record<string, unknown> = {}) =>
     ({
       tid: 11,
+      child_count: 0,
       alive: false,
       resumable: false,
       isProcessing: false,

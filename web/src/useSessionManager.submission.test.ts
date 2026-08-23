@@ -125,7 +125,9 @@ vi.mock("./connection", () => {
     onClientError: ((message: string) => void) | null = null;
 
     readonly connect = vi.fn();
-    readonly disconnect = vi.fn();
+    readonly disconnect = vi.fn(() => {
+      this.onStatusChange?.(false);
+    });
     readonly createTask = vi.fn();
     readonly deleteTask = vi.fn();
     readonly setEntryPoint = vi.fn();
@@ -428,6 +430,7 @@ async function submitAtomicReplacement(
 function activeSnapshot(tid: number): TaskSnapshotEntry {
   return {
     tid,
+    child_count: 0,
     alive: true,
     resumable: false,
     isProcessing: true,
@@ -443,6 +446,7 @@ function persistedSnapshot(
 ): TaskSnapshotEntry {
   return {
     tid,
+    child_count: 0,
     alive: false,
     resumable: false,
     isProcessing: false,
@@ -454,6 +458,13 @@ function persistedSnapshot(
     entry_point: "entry",
     agent_name: "agent",
   };
+}
+
+function tasksList(
+  tasks: TaskSnapshotEntry[],
+  complete = true,
+): ControlMessage {
+  return { type: "tasks_list", complete, tasks };
 }
 
 async function preparePreCatalogPersistedDraft(
@@ -469,6 +480,7 @@ async function preparePreCatalogPersistedDraft(
     testState.uuid = `pre-catalog-${snapshot.tid}-uuid`;
     connection.onControlMessage?.({
       type: "tasks_list",
+      complete: true,
       tasks: [snapshot],
     } satisfies ControlMessage);
     testState.uuid = "submission-uuid";
@@ -515,6 +527,162 @@ describe("submission acknowledgement routing", () => {
     vi.useRealTimers();
     testState.hidden = true;
     testState.animationFrames.clear();
+  });
+
+  it("merges arbitrary task-list packets and completes after the terminal merge", async () => {
+    testState.route.tid = "2";
+    await bootstrapProject();
+    const connection = testState.connection!;
+    const root = { ...activeSnapshot(1), child_count: 2 };
+    const child = {
+      ...activeSnapshot(2),
+      child_count: 0,
+      parent_tid: 1,
+    };
+
+    await act(() => {
+      connection.onControlMessage?.(tasksList([root], false));
+    });
+    let partial = await renderManager();
+    expect(partial.tasksLoaded).toBe(false);
+    expect(partial.getByTid(1)).toMatchObject({ childCount: 2 });
+    expect(partial.getByTid(2)).toBeUndefined();
+    expect(partial.sidebarTasks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ tid: 1, childCount: 2 }),
+      ]),
+    );
+    expect(connection.requestHistory).not.toHaveBeenCalled();
+
+    await act(() => {
+      connection.onControlMessage?.(tasksList([], false));
+      connection.onControlMessage?.(tasksList([child], true));
+    });
+    partial = await renderManager();
+    expect(partial.tasksLoaded).toBe(true);
+    expect(partial.getByTid(1)).toBeDefined();
+    expect(partial.getByTid(2)).toMatchObject({ childCount: 0, parentTid: 1 });
+    expect(connection.requestHistory).toHaveBeenCalledWith(2);
+  });
+
+  it("accepts one-packet empty completion and clears a partial snapshot on reconnect", async () => {
+    await bootstrapProject();
+    const connection = testState.connection!;
+
+    await act(() => {
+      connection.onControlMessage?.(tasksList([activeSnapshot(1)], false));
+    });
+    expect((await renderManager()).getByTid(1)).toBeDefined();
+    expect(manager!.tasksLoaded).toBe(false);
+
+    await act(() => {
+      connection.onStatusChange?.(false);
+    });
+    let fresh = await renderManager();
+    expect(fresh.tasks).toEqual(new Map());
+    expect(fresh.tasksLoaded).toBe(false);
+
+    await act(() => {
+      connection.onStatusChange?.(true);
+      connection.onControlMessage?.(workspaceCatalog());
+      connection.onControlMessage?.(tasksList([], true));
+    });
+    fresh = await renderManager();
+    expect(fresh.tasks).toEqual(new Map());
+    expect(fresh.tasksLoaded).toBe(true);
+  });
+
+  it("rejects malformed, duplicate, and post-terminal task-list packets before mutation", async () => {
+    await bootstrapProject();
+    const connection = testState.connection!;
+    const first = activeSnapshot(1);
+
+    await act(() => {
+      connection.onControlMessage?.(tasksList([first], false));
+    });
+    expect(() =>
+      connection.onControlMessage?.(tasksList([first], false)),
+    ).toThrow("duplicate tid");
+    expect(manager!.getByTid(1)).toBeDefined();
+
+    const malformed = {
+      type: "tasks_list",
+      complete: false,
+      tasks: {},
+    } as unknown as ControlMessage;
+    expect(() => connection.onControlMessage?.(malformed)).toThrow(
+      "Invalid tasks list packet",
+    );
+
+    const invalid = {
+      type: "tasks_list",
+      complete: false,
+      tasks: [{ ...activeSnapshot(2), child_count: -1 }],
+    } as unknown as ControlMessage;
+    expect(() => connection.onControlMessage?.(invalid)).toThrow(
+      "Invalid tasks list entry",
+    );
+    expect(manager!.getByTid(2)).toBeUndefined();
+
+    const invalidTid = {
+      type: "tasks_list",
+      complete: false,
+      tasks: [{ ...activeSnapshot(3), tid: 0 }],
+    } as unknown as ControlMessage;
+    expect(() => connection.onControlMessage?.(invalidTid)).toThrow(
+      "Invalid tasks list entry",
+    );
+    expect(manager!.getByTid(3)).toBeUndefined();
+
+    expect(() =>
+      connection.onControlMessage?.(
+        tasksList([activeSnapshot(4), activeSnapshot(4)], false),
+      ),
+    ).toThrow("duplicate tid");
+    expect(manager!.getByTid(4)).toBeUndefined();
+
+    await act(() => {
+      connection.onControlMessage?.(tasksList([activeSnapshot(5)], true));
+    });
+    expect(() =>
+      connection.onControlMessage?.(tasksList([activeSnapshot(6)], false)),
+    ).toThrow("after completion");
+    expect(manager!.getByTid(6)).toBeUndefined();
+  });
+
+  it("defers outbox reconciliation until a terminal packet proves the task set", async () => {
+    await renderManager();
+    const connection = testState.connection!;
+    await act(() => {
+      connection.onStatusChange?.(true);
+      connection.onControlMessage?.(workspaceCatalog());
+    });
+    testState.outboxEntries = [
+      {
+        tid: 91,
+        nonce: "later-packet-outbox",
+        content: [{ type: "text", text: "arrives later" }],
+        createdAt: 0,
+      },
+    ];
+
+    await act(() => {
+      connection.onControlMessage?.(tasksList([], false));
+    });
+    await renderManager();
+    expect(testState.outbox.remove).not.toHaveBeenCalled();
+    expect(connection.sendMessage).not.toHaveBeenCalled();
+
+    await act(() => {
+      connection.onControlMessage?.(tasksList([activeSnapshot(91)], true));
+    });
+    await renderManager();
+    expect(connection.sendMessage).toHaveBeenCalledWith(
+      91,
+      [{ type: "text", text: "arrives later" }],
+      "later-packet-outbox",
+    );
+    expect(testState.outbox.remove).not.toHaveBeenCalled();
   });
 
   it("routes an attached project-root submission acknowledgement", async () => {
@@ -806,6 +974,7 @@ describe("submission acknowledgement routing", () => {
         } else {
           connection.onControlMessage?.({
             type: "tasks_list",
+            complete: true,
             tasks: [activeSnapshot(71)],
           } satisfies ControlMessage);
         }
@@ -1248,6 +1417,7 @@ describe("submission acknowledgement routing", () => {
       testState.uuid = "persisted-reload-uuid";
       connection.onControlMessage?.({
         type: "tasks_list",
+        complete: true,
         tasks: [persistedSnapshot(91, "reloaded persisted draft")],
       } satisfies ControlMessage);
       testState.uuid = "submission-uuid";
@@ -1284,6 +1454,7 @@ describe("submission acknowledgement routing", () => {
     await act(() => {
       connection.onControlMessage?.({
         type: "tasks_list",
+        complete: true,
         tasks: [activeSnapshot(71)],
       } satisfies ControlMessage);
     });
@@ -2193,6 +2364,7 @@ describe("submission acknowledgement routing", () => {
       } satisfies ControlMessage);
       testState.connection!.onControlMessage?.({
         type: "tasks_list",
+        complete: true,
         tasks: [persistedSnapshot(82)],
       } satisfies ControlMessage);
     });
@@ -2284,6 +2456,7 @@ describe("submission acknowledgement routing", () => {
     testState.outbox.all.mockClear();
     connection.onControlMessage?.({
       type: "tasks_list",
+      complete: true,
       tasks: [activeSnapshot(903)],
     } satisfies ControlMessage);
     expect(commitRouteWithoutPassiveEffects().getByTid(903)).toBeDefined();
@@ -2357,6 +2530,7 @@ describe("submission acknowledgement routing", () => {
     connection.onControlMessage?.(workspaceCatalog());
     connection.onControlMessage?.({
       type: "tasks_list",
+      complete: true,
       tasks: [activeSnapshot(904)],
     } satisfies ControlMessage);
     expect(commitRouteWithoutPassiveEffects().getByTid(904)).toBeDefined();
@@ -2406,6 +2580,7 @@ describe("submission acknowledgement routing", () => {
     ];
     connection.onControlMessage?.({
       type: "tasks_list",
+      complete: true,
       tasks: [activeSnapshot(903)],
     } satisfies ControlMessage);
     expect(commitRouteWithoutPassiveEffects().getByTid(903)).toBeDefined();
@@ -2429,6 +2604,7 @@ describe("submission acknowledgement routing", () => {
       connection.onControlMessage?.(workspaceCatalog());
       connection.onControlMessage?.({
         type: "tasks_list",
+        complete: true,
         tasks: [activeSnapshot(903)],
       } satisfies ControlMessage);
     });
@@ -2468,6 +2644,7 @@ describe("submission acknowledgement routing", () => {
       connection.onControlMessage?.(workspaceCatalog());
       connection.onControlMessage?.({
         type: "tasks_list",
+        complete: true,
         tasks: [],
       } satisfies ControlMessage);
     });
@@ -2651,6 +2828,7 @@ describe("submission acknowledgement routing", () => {
       connection.onControlMessage?.(workspaceCatalog());
       connection.onControlMessage?.({
         type: "tasks_list",
+        complete: true,
         tasks: [activeSnapshot(tid)],
       } satisfies ControlMessage);
     });

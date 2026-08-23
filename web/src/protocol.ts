@@ -187,65 +187,42 @@ export interface TaskCreatedMessage {
   relation_type?: string;
   correlation_id?: string;
 }
+export interface TaskListEntry {
+  tid: number;
+  alive: boolean;
+  resumable: boolean;
+  isProcessing: boolean;
+  stdinClosed?: boolean;
+  canStop?: boolean;
+  needsAttention?: boolean;
+  hasPendingQuestion?: boolean;
+  notificationBody?: string;
+  title?: string;
+  workspace?: string;
+  project_path?: string;
+  parent_tid?: number;
+  child_count: number;
+  relation_type?: string;
+  status?: TaskStatus;
+  task_type?: string;
+  entry_point?: string;
+  agent_name?: string;
+  driver?: string;
+  archived?: boolean;
+  archiving?: boolean;
+  draft?: string;
+  error?: string;
+  created_at?: number;
+  last_active?: number;
+}
 export interface TasksListMessage {
   type: "tasks_list";
-  tasks: {
-    tid: number;
-    alive: boolean;
-    resumable: boolean;
-    isProcessing: boolean;
-    stdinClosed?: boolean;
-    canStop?: boolean;
-    needsAttention?: boolean;
-    hasPendingQuestion?: boolean;
-    notificationBody?: string;
-    title?: string;
-    workspace?: string;
-    project_path?: string;
-    parent_tid?: number;
-    relation_type?: string;
-    status?: TaskStatus;
-    task_type?: string;
-    entry_point?: string;
-    agent_name?: string;
-    driver?: string;
-    archived?: boolean;
-    archiving?: boolean;
-    draft?: string;
-    error?: string;
-    created_at?: number;
-    last_active?: number;
-  }[];
+  complete: boolean;
+  tasks: TaskListEntry[];
 }
 export interface TaskUpdatedMessage {
   type: "task_updated";
-  task: {
-    tid: number;
-    alive: boolean;
-    resumable: boolean;
-    isProcessing: boolean;
-    stdinClosed?: boolean;
-    canStop?: boolean;
-    needsAttention?: boolean;
-    hasPendingQuestion?: boolean;
-    notificationBody?: string;
-    title?: string;
-    workspace?: string;
-    project_path?: string;
-    parent_tid?: number;
-    relation_type?: string;
-    status?: TaskStatus;
-    task_type?: string;
-    entry_point?: string;
-    agent_name?: string;
-    driver?: string;
-    archived?: boolean;
-    archiving?: boolean;
-    draft?: string;
-    error?: string;
-    created_at?: number;
-    last_active?: number;
-  };
+  task: TaskListEntry;
 }
 export interface TaskReloadMessage {
   type: "task_reload";

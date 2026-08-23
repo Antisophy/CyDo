@@ -28,6 +28,7 @@ function task(tid: number, extra: Partial<SidebarTask> = {}): SidebarTask {
     canStop: false,
     resumable: false,
     isProcessing: false,
+    childCount: 0,
     ...extra,
   };
 }

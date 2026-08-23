@@ -61,7 +61,7 @@ test("draft clears after sending message", async ({ page, agentType }) => {
   await expect(input).toHaveValue("");
 });
 
-test("draft syncs to second client via tasks_list", async ({
+test("draft syncs to second client via task-list packets", async ({
   page,
   browser,
   agentType,
@@ -82,7 +82,7 @@ test("draft syncs to second client via tasks_list", async ({
   // Wait for debounce to fire and persist to backend
   await page.waitForTimeout(1000);
 
-  // Open page 2 — it will get tasks_list with the draft on connect
+  // Open page 2 — it will get task-list packets with the draft on connect
   const context2 = await browser.newContext();
   const page2 = await context2.newPage();
   await page2.goto(page.url());
@@ -92,7 +92,7 @@ test("draft syncs to second client via tasks_list", async ({
     .locator(".sidebar-item .sidebar-label", { hasText: "draft-sync-test" })
     .click({ timeout: 15_000 });
 
-  // Page 2 should see the draft hydrated from tasks_list
+  // Page 2 should see the draft hydrated from the task-list packets
   const input2 = page2.locator(".input-textarea:visible").first();
   await expect(input2).toBeVisible({ timeout: 15_000 });
   await expect(input2).toHaveValue("synced draft text", { timeout: 5_000 });

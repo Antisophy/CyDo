@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Connection } from "./connection";
 
 class MockWebSocket {
@@ -18,7 +18,7 @@ class MockWebSocket {
     MockWebSocket.instances.push(this);
   }
 
-  emitMessage(data: string) {
+  emitMessage(data: string | ArrayBuffer) {
     this.onmessage?.call(
       this as unknown as WebSocket,
       {
@@ -26,19 +26,109 @@ class MockWebSocket {
       } as MessageEvent,
     );
   }
+
+  emitClose() {
+    this.onclose?.call(this as unknown as WebSocket, {} as CloseEvent);
+  }
+}
+
+class AnimationFrameController {
+  private nextId = 0;
+  private frames = new Map<
+    number,
+    { callback: FrameRequestCallback; cancelled: boolean }
+  >();
+  readonly cancelled: number[] = [];
+
+  reset() {
+    this.nextId = 0;
+    this.frames.clear();
+    this.cancelled.length = 0;
+  }
+
+  request = (callback: FrameRequestCallback) => {
+    const id = ++this.nextId;
+    this.frames.set(id, { callback, cancelled: false });
+    return id;
+  };
+
+  cancel = (id: number) => {
+    const frame = this.frames.get(id);
+    if (!frame) return;
+    frame.cancelled = true;
+    this.cancelled.push(id);
+  };
+
+  pendingIds() {
+    return [...this.frames]
+      .filter(([, frame]) => !frame.cancelled)
+      .map(([id]) => id);
+  }
+
+  runNext() {
+    const id = this.pendingIds()[0];
+    if (id === undefined) throw new Error("No animation frame is pending");
+    this.run(id);
+    return id;
+  }
+
+  run(id: number, allowCancelled = false) {
+    const frame = this.frames.get(id);
+    if (!frame) throw new Error(`Unknown animation frame ${id}`);
+    this.frames.delete(id);
+    if (!frame.cancelled || allowCancelled) frame.callback(0);
+  }
+}
+
+const animationFrames = new AnimationFrameController();
+const visibilityListeners = new Set<EventListener>();
+let pageHidden = false;
+
+function setPageHidden(hidden: boolean) {
+  pageHidden = hidden;
+}
+
+function emitVisibilityChange() {
+  for (const listener of [...visibilityListeners])
+    listener({ type: "visibilitychange" } as Event);
+}
+
+function tasksList(complete: unknown, tasks: unknown = []) {
+  return JSON.stringify({ type: "tasks_list", complete, tasks });
+}
+
+function taskEvent(tid: number) {
+  return JSON.stringify({ tid, event: { type: "turn/stop" } });
 }
 
 describe("Connection client behavior", () => {
   beforeEach(() => {
     MockWebSocket.instances = [];
-    Object.defineProperty(globalThis, "location", {
-      value: { protocol: "http:", host: "localhost:3940" },
-      configurable: true,
+    animationFrames.reset();
+    visibilityListeners.clear();
+    pageHidden = false;
+    vi.stubGlobal("location", { protocol: "http:", host: "localhost:3940" });
+    vi.stubGlobal("WebSocket", MockWebSocket as unknown as typeof WebSocket);
+    vi.stubGlobal("document", {
+      get hidden() {
+        return pageHidden;
+      },
+      addEventListener(type: string, listener: EventListener) {
+        if (type === "visibilitychange") visibilityListeners.add(listener);
+      },
+      removeEventListener(type: string, listener: EventListener) {
+        if (type === "visibilitychange") visibilityListeners.delete(listener);
+      },
     });
-    Object.defineProperty(globalThis, "WebSocket", {
-      value: MockWebSocket as unknown as typeof WebSocket,
-      configurable: true,
-    });
+    vi.stubGlobal("requestAnimationFrame", animationFrames.request);
+    vi.stubGlobal("cancelAnimationFrame", animationFrames.cancel);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("reports invalid JSON payloads through onClientError", () => {
@@ -108,6 +198,172 @@ describe("Connection client behavior", () => {
     );
 
     expect(controls).toEqual(["agent_usage"]);
+  });
+
+  describe("incremental task-list gate", () => {
+    it("dispatches a terminal first list immediately and drains later raw frames FIFO after two animation frames", () => {
+      const conn = new Connection();
+      const received: string[] = [];
+      const parse = vi.spyOn(JSON, "parse");
+      conn.onControlMessage = (message) => {
+        received.push(
+          message.type === "tasks_list"
+            ? `tasks_list:${message.complete}`
+            : message.type,
+        );
+      };
+      conn.onTaskMessage = (tid) => received.push(`task:${tid}`);
+
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+      ws.emitMessage(tasksList(true));
+
+      expect(received).toEqual(["tasks_list:true"]);
+      expect(parse).toHaveBeenCalledTimes(1);
+      expect(animationFrames.pendingIds()).toHaveLength(1);
+
+      ws.emitMessage(JSON.stringify({ type: "task_updated" }));
+      ws.emitMessage(taskEvent(7));
+      ws.emitMessage(JSON.stringify({ type: "title_update" }));
+
+      expect(received).toEqual(["tasks_list:true"]);
+      expect(parse).toHaveBeenCalledTimes(1);
+
+      animationFrames.runNext();
+
+      expect(received).toEqual(["tasks_list:true"]);
+      expect(parse).toHaveBeenCalledTimes(1);
+      expect(animationFrames.pendingIds()).toHaveLength(1);
+
+      animationFrames.runNext();
+
+      expect(received).toEqual([
+        "tasks_list:true",
+        "task_updated",
+        "task:7",
+        "title_update",
+      ]);
+      expect(parse).toHaveBeenCalledTimes(4);
+      expect(animationFrames.pendingIds()).toEqual([]);
+    });
+
+    it.each([
+      ["a non-boolean complete flag", "false", []],
+      ["a non-array tasks payload", false, {}],
+    ])("reports %s as a client error", (_description, complete, tasks) => {
+      const conn = new Connection();
+      const errors: string[] = [];
+      const controls = vi.fn();
+      conn.onClientError = (message) => errors.push(message);
+      conn.onControlMessage = controls;
+
+      conn.connect();
+      MockWebSocket.instances[0]!.emitMessage(tasksList(complete, tasks));
+
+      expect(controls).not.toHaveBeenCalled();
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toContain("Failed to parse WebSocket message");
+      expect(animationFrames.pendingIds()).toEqual([]);
+    });
+
+    it("does not pause when the first task list arrives while hidden", () => {
+      setPageHidden(true);
+      const conn = new Connection();
+      const received: string[] = [];
+      conn.onControlMessage = (message) => received.push(message.type);
+      conn.onTaskMessage = (tid) => received.push(`task:${tid}`);
+
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+      ws.emitMessage(tasksList(false));
+      ws.emitMessage(taskEvent(3));
+
+      expect(received).toEqual(["tasks_list", "task:3"]);
+      expect(animationFrames.pendingIds()).toEqual([]);
+    });
+
+    it("cancels the gate and drains queued frames when the page becomes hidden", () => {
+      const conn = new Connection();
+      const received: string[] = [];
+      conn.onControlMessage = (message) => received.push(message.type);
+      conn.onTaskMessage = (tid) => received.push(`task:${tid}`);
+
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+      ws.emitMessage(tasksList(false));
+      const firstFrame = animationFrames.pendingIds()[0]!;
+      ws.emitMessage(taskEvent(3));
+
+      setPageHidden(true);
+      emitVisibilityChange();
+
+      expect(received).toEqual(["tasks_list", "task:3"]);
+      expect(animationFrames.cancelled).toContain(firstFrame);
+      expect(animationFrames.pendingIds()).toEqual([]);
+
+      animationFrames.run(firstFrame, true);
+      expect(received).toEqual(["tasks_list", "task:3"]);
+    });
+
+    it("cleans up the gate when first-list dispatch throws", () => {
+      const conn = new Connection();
+      const errors: string[] = [];
+      const taskMessages = vi.fn();
+      conn.onControlMessage = () => {
+        throw new Error("render failed");
+      };
+      conn.onClientError = (message) => errors.push(message);
+      conn.onTaskMessage = taskMessages;
+
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+      ws.emitMessage(tasksList(false));
+
+      expect(errors).toHaveLength(1);
+      expect(animationFrames.cancelled).toHaveLength(1);
+      expect(animationFrames.pendingIds()).toEqual([]);
+
+      ws.emitMessage(taskEvent(9));
+      expect(taskMessages).toHaveBeenCalledOnce();
+      expect(taskMessages.mock.calls[0]?.slice(0, 2)).toEqual([
+        9,
+        { type: "turn/stop" },
+      ]);
+    });
+
+    it("drops queued frames and stale release callbacks after close and reconnect", () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const conn = new Connection();
+      const received: string[] = [];
+      conn.onControlMessage = (message) => {
+        received.push(
+          message.type === "tasks_list"
+            ? `tasks_list:${message.complete}`
+            : message.type,
+        );
+      };
+      conn.onTaskMessage = (tid) => received.push(`task:${tid}`);
+
+      conn.connect();
+      const firstSocket = MockWebSocket.instances[0]!;
+      firstSocket.emitMessage(tasksList(false));
+      animationFrames.runNext();
+      const staleRelease = animationFrames.pendingIds()[0]!;
+      firstSocket.emitMessage(taskEvent(1));
+      firstSocket.emitClose();
+
+      expect(animationFrames.cancelled).toContain(staleRelease);
+
+      vi.advanceTimersByTime(2_000);
+      const secondSocket = MockWebSocket.instances[1]!;
+      animationFrames.run(staleRelease, true);
+      firstSocket.emitMessage(taskEvent(2));
+
+      expect(received).toEqual(["tasks_list:false"]);
+
+      secondSocket.emitMessage(tasksList(true));
+      expect(received).toEqual(["tasks_list:false", "tasks_list:true"]);
+    });
   });
 
   it("rejects malformed history operation policies", () => {

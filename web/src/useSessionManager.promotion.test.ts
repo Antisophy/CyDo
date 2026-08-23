@@ -121,9 +121,11 @@ describe("task promotion", () => {
     await act(() => {
       connection.onControlMessage?.({
         type: "tasks_list",
+        complete: true,
         tasks: [
           {
             tid: 42,
+            child_count: 0,
             alive: false,
             resumable: true,
             isProcessing: false,
@@ -149,9 +151,11 @@ describe("task promotion", () => {
     await act(() => {
       connection.onControlMessage?.({
         type: "tasks_list",
+        complete: true,
         tasks: [
           {
             tid: 42,
+            child_count: 0,
             alive: false,
             resumable: true,
             isProcessing: false,

@@ -29,11 +29,13 @@ def fmt(obj):
 async def list_tasks():
     """Connect, receive initial messages, print tasks list, disconnect."""
     async with websockets.connect(URL) as ws:
-        # Server sends workspaces_list then tasks_list on connect
+        tasks = []
         while True:
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
             if msg.get("type") == "tasks_list":
-                tasks = msg.get("tasks", [])
+                tasks.extend(msg.get("tasks", []))
+                if not msg.get("complete"):
+                    continue
                 if not tasks:
                     print("No tasks.")
                     return
@@ -42,7 +44,6 @@ async def list_tasks():
                     title = t.get("title", "(untitled)")
                     status = t.get("status", "?")
                     alive = t.get("alive", False)
-                    ws_name = t.get("workspace", "")
                     parent = t.get("parent_tid", 0)
                     indicator = "*" if alive else " "
                     parent_str = f"  parent={parent}" if parent else ""
@@ -53,10 +54,10 @@ async def list_tasks():
 async def fetch_history(tid: int):
     """Request and print full history for a task."""
     async with websockets.connect(URL) as ws:
-        # Drain initial messages
+        # Drain the complete initial snapshot.
         while True:
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-            if msg.get("type") == "tasks_list":
+            if msg.get("type") == "tasks_list" and msg.get("complete"):
                 break
 
         # Request history
@@ -103,15 +104,22 @@ async def watch(tid_filter: int | None = None):
         print(f"Connected to {URL}, streaming events" +
               (f" for task {tid_filter}" if tid_filter is not None else "") +
               "... (Ctrl+C to stop)")
+        task_count = 0
         while True:
             raw = await ws.recv()
             msg = json.loads(raw)
             msg_tid = msg.get("tid")
 
             # Skip initial bulk messages unless watching all
-            if msg.get("type") in ("workspaces_list", "tasks_list"):
+            if msg.get("type") == "tasks_list":
+                task_count += len(msg.get("tasks", []))
                 if tid_filter is None:
-                    print(f"[init] {msg['type']}: {len(msg.get('tasks', msg.get('workspaces', [])))} entries")
+                    complete = " (complete)" if msg.get("complete") else ""
+                    print(f"[init] tasks_list: {len(msg.get('tasks', []))} entries, {task_count} total{complete}")
+                continue
+            if msg.get("type") == "workspaces_list":
+                if tid_filter is None:
+                    print(f"[init] workspaces_list: {len(msg.get('workspaces', []))} entries")
                 continue
 
             if tid_filter is not None and msg_tid != tid_filter:

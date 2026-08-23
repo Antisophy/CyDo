@@ -21,7 +21,7 @@ import type {
   ContentBlock,
   HistoryBoundary,
   Notice,
-  TasksListMessage,
+  TaskListEntry,
 } from "./protocol";
 import type { CydoMeta, TaskState, UndoPending } from "./types";
 import { makeTaskState } from "./types";
@@ -234,6 +234,7 @@ export interface TaskManager {
     stdinClosed?: boolean;
     title?: string;
     parentTid?: number;
+    childCount: number;
     relationType?: string;
     status?: string;
     archived?: boolean;
@@ -359,7 +360,7 @@ export function receiveServerError(
 }
 
 /** Snapshot entry shape shared by tasks_list and task_updated messages. */
-export type TaskSnapshotEntry = TasksListMessage["tasks"][number];
+export type TaskSnapshotEntry = TaskListEntry;
 
 /** Build (or merge) the TaskState a tasks_list/task_updated snapshot entry seeds. */
 export function taskStateFromEntry(
@@ -399,6 +400,7 @@ export function taskStateFromEntry(
     return {
       ...base,
       uuid: existingUuid ?? base.uuid,
+      childCount: entry.child_count,
       serverDraft: hasDraft ? entry.draft || undefined : base.serverDraft,
       error: entry.error || undefined,
     };
@@ -422,6 +424,7 @@ export function taskStateFromEntry(
     workspace: workspace || existing.workspace,
     projectPath: projectPath || existing.projectPath,
     parentTid: entry.parent_tid || existing.parentTid,
+    childCount: entry.child_count,
     relationType: entry.relation_type || existing.relationType,
     status: entry.status || existing.status,
     taskType: entry.task_type || existing.taskType,
@@ -703,6 +706,10 @@ export function useTaskManager(
   const outboxReplayedEpochRef = useRef<number | null>(null);
   const outboxAttemptedNoncesRef = useRef(new Set<string>());
   const tasksListEpochRef = useRef<number | null>(null);
+  const tasksListAcceptedTidsRef = useRef(new Set<number>());
+  const tasksListPhaseRef = useRef<"awaiting" | "receiving" | "complete">(
+    "awaiting",
+  );
   const connectionEpochRef = useRef(0);
   const openConnectionEpochRef = useRef<number | null>(0);
 
@@ -1458,6 +1465,40 @@ export function useTaskManager(
           break;
         }
         case "tasks_list": {
+          const epoch = openConnectionEpochRef.current;
+          if (!isCurrentOpenEpoch(epoch))
+            throw new Error("Tasks list arrived outside an open connection");
+          if (typeof msg.complete !== "boolean" || !Array.isArray(msg.tasks))
+            throw new Error("Invalid tasks list packet");
+          if (tasksListPhaseRef.current === "complete")
+            throw new Error("Tasks list arrived after completion");
+
+          const packetTids = new Set<number>();
+          for (const rawEntry of msg.tasks as unknown[]) {
+            if (typeof rawEntry !== "object" || rawEntry === null)
+              throw new Error("Invalid tasks list entry");
+            const entry = rawEntry as Record<string, unknown>;
+            const tid = entry.tid;
+            const childCount = entry.child_count;
+            if (
+              typeof tid !== "number" ||
+              !Number.isSafeInteger(tid) ||
+              tid <= 0 ||
+              typeof childCount !== "number" ||
+              !Number.isSafeInteger(childCount) ||
+              childCount < 0
+            )
+              throw new Error("Invalid tasks list entry");
+            if (
+              packetTids.has(tid) ||
+              tasksListAcceptedTidsRef.current.has(tid)
+            )
+              throw new Error("Tasks list contains a duplicate tid");
+            packetTids.add(tid);
+          }
+          for (const tid of packetTids)
+            tasksListAcceptedTidsRef.current.add(tid);
+
           const updates = new Map<string, TaskState>();
           const effects: DraftEffect[] = [];
           for (const entry of msg.tasks) {
@@ -1501,12 +1542,14 @@ export function useTaskManager(
             }
             return next;
           });
-          const epoch = openConnectionEpochRef.current;
-          if (!isCurrentOpenEpoch(epoch))
-            throw new Error("Tasks list arrived outside an open connection");
-          tasksListEpochRef.current = epoch;
-          setTasksListEpoch(epoch);
           executeDraftEffects(effects);
+          if (msg.complete) {
+            tasksListPhaseRef.current = "complete";
+            tasksListEpochRef.current = epoch;
+            setTasksListEpoch(epoch);
+          } else {
+            tasksListPhaseRef.current = "receiving";
+          }
           break;
         }
         case "task_updated": {
@@ -2149,6 +2192,8 @@ export function useTaskManager(
         outboxReplayedEpochRef.current = null;
         outboxAttemptedNoncesRef.current.clear();
         tasksListEpochRef.current = null;
+        tasksListAcceptedTidsRef.current.clear();
+        tasksListPhaseRef.current = "awaiting";
         for (const runtime of createRuntimeRef.current.values())
           clearTimeout(runtime.handle);
         for (const runtime of saveRuntimeRef.current.values())
@@ -2182,6 +2227,8 @@ export function useTaskManager(
         setAgentUsage({});
       } else {
         openConnectionEpochRef.current = connectionEpochRef.current;
+        tasksListAcceptedTidsRef.current.clear();
+        tasksListPhaseRef.current = "awaiting";
         initialNoticeLoadRef.current = true;
       }
     };
@@ -3147,6 +3194,7 @@ export function useTaskManager(
             ? t.serverDraft.replace(/\s+/g, " ").trim().slice(0, 100)
             : undefined),
         parentTid: t.parentTid,
+        childCount: t.childCount,
         relationType: t.relationType,
         status: t.status,
         archived: t.archived,
@@ -3170,6 +3218,7 @@ export function useTaskManager(
           t.stdinClosed === p.stdinClosed &&
           t.title === p.title &&
           t.parentTid === p.parentTid &&
+          t.childCount === p.childCount &&
           t.relationType === p.relationType &&
           t.status === p.status &&
           t.archived === p.archived &&

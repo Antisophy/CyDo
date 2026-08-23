@@ -299,6 +299,8 @@ export interface TaskState {
   projectPath?: string;
   /** Parent task ID (0 or undefined = no parent). */
   parentTid?: number;
+  /** Number of direct children in the current full task snapshot. */
+  childCount: number;
   /** Relation type to parent (e.g. "fork"). */
   relationType?: string;
   historyOperations: import("./protocol").HistoryOperations | null;
@@ -401,6 +403,7 @@ export function makeTaskState(
     workspace,
     projectPath,
     parentTid,
+    childCount: 0,
     relationType,
     everLoaded: historyLoaded,
     historyOperations: null,

@@ -31,6 +31,8 @@ export class Connection {
   private ws: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
+  private socketGeneration = 0;
+  private teardownRawFrameGate: (() => void) | null = null;
 
   onTaskMessage:
     | ((tid: number, event: AgnosticEvent, seq?: number, ts?: number) => void)
@@ -63,30 +65,92 @@ export class Connection {
   }
 
   connect() {
+    const generation = ++this.socketGeneration;
+    this.teardownRawFrameGate?.();
+    this.teardownRawFrameGate = null;
+
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    this.ws = new WebSocket(`${proto}//${location.host}/ws`);
-    this.ws.binaryType = "arraybuffer";
+    const ws = new WebSocket(`${proto}//${location.host}/ws`);
+    this.ws = ws;
+    ws.binaryType = "arraybuffer";
 
-    this.ws.onopen = () => {
-      this.onStatusChange?.(true);
+    type RawFrame = string | ArrayBuffer;
+    let firstTaskListSeen = false;
+    let gatePaused = false;
+    let queuedFrames: RawFrame[] = [];
+    let firstAnimationFrame: number | null = null;
+    let secondAnimationFrame: number | null = null;
+    const isCurrent = () =>
+      this.socketGeneration === generation && this.ws === ws;
+    const cancelGateFrames = () => {
+      if (firstAnimationFrame !== null) {
+        cancelAnimationFrame(firstAnimationFrame);
+        firstAnimationFrame = null;
+      }
+      if (secondAnimationFrame !== null) {
+        cancelAnimationFrame(secondAnimationFrame);
+        secondAnimationFrame = null;
+      }
+    };
+    const clearPausedGate = () => {
+      cancelGateFrames();
+      queuedFrames = [];
+      gatePaused = false;
+    };
+    const drainQueuedFrames = () => {
+      if (!gatePaused) return;
+      cancelGateFrames();
+      gatePaused = false;
+      const frames = queuedFrames;
+      queuedFrames = [];
+      for (const frame of frames) {
+        if (!isCurrent()) return;
+        dispatchFrame(frame);
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden && gatePaused) drainQueuedFrames();
+    };
+    const teardownRawFrameGate = () => {
+      clearPausedGate();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (this.teardownRawFrameGate === teardownRawFrameGate)
+        this.teardownRawFrameGate = null;
+    };
+    this.teardownRawFrameGate = teardownRawFrameGate;
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    const scheduleGateRelease = () => {
+      firstAnimationFrame = requestAnimationFrame(() => {
+        firstAnimationFrame = null;
+        if (!isCurrent() || !gatePaused) return;
+        secondAnimationFrame = requestAnimationFrame(() => {
+          secondAnimationFrame = null;
+          if (!isCurrent() || !gatePaused) return;
+          drainQueuedFrames();
+        });
+      });
     };
 
-    this.ws.onclose = () => {
-      this.onStatusChange?.(false);
-      this.scheduleReconnect();
-    };
-
-    this.ws.onerror = () => {
-      this.ws?.close();
-    };
-
-    this.ws.onmessage = (ev) => {
+    const dispatchFrame = (data: RawFrame) => {
+      let text = "";
+      let armedGate = false;
       try {
-        const data = ev.data as string | ArrayBuffer;
-        const text =
-          typeof data === "string" ? data : new TextDecoder().decode(data);
+        text = typeof data === "string" ? data : new TextDecoder().decode(data);
         const raw = JSON.parse(text) as Record<string, unknown>;
-        if (raw.type === "task_history_boundary_replaced") {
+        if (raw.type === "tasks_list") {
+          if (typeof raw.complete !== "boolean" || !Array.isArray(raw.tasks))
+            throw new Error("Invalid tasks list message");
+          if (!firstTaskListSeen) {
+            firstTaskListSeen = true;
+            if (!document.hidden) {
+              gatePaused = true;
+              armedGate = true;
+              scheduleGateRelease();
+            }
+          }
+          this.onControlMessage?.(raw as unknown as ControlMessage);
+        } else if (raw.type === "task_history_boundary_replaced") {
           if (
             typeof raw.tid !== "number" ||
             typeof raw.seq !== "number" ||
@@ -105,7 +169,6 @@ export class Connection {
           this.onControlMessage?.(raw as unknown as ControlMessage);
         } else if (
           raw.type === "task_created" ||
-          raw.type === "tasks_list" ||
           raw.type === "task_updated" ||
           raw.type === "task_reload" ||
           raw.type === "title_update" ||
@@ -167,14 +230,43 @@ export class Connection {
           );
         }
       } catch (e) {
-        const data = ev.data as string | ArrayBuffer;
-        const text =
-          typeof data === "string" ? data : new TextDecoder().decode(data);
+        if (armedGate) clearPausedGate();
+        if (!text)
+          text =
+            typeof data === "string" ? data : new TextDecoder().decode(data);
         this.reportClientError(
           `Failed to parse WebSocket message: ${this.summarizePayload(text)}`,
           e,
         );
       }
+    };
+
+    ws.onopen = () => {
+      if (!isCurrent()) return;
+      this.onStatusChange?.(true);
+    };
+
+    ws.onclose = () => {
+      teardownRawFrameGate();
+      if (!isCurrent()) return;
+      this.onStatusChange?.(false);
+      this.scheduleReconnect();
+    };
+
+    ws.onerror = () => {
+      teardownRawFrameGate();
+      if (!isCurrent()) return;
+      ws.close();
+    };
+
+    ws.onmessage = (ev) => {
+      if (!isCurrent()) return;
+      const data = ev.data as RawFrame;
+      if (gatePaused) {
+        queuedFrames.push(data);
+        return;
+      }
+      dispatchFrame(data);
     };
   }
 
@@ -351,6 +443,7 @@ export class Connection {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.teardownRawFrameGate?.();
     this.ws?.close();
   }
 }

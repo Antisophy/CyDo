@@ -10,7 +10,7 @@ private ProjectRepoResolution[string] projectRepoResolutionCache;
 
 import ae.sys.data : Data;
 import ae.sys.dataset : DataVec;
-import ae.utils.json : JSONFragment, JSONOptional, JSONPartial;
+import ae.utils.json : JSONFragment, JSONName, JSONOptional, JSONPartial;
 import ae.utils.promise : Promise, PromiseQueue;
 import ae.utils.statequeue : StateQueue;
 
@@ -1047,6 +1047,7 @@ struct TaskCreatedMessage
 struct TasksListMessage
 {
 	string type;
+	bool complete;
 	TaskListEntry[] tasks;
 }
 
@@ -1078,6 +1079,7 @@ struct TaskListEntry
 	string workspace;
 	string project_path;
 	int parent_tid;
+	@JSONName("child_count") size_t childCount;
 	string relation_type;
 	string status;
 	string task_type;

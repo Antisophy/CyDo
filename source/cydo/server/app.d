@@ -43,7 +43,7 @@ import cydo.workflow.discovery.service : DiscoveryService, DiscoveryServiceHost,
 	DiscoveryTaskSnapshot, ImportableReconciliationCommit, ImportableScanRecord,
 	ImportableTaskSpec;
 import cydo.web.snapshots : buildAgentsList, buildNoticesList,
-	buildServerStatus, buildTaskEntry, buildTasksList, buildTaskTypesList,
+	buildServerStatus, buildTaskEntry, buildTasksListPackets, buildTaskTypesList,
 	buildTaskTypesListForProject, buildWorkspacesList;
 import cydo.workflow.history.pipeline : HistoryBroadcastPlan, HistoryEventPipeline,
 	HistoryEventPipelineHost;
@@ -98,6 +98,41 @@ import cydo.workflow.history.jsonl_store : findNextUserUuid,
 import cydo.workflow.workspace.worktree;
 
 private enum maxToolDescriptionNoticeViolations = 3;
+
+private struct TaskListScope
+{
+	int tid;
+	int parentTid;
+	string workspace;
+	string projectPath;
+}
+
+private size_t[int] countTaskListChildren(TaskListScope[] scopes)
+{
+	size_t[int] indexByTid;
+	size_t[int] childCounts;
+	foreach (index, taskScope; scopes)
+	{
+		enforce(taskScope.tid > 0, "Task list scope tid must be positive");
+		enforce((taskScope.tid in indexByTid) is null,
+			"Task list scopes must not contain duplicate tids");
+		indexByTid[taskScope.tid] = index;
+		childCounts[taskScope.tid] = 0;
+	}
+
+	foreach (child; scopes)
+	{
+		auto parentIndex = child.parentTid in indexByTid;
+		if (parentIndex is null)
+			continue;
+		auto parent = scopes[*parentIndex];
+		if (parent.projectPath.length > 0
+			&& child.workspace == parent.workspace
+			&& child.projectPath == parent.projectPath)
+			childCounts[parent.tid]++;
+	}
+	return childCounts;
+}
 
 private string mcpToolDescriptionLimitNoticeId(string projectPath, string taskType)
 {
@@ -1094,7 +1129,9 @@ class App
 			configuredAgentNames(),
 		).representation));
 		ws.send(Data(buildAgentsList(snapshotAgentEntries(), config.default_agent).representation));
-		ws.send(Data(buildCurrentTasksList().representation));
+		auto taskListPackets = buildCurrentTasksListPackets();
+		foreach (packet; taskListPackets)
+			ws.send(Data(packet.representation));
 		ws.send(Data(buildServerStatus(
 			authUser.length > 0 || authPass.length > 0,
 			config.dev_mode,
@@ -3529,20 +3566,42 @@ class App
 		return a is null ? "" : to!string(a.driver);
 	}
 
-	private string buildCurrentTasksList()
+	private TaskListScope[] captureTaskListScopes()
 	{
-		TaskListEntry[] entries;
+		TaskListScope[] scopes;
 		foreach (tid, ref td; tasks)
-			entries ~= buildTaskEntry(td, taskAlive(tid), taskCanStop(tid), driverForTask(tid));
-		return buildTasksList(entries);
+			scopes ~= TaskListScope(tid, td.parentTid, td.workspace, td.projectPath);
+		return scopes;
+	}
+
+	private string[4] buildCurrentTasksListPackets()
+	{
+		auto scopes = captureTaskListScopes();
+		auto childCounts = countTaskListChildren(scopes);
+		TaskListEntry[] entries;
+		foreach (taskScope; scopes)
+		{
+			auto td = taskScope.tid in tasks;
+			assert(td !is null, "Captured task disappeared while building task list");
+			auto alive = taskAlive(taskScope.tid);
+			auto canStop = taskCanStop(taskScope.tid);
+			auto driver = driverForTask(taskScope.tid);
+			entries ~= buildTaskEntry(*td, childCounts[taskScope.tid], alive, canStop, driver);
+		}
+		return buildTasksListPackets(entries);
 	}
 
 	private void broadcastTaskUpdate(int tid)
 	{
 		import ae.utils.json : toJson;
 
+		auto scopes = captureTaskListScopes();
+		auto childCounts = countTaskListChildren(scopes);
+		auto td = tid in tasks;
+		assert(td !is null, "Task update requested for missing task");
 		clientHub.broadcast(toJson(TaskUpdatedMessage("task_updated",
-			buildTaskEntry(tasks[tid], taskAlive(tid), taskCanStop(tid), driverForTask(tid)))));
+			buildTaskEntry(*td, childCounts[tid], taskAlive(tid), taskCanStop(tid),
+				driverForTask(tid)))));
 	}
 
 	private void transitionTask(int tid, TaskStatus expectedFrom, TaskStatus to,
@@ -4070,6 +4129,87 @@ version (unittest) private final class SubmissionCaptureWebSocket : WebSocketAda
 		if (onSend_)
 			onSend_(payload);
 	}
+}
+
+unittest
+{
+	auto childCounts = countTaskListChildren([
+		TaskListScope(1, 0, "main", "/repo"),
+		TaskListScope(2, 1, "main", "/repo"),
+		TaskListScope(3, 2, "main", "/repo"),
+		TaskListScope(4, 1, "main", "/other-project"),
+		TaskListScope(5, 1, "other", "/repo"),
+		TaskListScope(6, 0, "main", ""),
+		TaskListScope(7, 6, "main", ""),
+		TaskListScope(8, 1, "main", "/repo"),
+	]);
+	assert(childCounts[1] == 2,
+		"Only same-workspace, same-project direct children count");
+	assert(childCounts[2] == 1, "Grandchildren count only for their direct parent");
+	assert(childCounts[6] == 0, "Parents without a project do not advertise children");
+	assert(childCounts[3] == 0 && childCounts[4] == 0 && childCounts[5] == 0
+		&& childCounts[7] == 0 && childCounts[8] == 0);
+}
+
+unittest
+{
+	auto app = new App;
+	AgentConfig agentConfig;
+	agentConfig.driver = typeof(agentConfig.driver)(AgentDriver.claude, true);
+	app.config.agents["claude"] = agentConfig;
+	app.config.default_agent = "claude";
+	app.agentsByName["claude"] = new TestClaudePromptAgent;
+	app.taskTypeCatalog = new TaskTypeCatalog("", "", (string) => true);
+	app.discoveryService = new DiscoveryService(DiscoveryServiceHost.init);
+	app.taskSessionRunner = new GatedSubmissionRunner(new GatedSubmissionSession);
+
+	void addTask(int tid, int parentTid, string workspace, string projectPath,
+		bool archived = false)
+	{
+		app.tasks[tid] = TaskData(tid, workspace, projectPath);
+		app.tasks[tid].parentTid = parentTid;
+		app.tasks[tid].archived = archived;
+	}
+
+	addTask(1, 0, "main", "/repo");
+	addTask(2, 1, "main", "/repo", true);
+	addTask(3, 2, "main", "/repo");
+	addTask(4, 1, "main", "/other-project");
+	addTask(5, 1, "other", "/repo");
+	addTask(6, 0, "main", "");
+	addTask(7, 6, "main", "");
+
+	auto ws = new SubmissionCaptureWebSocket;
+	scope(exit) app.clientHub.remove(ws);
+	app.onWebSocketAccepted(ws);
+	app.broadcastTaskUpdate(1);
+
+	assert(ws.sent.length == 10);
+	assert(ws.sent[0].canFind(`"type":"workspaces_list"`));
+	assert(ws.sent[1].canFind(`"type":"task_types_list"`));
+	assert(ws.sent[2].canFind(`"type":"agents_list"`));
+
+	bool[int] snapshotTids;
+	foreach (index; 3 .. 7)
+	{
+		auto packet = jsonParse!TasksListMessage(ws.sent[index]);
+		assert(packet.type == "tasks_list");
+		assert(packet.complete == (index == 6));
+		foreach (entry; packet.tasks)
+		{
+			assert((entry.tid in snapshotTids) is null);
+			snapshotTids[entry.tid] = true;
+		}
+	}
+	assert(snapshotTids.length == 7);
+	assert(ws.sent[7].canFind(`"type":"server_status"`));
+	assert(ws.sent[8].canFind(`"type":"notices_list"`));
+	assert(ws.sent[9].canFind(`"type":"task_updated"`));
+
+	auto update = jsonParse!TaskUpdatedMessage(ws.sent[9]);
+	assert(update.task.tid == 1);
+	assert(update.task.childCount == 1,
+		"Raw-archived same-scope children count, while cross-scope rows do not");
 }
 
 version (unittest) private final class GatedSubmissionFixture

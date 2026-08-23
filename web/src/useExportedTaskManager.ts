@@ -203,6 +203,7 @@ export function useExportedTaskManager(): TaskManager {
           stdinClosed: t.stdinClosed,
           title: t.title,
           parentTid: t.parentTid,
+          childCount: t.childCount,
           relationType: t.relationType,
           status: t.status,
           archived: t.archived,

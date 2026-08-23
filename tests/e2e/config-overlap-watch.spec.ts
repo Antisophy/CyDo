@@ -501,6 +501,7 @@ test(
           ws.addEventListener("message", (ev) => {
             const msg = JSON.parse(decodeWebSocketData(ev.data)) as {
               type?: string;
+              complete?: boolean;
               tasks?: { tid: number; project_path: string }[];
             };
             const task = msg.tasks?.find((entry) => entry.tid === tid);
@@ -508,6 +509,12 @@ test(
               clearTimeout(timeout);
               ws.close();
               resolve(task.project_path);
+              return;
+            }
+            if (msg.type === "tasks_list" && msg.complete === true) {
+              clearTimeout(timeout);
+              ws.close();
+              reject(new Error(`Persisted task ${tid} was absent from tasks_list`));
             }
           });
           ws.addEventListener("error", () => {

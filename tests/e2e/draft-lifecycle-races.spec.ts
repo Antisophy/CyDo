@@ -12,6 +12,7 @@ type SocketMessage = string | Buffer;
 
 type ControlFrame = {
   type?: string;
+  complete?: boolean;
   tid?: number;
   from_tid?: number;
   to_tid?: number;
@@ -125,6 +126,7 @@ async function installDraftRaceProxy(page: Page): Promise<DraftRaceProxy> {
   const rawMessages: RawMessage[] = [];
   const observations: ObservedControl[] = [];
   const bootstrapFrames = new Set<string>();
+  let tasksListComplete = false;
   const deferredServerFrames: SocketMessage[] = [];
 
   let createCorrelation: string | null = null;
@@ -177,6 +179,8 @@ async function installDraftRaceProxy(page: Page): Promise<DraftRaceProxy> {
     const consumeServerFrame = (message: SocketMessage) => {
       const frame = parseControlFrame(message);
       if (frame?.type) bootstrapFrames.add(frame.type);
+      if (frame?.type === "tasks_list" && frame.complete === true)
+        tasksListComplete = true;
       recordControl("server-received", frame);
 
       if (frame?.type === "task_created" && typeof frame.tid === "number") {
@@ -340,10 +344,9 @@ async function installDraftRaceProxy(page: Page): Promise<DraftRaceProxy> {
         "workspaces_list",
         "task_types_list",
         "agents_list",
-        "tasks_list",
         "server_status",
         "notices_list",
-      ].every((type) => bootstrapFrames.has(type)),
+      ].every((type) => bootstrapFrames.has(type)) && tasksListComplete,
     createdTid: (correlationId) =>
       taskCreated.find((task) => task.correlationId === correlationId)?.tid ??
       null,

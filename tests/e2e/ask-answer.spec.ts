@@ -989,6 +989,11 @@ test("Ask/Answer: same-workspace non-direct Ask succeeds", async ({
     )
     .not.toBe("pending");
 
+  await expect(nonDirectAnswer).toBeVisible({ timeout: 60_000 });
+  await expect(
+    page.locator(`.sidebar-item[data-tid="${askerTid}"].active`),
+  ).toBeVisible({ timeout: 90_000 });
+
   await openTask(page, leafTid);
   await expect(
     page
