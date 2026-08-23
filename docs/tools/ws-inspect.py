@@ -34,7 +34,7 @@ async def list_tasks():
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
             if msg.get("type") == "tasks_list":
                 tasks.extend(msg.get("tasks", []))
-                if not msg.get("complete"):
+                if msg.get("complete") is not True:
                     continue
                 if not tasks:
                     print("No tasks.")
@@ -57,7 +57,7 @@ async def fetch_history(tid: int):
         # Drain the complete initial snapshot.
         while True:
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-            if msg.get("type") == "tasks_list" and msg.get("complete"):
+            if msg.get("type") == "tasks_list" and msg.get("complete") is True:
                 break
 
         # Request history
@@ -114,7 +114,7 @@ async def watch(tid_filter: int | None = None):
             if msg.get("type") == "tasks_list":
                 task_count += len(msg.get("tasks", []))
                 if tid_filter is None:
-                    complete = " (complete)" if msg.get("complete") else ""
+                    complete = " (complete)" if msg.get("complete") is True else ""
                     print(f"[init] tasks_list: {len(msg.get('tasks', []))} entries, {task_count} total{complete}")
                 continue
             if msg.get("type") == "workspaces_list":

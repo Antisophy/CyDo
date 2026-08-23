@@ -65,9 +65,9 @@ export class Connection {
   }
 
   connect() {
-    const generation = ++this.socketGeneration;
     this.teardownRawFrameGate?.();
     this.teardownRawFrameGate = null;
+    const generation = ++this.socketGeneration;
 
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${proto}//${location.host}/ws`);
@@ -80,8 +80,10 @@ export class Connection {
     let queuedFrames: RawFrame[] = [];
     let firstAnimationFrame: number | null = null;
     let secondAnimationFrame: number | null = null;
+    let acceptingRawFrames = true;
     const isCurrent = () =>
       this.socketGeneration === generation && this.ws === ws;
+    const canDispatchRawFrames = () => acceptingRawFrames && isCurrent();
     const cancelGateFrames = () => {
       if (firstAnimationFrame !== null) {
         cancelAnimationFrame(firstAnimationFrame);
@@ -98,13 +100,13 @@ export class Connection {
       gatePaused = false;
     };
     const drainQueuedFrames = () => {
-      if (!gatePaused) return;
+      if (!canDispatchRawFrames() || !gatePaused) return;
       cancelGateFrames();
       gatePaused = false;
       const frames = queuedFrames;
       queuedFrames = [];
       for (const frame of frames) {
-        if (!isCurrent()) return;
+        if (!canDispatchRawFrames()) return;
         dispatchFrame(frame);
       }
     };
@@ -112,6 +114,7 @@ export class Connection {
       if (document.hidden && gatePaused) drainQueuedFrames();
     };
     const teardownRawFrameGate = () => {
+      acceptingRawFrames = false;
       clearPausedGate();
       document.removeEventListener("visibilitychange", onVisibilityChange);
       if (this.teardownRawFrameGate === teardownRawFrameGate)
@@ -123,10 +126,10 @@ export class Connection {
     const scheduleGateRelease = () => {
       firstAnimationFrame = requestAnimationFrame(() => {
         firstAnimationFrame = null;
-        if (!isCurrent() || !gatePaused) return;
+        if (!canDispatchRawFrames() || !gatePaused) return;
         secondAnimationFrame = requestAnimationFrame(() => {
           secondAnimationFrame = null;
-          if (!isCurrent() || !gatePaused) return;
+          if (!canDispatchRawFrames() || !gatePaused) return;
           drainQueuedFrames();
         });
       });
@@ -260,7 +263,7 @@ export class Connection {
     };
 
     ws.onmessage = (ev) => {
-      if (!isCurrent()) return;
+      if (!canDispatchRawFrames()) return;
       const data = ev.data as RawFrame;
       if (gatePaused) {
         queuedFrames.push(data);

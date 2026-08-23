@@ -30,6 +30,10 @@ class MockWebSocket {
   emitClose() {
     this.onclose?.call(this as unknown as WebSocket, {} as CloseEvent);
   }
+
+  emitError() {
+    this.onerror?.call(this as unknown as WebSocket, {} as Event);
+  }
 }
 
 class AnimationFrameController {
@@ -363,6 +367,97 @@ describe("Connection client behavior", () => {
 
       secondSocket.emitMessage(tasksList(true));
       expect(received).toEqual(["tasks_list:false", "tasks_list:true"]);
+    });
+
+    it("drops an in-flight raw frame after explicit disconnect", () => {
+      const conn = new Connection();
+      const taskMessages = vi.fn();
+      conn.onTaskMessage = taskMessages;
+
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+      conn.disconnect();
+      ws.emitMessage(taskEvent(7));
+
+      expect(taskMessages).not.toHaveBeenCalled();
+    });
+
+    it("stops a local queue drain when its first callback disconnects", () => {
+      const conn = new Connection();
+      const received: string[] = [];
+      conn.onControlMessage = (message) => {
+        received.push(message.type);
+        if (message.type === "task_updated") conn.disconnect();
+      };
+      conn.onTaskMessage = (tid) => received.push(`task:${tid}`);
+
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+      ws.emitMessage(tasksList(false));
+      ws.emitMessage(JSON.stringify({ type: "task_updated" }));
+      ws.emitMessage(taskEvent(8));
+
+      animationFrames.runNext();
+      animationFrames.runNext();
+
+      expect(received).toEqual(["tasks_list", "task_updated"]);
+    });
+
+    it("discards queued and later raw frames after an error teardown", () => {
+      const conn = new Connection();
+      const received: string[] = [];
+      conn.onControlMessage = (message) => {
+        received.push(
+          message.type === "tasks_list"
+            ? `tasks_list:${message.complete}`
+            : message.type,
+        );
+      };
+      conn.onTaskMessage = (tid) => received.push(`task:${tid}`);
+
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+      ws.emitMessage(tasksList(false));
+      const staleRelease = animationFrames.pendingIds()[0]!;
+      ws.emitMessage(taskEvent(9));
+      ws.emitError();
+      animationFrames.run(staleRelease, true);
+      ws.emitMessage(taskEvent(10));
+
+      expect(ws.close).toHaveBeenCalledOnce();
+      expect(received).toEqual(["tasks_list:false"]);
+    });
+
+    it("defers queued binary decoding and parsing until the second animation frame", () => {
+      const conn = new Connection();
+      const received: string[] = [];
+      const decode = vi.spyOn(TextDecoder.prototype, "decode");
+      const parse = vi.spyOn(JSON, "parse");
+      conn.onControlMessage = (message) => received.push(message.type);
+      conn.onTaskMessage = (tid) => received.push(`task:${tid}`);
+
+      conn.connect();
+      const ws = MockWebSocket.instances[0]!;
+      ws.emitMessage(tasksList(true));
+      decode.mockClear();
+      parse.mockClear();
+
+      const binaryTask = new TextEncoder().encode(taskEvent(11)).buffer;
+      ws.emitMessage(binaryTask);
+
+      expect(decode).not.toHaveBeenCalled();
+      expect(parse).not.toHaveBeenCalled();
+
+      animationFrames.runNext();
+
+      expect(decode).not.toHaveBeenCalled();
+      expect(parse).not.toHaveBeenCalled();
+
+      animationFrames.runNext();
+
+      expect(decode).toHaveBeenCalledOnce();
+      expect(parse).toHaveBeenCalledOnce();
+      expect(received).toEqual(["tasks_list", "task:11"]);
     });
   });
 

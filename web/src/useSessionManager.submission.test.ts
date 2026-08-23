@@ -650,6 +650,116 @@ describe("submission acknowledgement routing", () => {
     expect(manager!.getByTid(6)).toBeUndefined();
   });
 
+  it.each([
+    [
+      "a missing alive flag",
+      (entry: TaskSnapshotEntry): Record<string, unknown> => {
+        const { alive: _alive, ...withoutAlive } = entry;
+        return withoutAlive;
+      },
+    ],
+    [
+      "a non-boolean resumable flag",
+      (entry: TaskSnapshotEntry): Record<string, unknown> => ({
+        ...entry,
+        resumable: "false",
+      }),
+    ],
+    [
+      "a non-boolean isProcessing flag",
+      (entry: TaskSnapshotEntry): Record<string, unknown> => ({
+        ...entry,
+        isProcessing: 1,
+      }),
+    ],
+  ])(
+    "rejects a task-list packet with %s without accepting any of its IDs",
+    async (_description, invalidate) => {
+      await bootstrapProject();
+      const connection = testState.connection!;
+      const first = activeSnapshot(21);
+      const second = activeSnapshot(22);
+      const malformed = {
+        type: "tasks_list",
+        complete: false,
+        tasks: [first, invalidate(second)],
+      } as unknown as ControlMessage;
+
+      expect(() => connection.onControlMessage?.(malformed)).toThrow(
+        "Invalid tasks list entry",
+      );
+      expect((await renderManager()).getByTid(first.tid)).toBeUndefined();
+      expect(manager!.getByTid(second.tid)).toBeUndefined();
+
+      await act(() => {
+        connection.onControlMessage?.(tasksList([first, second]));
+      });
+
+      const accepted = await renderManager();
+      expect(accepted.getByTid(first.tid)).toBeDefined();
+      expect(accepted.getByTid(second.tid)).toBeDefined();
+    },
+  );
+
+  it.each([
+    ["a fractional tid", { tid: 23.5 }],
+    ["a fractional child count", { child_count: 0.5 }],
+  ])("rejects a task-list entry with %s", async (_description, overrides) => {
+    await bootstrapProject();
+    const connection = testState.connection!;
+    const invalid = {
+      type: "tasks_list",
+      complete: false,
+      tasks: [{ ...activeSnapshot(23), ...overrides }],
+    } as unknown as ControlMessage;
+
+    expect(() => connection.onControlMessage?.(invalid)).toThrow(
+      "Invalid tasks list entry",
+    );
+    expect((await renderManager()).tasks).toEqual(new Map());
+  });
+
+  it("drops a task-list packet after its open epoch closes", async () => {
+    await bootstrapProject();
+    const connection = testState.connection!;
+
+    await act(() => {
+      connection.onStatusChange?.(false);
+    });
+
+    connection.onControlMessage?.(tasksList([activeSnapshot(24)]));
+    await act(() => {});
+
+    const closed = await renderManager();
+    expect(closed.getByTid(24)).toBeUndefined();
+    expect(closed.tasksLoaded).toBe(false);
+  });
+
+  it("reuses a task ID after reconnect discards its partial epoch", async () => {
+    await bootstrapProject();
+    const connection = testState.connection!;
+    const task = activeSnapshot(25);
+
+    await act(() => {
+      connection.onControlMessage?.(tasksList([task], false));
+    });
+    expect((await renderManager()).getByTid(task.tid)).toBeDefined();
+
+    await act(() => {
+      connection.onStatusChange?.(false);
+    });
+    expect((await renderManager()).getByTid(task.tid)).toBeUndefined();
+
+    await act(() => {
+      connection.onStatusChange?.(true);
+      connection.onControlMessage?.(tasksList([task]));
+    });
+
+    const reconnected = await renderManager();
+    expect(reconnected.getByTid(task.tid)).toBeDefined();
+    expect(reconnected.tasksLoaded).toBe(true);
+  });
+
   it("defers outbox reconciliation until a terminal packet proves the task set", async () => {
     await renderManager();
     const connection = testState.connection!;

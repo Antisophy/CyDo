@@ -1486,7 +1486,10 @@ export function useTaskManager(
               tid <= 0 ||
               typeof childCount !== "number" ||
               !Number.isSafeInteger(childCount) ||
-              childCount < 0
+              childCount < 0 ||
+              typeof entry.alive !== "boolean" ||
+              typeof entry.resumable !== "boolean" ||
+              typeof entry.isProcessing !== "boolean"
             )
               throw new Error("Invalid tasks list entry");
             if (

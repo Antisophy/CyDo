@@ -4054,6 +4054,7 @@ version (unittest) private final class GatedSubmissionRunner : TaskSessionRunner
 	private AgentSession session_;
 	private bool deferSessionUntilAlive_;
 	private bool[int] launched_;
+	size_t[int] sessionForTaskLookups;
 	void delegate(int) onLaunch;
 	/// When set, replaces the default `noSession()` resolution — used by
 	/// tests that need `resolveTaskHistory` to resolve some other kind.
@@ -4068,6 +4069,7 @@ version (unittest) private final class GatedSubmissionRunner : TaskSessionRunner
 
 	override AgentSession sessionForTask(int tid)
 	{
+		sessionForTaskLookups[tid]++;
 		if (deferSessionUntilAlive_ && tid !in launched_)
 			return null;
 		return session_;
@@ -4161,7 +4163,8 @@ unittest
 	app.agentsByName["claude"] = new TestClaudePromptAgent;
 	app.taskTypeCatalog = new TaskTypeCatalog("", "", (string) => true);
 	app.discoveryService = new DiscoveryService(DiscoveryServiceHost.init);
-	app.taskSessionRunner = new GatedSubmissionRunner(new GatedSubmissionSession);
+	auto runner = new GatedSubmissionRunner(new GatedSubmissionSession);
+	app.taskSessionRunner = runner;
 
 	void addTask(int tid, int parentTid, string workspace, string projectPath,
 		bool archived = false)
@@ -4182,6 +4185,9 @@ unittest
 	auto ws = new SubmissionCaptureWebSocket;
 	scope(exit) app.clientHub.remove(ws);
 	app.onWebSocketAccepted(ws);
+	foreach (tid; [1, 2, 3, 4, 5, 6, 7])
+		assert(runner.sessionForTaskLookups[tid] == 2,
+			"Each snapshot task samples taskAlive and taskCanStop once");
 	app.broadcastTaskUpdate(1);
 
 	assert(ws.sent.length == 10);
@@ -4189,7 +4195,7 @@ unittest
 	assert(ws.sent[1].canFind(`"type":"task_types_list"`));
 	assert(ws.sent[2].canFind(`"type":"agents_list"`));
 
-	bool[int] snapshotTids;
+	int[] snapshotTids;
 	foreach (index; 3 .. 7)
 	{
 		auto packet = jsonParse!TasksListMessage(ws.sent[index]);
@@ -4197,11 +4203,21 @@ unittest
 		assert(packet.complete == (index == 6));
 		foreach (entry; packet.tasks)
 		{
-			assert((entry.tid in snapshotTids) is null);
-			snapshotTids[entry.tid] = true;
+			assert(!snapshotTids.canFind(entry.tid));
+			snapshotTids ~= entry.tid;
 		}
 	}
-	assert(snapshotTids.length == 7);
+	assert(snapshotTids == [1, 6, 4, 5, 7, 2, 3]);
+	auto earlyPacket = jsonParse!TasksListMessage(ws.sent[3]);
+	assert(earlyPacket.tasks.length == 2);
+	assert(earlyPacket.tasks[0].tid == 1);
+	assert(earlyPacket.tasks[0].childCount == 1,
+		"Raw-archived same-scope children count in the frozen early packet");
+	auto finalPacket = jsonParse!TasksListMessage(ws.sent[6]);
+	assert(finalPacket.tasks.length == 2);
+	assert(finalPacket.tasks[0].tid == 2 && finalPacket.tasks[0].archived);
+	assert(finalPacket.tasks[1].tid == 3 && !finalPacket.tasks[1].archived,
+		"Archived ancestry delivers descendants last without changing raw archive state");
 	assert(ws.sent[7].canFind(`"type":"server_status"`));
 	assert(ws.sent[8].canFind(`"type":"notices_list"`));
 	assert(ws.sent[9].canFind(`"type":"task_updated"`));
