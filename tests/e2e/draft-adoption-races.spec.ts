@@ -1,28 +1,69 @@
 import { Buffer } from "node:buffer";
-import { test, expect, enterSession } from "./fixtures";
+import {
+  test,
+  expect,
+  enterSession,
+  sendMessage,
+  assistantText,
+  responseTimeout,
+} from "./fixtures";
 import type { Page } from "./fixtures";
 
 type SocketMessage = string | Buffer;
 
+type TaskListEntry = {
+  tid: number;
+  parent_tid: number;
+  child_count: number;
+  archived: boolean;
+};
+
+type TaskListFrame = {
+  type: "tasks_list";
+  complete: boolean;
+  tasks: readonly TaskListEntry[];
+};
+
 type ControlFrame = {
   type?: string;
+  complete?: boolean;
   tid?: number;
+  parent_tid?: number;
+  relation_type?: string;
   correlation_id?: string;
   content?: unknown;
   entry_point?: string;
   agent_name?: string;
-  tasks?: readonly { tid?: number }[];
+  tasks?: readonly TaskListEntry[];
+};
+
+type TaskCreated = {
+  tid: number;
+  parentTid?: number;
+  relationType?: string;
 };
 
 interface PassiveRecorder {
   controls(type: string, tid?: number): readonly ControlFrame[];
+  createdTasks(): readonly TaskCreated[];
 }
+
+type SnapshotReleaseState = "waiting" | "holding" | "released";
 
 interface InitialSnapshotHold {
   createRequests: number[];
   deleteRequests: number[];
   targetSnapshotHeld(): boolean;
   targetSnapshotDelivered(): boolean;
+  earlyTaskEntry(tid: number): TaskListEntry | null;
+  heldTargetTaskEntry(): TaskListEntry | null;
+  heldTargetPacketComplete(): boolean | null;
+  terminalPacketDelivered(): boolean;
+  targetFrameOrder(): number | null;
+  heldFrameOrder(): readonly number[];
+  releasedFrameOrder(): readonly number[];
+  releaseState(): SnapshotReleaseState;
+  connectionCount(): number;
   release(): void;
 }
 
@@ -36,21 +77,43 @@ function parseControlFrame(message: SocketMessage): ControlFrame | null {
   }
 }
 
-function hasTask(frame: ControlFrame | null, tid: number): boolean {
-  return (
-    frame?.type === "tasks_list" &&
-    frame.tasks?.some((task) => task.tid === tid) === true
-  );
+function tasksListFrame(frame: ControlFrame | null): TaskListFrame | null {
+  if (
+    frame?.type !== "tasks_list" ||
+    typeof frame.complete !== "boolean" ||
+    !Array.isArray(frame.tasks)
+  )
+    return null;
+  return {
+    type: "tasks_list",
+    complete: frame.complete,
+    tasks: frame.tasks,
+  };
+}
+
+function taskEntry(frame: ControlFrame | null, tid: number): TaskListEntry | null {
+  return tasksListFrame(frame)?.tasks.find((task) => task.tid === tid) ?? null;
 }
 
 function installPassiveRecorder(page: Page): PassiveRecorder {
   const outbound: ControlFrame[] = [];
+  const createdTasks: TaskCreated[] = [];
 
   page.on("websocket", (socket) => {
     if (!socket.url().endsWith("/ws")) return;
     socket.on("framesent", (event) => {
       const frame = parseControlFrame(event.payload.toString());
       if (frame?.type) outbound.push(frame);
+    });
+    socket.on("framereceived", (event) => {
+      const frame = parseControlFrame(event.payload.toString());
+      if (frame?.type !== "task_created" || typeof frame.tid !== "number")
+        return;
+      createdTasks.push({
+        tid: frame.tid,
+        parentTid: frame.parent_tid,
+        relationType: frame.relation_type,
+      });
     });
   });
 
@@ -60,6 +123,7 @@ function installPassiveRecorder(page: Page): PassiveRecorder {
         (frame) =>
           frame.type === type && (tid === undefined || frame.tid === tid),
       ),
+    createdTasks: () => createdTasks,
   };
 }
 
@@ -84,6 +148,14 @@ async function waitForNewTid(page: Page, before: Set<string>): Promise<number> {
     expect(tid).toBeTruthy();
   }).toPass({ timeout: 10_000 });
   return Number(tid);
+}
+
+async function taskURLFromSidebar(page: Page, tid: number): Promise<string> {
+  const taskLink = page.locator(`.sidebar-item[data-tid="${tid}"]`);
+  await expect(taskLink).toHaveCount(1);
+  const href = await taskLink.getAttribute("href");
+  if (!href) throw new Error(`Task ${tid} sidebar row did not have a URL`);
+  return new URL(href, page.url()).toString();
 }
 
 async function waitForPersistedForm(
@@ -115,39 +187,70 @@ async function installInitialSnapshotHold(
 ): Promise<InitialSnapshotHold> {
   const createRequests: number[] = [];
   const deleteRequests: number[] = [];
-  const heldServerFrames: SocketMessage[] = [];
-  const deferredServerFrames: SocketMessage[] = [];
-  let holding = false;
+  const earlyTaskEntries = new Map<number, TaskListEntry>();
+  const heldServerFrames: {
+    message: SocketMessage;
+    frame: ControlFrame | null;
+    order: number;
+  }[] = [];
+  const deferredServerFrames: typeof heldServerFrames = [];
+  const heldFrameOrder: number[] = [];
+  const releasedFrameOrder: number[] = [];
+  let state: SnapshotReleaseState = "waiting";
   let deliveredTargetSnapshot = false;
+  let deliveredTerminalPacket = false;
+  let heldTargetEntry: TaskListEntry | null = null;
+  let heldTargetPacketComplete: boolean | null = null;
+  let heldTargetFrameOrder: number | null = null;
   let replaying = false;
+  let nextServerFrameOrder = 0;
+  let socketConnections = 0;
   let release = () => {
     throw new Error("WebSocket route was not installed");
   };
 
   await page.routeWebSocket(/\/ws$/, (browserSocket) => {
+    socketConnections++;
     const serverSocket = browserSocket.connectToServer();
 
-    const deliverServerFrame = (message: SocketMessage) => {
-      if (hasTask(parseControlFrame(message), targetTid))
+    const deliverServerFrame = (serverFrame: (typeof heldServerFrames)[number]) => {
+      const list = tasksListFrame(serverFrame.frame);
+      if (list?.complete) deliveredTerminalPacket = true;
+      if (taskEntry(serverFrame.frame, targetTid))
         deliveredTargetSnapshot = true;
-      browserSocket.send(message);
+      if (state === "waiting" && list) {
+        for (const entry of list.tasks) earlyTaskEntries.set(entry.tid, entry);
+      }
+      if (replaying) releasedFrameOrder.push(serverFrame.order);
+      browserSocket.send(serverFrame.message);
     };
 
     const relayServerFrame = (message: SocketMessage) => {
+      const serverFrame = {
+        message,
+        frame: parseControlFrame(message),
+        order: ++nextServerFrameOrder,
+      };
       if (replaying) {
-        deferredServerFrames.push(message);
+        deferredServerFrames.push(serverFrame);
         return;
       }
-      if (holding) {
-        heldServerFrames.push(message);
+      if (state === "holding") {
+        heldServerFrames.push(serverFrame);
+        heldFrameOrder.push(serverFrame.order);
         return;
       }
-      if (hasTask(parseControlFrame(message), targetTid)) {
-        holding = true;
-        heldServerFrames.push(message);
+      const targetEntry = taskEntry(serverFrame.frame, targetTid);
+      if (targetEntry) {
+        state = "holding";
+        heldTargetEntry = targetEntry;
+        heldTargetPacketComplete = tasksListFrame(serverFrame.frame)!.complete;
+        heldTargetFrameOrder = serverFrame.order;
+        heldServerFrames.push(serverFrame);
+        heldFrameOrder.push(serverFrame.order);
         return;
       }
-      deliverServerFrame(message);
+      deliverServerFrame(serverFrame);
     };
 
     browserSocket.onMessage((message) => {
@@ -159,12 +262,12 @@ async function installInitialSnapshotHold(
     serverSocket.onMessage(relayServerFrame);
 
     release = () => {
-      if (!holding) throw new Error("Target tasks_list was not held");
-      holding = false;
+      if (state !== "holding") throw new Error("Target tasks_list was not held");
+      state = "released";
       replaying = true;
       try {
-        for (const message of heldServerFrames.splice(0))
-          deliverServerFrame(message);
+        while (heldServerFrames.length > 0)
+          deliverServerFrame(heldServerFrames.shift()!);
         while (deferredServerFrames.length > 0)
           deliverServerFrame(deferredServerFrames.shift()!);
       } finally {
@@ -176,8 +279,17 @@ async function installInitialSnapshotHold(
   return {
     createRequests,
     deleteRequests,
-    targetSnapshotHeld: () => holding,
+    targetSnapshotHeld: () => state === "holding",
     targetSnapshotDelivered: () => deliveredTargetSnapshot,
+    earlyTaskEntry: (tid) => earlyTaskEntries.get(tid) ?? null,
+    heldTargetTaskEntry: () => heldTargetEntry,
+    heldTargetPacketComplete: () => heldTargetPacketComplete,
+    terminalPacketDelivered: () => deliveredTerminalPacket,
+    targetFrameOrder: () => heldTargetFrameOrder,
+    heldFrameOrder: () => [...heldFrameOrder],
+    releasedFrameOrder: () => [...releasedFrameOrder],
+    releaseState: () => state,
+    connectionCount: () => socketConnections,
     release: () => release(),
   };
 }
@@ -218,12 +330,7 @@ test("direct persisted draft route adopts after its initial task snapshot", asyn
     "blank",
     persistedAgent,
   );
-  const targetLink = seedPage.locator(`.sidebar-item[data-tid="${tid}"]`);
-  await expect(targetLink).toHaveCount(1);
-  const targetHref = await targetLink.getAttribute("href");
-  if (!targetHref)
-    throw new Error("Persisted sidebar draft did not have a URL");
-  const targetURL = new URL(targetHref, seedPage.url()).toString();
+  const targetURL = await taskURLFromSidebar(seedPage, tid);
   const projectPath = new URL(targetURL).pathname.replace(/\/task\/\d+$/, "");
 
   await seedContext.close();
@@ -284,4 +391,292 @@ test("direct persisted draft route adopts after its initial task snapshot", asyn
   );
   expect(proxy.createRequests).toEqual([]);
   expect(proxy.deleteRequests).toEqual([tid]);
+});
+
+test("held incremental bootstrap keeps an archived child route truthful", async ({
+  page,
+  browser,
+  baseURL,
+  agentType,
+}) => {
+  test.setTimeout(120_000);
+  const seedContext = await browser.newContext({ baseURL });
+  const seedPage = await seedContext.newPage();
+  const seedRecorder = installPassiveRecorder(seedPage);
+  const marker = Date.now();
+  const parentMarker = `held-bootstrap-parent-${marker}`;
+  const childMarker = `held-bootstrap-child-history-${marker}`;
+
+  await seedPage.goto(baseURL!);
+  await enterSession(seedPage);
+  await sendMessage(seedPage, `reply with "${parentMarker}"`);
+  await expect(assistantText(seedPage, parentMarker).last()).toBeVisible({
+    timeout: responseTimeout(agentType),
+  });
+
+  const activeParent = seedPage.locator(
+    ".sidebar-item.active[data-tid]",
+  ).first();
+  await expect(activeParent).toBeVisible();
+  const parentTidText = await activeParent.getAttribute("data-tid");
+  if (!parentTidText) throw new Error("Top-level task did not have a numeric tid");
+  const parentTid = Number(parentTidText);
+
+  await sendMessage(
+    seedPage,
+    `call task research reply with "${childMarker}"`,
+  );
+  const seedMessages = seedPage.locator(
+    '[style*="display: contents"] .message-list',
+  );
+  await expect(
+    seedMessages.getByText(childMarker, { exact: true }).last(),
+  ).toBeVisible({ timeout: 90_000 });
+  await expect(
+    seedMessages.getByText("Done.", { exact: true }).last(),
+  ).toBeVisible({ timeout: 30_000 });
+
+  const directChild = () =>
+    seedRecorder
+      .createdTasks()
+      .find(
+        (task) =>
+          task.parentTid === parentTid && task.relationType === "subtask",
+      );
+  await expect
+    .poll(() => directChild()?.tid ?? null, { timeout: 30_000 })
+    .not.toBeNull();
+  const childTid = directChild()?.tid;
+  if (childTid === undefined)
+    throw new Error("Task workflow did not create the direct child");
+
+  await expect(
+    seedPage.locator(`.sidebar-item[data-tid="${parentTid}"].active`),
+  ).toBeVisible({ timeout: 90_000 });
+  await seedPage.locator(".btn-banner-stop:visible").click();
+  await expect(seedPage.locator(".btn-banner-archive:visible")).toHaveText(
+    "Archive",
+    { timeout: 15_000 },
+  );
+
+  const childLink = seedPage.locator(`.sidebar-item[data-tid="${childTid}"]`);
+  await expect(childLink).toBeVisible({ timeout: 30_000 });
+  await childLink.click();
+  await expect(
+    seedPage.locator(`.sidebar-item[data-tid="${childTid}"].active`),
+  ).toBeVisible();
+  const archiveButton = seedPage.locator(".btn-banner-archive:visible");
+  await expect(archiveButton).toHaveText("Archive", { timeout: 30_000 });
+  await archiveButton.click();
+  await expect(archiveButton).toHaveText("Unarchive");
+
+  const parentURL = await taskURLFromSidebar(seedPage, parentTid);
+  const childURL = await taskURLFromSidebar(seedPage, childTid);
+  await seedPage.locator(`.sidebar-item[data-tid="${parentTid}"]`).click();
+  await expect(
+    seedPage.locator(`.sidebar-item[data-tid="${parentTid}"].active`),
+  ).toBeVisible();
+  await expect(seedPage.locator(".btn-banner-archive:visible")).toHaveText(
+    "Archive",
+  );
+  await seedContext.close();
+
+  await page.addInitScript((notFoundText) => {
+    type HeldBootstrapObserverState = {
+      sawNotFound: boolean;
+      sawConnectedWithPlaceholder: boolean;
+      loadingItems: number;
+      connectedStatuses: number;
+      observer: MutationObserver | null;
+    };
+    const beginObservation = () => {
+      const observerWindow = window as Window & {
+        __cydoHeldBootstrapObserver?: HeldBootstrapObserverState;
+      };
+      observerWindow.__cydoHeldBootstrapObserver?.observer?.disconnect();
+      const count = (node: Element, selector: string) =>
+        Number(node.matches(selector)) + node.querySelectorAll(selector).length;
+      const state: HeldBootstrapObserverState = {
+        sawNotFound: false,
+        sawConnectedWithPlaceholder: false,
+        loadingItems: document.querySelectorAll(".sidebar-loading-item").length,
+        connectedStatuses: document.querySelectorAll(".banner-status.connected")
+          .length,
+        observer: null,
+      };
+      const inspect = () => {
+        if (document.body.textContent?.includes(notFoundText))
+          state.sawNotFound = true;
+        if (state.loadingItems > 0 && state.connectedStatuses > 0)
+          state.sawConnectedWithPlaceholder = true;
+      };
+      const inspectNode = (node: Node, direction: 1 | -1) => {
+        if (node.textContent?.includes(notFoundText)) state.sawNotFound = true;
+        if (!(node instanceof Element)) return;
+        state.loadingItems += direction * count(node, ".sidebar-loading-item");
+        state.connectedStatuses +=
+          direction * count(node, ".banner-status.connected");
+      };
+      const observer = new MutationObserver((records) => {
+        for (const record of records) {
+          if (record.type === "childList") {
+            for (const node of record.removedNodes) inspectNode(node, -1);
+            for (const node of record.addedNodes) inspectNode(node, 1);
+          } else if (
+            record.type === "attributes" &&
+            record.target instanceof Element
+          ) {
+            const oldClasses = record.oldValue?.split(/\s+/) ?? [];
+            const wasConnected =
+              oldClasses.includes("banner-status") &&
+              oldClasses.includes("connected");
+            const isConnected = record.target.matches(
+              ".banner-status.connected",
+            );
+            state.connectedStatuses += Number(isConnected) - Number(wasConnected);
+          } else if (record.target.textContent?.includes(notFoundText)) {
+            state.sawNotFound = true;
+          }
+          inspect();
+        }
+      });
+      state.observer = observer;
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ["class"],
+        attributeOldValue: true,
+      });
+      observerWindow.__cydoHeldBootstrapObserver = state;
+      inspect();
+    };
+    if (document.readyState === "loading")
+      document.addEventListener("DOMContentLoaded", beginObservation, {
+        once: true,
+      });
+    else beginObservation();
+  }, `Task ${childTid} not found`);
+
+  const proxy = await installInitialSnapshotHold(page, childTid);
+  await page.goto(childURL);
+  await expect.poll(() => proxy.targetSnapshotHeld()).toBe(true);
+  await expect
+    .poll(() => proxy.heldFrameOrder().length > 1)
+    .toBe(true);
+
+  expect(proxy.releaseState()).toBe("holding");
+  expect(proxy.earlyTaskEntry(parentTid)).toMatchObject({
+    tid: parentTid,
+    child_count: 1,
+    archived: false,
+  });
+  expect(proxy.heldTargetTaskEntry()).toMatchObject({
+    tid: childTid,
+    parent_tid: parentTid,
+    archived: true,
+  });
+  expect(proxy.heldTargetPacketComplete()).toBe(true);
+  expect(proxy.terminalPacketDelivered()).toBe(false);
+
+  const parentRow = page.locator(`.sidebar-item[data-tid="${parentTid}"]`);
+  const parentPlaceholder = page.locator(
+    `.sidebar-loading-item:has(+ .sidebar-item[data-tid="${parentTid}"])`,
+  );
+  await expect(parentRow).toBeVisible();
+  await expect(page).toHaveURL(childURL);
+  await expect(parentPlaceholder).toHaveCount(1);
+  await expect(parentPlaceholder).toHaveText("(loading…)");
+  await expect(parentPlaceholder.locator("a")).toHaveCount(0);
+  await expect(parentPlaceholder).not.toHaveClass(/sidebar-item/);
+  expect(await parentPlaceholder.getAttribute("data-tid")).toBeNull();
+
+  const taskLoading = page.locator(".session-empty:visible", {
+    hasText: "Loading task…",
+  });
+  await expect(taskLoading).toHaveCount(1);
+  await expect(
+    page.getByText(`Task ${childTid} not found`, { exact: true }),
+  ).toHaveCount(0);
+  expect(proxy.createRequests).toEqual([]);
+  expect(proxy.deleteRequests).toEqual([]);
+
+  const initialSocketCount = proxy.connectionCount();
+  await parentRow.click();
+  await expect(page).toHaveURL(parentURL);
+  expect(proxy.connectionCount()).toBe(initialSocketCount);
+  const loadingBanner = page.locator(".banner-status.loading:visible");
+  await expect(loadingBanner).toHaveCount(1);
+  await expect(loadingBanner).toHaveText("Loading…");
+  await expect(
+    page.locator(".sidebar").getByText("Loading…", { exact: true }),
+  ).toHaveCount(0);
+  await expect(parentPlaceholder).toHaveCount(1);
+
+  await page.goBack();
+  await expect(page).toHaveURL(childURL);
+  expect(proxy.connectionCount()).toBe(initialSocketCount);
+  await expect(taskLoading).toHaveCount(1);
+  await expect(
+    page.getByText(`Task ${childTid} not found`, { exact: true }),
+  ).toHaveCount(0);
+
+  const heldOrder = proxy.heldFrameOrder();
+  expect(proxy.targetFrameOrder()).toBe(heldOrder[0]);
+  proxy.release();
+  await expect.poll(() => proxy.targetSnapshotDelivered()).toBe(true);
+  await expect.poll(() => proxy.terminalPacketDelivered()).toBe(true);
+  expect(proxy.releaseState()).toBe("released");
+  const replayOrder = proxy.releasedFrameOrder();
+  expect(replayOrder.slice(0, heldOrder.length)).toEqual(heldOrder);
+  expect(replayOrder).toEqual([...replayOrder].sort((a, b) => a - b));
+  expect(new Set(replayOrder).size).toBe(replayOrder.length);
+  await expect(page).toHaveURL(childURL);
+
+  const parentArchiveGroup = page.locator(
+    `.sidebar-item.sidebar-archive-node[data-tid="archive:${parentTid}"]`,
+  );
+  const childRow = page.locator(`.sidebar-item[data-tid="${childTid}"]`);
+  await expect(parentArchiveGroup).toBeVisible();
+  await expect(childRow).toBeVisible();
+  await expect(
+    childRow.locator(
+      `xpath=following-sibling::a[@data-tid="archive:${parentTid}"][1]`,
+    ),
+  ).toHaveCount(1);
+  await expect(assistantText(page, childMarker).last()).toBeVisible({
+    timeout: responseTimeout(agentType),
+  });
+  await expect(parentPlaceholder).toHaveCount(0);
+  await expect(page.locator(".sidebar-loading-item")).toHaveCount(0);
+  const connectedBanner = page.locator(".banner-status.connected:visible");
+  await expect(connectedBanner).toHaveCount(1);
+  await expect(connectedBanner).toHaveText("Connected");
+  await expect(taskLoading).toHaveCount(0);
+  await expect(
+    page.getByText(`Task ${childTid} not found`, { exact: true }),
+  ).toHaveCount(0);
+
+  const prohibitedTransient = await page.evaluate(() => {
+    const observerWindow = window as Window & {
+      __cydoHeldBootstrapObserver?: {
+        sawNotFound: boolean;
+        sawConnectedWithPlaceholder: boolean;
+      };
+    };
+    return observerWindow.__cydoHeldBootstrapObserver;
+  });
+  expect(prohibitedTransient?.sawNotFound).toBe(false);
+  expect(prohibitedTransient?.sawConnectedWithPlaceholder).toBe(false);
+  expect(proxy.createRequests).toEqual([]);
+  expect(proxy.deleteRequests).toEqual([]);
+  expect(() => proxy.release()).toThrow("Target tasks_list was not held");
+
+  await page.evaluate(() => {
+    const observerWindow = window as Window & {
+      __cydoHeldBootstrapObserver?: { observer: MutationObserver | null };
+    };
+    observerWindow.__cydoHeldBootstrapObserver?.observer?.disconnect();
+  });
 });
