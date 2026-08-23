@@ -14,7 +14,7 @@ import type { TaskState } from "./types";
 // SharedWorker — detects needsAttention transitions for browser Notifications
 // ---------------------------------------------------------------------------
 
-function makeWorkerCode(wsUrl: string) {
+export function makeWorkerCode(wsUrl: string) {
   return `
 var WS_URL = "${wsUrl}";
 var state = new Map();
@@ -58,13 +58,13 @@ function connect() {
     try {
       var text = typeof ev.data === "string" ? ev.data : new TextDecoder().decode(ev.data);
       var raw = JSON.parse(text);
-      if (raw.type === "tasks_list") handleTasksList(raw.tasks || []);
-      else if (raw.type === "task_updated" && raw.task) handleTasksList([raw.task]);
+      if (raw.type === "tasks_list") handleTasksList(raw.tasks || [], raw.complete === true);
+      else if (raw.type === "task_updated" && raw.task) handleTasksList([raw.task], false);
     } catch(e) {}
   };
 }
 
-function handleTasksList(entries) {
+function handleTasksList(entries, complete) {
   for (var i = 0; i < entries.length; i++) {
     var e = entries[i];
     var prev = state.get(e.tid);
@@ -88,7 +88,7 @@ function handleTasksList(entries) {
       }
     }
   }
-  initialized = true;
+  if (complete) initialized = true;
 }
 
 connect();
