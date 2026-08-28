@@ -76,6 +76,8 @@ function AppContent() {
     serverError,
     dismissServerError,
     devMode,
+    historyWindowStep,
+    loadMoreHistory,
     navigateHome,
     navigateToProject,
     getProjectHref,
@@ -541,6 +543,8 @@ function AppContent() {
                     onEditRawEvent={editRawEvent}
                     defaultAgent={effectiveDefaultAgent}
                     agentUsage={agentUsage}
+                    historyWindowStep={historyWindowStep}
+                    onLoadMoreHistory={loadMoreHistory}
                     getTaskHref={getTaskHref}
                   />
                 </div>
