@@ -957,6 +957,29 @@ body,
   color: var(--text);
 }
 
+/* while the older slice is on its way the buttons swap for the same band
+   that plays while awaiting a response, in grey */
+.load-more-loading {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  flex: 1;
+  /* the height of the buttons it replaces, so nothing shifts */
+  height: 31px;
+}
+
+.load-more-loading .status-band[data-status="requesting"] {
+  --status-color: var(--text-dim);
+}
+
+/* the band mounts fresh at each click, and the stock 22s ease-in-out starts
+   at its slowest phase: a short fetch ends before any visible motion. start
+   mid-cycle at a faster tempo so the very first frame is already moving */
+.load-more-loading .sb-layer-requesting {
+  animation-duration: 8s;
+  animation-delay: -2s;
+}
+
 /* Messages */
 .message {
   margin-bottom: 16px;

@@ -874,6 +874,9 @@ export function MessageList({
   // above everything and drags the viewport up to the new top.
   const heldScrollRef = useRef<number | null>(null);
   const previousWindowStartRef = useRef(historyWindowStart);
+  // a click swaps the buttons for the loading line; the slice landing (the
+  // window start moving) brings the row back, or removes it entirely
+  const [loadingMore, setLoadingMore] = useState(false);
 
   useLayoutEffect(() => {
     const el = containerRef.current;
@@ -901,6 +904,7 @@ export function MessageList({
       el.style.overflowAnchor = "none";
     }
     onLoadMoreHistory?.(step);
+    setLoadingMore(true);
   };
 
   // Subscribe to outbox so the component re-renders when entries are added/removed.
@@ -960,6 +964,10 @@ export function MessageList({
         : undefined,
     [onEditRawEvent, taskTid],
   );
+
+  useEffect(() => {
+    setLoadingMore(false);
+  }, [historyWindowStart, taskTid]);
 
   // On session switch, scroll to bottom (scrollTop 0 = bottom in column-reverse).
   const prevTaskTid = useRef(taskTid);
@@ -1090,30 +1098,41 @@ export function MessageList({
             historyWindowStep > 0 &&
             onLoadMoreHistory && (
               <div class="load-more-row">
-                <button
-                  class="btn"
-                  onClick={() => {
-                    loadMore(historyWindowStep);
-                  }}
-                >
-                  Load {historyWindowStep} more
-                </button>
-                <button
-                  class="btn"
-                  onClick={() => {
-                    loadMore(historyWindowStep * 5);
-                  }}
-                >
-                  Load {historyWindowStep * 5} more
-                </button>
-                <button
-                  class="btn"
-                  onClick={() => {
-                    loadMore(0);
-                  }}
-                >
-                  Load all
-                </button>
+                {loadingMore ? (
+                  <div
+                    class="load-more-loading"
+                    aria-label="Loading older messages"
+                  >
+                    <StatusBand status="requesting" />
+                  </div>
+                ) : (
+                  <>
+                    <button
+                      class="btn"
+                      onClick={() => {
+                        loadMore(historyWindowStep);
+                      }}
+                    >
+                      Load {historyWindowStep} more
+                    </button>
+                    <button
+                      class="btn"
+                      onClick={() => {
+                        loadMore(historyWindowStep * 5);
+                      }}
+                    >
+                      Load {historyWindowStep * 5} more
+                    </button>
+                    <button
+                      class="btn"
+                      onClick={() => {
+                        loadMore(0);
+                      }}
+                    >
+                      Load all
+                    </button>
+                  </>
+                )}
               </div>
             )}
           {topLevelMessages.map((msg) => {
