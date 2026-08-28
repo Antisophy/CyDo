@@ -38,6 +38,7 @@ import {
   beginTaskHistoryReplay,
   excludeReloadDraftUuid,
   reconcileInputDraft,
+  resetTaskForHistoryReplay,
   resetTaskForReload,
   snapshotUserDrafts,
 } from "./historyReplayReset";
@@ -587,6 +588,9 @@ export function useTaskManager(
       { phase: "requested" } | { phase: "capturing"; frames: HistoryFrame[] }
     >(),
   );
+  // tasks whose window was grown by a load-more; the extra history lives only
+  // while the task is focused, and unfocusing releases it back to the window
+  const grownHistoryRef = useRef(new Set<string>());
   const addToastRef = useRef(addToast);
   addToastRef.current = addToast;
   const prevNoticeIdsRef = useRef<Set<string>>(new Set());
@@ -1591,6 +1595,7 @@ export function useTaskManager(
           requestedHistoryRef.current.delete(t.uuid);
           historyFramesRef.current.delete(t.uuid);
           prependCaptureRef.current.delete(t.uuid);
+          grownHistoryRef.current.delete(t.uuid);
 
           const isEdit = msg.reason === "edit";
           const excludedNativeUuid =
@@ -1643,8 +1648,10 @@ export function useTaskManager(
           const t0 = findByTid(tid);
           if (!t0) break;
           // the frame cache mirrors the timeline reset in beginTaskHistoryReplay
-          if (t0.pendingHistoryReplies === 0)
+          if (t0.pendingHistoryReplies === 0) {
             historyFramesRef.current.set(t0.uuid, []);
+            grownHistoryRef.current.delete(t0.uuid);
+          }
           prependCaptureRef.current.delete(t0.uuid);
           const windowStart = msg.window_start ?? 0;
           // historyTotal drives the progress bar, so count only what will
@@ -1705,6 +1712,7 @@ export function useTaskManager(
           }
           const frames = context.concat(capture.frames, rest);
           historyFramesRef.current.set(t0.uuid, frames);
+          grownHistoryRef.current.add(t0.uuid);
           const t = rebuildFromFrames(t0, frames, windowStart);
           liveStates.set(t0.uuid, t);
           setTasks((prev) => {
@@ -2356,6 +2364,46 @@ export function useTaskManager(
       requestedHistoryRef.current.add(t.uuid);
     }
   }, [connected, activeTaskId, tasks]);
+
+  // Extra history loaded with "Load more" persists only while its task is
+  // focused: on unfocus the task falls back to the plain window, so grown
+  // timelines never pile up in memory. Refocusing replays the window fresh
+  // through the effect above (historyLoaded false, request guard cleared).
+  // the previous route id, not uuid: on the first run the tid-to-uuid map may
+  // not be populated yet, and this effect's only dep is the route id, so a
+  // uuid recorded then would stay null forever and mask every later unfocus
+  const prevActiveTaskIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const previousId = prevActiveTaskIdRef.current;
+    prevActiveTaskIdRef.current = activeTaskId;
+    if (previousId === null || previousId === activeTaskId) return;
+    const prevTid = parseTaskId(previousId);
+    if (prevTid === null) return;
+    const previous = tidToUuid.get(prevTid);
+    if (previous === undefined) return;
+    if (!grownHistoryRef.current.has(previous)) return;
+
+    grownHistoryRef.current.delete(previous);
+    historyFramesRef.current.delete(previous);
+    prependCaptureRef.current.delete(previous);
+    requestedHistoryRef.current.delete(previous);
+    const t = liveStates.get(previous);
+    if (!t) return;
+    const released: TaskState = {
+      ...resetTaskForHistoryReplay(t, 0),
+      historyTotal: undefined,
+      historyReceived: undefined,
+      historyWindowStart: undefined,
+      historyLoaded: false,
+    };
+    liveStates.set(previous, released);
+    setTasks((prev) => {
+      if (!prev.has(previous)) return prev;
+      const next = new Map(prev);
+      next.set(previous, released);
+      return next;
+    });
+  }, [activeTaskId]);
 
   // Replay outbox entries after tasks_list arrives and WS is connected.
   // The backend deduplicates by nonce, so replaying is safe.
