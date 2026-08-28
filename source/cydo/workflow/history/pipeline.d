@@ -23,6 +23,7 @@ import cydo.protocol : ContentBlock, ItemStartedEvent, TaskEventEnvelope,
 import cydo.runtime.config : AgentDriver;
 import cydo.domain.storage.persistence : LoadedHistory;
 import cydo.domain.tasks.model : QueueOperationProbe, TaskData, TaskHistoryEndMessage,
+	TaskHistoryPrependEndMessage, TaskHistoryPrependStartMessage,
 	TaskHistoryStartMessage, Watermark, buildSyntheticUserEvent, extractEventFromEnvelope,
 	extractTsFromEnvelope, watermarkFromPath;
 import cydo.workflow.history.native_history : HistoryAccess,
@@ -462,6 +463,32 @@ class HistoryEventPipeline
 		host_.onHistorySubscribed(tid);
 	}
 
+	/// Replay the messages immediately older than a window the client already
+	/// holds, so it can prepend them instead of rebuilding its list; growing
+	/// the window instead would replay everything the client already has.
+	void handleRequestHistoryBefore(WebSocketAdapter ws, int tid, int beforeSeq, int messageLimit)
+	{
+		if (tid < 0)
+			return;
+		ensureHistoryLoaded(tid);
+		auto td = host_.getTask(tid);
+		if (td is null)
+			return;
+
+		size_t end = beforeSeq < 0 ? 0 : beforeSeq;
+		if (end > td.history.length)
+			end = td.history.length;
+		auto start = messageLimit > 0 ? historyWindowStart(td, messageLimit, end) : 0;
+
+		ws.send(Data(toJson(TaskHistoryPrependStartMessage("task_history_prepend_start",
+			tid, cast(int) start, cast(int) end)).representation));
+		sendHistoryRange(ws, tid, td, start, end);
+		ws.send(Data(toJson(TaskHistoryPrependEndMessage("task_history_prepend_end",
+			tid, cast(int) start)).representation));
+		host_.subscribe(ws, tid);
+		host_.onHistorySubscribed(tid);
+	}
+
 	private void sendHistoryRange(WebSocketAdapter ws, int tid, TaskData* td,
 		size_t start, size_t end)
 	{
@@ -543,6 +570,7 @@ class HistoryEventPipeline
 			return [initIndex];
 		return [initIndex, metadataIndex];
 	}
+
 
 	void appendUnconfirmedUserMessage(int tid, const(ContentBlock)[] content,
 		const(ContentBlock)[] broadcastContent = null, string cydoMeta = null,
@@ -1592,6 +1620,33 @@ unittest
 
 	// tool events neither count toward the window nor shrink it: forty of
 	// them ride along with the three newest message bubbles
+	// loading older history replays only the slice before what the client holds,
+	// framed so it can prepend rather than rebuild
+	@JSONPartial static struct PrependProbe
+	{
+		string type; int tid; int window_start; int before_seq;
+	}
+	auto wsBefore = new StubWebSocketAdapter();
+	scope(exit) wsBefore.disconnect("test complete", DisconnectType.requested);
+	pipeline.handleRequestHistoryBefore(wsBefore, tid, 3, 2);
+	auto prependStart = jsonParse!PrependProbe(wsBefore.sent[0]);
+	assert(prependStart.type == "task_history_prepend_start");
+	assert(prependStart.before_seq == 3, "the batch stops where the client's window began");
+	assert(prependStart.window_start == 0, "two messages back from seq 3 reaches the start");
+	assert(jsonParse!PrependProbe(wsBefore.sent[$ - 1]).type == "task_history_prepend_end");
+	assert(wsBefore.sent.length == 5, "only the older slice replays");
+	assert(jsonParse!SeqProbe(wsBefore.sent[1]).seq == 0);
+	assert(jsonParse!SeqProbe(wsBefore.sent[3]).seq == 2);
+
+	// asking for older history when nothing is held back replays nothing
+	auto wsNone = new StubWebSocketAdapter();
+	scope(exit) wsNone.disconnect("test complete", DisconnectType.requested);
+	pipeline.handleRequestHistoryBefore(wsNone, tid, 0, 2);
+	assert(wsNone.sent.length == 2, "just the frames, no events");
+
+	// the event budget ends the window even when the message budget is nowhere
+	// near spent: a tool-heavy turn is what makes a page unusable, and a message
+	// count cannot see it coming
 	foreach (n; 0 .. 40)
 		pipeline.appendAndBroadcastTaskEvent(tid, TranslatedEvent(
 			`{"type":"item/started","item_type":"tool_use","item_id":"noise"}`, null, AbsTime(1000)));
@@ -1878,3 +1933,4 @@ unittest
 	assert(jsonParse!SeqProbe(wsAll.sent[1]).seq == 0);
 	assert(wsAll.sent.length == 9, "full replay carries no duplicated context");
 }
+

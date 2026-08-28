@@ -19,17 +19,20 @@ import type {
   AgnosticEvent,
   ControlMessage,
   ContentBlock,
-  HistoryBoundary,
   Notice,
   TasksListMessage,
 } from "./protocol";
-import type { CydoMeta, TaskState, UndoPending } from "./types";
+import type { TaskState, UndoPending } from "./types";
 import { makeTaskState } from "./types";
+import { reduceAgentAck, replaceHistoryBoundary } from "./sessionReducer";
 import {
-  reduceAgentAck,
-  reduceMessage,
-  replaceHistoryBoundary,
-} from "./sessionReducer";
+  hasHistoryBoundary,
+  rebuildFromFrames,
+  reduceHistoryFrame,
+  reduceUnconfirmedUserMessage,
+  type HistoryBoundaryEvent,
+  type HistoryFrame,
+} from "./historyContinuation";
 import { outbox } from "./outbox";
 import {
   beginTaskHistoryReplay,
@@ -90,23 +93,6 @@ export interface ImageAttachment {
   dataURL: string;
   base64: string;
   mediaType: string;
-}
-
-type HistoryBoundaryEvent =
-  | (Extract<AgnosticEvent, { type: "item/started" }> & {
-      history_boundary: HistoryBoundary;
-    })
-  | (Extract<AgnosticEvent, { type: "turn/stop" }> & {
-      history_boundary: HistoryBoundary;
-    });
-
-function hasHistoryBoundary(
-  event: AgnosticEvent,
-): event is HistoryBoundaryEvent {
-  return (
-    (event.type === "item/started" || event.type === "turn/stop") &&
-    event.history_boundary !== undefined
-  );
 }
 
 export function revertFilesForUndo(
@@ -279,6 +265,10 @@ export interface TaskManager {
   serverError: { message: string; tid?: number } | null;
   dismissServerError: () => void;
   devMode: boolean;
+  /** configured history window in messages for this device class; 0 = off */
+  historyWindowStep: number;
+  /** load `step` more messages of older history (0 = all) */
+  loadMoreHistory: (tid: number, step: number) => void;
   exportLoadError?: string | null;
   navigateHome: () => void;
   navigateToProject: (workspace: string, projectName: string) => void;
@@ -515,13 +505,6 @@ function activityOnlyObservation(
   };
 }
 
-/// Extract text content from a user message event (for unconfirmed display).
-function extractTextContent(msg: AgnosticEvent): string {
-  if (msg.type !== "item/started" || msg.item_type !== "user_message")
-    return "";
-  return msg.text ?? "";
-}
-
 // Mutable mirror of task states, keyed by uuid. Updated synchronously outside
 // Preact's render cycle so reducers and notification checks run immediately
 // when WebSocket messages arrive, even when Preact defers state updates in
@@ -589,6 +572,21 @@ export function useTaskManager(
     tid?: number;
   } | null>(null);
   const [devMode, setDevMode] = useState(false);
+  // the configured window for this device class, used to label the load-more
+  // buttons; the server still decides what a request actually returns
+  const [historyWindowStep, setHistoryWindowStep] = useState(0);
+  // every frame that built each task's current timeline, in arrival order;
+  // load-more puts its fetched slice in front and re-reduces the whole
+  // sequence, so the result matches a larger initial window exactly
+  const historyFramesRef = useRef(new Map<string, HistoryFrame[]>());
+  // a "Load more" in flight: requested until the prepend_start marker
+  // arrives, then capturing the slice until prepend_end triggers the rebuild
+  const prependCaptureRef = useRef(
+    new Map<
+      string,
+      { phase: "requested" } | { phase: "capturing"; frames: HistoryFrame[] }
+    >(),
+  );
   const addToastRef = useRef(addToast);
   addToastRef.current = addToast;
   const prevNoticeIdsRef = useRef<Set<string>>(new Set());
@@ -1178,6 +1176,31 @@ export function useTaskManager(
     [entryPointFor],
   );
 
+  // continue the initial load with older messages: fetch only the slice the
+  // window held back, then re-reduce it in front of every frame already
+  // reduced, so nothing on screen is lost and nothing is fetched twice
+  const loadMoreHistory = useCallback((tid: number, step: number) => {
+    const task = findByTid(tid);
+    if (!task) throw new Error(`Loading more history requires task ${tid}`);
+    const beforeSeq = task.historyWindowStart ?? 0;
+    if (beforeSeq <= 0) return; // nothing older is being held back
+    if (prependCaptureRef.current.has(task.uuid)) return; // one batch at a time
+
+    prependCaptureRef.current.set(task.uuid, { phase: "requested" });
+
+    // step 0 is "load all", i.e. everything before the current start
+    const sent = connRef.current?.requestHistoryBefore(
+      tid,
+      beforeSeq,
+      step === 0 ? -1 : step,
+      deviceClass(),
+    );
+    if (!sent) {
+      prependCaptureRef.current.delete(task.uuid);
+      throw new Error(`History request failed for ${tid}`);
+    }
+  }, []);
+
   const requestTaskHistory = useCallback((tid: number) => {
     const task = findByTid(tid);
     if (!task) throw new Error(`History request requires task ${tid}`);
@@ -1223,67 +1246,24 @@ export function useTaskManager(
         executeDraftEffectsRef.current(effects);
         return;
       }
+      const capture = prependCaptureRef.current.get(uuid);
+      if (capture !== undefined && capture.phase === "capturing") {
+        // part of the older slice being fetched; joins the rebuild instead
+        capture.frames.push({ kind: "unconfirmed", msg, correlationId });
+        executeDraftEffectsRef.current(effects);
+        return;
+      }
+
+      if (correlationId) outbox.remove(correlationId);
       const prev = liveStates.get(uuid) ?? {
         ...makeTaskState(tid, true),
         uuid,
       };
-      const meta = (msg as Record<string, unknown>).meta as
-        | CydoMeta
-        | undefined;
-      const content = ((msg as Record<string, unknown>).content as
-        | import("./protocol").AssistantContentBlock[]
-        | undefined) ?? [
-        { type: "text" as const, text: extractTextContent(msg) },
-      ];
-
-      // If a local ackState=4 placeholder with this nonce exists, upgrade it
-      // to ackState=3 (backend acked). Otherwise insert a fresh ackState=3 bubble.
-      let messages = prev.messages;
-      if (correlationId) {
-        outbox.remove(correlationId);
-        const idx = messages.findIndex(
-          (m) => m.type === "user" && m.nonce === correlationId,
-        );
-        if (idx >= 0) {
-          messages = messages.map((m, i) =>
-            i === idx
-              ? {
-                  ...m,
-                  ackState: 3 as const,
-                  pending: true,
-                  isProvisional: true,
-                }
-              : m,
-          );
-          const updated = { ...prev, messages };
-          liveStates.set(uuid, updated);
-          setTasks((map) => {
-            const next = new Map(map);
-            next.set(uuid, updated);
-            return next;
-          });
-          executeDraftEffectsRef.current(effects);
-          return;
-        }
-      }
-
-      const id = `pending-${++prev.msgIdCounter}`;
-      const updated = {
-        ...prev,
-        messages: [
-          ...messages,
-          {
-            id,
-            type: "user" as const,
-            content,
-            ackState: 3 as const,
-            pending: true,
-            nonce: correlationId,
-            cydoMeta: meta,
-            isProvisional: true,
-          },
-        ],
-      };
+      const updated = reduceUnconfirmedUserMessage(prev, msg, correlationId);
+      const frame: HistoryFrame = { kind: "unconfirmed", msg, correlationId };
+      const frames = historyFramesRef.current.get(uuid);
+      if (frames) frames.push(frame);
+      else historyFramesRef.current.set(uuid, [frame]);
       liveStates.set(uuid, updated);
       setTasks((map) => {
         const next = new Map(map);
@@ -1311,13 +1291,24 @@ export function useTaskManager(
         executeDraftEffectsRef.current(effects);
         return;
       }
+      const capture = prependCaptureRef.current.get(uuid);
+      if (capture !== undefined && capture.phase === "capturing") {
+        // between the prepend markers every frame of this task belongs to
+        // the older slice; it is reduced during the rebuild, not here
+        capture.frames.push({ kind: "event", msg, seq, ts });
+        executeDraftEffectsRef.current(effects);
+        return;
+      }
+
       const prev = liveStates.get(uuid) ?? {
         ...makeTaskState(tid, true),
         uuid,
       };
-      let updated = reduceMessage(prev, msg, seq, ts);
-      if (hasHistoryBoundary(msg) && seq !== undefined)
-        updated = replaceHistoryBoundary(updated, msg, seq);
+      const frame: HistoryFrame = { kind: "event", msg, seq, ts };
+      const frames = historyFramesRef.current.get(uuid);
+      if (frames) frames.push(frame);
+      else historyFramesRef.current.set(uuid, [frame]);
+      let updated = reduceHistoryFrame(prev, frame);
       if (!updated.historyLoaded && updated.historyTotal !== undefined) {
         updated = {
           ...updated,
@@ -1598,6 +1589,8 @@ export function useTaskManager(
           if (!t) break;
           outbox.removeForTask(tid);
           requestedHistoryRef.current.delete(t.uuid);
+          historyFramesRef.current.delete(t.uuid);
+          prependCaptureRef.current.delete(t.uuid);
 
           const isEdit = msg.reason === "edit";
           const excludedNativeUuid =
@@ -1649,13 +1642,70 @@ export function useTaskManager(
           const { tid, total } = msg;
           const t0 = findByTid(tid);
           if (!t0) break;
+          // the frame cache mirrors the timeline reset in beginTaskHistoryReplay
+          if (t0.pendingHistoryReplies === 0)
+            historyFramesRef.current.set(t0.uuid, []);
+          prependCaptureRef.current.delete(t0.uuid);
           const windowStart = msg.window_start ?? 0;
           // historyTotal drives the progress bar, so count only what will
           // actually be sent
           const t = {
             ...beginTaskHistoryReplay(t0, total - windowStart),
             historyWindowed: (msg.window_limit ?? 0) > 0,
+            historyWindowStart: windowStart,
           };
+          liveStates.set(t0.uuid, t);
+          setTasks((prev) => {
+            if (!prev.has(t0.uuid)) return prev;
+            const next = new Map(prev);
+            next.set(t0.uuid, t);
+            return next;
+          });
+          break;
+        }
+        case "task_history_prepend_start": {
+          const t0 = findByTid(msg.tid);
+          if (!t0) break;
+          const capture = prependCaptureRef.current.get(t0.uuid);
+          if (capture === undefined || capture.phase !== "requested")
+            throw new Error(`Unrequested history prepend for task ${msg.tid}`);
+          // until prepend_end, every frame of this task is the older slice
+          prependCaptureRef.current.set(t0.uuid, {
+            phase: "capturing",
+            frames: [],
+          });
+          break;
+        }
+        case "task_history_prepend_end": {
+          const { tid, window_start: windowStart } = msg;
+          const t0 = findByTid(tid);
+          if (!t0) break;
+          const capture = prependCaptureRef.current.get(t0.uuid);
+          prependCaptureRef.current.delete(t0.uuid);
+          if (capture === undefined || capture.phase !== "capturing")
+            throw new Error(`Unexpected history prepend end for task ${tid}`);
+
+          // continue the initial load: the fetched slice goes in front of
+          // every frame already reduced, and the whole sequence re-reduces
+          // through the same path, so the result is exactly what an initial
+          // load of the larger window would have produced. session context
+          // (init/metadata replayed from before the window) stays ahead of
+          // the slice, and context the slice now covers is dropped since the
+          // slice carries the authoritative copy at those seqs
+          const cached = historyFramesRef.current.get(t0.uuid) ?? [];
+          const sliceEnd = t0.historyWindowStart ?? 0;
+          const context: HistoryFrame[] = [];
+          const rest: HistoryFrame[] = [];
+          for (const f of cached) {
+            if (f.kind === "event" && f.seq !== undefined && f.seq < sliceEnd) {
+              if (f.seq < windowStart) context.push(f);
+            } else {
+              rest.push(f);
+            }
+          }
+          const frames = context.concat(capture.frames, rest);
+          historyFramesRef.current.set(t0.uuid, frames);
+          const t = rebuildFromFrames(t0, frames, windowStart);
           liveStates.set(t0.uuid, t);
           setTasks((prev) => {
             if (!prev.has(t0.uuid)) return prev;
@@ -1906,6 +1956,11 @@ export function useTaskManager(
         }
         case "server_status": {
           setDevMode(msg.dev_mode ?? false);
+          setHistoryWindowStep(
+            deviceClass() === "mobile"
+              ? (msg.history_window_mobile ?? 0)
+              : (msg.history_window_desktop ?? 0),
+          );
           const serverBuildId = msg.build_id ?? "";
           if (
             serverBuildId.length > 0 &&
@@ -3271,6 +3326,8 @@ export function useTaskManager(
       setServerError(null);
     },
     devMode,
+    historyWindowStep,
+    loadMoreHistory,
     exportLoadError: null,
     navigateHome,
     navigateToProject,
