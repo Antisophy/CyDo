@@ -48,7 +48,7 @@ test("archive and unarchive a spike task's worktree", { tag: "@no-codex" }, asyn
   await expect(async () => {
     const spike = taskCreatedEvents.find((e) => e.relation_type === "subtask");
     expect(spike).toBeTruthy();
-  }).toPass({ timeout: 60_000 });
+  }).toPass();
   const spikeTid = taskCreatedEvents.find(
     (e) => e.relation_type === "subtask",
   )!.tid;
@@ -66,26 +66,20 @@ test("archive and unarchive a spike task's worktree", { tag: "@no-codex" }, asyn
       }
     }
     expect(completed).toBeTruthy();
-  }).toPass({ timeout: 60_000 });
+  }).toPass();
 
   // 4. Wait for auto-navigation away from the spike (process/exit handler fires).
-  await page.waitForURL((url) => !url.pathname.endsWith(`/task/${spikeTid}`), {
-    timeout: 10_000,
-  });
+  await page.waitForURL((url) => !url.pathname.endsWith(`/task/${spikeTid}`));
 
   // 5. Navigate to the spike task and wait for the Archive button (task is inactive).
   await expect(async () => {
     await page.locator(`.sidebar-item[data-tid="${spikeTid}"]`).click();
     await expect(
       page.locator(`.sidebar-item[data-tid="${spikeTid}"].active`),
-    ).toBeVisible({ timeout: 3_000 });
-    await expect(page.locator(".btn-banner-archive")).toBeVisible({
-      timeout: 3_000,
-    });
-    await expect(page.locator(".btn-banner-archive")).toHaveText("Archive", {
-      timeout: 1_000,
-    });
-  }).toPass({ timeout: 30_000 });
+    ).toBeVisible();
+    await expect(page.locator(".btn-banner-archive")).toBeVisible();
+    await expect(page.locator(".btn-banner-archive")).toHaveText("Archive");
+  }).toPass();
 
   // Verify worktree directory exists before archiving.
   const wtDir = `${backend.wsDir}/.cydo/tasks/${spikeTid}/worktree`;
@@ -162,14 +156,14 @@ test("cannot archive parent with alive descendant", { tag: "@no-codex" }, async 
   // 2. Wait for the conversation task_created event (first event).
   await expect(async () => {
     expect(taskCreatedEvents.length).toBeGreaterThan(0);
-  }).toPass({ timeout: 30_000 });
+  }).toPass();
   const convTid = taskCreatedEvents[0].tid;
 
   // 3. Wait for spike to be created and alive.
   await expect(async () => {
     const spike = taskCreatedEvents.find((e) => e.relation_type === "subtask");
     expect(spike).toBeTruthy();
-  }).toPass({ timeout: 60_000 });
+  }).toPass();
   const spikeTid = taskCreatedEvents.find(
     (e) => e.relation_type === "subtask",
   )!.tid;
@@ -179,7 +173,7 @@ test("cannot archive parent with alive descendant", { tag: "@no-codex" }, async 
       (e) => e.tid === spikeTid && e.alive,
     );
     expect(aliveEvent).toBeTruthy();
-  }).toPass({ timeout: 30_000 });
+  }).toPass();
 
   // 4. Navigate to the parent conversation task (which is alive, waiting for
   //    the stalling spike's MCP result).
@@ -187,8 +181,8 @@ test("cannot archive parent with alive descendant", { tag: "@no-codex" }, async 
     await page.locator(`.sidebar-item[data-tid="${convTid}"]`).click();
     await expect(
       page.locator(`.sidebar-item[data-tid="${convTid}"].active`),
-    ).toBeVisible({ timeout: 3_000 });
-  }).toPass({ timeout: 15_000 });
+    ).toBeVisible();
+  }).toPass();
 
   // 5. Attempt to archive via keyboard shortcut while the subtree is alive.
   //    Ctrl+Shift+A calls setArchived regardless of the task's own alive state,
@@ -245,14 +239,14 @@ test("archiving parent task archives spike's worktree", { tag: "@no-codex" }, as
   // 2. Wait for the conversation task_created event (first event).
   await expect(async () => {
     expect(taskCreatedEvents.length).toBeGreaterThan(0);
-  }).toPass({ timeout: 30_000 });
+  }).toPass();
   const convTid = taskCreatedEvents[0].tid;
 
   // 3. Wait for spike to be created.
   await expect(async () => {
     const spike = taskCreatedEvents.find((e) => e.relation_type === "subtask");
     expect(spike).toBeTruthy();
-  }).toPass({ timeout: 60_000 });
+  }).toPass();
   const spikeTid = taskCreatedEvents.find(
     (e) => e.relation_type === "subtask",
   )!.tid;
@@ -270,23 +264,24 @@ test("archiving parent task archives spike's worktree", { tag: "@no-codex" }, as
       }
     }
     expect(completed).toBeTruthy();
-  }).toPass({ timeout: 60_000 });
+  }).toPass();
 
   // 5. Wait for auto-navigation away from the spike.
-  await page.waitForURL((url) => !url.pathname.endsWith(`/task/${spikeTid}`), {
-    timeout: 10_000,
-  });
+  await page.waitForURL((url) => !url.pathname.endsWith(`/task/${spikeTid}`));
 
   // 6. Navigate to the parent conversation task.
   await expect(async () => {
     await page.locator(`.sidebar-item[data-tid="${convTid}"]`).click();
     await expect(
       page.locator(`.sidebar-item[data-tid="${convTid}"].active`),
-    ).toBeVisible({ timeout: 3_000 });
-  }).toPass({ timeout: 15_000 });
+    ).toBeVisible();
+  }).toPass();
 
   // 7. Stop if still alive, then wait for Archive button.
   try {
+    // Probe, not an assertion: the absent-button branch is expected, so this
+    // keeps a tight bound rather than the shared budget — waiting minutes to
+    // learn the task already stopped would burn the whole test timeout.
     await expect(page.locator(".btn-banner-stop")).toBeVisible({
       timeout: 5_000,
     });

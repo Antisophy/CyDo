@@ -25,14 +25,10 @@ test(
     await enterSession(page);
 
     await sendMessage(page, 'Please reply with "first-reply"');
-    await expect(assistantText(page, "first-reply")).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(assistantText(page, "first-reply")).toBeVisible();
 
     await sendMessage(page, 'Please reply with "second-reply"');
-    await expect(assistantText(page, "second-reply")).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(assistantText(page, "second-reply")).toBeVisible();
     const tid = currentTaskTid(page);
 
     // Send "stall session" — mock API starts a response but never completes it,
@@ -40,9 +36,7 @@ test(
     await sendMessage(page, "stall session");
 
     // Confirm the session is still running (stop button visible means it's processing).
-    await expect(page.locator(".btn-banner-stop")).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(page.locator(".btn-banner-stop")).toBeVisible();
 
     // Hover over the second user message to reveal the undo button.
     const secondUserMsg = page
@@ -52,12 +46,10 @@ test(
       .last();
     await secondUserMsg.hover();
 
-    await expect(secondUserMsg.locator(".undo-btn")).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(secondUserMsg.locator(".undo-btn")).toBeVisible();
     await secondUserMsg.locator(".undo-btn").click();
 
-    await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator(".undo-dialog")).toBeVisible();
     // A busy Codex session uses the resolved JSONL fallback preview, rather
     // than a stale native-turn count.
     await expect(page.locator(".undo-dialog-count")).toContainText(
@@ -74,7 +66,7 @@ test(
       page.locator(".message.user-message:not(.pending)", {
         hasText: "second-reply",
       }),
-    ).not.toBeVisible({ timeout: 30_000 });
+    ).not.toBeVisible();
 
     const rollbackFrames = () => frames.slice(rollbackFrameStart);
     await expect
@@ -100,7 +92,6 @@ test(
             historyEndIdx > historyStartIdx
           );
         },
-        { timeout: 30_000 },
       )
       .toBe(true);
     const backups = rollbackFrames().filter(
@@ -118,44 +109,34 @@ test(
     );
 
     // The first reply should still be visible.
-    await expect(assistantText(page, "first-reply").first()).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(assistantText(page, "first-reply").first()).toBeVisible();
 
     // The fallback truncation must be durable in the canonical rollout, not
     // merely hidden by the optimistic in-memory view.
     await expect
-      .poll(() => JSON.stringify(codexRolloutRecords(tid)), { timeout: 15_000 })
+      .poll(() => JSON.stringify(codexRolloutRecords(tid)))
       .not.toContain("second-reply");
 
     // Reload from the server's canonical history before sending another turn.
     // This catches a rollback that only updates the currently mounted view.
     await page.reload();
-    await expect(assistantText(page, "first-reply")).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(assistantText(page, "first-reply")).toBeVisible();
     await expect(assistantText(page, "second-reply")).toHaveCount(0);
 
     const backup = page.locator(`.sidebar-item[data-tid="${backups[0].tid}"]`);
-    await expect(backup).toBeVisible({ timeout: 15_000 });
+    await expect(backup).toBeVisible();
     await backup.click();
-    await expect(assistantText(page, "second-reply")).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(assistantText(page, "second-reply")).toBeVisible();
     await expect(page.locator(".user-message", { hasText: "stall session" })).toHaveCount(0);
     await page.locator(`.sidebar-item[data-tid="${tid}"]`).click();
 
     // Verify the session auto-resumed (input box visible).
-    await expect(page.locator(".input-textarea:visible").first()).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(page.locator(".input-textarea:visible").first()).toBeVisible();
 
     await sendMessage(page, 'Please reply with "third-reply"');
-    await expect(assistantText(page, "third-reply")).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(assistantText(page, "third-reply")).toBeVisible();
     await expect
-      .poll(() => JSON.stringify(codexRolloutRecords(tid)), { timeout: 15_000 })
+      .poll(() => JSON.stringify(codexRolloutRecords(tid)))
       .toContain("third-reply");
   },
 );

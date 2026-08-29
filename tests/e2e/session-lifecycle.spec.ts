@@ -20,17 +20,17 @@ test("history survives page reload", async ({ page, agentType }) => {
 
   await expect(
     page.locator(".message.user-message", { hasText: "persistent" }),
-  ).toBeVisible({ timeout: 15_000 });
+  ).toBeVisible();
 
   await page.reload();
 
   await page
     .locator(".sidebar-item .sidebar-label", { hasText: "persistent" })
-    .click({ timeout: 15_000 });
+    .click();
 
   await expect(
     page.locator(".message.user-message", { hasText: "persistent" }),
-  ).toBeVisible({ timeout: 15_000 });
+  ).toBeVisible();
 });
 
 test("no duplicate messages after reload", async ({ page, agentType }) => {
@@ -45,17 +45,17 @@ test("no duplicate messages after reload", async ({ page, agentType }) => {
 
   await expect(
     page.locator(".message.user-message", { hasText: "nodups" }),
-  ).toBeVisible({ timeout: 15_000 });
+  ).toBeVisible();
   const countBefore = await page.locator(".message.user-message").count();
 
   await page.reload();
   await page
     .locator(".sidebar-item .sidebar-label", { hasText: "nodups" })
-    .click({ timeout: 15_000 });
+    .click();
 
   await expect(
     page.locator(".message.user-message", { hasText: "nodups" }),
-  ).toBeVisible({ timeout: 15_000 });
+  ).toBeVisible();
 
   const countAfter = await page.locator(".message.user-message").count();
   expect(countAfter).toBeLessThanOrEqual(countBefore);
@@ -85,10 +85,7 @@ test("resumed session starts in idle state", async ({ page, agentType }) => {
 
   await page.locator(".btn-banner-resume").click();
 
-  const bannerTimeout = agentType === "codex" ? 30_000 : 15_000;
-  await expect(page.locator(".btn-banner-stop")).toBeVisible({
-    timeout: bannerTimeout,
-  });
+  await expect(page.locator(".btn-banner-stop")).toBeVisible();
 
   // After resume completes, the session must be idle — not in processing state
   await expect(page.locator(".banner-processing")).not.toBeVisible();
@@ -113,21 +110,14 @@ test("session resume continues conversation", async ({ page, agentType }) => {
 
   await page.locator(".btn-banner-resume").click();
 
-  const bannerTimeout = agentType === "codex" ? 30_000 : 15_000;
-  await expect(page.locator(".btn-banner-stop")).toBeVisible({
-    timeout: bannerTimeout,
-  });
-  await expect(page.locator(".btn-stop")).not.toBeVisible({
-    timeout: bannerTimeout,
-  });
+  await expect(page.locator(".btn-banner-stop")).toBeVisible();
+  await expect(page.locator(".btn-stop")).not.toBeVisible();
 
   const input = page.locator(".input-textarea").first();
-  await expect(input).toBeVisible({ timeout: 5_000 });
+  await expect(input).toBeVisible();
   await input.click();
   await input.fill('Please reply with "post-resume"');
-  await expect(page.locator(".btn-send").first()).toBeEnabled({
-    timeout: 5_000,
-  });
+  await expect(page.locator(".btn-send").first()).toBeEnabled();
   await page.locator(".btn-send").first().click();
 
   await expect(assistantText(page, "post-resume")).toBeVisible({
@@ -168,7 +158,7 @@ test("codex reload replays apply_patch tool call", { tag: "@codex-only" }, async
   });
 
   const activeTaskRow = page.locator(".sidebar-item.active").first();
-  await expect(activeTaskRow).toBeVisible({ timeout: 5_000 });
+  await expect(activeTaskRow).toBeVisible();
   const taskTid = await activeTaskRow.getAttribute("data-tid");
   expect(taskTid).toBeTruthy();
 
@@ -177,7 +167,7 @@ test("codex reload replays apply_patch tool call", { tag: "@codex-only" }, async
   const reloadedTaskRow = page
     .locator(`.sidebar-item[data-tid="${taskTid!}"]`)
     .first();
-  await expect(reloadedTaskRow).toBeVisible({ timeout: 15_000 });
+  await expect(reloadedTaskRow).toBeVisible();
   await reloadedTaskRow.click();
   await expect(reloadedTaskRow).toHaveClass(/active/);
 
@@ -189,9 +179,9 @@ test("codex reload replays apply_patch tool call", { tag: "@codex-only" }, async
 
   await tool.locator(".tool-header").hover();
   const viewBtn = tool.locator(".tool-view-file");
-  await expect(viewBtn).toBeVisible({ timeout: 5_000 });
+  await expect(viewBtn).toBeVisible();
   await viewBtn.click();
-  await expect(page.locator(".file-viewer")).toBeVisible({ timeout: 5_000 });
+  await expect(page.locator(".file-viewer")).toBeVisible();
   await expect(page.locator(".file-viewer")).toContainText(
     "codex-fileviewer-create.txt",
   );

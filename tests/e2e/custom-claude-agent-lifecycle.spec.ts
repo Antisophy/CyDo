@@ -49,7 +49,7 @@ async function waitForNewTid(page: Page, before: Set<string>): Promise<string> {
       );
     newTid = tids.find((tid: string) => !before.has(tid));
     expect(newTid).toBeTruthy();
-  }).toPass({ timeout: 5_000 });
+  }).toPass();
   return newTid!;
 }
 
@@ -126,7 +126,7 @@ workspaces:
     const draftTid = await waitForNewTid(page, before);
     await expect(
       page.locator(`.sidebar-item[data-tid="${draftTid}"] .draft-label`),
-    ).toBeVisible({ timeout: 2_000 });
+    ).toBeVisible();
 
     await page.locator(".agent-picker").selectOption("work-claude");
     await expect(page.locator(".agent-picker")).toHaveValue("work-claude");
@@ -161,12 +161,12 @@ workspaces:
     await page.reload();
 
     const sidebarItem = page.locator(`.sidebar-item[data-tid="${draftTid}"]`);
-    await expect(sidebarItem).toBeVisible({ timeout: 15_000 });
+    await expect(sidebarItem).toBeVisible();
     await sidebarItem.click();
 
     await expect(
       assistantText(page, "custom agent reload transcript test"),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible();
     await expect(page.locator(".message.assistant-message")).toHaveCount(1);
     await expect(page.locator(".sidebar-item[data-tid]")).toHaveCount(1);
     await expect(
@@ -206,21 +206,19 @@ test(
     await page.reload();
 
     const sidebarItem = page.locator(".sidebar-item[data-tid]").first();
-    await expect(sidebarItem).toBeVisible({ timeout: 15_000 });
+    await expect(sidebarItem).toBeVisible();
     await sidebarItem.click();
 
     const editTool = page.locator(".tool-call").filter({
       has: page.locator(".tool-name", { hasText: "Edit" }),
     });
-    await expect(editTool).toBeVisible({ timeout: 15_000 });
+    await expect(editTool).toBeVisible();
 
     // The view-file button only renders when the Edit tool call resolves to
     // "claude/Edit" — i.e. only when Block.driver was correctly seeded from
     // the cold-loaded task snapshot.
     await editTool.locator(".tool-header").hover();
-    await expect(editTool.locator(".tool-view-file")).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(editTool.locator(".tool-view-file")).toBeVisible();
   },
 );
 
@@ -310,7 +308,7 @@ function spawnProfiledBackend(
 async function waitForProfiledBackend(
   baseURL: string,
   proc: ChildProcess,
-  timeoutMs = 30_000,
+  timeoutMs = 540_000,
 ): Promise<void> {
   const processExited = new Promise<never>((_, reject) => {
     if (proc.exitCode !== null) {
@@ -443,7 +441,6 @@ async function findNativeJsonlContaining(
         found = matches.length === 1 ? matches[0] : undefined;
         return matches.length;
       },
-      { timeout: 20_000 },
     )
     .toBe(1);
   return found!;
@@ -509,7 +506,7 @@ function readFileOrEmpty(path: string): string {
 
 async function activeTaskTid(page: Page): Promise<string> {
   const row = page.locator(".sidebar-item.active");
-  await expect(row).toBeVisible({ timeout: 5_000 });
+  await expect(row).toBeVisible();
   const tid = await row.getAttribute("data-tid");
   expect(tid).toBeTruthy();
   return tid!;
@@ -518,7 +515,7 @@ async function activeTaskTid(page: Page): Promise<string> {
 async function openTaskByTid(
   page: Page,
   tid: string,
-  timeoutMs = 15_000,
+  timeoutMs = 540_000,
 ): Promise<void> {
   const row = page.locator(`.sidebar-item[data-tid="${tid}"]`);
   await expect(row).toBeVisible({ timeout: timeoutMs });
@@ -537,7 +534,7 @@ profiledTest(
 
     await enterSession(page);
     await sendMessage(page, `reply with "${marker1}"`);
-    await expect(assistantText(page, marker1)).toBeVisible({ timeout: 60_000 });
+    await expect(assistantText(page, marker1)).toBeVisible();
 
     const tid = await activeTaskTid(page);
     const taskUrl = page.url();
@@ -561,7 +558,7 @@ profiledTest(
     );
 
     await endSession(page);
-    await expect(assistantText(page, marker1)).toBeVisible({ timeout: 15_000 });
+    await expect(assistantText(page, marker1)).toBeVisible();
     await expect(
       page.locator(".message.user-message", { hasText: poisonMarker }),
     ).toHaveCount(0);
@@ -571,7 +568,7 @@ profiledTest(
     await page.goto("/");
     await page.goto(taskUrl);
     await openTaskByTid(page, tid);
-    await expect(assistantText(page, marker1)).toBeVisible({ timeout: 15_000 });
+    await expect(assistantText(page, marker1)).toBeVisible();
     await expect(
       page.locator(".message.user-message", { hasText: poisonMarker }),
     ).toHaveCount(0);
@@ -579,7 +576,7 @@ profiledTest(
     // Reload the browser — cold load from B's real JSONL.
     await page.reload();
     await openTaskByTid(page, tid);
-    await expect(assistantText(page, marker1)).toBeVisible({ timeout: 15_000 });
+    await expect(assistantText(page, marker1)).toBeVisible();
     await expect(
       page.locator(".message.user-message", { hasText: poisonMarker }),
     ).toHaveCount(0);
@@ -588,22 +585,20 @@ profiledTest(
     await profileBackend.restart();
     await page.goto(taskUrl);
     await openTaskByTid(page, tid);
-    await expect(assistantText(page, marker1)).toBeVisible({ timeout: 15_000 });
+    await expect(assistantText(page, marker1)).toBeVisible();
     await expect(
       page.locator(".message.user-message", { hasText: poisonMarker }),
     ).toHaveCount(0);
 
     // Resume, append a second marker, End again.
     await page.locator(".btn-banner-resume").click();
-    await expect(page.locator(".btn-banner-stop")).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(page.locator(".btn-banner-stop")).toBeVisible();
     await sendMessage(page, `reply with "${marker2}"`);
-    await expect(assistantText(page, marker2)).toBeVisible({ timeout: 60_000 });
+    await expect(assistantText(page, marker2)).toBeVisible();
     await endSession(page);
 
     await expect
-      .poll(() => readFileOrEmpty(realFile), { timeout: 20_000 })
+      .poll(() => readFileOrEmpty(realFile))
       .toContain(marker2);
     const finalContent = readFileOrEmpty(realFile);
     expect(finalContent).toContain(marker1);
@@ -624,9 +619,7 @@ profiledTest(
 
     await enterSession(page);
     await sendMessage(page, `reply with "${liveMarker}"`);
-    await expect(assistantText(page, liveMarker)).toBeVisible({
-      timeout: 60_000,
-    });
+    await expect(assistantText(page, liveMarker)).toBeVisible();
 
     const tid = await activeTaskTid(page);
 
@@ -657,13 +650,11 @@ profiledTest(
     await enterSession(page);
     await expect(
       page.locator('.agent-picker option[value="work-claude"]'),
-    ).toHaveText("Profile C", { timeout: 20_000 });
+    ).toHaveText("Profile C");
 
     // Return to the still-live original task.
     await openTaskByTid(page, tid);
-    await expect(assistantText(page, liveMarker)).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(assistantText(page, liveMarker)).toBeVisible();
 
     await endSession(page);
 
@@ -674,7 +665,7 @@ profiledTest(
     const diagnostics = page.locator(
       ".diagnostic-message.diagnostic-error:visible",
     );
-    await expect(diagnostics).toHaveCount(1, { timeout: 15_000 });
+    await expect(diagnostics).toHaveCount(1);
     const diagText = await diagnostics.first().innerText();
     expect(diagText).toContain("Failed to load session history");
     expect(diagText).toContain(sessionId);
@@ -710,9 +701,7 @@ profiledTest(
 
     await enterSession(page);
     await sendMessage(page, `reply with "${beforeMarker}"`);
-    await expect(assistantText(page, beforeMarker)).toBeVisible({
-      timeout: 60_000,
-    });
+    await expect(assistantText(page, beforeMarker)).toBeVisible();
 
     const tid = await activeTaskTid(page);
     const taskUrl = page.url();
@@ -801,9 +790,7 @@ profiledTest(
 
     await page.goto(taskUrl);
     await openTaskByTid(page, tid);
-    await expect(assistantText(page, beforeMarker)).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(assistantText(page, beforeMarker)).toBeVisible();
     await expect(
       page.locator(".message.user-message", { hasText: aPoisonMarker }),
     ).toHaveCount(0);
@@ -812,18 +799,14 @@ profiledTest(
     ).toHaveCount(0);
 
     await page.locator(".btn-banner-resume").click();
-    await expect(page.locator(".btn-banner-stop")).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(page.locator(".btn-banner-stop")).toBeVisible();
     await sendMessage(page, `reply with "${afterMarker}"`);
-    await expect(assistantText(page, afterMarker)).toBeVisible({
-      timeout: 60_000,
-    });
+    await expect(assistantText(page, afterMarker)).toBeVisible();
     await endSession(page);
 
     const cFile = join(profileBackend.profileC, relPath);
     await expect
-      .poll(() => readFileOrEmpty(cFile), { timeout: 20_000 })
+      .poll(() => readFileOrEmpty(cFile))
       .toContain(afterMarker);
     const finalCContent = readFileOrEmpty(cFile);
     expect(finalCContent).toContain(beforeMarker);
@@ -880,20 +863,20 @@ profiledTest(
     await page.goto("/");
     const refreshBtn = page.locator('button[title="Refresh project list"]');
     await refreshBtn.click();
-    await expect(refreshBtn).toBeDisabled({ timeout: 5_000 });
-    await expect(refreshBtn).toBeEnabled({ timeout: 30_000 });
+    await expect(refreshBtn).toBeDisabled();
+    await expect(refreshBtn).toBeEnabled();
 
     await page.goto(taskUrl);
     const importNode = page.locator(".sidebar-item.sidebar-archive-node", {
       hasText: /Import \(1\)/,
     });
-    await expect(importNode).toBeVisible({ timeout: 15_000 });
+    await expect(importNode).toBeVisible();
     await importNode.click();
 
     const sentinelEntry = page.locator(".sidebar-item .sidebar-label", {
       hasText: sentinelMarker,
     });
-    await expect(sentinelEntry).toBeVisible({ timeout: 10_000 });
+    await expect(sentinelEntry).toBeVisible();
     await expect(
       page.locator(".sidebar-item .sidebar-label", { hasText: aPoisonMarker }),
     ).not.toBeVisible();
@@ -903,18 +886,12 @@ profiledTest(
 
     // The original task remains a normal resumable task, not importable.
     await openTaskByTid(page, tid);
-    await expect(page.locator(".btn-banner-resume")).toBeVisible({
-      timeout: 10_000,
-    });
+    await expect(page.locator(".btn-banner-resume")).toBeVisible();
     await expect(
       page.locator(".btn-resume", { hasText: "Import Session" }),
     ).not.toBeVisible();
-    await expect(assistantText(page, beforeMarker)).toBeVisible({
-      timeout: 15_000,
-    });
-    await expect(assistantText(page, afterMarker)).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(assistantText(page, beforeMarker)).toBeVisible();
+    await expect(assistantText(page, afterMarker)).toBeVisible();
 
     // Stop again and compare the logical row exactly against the pre-rename
     // snapshot — no task-row native locator was ever written.

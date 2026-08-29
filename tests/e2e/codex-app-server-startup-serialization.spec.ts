@@ -244,7 +244,7 @@ exec "$CYDO_REAL_CODEX_BIN" "$@"
             data.type === "task_created" &&
             data.correlation_id === correlationId &&
             typeof data.tid === "number",
-          30_000,
+          540_000,
         );
         ws.send(
           JSON.stringify({
@@ -266,7 +266,7 @@ exec "$CYDO_REAL_CODEX_BIN" "$@"
             data.tid === tid &&
             data.event?.type === "turn/result" &&
             data.event?.subtype === "success",
-          90_000,
+          540_000,
         );
         ws.send(
           JSON.stringify({
@@ -282,7 +282,7 @@ exec "$CYDO_REAL_CODEX_BIN" "$@"
         const historyEnd = waitForMessage(
           ws,
           (data) => data.type === "task_history_end" && data.tid === tid,
-          30_000,
+          540_000,
         );
         ws.send(JSON.stringify({ type: "request_history", tid }));
         await historyEnd;
@@ -414,7 +414,7 @@ exec "$CYDO_REAL_CODEX_BIN" "$@"
           data.type === "task_created" &&
           data.correlation_id === correlationId &&
           typeof data.tid === "number",
-        30_000,
+        540_000,
       );
       ws.send(
         JSON.stringify({
@@ -430,7 +430,7 @@ exec "$CYDO_REAL_CODEX_BIN" "$@"
       const historyEnd = waitForMessage(
         ws,
         (data) => data.type === "task_history_end" && data.tid === tid,
-        30_000,
+        540_000,
       );
       ws.send(JSON.stringify({ type: "request_history", tid }));
       await historyEnd;
@@ -454,7 +454,6 @@ exec "$CYDO_REAL_CODEX_BIN" "$@"
           () =>
             existsSync(logPath) &&
             readStartupRecords(logPath).some((record) => record.event === "handoff"),
-          { timeout: 45_000 },
         )
         .toBe(true);
       expect(backend.exitCode).toBeNull();

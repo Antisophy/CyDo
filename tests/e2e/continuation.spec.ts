@@ -251,17 +251,17 @@ test("keep_context continuation injects prompt template", async ({
   // Verify MCP tool call shows correct tool name (not "cydo__SwitchMode" or "unknown").
   await expect(
     page.locator(".tool-name", { hasText: "SwitchMode" }),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   await expect(
     page.locator(".result-divider.system-user-message", {
       hasText: "Mode switch: plan",
     }),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   await expect(
     assistantText(page, "SwitchMode to plan successful."),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   assertRepairedContinuationHistory(
     agentType,
@@ -294,11 +294,11 @@ test("keep_context SwitchMode preface uses continuation key", async ({
     page.locator(".result-divider.system-user-message", {
       hasText: "Mode switch: implement",
     }),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   await expect(
     assistantText(page, "SwitchMode to implement successful."),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 });
 
 test("mode switch replay rebuilds known system message metadata", async ({
@@ -306,7 +306,7 @@ test("mode switch replay rebuilds known system message metadata", async ({
   agentType,
 }) => {
   await enterSession(page);
-  const timeout = agentType === "copilot" ? 60_000 : 30_000;
+  const timeout = responseTimeout(agentType);
 
   await sendMessage(page, "call switchmode plan");
   await expect(
@@ -330,21 +330,17 @@ test("unsent steer is either recovered into input box or shown in history after 
 
   await sendMessage(page, "run command sleep 60");
 
-  await expect(page.locator(".tool-call", { hasText: "sleep 60" })).toBeVisible(
-    { timeout: 30_000 },
-  );
+  await expect(
+    page.locator(".tool-call", { hasText: "sleep 60" }),
+  ).toBeVisible();
 
   await sendMessage(page, "this should be recovered");
 
   await page.locator(".btn-banner-stop").click();
-  await expect(page.locator(".btn-banner-resume")).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(page.locator(".btn-banner-resume")).toBeVisible();
 
   await page.locator(".btn-banner-resume").click();
-  await expect(page.locator(".btn-banner-stop")).toBeVisible({
-    timeout: 15_000,
-  });
+  await expect(page.locator(".btn-banner-stop")).toBeVisible();
 
   const input = page.locator(".input-textarea:visible").first();
   const historyMessage = page.locator(".user-message", {
@@ -357,7 +353,7 @@ test("unsent steer is either recovered into input box or shown in history after 
     expect(inputValue === "this should be recovered" || messageVisible).toBe(
       true,
     );
-  }).toPass({ timeout: 10_000 });
+  }).toPass();
 });
 
 test("handoff continuation exit navigates to grandparent, not completed parent", async ({
@@ -415,9 +411,7 @@ test("handoff continuation exit navigates to grandparent, not completed parent",
   );
 
   // Wait for the task URL to settle so we can capture G's tid.
-  await expect(page).toHaveURL(/\/[^/]+\/[^/]+\/task\/\d+/, {
-    timeout: 15_000,
-  });
+  await expect(page).toHaveURL(/\/[^/]+\/[^/]+\/task\/\d+/);
   const tidG = parseInt(
     page.url().match(/\/[^/]+\/[^/]+\/task\/(\d+)/)?.[1] ?? "0",
   );
@@ -432,7 +426,7 @@ test("handoff continuation exit navigates to grandparent, not completed parent",
     );
   await expect(async () => {
     expect(handingOffTasks()).toHaveLength(1);
-  }).toPass({ timeout: 30_000 });
+  }).toPass();
   const handingOffTid = handingOffTasks()[0]!.tid;
 
   // Flow: A calls Handoff → A completes → continuation C created → C auto-focused
@@ -440,9 +434,7 @@ test("handoff continuation exit navigates to grandparent, not completed parent",
   //
   // With the bug, it would navigate to A (completed direct parent).
   // With the fix, it walks up through completed A to find alive G.
-  await expect(page).toHaveURL(new RegExp(`/task/${tidG}$`), {
-    timeout: 30_000,
-  });
+  await expect(page).toHaveURL(new RegExp(`/task/${tidG}$`));
 
   assertRepairedContinuationHistory(
     agentType,
@@ -495,7 +487,7 @@ test("handoff replay rebuilds known system message metadata", async ({
   });
 
   await enterSession(page);
-  const timeout = agentType === "copilot" ? 60_000 : 30_000;
+  const timeout = responseTimeout(agentType);
 
   await sendMessage(
     page,
@@ -580,7 +572,7 @@ test("SwitchMode from sub-task sends is_continuation flag", async ({
   // "call switchmode plan", triggering a keep_context continuation.
   await sendMessage(page, "call task blank call switchmode plan");
 
-  const timeout = agentType === "copilot" ? 60_000 : 30_000;
+  const timeout = responseTimeout(agentType);
 
   // Wait for the child task to be created first; otherwise continuation reload
   // checks can race ahead before the sub-task exists on slower MCP paths.
@@ -641,7 +633,7 @@ test("on_yield continuation auto-fires on clean exit", async ({
       (e) => e.relation_type === "continuation",
     );
     expect(continuationCreated).toBeTruthy();
-  }).toPass({ timeout: 30_000 });
+  }).toPass();
 });
 
 test("on_yield does not fire on non-zero exit", { tag: "@no-codex" }, async ({ page, agentType }) => {
@@ -686,14 +678,14 @@ test("on_yield does not fire on non-zero exit", { tag: "@no-codex" }, async ({ p
       (e) => e.relation_type === "subtask",
     );
     expect(subTask).toBeTruthy();
-  }).toPass({ timeout: 30_000 });
+  }).toPass();
   const subTaskTid = taskCreatedEvents.find(
     (e) => e.relation_type === "subtask",
   )!.tid;
 
   // Kill the sub-task. getByRole targets only accessible elements, so it
   // finds the sub-task's Kill button and ignores hidden buttons from other tasks.
-  await page.getByRole("button", { name: "Kill" }).click({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Kill" }).click();
 
   // Wait for the sub-task to show as dead via broadcast task_updated.
   await expect(async () => {
@@ -701,7 +693,7 @@ test("on_yield does not fire on non-zero exit", { tag: "@no-codex" }, async ({ p
       (e) => e.tid === subTaskTid && !e.alive,
     );
     expect(deadUpdate).toBeTruthy();
-  }).toPass({ timeout: 10_000 });
+  }).toPass();
 
   // No task_created with relation_type "continuation" should have appeared.
   const continuationCreated = taskCreatedEvents.find(
@@ -736,10 +728,10 @@ test("input box stays empty after mode switch", async ({ page, agentType }) => {
     page.locator(".result-divider.system-user-message", {
       hasText: "Mode switch: plan",
     }),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   const input = page.locator(".input-textarea:visible").first();
-  await expect(input).toBeEnabled({ timeout: 10_000 });
+  await expect(input).toBeEnabled();
   await expect(input).toHaveValue("");
 
   const continuationReload = exactlyOne(
@@ -766,9 +758,9 @@ test("input box stays empty after mode switch", async ({ page, agentType }) => {
     page.locator(".result-divider.system-user-message", {
       hasText: "Mode switch: plan",
     }),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
   const reloadedInput = page.locator(".input-textarea:visible").first();
-  await expect(reloadedInput).toBeEnabled({ timeout: 10_000 });
+  await expect(reloadedInput).toBeEnabled();
   await expect(reloadedInput).toHaveValue("");
 });
 

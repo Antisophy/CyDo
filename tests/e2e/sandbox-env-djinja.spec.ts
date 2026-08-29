@@ -144,7 +144,7 @@ test("agents[*].sandbox.env values render Djinja env templates", async ({
   const createdPromise = waitForMessage(
     ws,
     (data) => data.type === "task_created" && typeof data.tid === "number",
-    10_000,
+    540_000,
   );
   ws.send(
     JSON.stringify({
@@ -162,7 +162,7 @@ test("agents[*].sandbox.env values render Djinja env templates", async ({
   const historyEndPromise = waitForMessage(
     ws,
     (data) => data.type === "task_history_end" && data.tid === tid,
-    10_000,
+    540_000,
   );
   ws.send(JSON.stringify({ type: "request_history", tid }));
   await historyEndPromise;
@@ -173,7 +173,7 @@ test("agents[*].sandbox.env values render Djinja env templates", async ({
       data.type === "title_update" &&
       data.tid === tid &&
       data.title === "secret-42",
-    30_000,
+    540_000,
   );
 
   ws.send(

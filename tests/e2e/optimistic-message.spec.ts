@@ -21,7 +21,7 @@ test("user bubble appears immediately after Send (ack-4 optimistic render)", { t
   await input.click();
   await input.fill("stall session");
   const sendBtn = page.locator(".btn-send:visible").first();
-  await expect(sendBtn).toBeEnabled({ timeout: 5_000 });
+  await expect(sendBtn).toBeEnabled();
 
   // Click send — do NOT await the assistant reply, check immediately.
   await sendBtn.click();
@@ -29,7 +29,7 @@ test("user bubble appears immediately after Send (ack-4 optimistic render)", { t
   // The optimistic bubble must be visible within one render cycle.
   await expect(
     page.locator(".user-message", { hasText: "stall session" }),
-  ).toBeVisible({ timeout: 3_000 });
+  ).toBeVisible();
 });
 
 test("outbox replays unsent message after offline reload", { tag: "@claude-only" }, async ({
@@ -54,13 +54,13 @@ test("outbox replays unsent message after offline reload", { tag: "@claude-only"
   await input.click();
   await input.fill('Please reply with "outbox-recovery"');
   const sendBtn = page.locator(".btn-send:visible").first();
-  await expect(sendBtn).toBeEnabled({ timeout: 5_000 });
+  await expect(sendBtn).toBeEnabled();
   await sendBtn.click();
 
   // Placeholder should be visible with ack-4 (offline, no backend ack).
   await expect(
     page.locator(".user-message", { hasText: "outbox-recovery" }),
-  ).toBeVisible({ timeout: 3_000 });
+  ).toBeVisible();
 
   // Verify outbox has an entry.
   const outboxBefore = await page.evaluate(() =>
@@ -77,7 +77,7 @@ test("outbox replays unsent message after offline reload", { tag: "@claude-only"
     .locator(".sidebar-item .sidebar-label", {
       hasText: "outbox-test-established",
     })
-    .click({ timeout: 15_000 });
+    .click();
 
   // The replayed message should eventually get a response.
   await expect(assistantText(page, "outbox-recovery")).toBeVisible({
@@ -124,7 +124,7 @@ test("backend deduplicates message sent twice with same nonce", { tag: "@claude-
   await input.click();
   await input.fill('Please reply with "dedupe-test"');
   const sendBtn = page.locator(".btn-send:visible").first();
-  await expect(sendBtn).toBeEnabled({ timeout: 5_000 });
+  await expect(sendBtn).toBeEnabled();
   await sendBtn.click();
 
   const outboxSnapshot = await page.evaluate(() => {
@@ -172,7 +172,7 @@ test("backend deduplicates message sent twice with same nonce", { tag: "@claude-
   await page.reload();
   await page
     .locator(".sidebar-item .sidebar-label", { hasText: "dedupe-test" })
-    .click({ timeout: 15_000 });
+    .click();
 
   // Wait for the task to be visible, then check no second reply arrives.
   await expect(assistantText(page, "dedupe-test").first()).toBeVisible({
@@ -324,7 +324,7 @@ test("claude skips ack-2 (no agent-ack signal)", { tag: "@claude-only" }, async 
   await input.click();
   await input.fill("stall session");
   const sendBtn = page.locator(".btn-send:visible").first();
-  await expect(sendBtn).toBeEnabled({ timeout: 5_000 });
+  await expect(sendBtn).toBeEnabled();
   await sendBtn.click();
 
   const bubble = page
@@ -335,7 +335,7 @@ test("claude skips ack-2 (no agent-ack signal)", { tag: "@claude-only" }, async 
 
   // By the time the DOM paints, the optimistic placeholder may still be
   // ack-4 or may already have been upgraded to ack-3 by the backend echo.
-  await expect(bubble).toHaveClass(/ack-(3|4)/, { timeout: 3_000 });
+  await expect(bubble).toHaveClass(/ack-(3|4)/);
 
   // Claude has no agent-ack signal — ack-2 must never appear. The bubble
   // settles at ack-3 (submitted to the harness) until the queue records
@@ -346,7 +346,7 @@ test("claude skips ack-2 (no agent-ack signal)", { tag: "@claude-only" }, async 
     const cls = (await bubble.getAttribute("class")) ?? "";
     expect(cls).not.toMatch(/ack-2/);
     expect(/ack-3/.test(cls) || !/ack-\d/.test(cls)).toBe(true);
-  }).toPass({ timeout: 15_000 });
+  }).toPass();
   await page.waitForTimeout(3_000);
   await expect(bubble).not.toHaveClass(/ack-2/);
 });
@@ -365,13 +365,13 @@ test("late-joining tab sees pending bubble from history", { tag: "@claude-only" 
   await input.click();
   await input.fill("stall session");
   const sendBtn = page.locator(".btn-send:visible").first();
-  await expect(sendBtn).toBeEnabled({ timeout: 5_000 });
+  await expect(sendBtn).toBeEnabled();
   await sendBtn.click();
 
   // Wait for the unconfirmed-user-event echo so the pending bubble is in history.
   await expect(
     page.locator(".user-message", { hasText: "stall session" }),
-  ).toBeVisible({ timeout: 5_000 });
+  ).toBeVisible();
 
   // Open the same task in a second context.
   const url = page.url();
@@ -382,7 +382,7 @@ test("late-joining tab sees pending bubble from history", { tag: "@claude-only" 
   // Tab B should see the pending bubble replayed from history.
   await expect(
     page2.locator(".user-message", { hasText: "stall session" }),
-  ).toBeVisible({ timeout: 15_000 });
+  ).toBeVisible();
 
   await ctx2.close();
 });
@@ -407,14 +407,14 @@ test("outbox ack-4 placeholder visible offline; persists across reload", { tag: 
   await inputEl.click();
   await inputEl.fill('Please reply with "outbox-reload-pending"');
   const sendBtn = page.locator(".btn-send:visible").first();
-  await expect(sendBtn).toBeEnabled({ timeout: 5_000 });
+  await expect(sendBtn).toBeEnabled();
   await sendBtn.click();
 
   // Render-layer outbox composition: ack-4 placeholder is visible immediately
   // from localStorage — no WS round-trip needed (we're offline).
   await expect(
     page.locator(".user-message.ack-4", { hasText: "outbox-reload-pending" }),
-  ).toBeVisible({ timeout: 3_000 });
+  ).toBeVisible();
   const outboxBefore = await page.evaluate(() =>
     JSON.parse(localStorage.getItem("cydo.outbox.v1") ?? "[]"),
   );
@@ -431,7 +431,7 @@ test("outbox ack-4 placeholder visible offline; persists across reload", { tag: 
     .locator(".sidebar-item .sidebar-label", {
       hasText: "reload-outbox-established",
     })
-    .click({ timeout: 15_000 });
+    .click();
 
   // Full delivery: outbox replays the message and the backend replies.
   await expect(assistantText(page, "outbox-reload-pending")).toBeVisible({
@@ -504,7 +504,7 @@ test("identical-text messages use separate nonces (no placeholder collision)", {
     .locator(".sidebar-item .sidebar-label", {
       hasText: "nonce-dedup-established",
     })
-    .click({ timeout: 15_000 });
+    .click();
 
   // After both outbox entries are replayed and ack-3 arrives for each, the
   // reducer places them as two separate user message bubbles (one per nonce).

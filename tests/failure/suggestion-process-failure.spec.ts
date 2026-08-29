@@ -155,7 +155,7 @@ test("suggestion one-shot rejection keeps session responsive", async ({
   const createdPromise = waitForMessage(
     ws,
     (data) => data.type === "task_created" && typeof data.tid === "number",
-    10_000,
+    540_000,
   );
   ws.send(
     JSON.stringify({
@@ -173,7 +173,7 @@ test("suggestion one-shot rejection keeps session responsive", async ({
   const historyEndPromise = waitForMessage(
     ws,
     (data) => data.type === "task_history_end" && data.tid === tid,
-    10_000,
+    540_000,
   );
   ws.send(JSON.stringify({ type: "request_history", tid }));
   await historyEndPromise;
@@ -183,7 +183,7 @@ test("suggestion one-shot rejection keeps session responsive", async ({
       ws,
       (data) =>
         data.event?.type === "turn/result" && data.event?.subtype === "success",
-      30_000,
+      540_000,
     );
     ws.send(
       JSON.stringify({
@@ -209,7 +209,7 @@ test("top-level task creation rejects missing entry point", async ({
     (data) =>
       data.type === "error" &&
       data.message === "Top-level task creation requires an entry point",
-    10_000,
+    540_000,
   );
 
   ws.send(

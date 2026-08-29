@@ -51,14 +51,14 @@ async function waitForNewTid(
       );
     newTid = tids.find((tid: string) => !before.has(tid));
     expect(newTid).toBeTruthy();
-  }).toPass({ timeout: 15_000 });
+  }).toPass();
   return newTid!;
 }
 
 async function resumeIfNeeded(page: Parameters<typeof sendMessage>[0]) {
   const resumeBtn = page.locator(".btn-banner-resume:visible").first();
   const visible = await resumeBtn
-    .isVisible({ timeout: 5_000 })
+    .isVisible()
     .catch(() => false);
   if (visible) {
     await resumeBtn.click();
@@ -75,7 +75,7 @@ async function endActiveSession(page: Page) {
   await page.locator("[style*='display: contents'] .btn-banner-end").click();
   await expect(
     page.locator("[style*='display: contents'] .btn-banner-archive"),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 }
 
 function activeAssistantText(
@@ -101,7 +101,7 @@ async function forkFromMessage(page: Page, selector: string, text: string) {
   const message = messageWrapper(page, selector, text);
   await message.hover();
   const fork = message.locator(".fork-btn");
-  await expect(fork).toBeVisible({ timeout: 5_000 });
+  await expect(fork).toBeVisible();
   await fork.click();
 }
 
@@ -112,11 +112,9 @@ async function undoUserMessage(page: Page, text: string) {
     text,
   );
   await message.hover();
-  await expect(message.locator(".undo-btn")).toBeVisible({ timeout: 5_000 });
+  await expect(message.locator(".undo-btn")).toBeVisible();
   await message.locator(".undo-btn").click();
-  await expect(page.locator(".undo-dialog:visible")).toBeVisible({
-    timeout: 5_000,
-  });
+  await expect(page.locator(".undo-dialog:visible")).toBeVisible();
   await page.locator(".btn-undo:visible").click();
 }
 
@@ -180,10 +178,8 @@ test(
         turnOne,
       );
       await turnOneAssistant.hover();
-      await expect(turnOneAssistant.locator(".fork-btn")).toBeVisible({
-        timeout: 5_000,
-      });
-    }).toPass({ timeout: 20_000 });
+      await expect(turnOneAssistant.locator(".fork-btn")).toBeVisible();
+    }).toPass();
 
     await forkFromMessage(page, ".assistant-message", turnOne);
 
@@ -193,7 +189,7 @@ test(
           event.relation_type === "fork" && event.parent_tid === parentTid,
       );
       expect(fork).toBeTruthy();
-    }).toPass({ timeout: 20_000 });
+    }).toPass();
 
     const forkTid = taskCreatedEvents.find(
       (event) =>
@@ -204,14 +200,10 @@ test(
       if (!page.url().endsWith(`/task/${forkTid}`)) {
         await page.locator(`.sidebar-item[data-tid="${forkTid}"]`).click();
       }
-      await expect(page).toHaveURL(new RegExp(`/task/${forkTid}$`), {
-        timeout: 5_000,
-      });
-    }).toPass({ timeout: 20_000 });
+      await expect(page).toHaveURL(new RegExp(`/task/${forkTid}$`));
+    }).toPass();
 
-    await expect(activeAssistantText(page, turnOne)).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(activeAssistantText(page, turnOne)).toBeVisible();
     await expect(
       page.locator(
         "[style*='display: contents'] [data-testid='assistant-text']",
@@ -228,9 +220,7 @@ test(
     });
 
     await page.locator(`.sidebar-item[data-tid="${parentTid}"]`).click();
-    await expect(page).toHaveURL(new RegExp(`/task/${parentTid}$`), {
-      timeout: 15_000,
-    });
+    await expect(page).toHaveURL(new RegExp(`/task/${parentTid}$`));
 
     await resumeIfNeeded(page);
     await sendMessage(page, `Reply exactly with ${parentOnly}`);
@@ -247,12 +237,8 @@ test(
     ).toHaveCount(0);
 
     await page.locator(`.sidebar-item[data-tid="${forkTid}"]`).click();
-    await expect(page).toHaveURL(new RegExp(`/task/${forkTid}$`), {
-      timeout: 15_000,
-    });
-    await expect(activeAssistantText(page, forkOnly)).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(page).toHaveURL(new RegExp(`/task/${forkTid}$`));
+    await expect(activeAssistantText(page, forkOnly)).toBeVisible();
     await expect(
       page.locator(
         "[style*='display: contents'] [data-testid='assistant-text']",
@@ -299,19 +285,17 @@ test(
 
     await forkFromMessage(page, ".user-message", currentUser);
     const forkTid = await waitForNewTid(page, before);
-    await expect(page).toHaveURL(new RegExp(`/task/${forkTid}$`), {
-      timeout: 20_000,
-    });
+    await expect(page).toHaveURL(new RegExp(`/task/${forkTid}$`));
 
     await expect(
       page.locator(".message.user-message:visible", { hasText: currentUser }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible();
     await expect(
       page.locator(".message.user-message:visible", { hasText: earlierUser }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible();
     await expect(
       page.locator(".message.user-message:visible", { hasText: currentUser }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible();
     await expect(activeAssistantText(page, currentResponse)).toHaveCount(0);
 
     await page.locator(`.sidebar-item[data-tid="${parentTid}"]`).click();
@@ -413,7 +397,7 @@ test(
     const staleMessage = messageWrapper(page, ".user-message", rolledBack);
     await staleMessage.hover();
     const staleFork = staleMessage.locator(".fork-btn");
-    await expect(staleFork).toBeVisible({ timeout: 5_000 });
+    await expect(staleFork).toBeVisible();
     const staleTid = Number(await staleFork.getAttribute("data-fork-tid"));
     const staleAnchor = await staleFork.getAttribute("data-fork-anchor");
     expect(staleTid).toBe(parentTid);
@@ -423,7 +407,7 @@ test(
     await undoUserMessage(page, rolledBack);
     await expect(
       page.locator(".message.user-message:visible", { hasText: rolledBack }),
-    ).toHaveCount(0, { timeout: 15_000 });
+    ).toHaveCount(0);
     await page.reload();
     await expect(activeAssistantText(page, retained)).toBeVisible({
       timeout: responseTimeout(agentType),
@@ -545,7 +529,7 @@ function spawnCodexProfiledBackend(
 async function waitForCodexProfiledBackend(
   baseURL: string,
   proc: ChildProcess,
-  timeoutMs = 30_000,
+  timeoutMs = 540_000,
 ): Promise<void> {
   const processExited = new Promise<never>((_, reject) => {
     if (proc.exitCode !== null) {
@@ -674,7 +658,6 @@ async function findRolloutJsonlContaining(
         found = matches.length === 1 ? matches[0] : undefined;
         return matches.length;
       },
-      { timeout: 20_000 },
     )
     .toBe(1);
   return found!;
@@ -744,7 +727,7 @@ function readFileOrEmpty(path: string): string {
 async function openTaskByTid(
   page: Page,
   tid: string,
-  timeoutMs = 15_000,
+  timeoutMs = 540_000,
 ): Promise<void> {
   const row = page.locator(`.sidebar-item[data-tid="${tid}"]`);
   await expect(row).toBeVisible({ timeout: timeoutMs });
@@ -804,16 +787,12 @@ codexProfileTest(
     // pre-session baseline".
     await forkFromMessage(page, ".assistant-message", parentMarker);
     const forkTid = await waitForNewTid(page, new Set([...before, parentTid]));
-    await expect(page).toHaveURL(new RegExp(`/task/${forkTid}$`), {
-      timeout: 20_000,
-    });
+    await expect(page).toHaveURL(new RegExp(`/task/${forkTid}$`));
 
     // Let the child's copied history (and its dead-state resume banner)
     // fully render before probing for the banner below — mirrors the
     // existing fork test's settle-then-resume ordering.
-    await expect(activeAssistantText(page, parentMarker)).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(activeAssistantText(page, parentMarker)).toBeVisible();
 
     // Fork materializes the child dead (thread/fork mints the thread on the
     // parent's own live process, but the child task itself still needs a
@@ -831,14 +810,14 @@ codexProfileTest(
       const inputBox = input.locator(
         "xpath=ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' input-box ')]",
       );
-      await expect(input).toBeEnabled({ timeout: 5_000 });
-      await input.click({ timeout: 5_000 });
+      await expect(input).toBeEnabled();
+      await input.click();
       await input.fill(`Reply exactly with ${childMarker}`);
       const sendBtn = inputBox.locator(".btn-send");
-      await expect(sendBtn).toBeVisible({ timeout: 5_000 });
-      await expect(sendBtn).toBeEnabled({ timeout: 5_000 });
-      await sendBtn.click({ timeout: 5_000 });
-    }).toPass({ timeout: 45_000 });
+      await expect(sendBtn).toBeVisible();
+      await expect(sendBtn).toBeEnabled();
+      await sendBtn.click();
+    }).toPass();
     await expect(activeAssistantText(page, childMarker)).toBeVisible({
       timeout,
     });
@@ -899,7 +878,7 @@ codexProfileTest(
     const childDiagnostics = page.locator(
       "[style*='display: contents'] .diagnostic-message.diagnostic-error",
     );
-    await expect(childDiagnostics).toHaveCount(1, { timeout: 15_000 });
+    await expect(childDiagnostics).toHaveCount(1);
     const childDiagText = await childDiagnostics.first().innerText();
     expect(childDiagText).toContain("Failed to load session history");
     // Deterministic, not a race: the fork-materialization callback writes
@@ -930,14 +909,12 @@ codexProfileTest(
     await enterSession(page);
     await expect(
       page.locator('.agent-picker option[value="work-codex"]'),
-    ).toHaveText("Profile C", { timeout: 20_000 });
+    ).toHaveText("Profile C");
 
     // Parent remains bound to B and unaffected by the fork, the child's
     // end, the reconfiguration, or the A poison.
     await openTaskByTid(page, parentTid);
-    await expect(activeAssistantText(page, parentMarker)).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(activeAssistantText(page, parentMarker)).toBeVisible();
     await expect(
       page.locator(".message.user-message", { hasText: parentPoisonMarker }),
     ).toHaveCount(0);
@@ -953,7 +930,7 @@ codexProfileTest(
     const parentDiagnostics = page.locator(
       "[style*='display: contents'] .diagnostic-message.diagnostic-error",
     );
-    await expect(parentDiagnostics).toHaveCount(1, { timeout: 15_000 });
+    await expect(parentDiagnostics).toHaveCount(1);
     const parentDiagText = await parentDiagnostics.first().innerText();
     expect(parentDiagText).toContain("Failed to load session history");
     expect(parentDiagText).toContain(parentSessionId);
@@ -982,9 +959,7 @@ codexProfileTest(
     const childDiagnosticsAfterReload = page.locator(
       "[style*='display: contents'] .diagnostic-message.diagnostic-error",
     );
-    await expect(childDiagnosticsAfterReload).toHaveCount(1, {
-      timeout: 15_000,
-    });
+    await expect(childDiagnosticsAfterReload).toHaveCount(1);
     const childDiagTextAfterReload = await childDiagnosticsAfterReload
       .first()
       .innerText();

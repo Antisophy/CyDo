@@ -177,12 +177,12 @@ test(
 
       await expect(
         page.locator(".project-card-title[title='monorepo/project']"),
-      ).toBeVisible({ timeout: 15_000 });
+      ).toBeVisible();
 
       await page.locator(".project-card-title[title='monorepo/project']").click();
-      await expect(page.locator(".input-textarea:visible").first()).toBeEnabled({
-        timeout: 15_000,
-      });
+      await expect(
+        page.locator(".input-textarea:visible").first(),
+      ).toBeEnabled();
       await expect(page).toHaveTitle("project — CyDo");
 
       await page.locator(".input-textarea:visible").first().fill(
@@ -200,13 +200,13 @@ test(
         const derived = listNumericTaskIds(tasksDir).filter((tid) => tid > 1);
         spikeTid = derived.length > 0 ? Math.min(...derived) : null;
         expect(spikeTid).not.toBeNull();
-      }).toPass({ timeout: 60_000 });
+      }).toPass();
 
       const workspaceScopedWorktree = `${wsRoot}/.cydo/tasks/${spikeTid!}/worktree`;
       const repoScopedWorktree = `${repoDir}/.cydo/tasks/${spikeTid!}/worktree`;
 
       await expect
-        .poll(() => existsSync(workspaceScopedWorktree), { timeout: 30_000 })
+        .poll(() => existsSync(workspaceScopedWorktree))
         .toBe(true);
       expect(existsSync(repoScopedWorktree)).toBe(false);
 
@@ -219,7 +219,6 @@ test(
             listFilesRecursive(expectedHistoryDir).filter((path) =>
               path.endsWith(".jsonl"),
             ).length,
-          { timeout: 30_000 },
         )
         .toBeGreaterThan(0);
     } finally {
@@ -247,12 +246,12 @@ test(
 
       await expect(
         page.locator(".project-card-title[title='monorepo/project']"),
-      ).toBeVisible({ timeout: 15_000 });
+      ).toBeVisible();
 
       await page.locator(".project-card-title[title='monorepo/project']").click();
-      await expect(page.locator(".input-textarea:visible").first()).toBeEnabled({
-        timeout: 15_000,
-      });
+      await expect(
+        page.locator(".input-textarea:visible").first(),
+      ).toBeEnabled();
 
       await page.locator(".input-textarea:visible").first().fill(
         "Please run command sh -lc 'printf sandbox-root-ok > ../repo-root-write.txt && cat ../repo-root-write.txt'",
@@ -260,7 +259,7 @@ test(
       await page.locator(".btn-send:visible").first().click();
 
       await expect
-        .poll(() => existsSync(repoRootFile), { timeout: 60_000 })
+        .poll(() => existsSync(repoRootFile))
         .toBe(true);
       expect(readFileSync(repoRootFile, "utf8")).toBe("sandbox-root-ok");
     } finally {

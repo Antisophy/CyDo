@@ -59,9 +59,7 @@ test("End button shows ending state then session exits", { tag: "@no-codex" }, a
   await page.locator(".btn-banner-end").click();
 
   // The End button should disappear (or be hidden)
-  await expect(page.locator(".btn-banner-end")).not.toBeVisible({
-    timeout: 5_000,
-  });
+  await expect(page.locator(".btn-banner-end")).not.toBeVisible();
 
   const ending = page.locator(".banner-processing", { hasText: "Ending..." });
   const stop = page.locator(".btn-banner-stop");
@@ -83,7 +81,7 @@ test("End button shows ending state then session exits", { tag: "@no-codex" }, a
     await expect(async () => {
       expect(await ending.isVisible()).toBe(true);
       expect(await stop.isVisible()).toBe(true);
-    }).toPass({ timeout: 5_000 });
+    }).toPass();
   }
 
   // The textarea should still be enabled (user can keep typing drafts)
@@ -94,9 +92,7 @@ test("End button shows ending state then session exits", { tag: "@no-codex" }, a
   await expect(page.locator(".btn-send").first()).toBeDisabled();
 
   // Eventually the session should exit and show the Archive button
-  await expect(page.locator(".btn-banner-archive")).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(page.locator(".btn-banner-archive")).toBeVisible();
 
   // "Ending..." should no longer be visible
   await expect(page.locator(".banner-processing")).not.toBeVisible();
@@ -151,7 +147,7 @@ test("background command output re-enters processing state", { tag: "@no-copilot
     expect(falseIdx).toBeGreaterThanOrEqual(0); // turn completed
     const reentry = processingTransitions.slice(falseIdx + 1).includes(true);
     expect(reentry).toBe(true); // re-entered processing
-  }).toPass({ timeout: 10_000 });
+  }).toPass();
 });
 
 test("repro: ending capability matches Stop visibility", { tag: "@copilot-only" }, async ({
@@ -168,9 +164,7 @@ test("repro: ending capability matches Stop visibility", { tag: "@copilot-only" 
   });
 
   await page.locator(".btn-banner-end").click();
-  await expect(page.locator(".btn-banner-end")).not.toBeVisible({
-    timeout: 5_000,
-  });
+  await expect(page.locator(".btn-banner-end")).not.toBeVisible();
 
   const ending = page.locator(".banner-processing", { hasText: "Ending..." });
   const stop = page.locator(".btn-banner-stop");
@@ -194,5 +188,5 @@ test("repro: ending capability matches Stop visibility", { tag: "@copilot-only" 
     return;
   }
 
-  await expect(archive).toBeVisible({ timeout: 30_000 });
+  await expect(archive).toBeVisible();
 });

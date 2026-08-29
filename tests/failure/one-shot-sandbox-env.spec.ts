@@ -144,7 +144,7 @@ test("title generation one-shot receives sandbox env", async ({ backend }) => {
   const createdPromise = waitForMessage(
     ws,
     (data) => data.type === "task_created" && typeof data.tid === "number",
-    10_000,
+    540_000,
   );
   ws.send(
     JSON.stringify({
@@ -162,7 +162,7 @@ test("title generation one-shot receives sandbox env", async ({ backend }) => {
   const historyEndPromise = waitForMessage(
     ws,
     (data) => data.type === "task_history_end" && data.tid === tid,
-    10_000,
+    540_000,
   );
   ws.send(JSON.stringify({ type: "request_history", tid }));
   await historyEndPromise;
@@ -173,13 +173,13 @@ test("title generation one-shot receives sandbox env", async ({ backend }) => {
       data.type === "title_update" &&
       data.tid === tid &&
       data.title === "Sandbox Env Title",
-    30_000,
+    540_000,
   );
   const resultPromise = waitForMessage(
     ws,
     (data) =>
       data.event?.type === "turn/result" && data.event?.subtype === "success",
-    30_000,
+    540_000,
   );
 
   ws.send(

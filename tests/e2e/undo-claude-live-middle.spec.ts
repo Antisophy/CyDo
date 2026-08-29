@@ -21,9 +21,9 @@ async function openUndoDialogForTurn(page: Page, turnText: string) {
     })
     .last();
   await userMsg.hover();
-  await expect(userMsg.locator(".undo-btn")).toBeVisible({ timeout: 5_000 });
+  await expect(userMsg.locator(".undo-btn")).toBeVisible();
   await userMsg.locator(".undo-btn").click();
-  await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+  await expect(page.locator(".undo-dialog")).toBeVisible();
 }
 
 async function readUndoRemovalCount(page: Page): Promise<number> {
@@ -126,11 +126,11 @@ test(
     await page.locator(".btn-undo").click();
 
     const input = page.locator(".input-textarea:visible").first();
-    await expect(input).toBeEnabled({ timeout: 15_000 });
+    await expect(input).toBeEnabled();
     await expect(async () => {
       await assertTurnPresence(page, ["alert-one"], true);
       await assertTurnPresence(page, ["alert-two"], false);
-    }).toPass({ timeout: 15_000 });
+    }).toPass();
 
     await expect(
       page.locator(".command-error-dialog", {
@@ -138,9 +138,7 @@ test(
       }),
     ).toHaveCount(0);
 
-    await expect(input).toHaveValue('Please reply with "alert-two"', {
-      timeout: 15_000,
-    });
+    await expect(input).toHaveValue('Please reply with "alert-two"');
   },
 );
 
@@ -215,7 +213,7 @@ test("all agents publish canonical boundary replacements without duplicate trans
         ),
       ).toBe(true);
     }
-  }).toPass({ timeout: 15_000 });
+  }).toPass();
   const replacements = frames.filter(
     (frame) => frame?.type === "task_history_boundary_replaced",
   );
@@ -241,7 +239,7 @@ test("all agents publish canonical boundary replacements without duplicate trans
     expect(
       replayFrames.some((frame) => frame?.type === "task_history_end"),
     ).toBe(true),
-  ).toPass({ timeout: 15_000 });
+  ).toPass();
 });
 
 test(
@@ -256,17 +254,17 @@ test(
     await expect(assistantText(page, "reply-one")).toBeVisible({ timeout });
 
     const input = page.locator(".input-textarea:visible").first();
-    await expect(input).toBeEnabled({ timeout: 15_000 });
+    await expect(input).toBeEnabled();
 
     await openUndoDialogForTurn(page, "reply-one");
     await page.locator(".btn-undo").click();
 
-    await expect(input).toBeEnabled({ timeout: 15_000 });
+    await expect(input).toBeEnabled();
     await expect(async () => {
       await assertTurnPresence(page, ["reply-one"], false);
-    }).toPass({ timeout: 15_000 });
+    }).toPass();
 
-    await expect(input).toHaveValue(prompt, { timeout: 15_000 });
+    await expect(input).toHaveValue(prompt);
   },
 );
 
@@ -289,10 +287,10 @@ test(
     }
 
     const input = page.locator(".input-textarea:visible").first();
-    await expect(input).toBeEnabled({ timeout: 15_000 });
+    await expect(input).toBeEnabled();
     await openUndoDialogForTurn(page, "live-three");
     await page.locator(".btn-undo").click();
-    await expect(input).toBeEnabled({ timeout: 15_000 });
+    await expect(input).toBeEnabled();
     await expect(async () => {
       const { userTexts, assistantTexts } = await readVisibleTurnTexts(page);
       const survivingUserTurns = turns.filter((turn) =>
@@ -311,11 +309,10 @@ test(
         ["live-three", "live-four", "live-five"],
         false,
       );
-    }).toPass({ timeout: 15_000 });
+    }).toPass();
 
     await expect(input).toHaveValue(
       'Please reply with "live-three"\n\nPlease reply with "live-four"\n\nPlease reply with "live-five"',
-      { timeout: 15_000 },
     );
 
     await sendMessage(page, 'Please reply with "live-six"');
@@ -342,31 +339,24 @@ test(
       await expect(assistantText(page, turn)).toBeVisible({ timeout });
     }
 
-    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled({
-      timeout: 15_000,
-    });
+    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled();
 
     await openUndoDialogForTurn(page, "reload-three");
     await page.locator(".undo-dialog .btn", { hasText: "Cancel" }).click();
-    await expect(page.locator(".undo-dialog")).not.toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(page.locator(".undo-dialog")).not.toBeVisible();
 
     await killSession(page, agentType);
     await expect(
       page.locator(".message.user-message:not(.pending):not(.meta-message)", {
         hasText: "reload-three",
       }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible();
 
     await openUndoDialogForTurn(page, "reload-three");
     await page.locator(".btn-undo").click();
-    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled({
-      timeout: 15_000,
-    });
+    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled();
     await expect(page.locator(".input-textarea:visible").first()).toHaveValue(
       /Please reply with "reload-three"/,
-      { timeout: 15_000 },
     );
     await expect(async () => {
       const { userTexts, assistantTexts } = await readVisibleTurnTexts(page);
@@ -386,7 +376,7 @@ test(
         ["reload-three", "reload-four", "reload-five"],
         false,
       );
-    }).toPass({ timeout: 15_000 });
+    }).toPass();
   },
 );
 
@@ -424,9 +414,7 @@ test(
     await openUndoDialogForTurn(page, "proto-three");
     const expectedRemoved = await readUndoRemovalCount(page);
     await page.locator(".btn-undo").click();
-    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled({
-      timeout: 15_000,
-    });
+    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled();
 
     await expect(async () => {
       const undoIdx = frames.findIndex(
@@ -454,7 +442,7 @@ test(
       );
       expect(historyEndIdx).toBeGreaterThan(reloadIdx);
       expect(operationsIdx).toBeLessThan(historyEndIdx);
-    }).toPass({ timeout: 15_000 });
+    }).toPass();
 
     const seqToAnchor = new Map<number, string>();
     const conflicts: string[] = [];

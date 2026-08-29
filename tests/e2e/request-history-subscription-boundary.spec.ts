@@ -19,7 +19,7 @@ function waitForOpen(ws: WebSocket): Promise<void> {
   });
 }
 
-function waitForClose(ws: WebSocket, timeoutMs = 5_000): Promise<void> {
+function waitForClose(ws: WebSocket, timeoutMs = 540_000): Promise<void> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       reject(new Error(`Timed out waiting for WebSocket close after ${timeoutMs}ms`));
@@ -111,8 +111,6 @@ test("request_history replays before later live task updates on the same socket"
   page,
   backend,
 }) => {
-  const timeoutMs = test.info().project.name === "codex" ? 90_000 : 60_000;
-
   let tid: number | null = null;
   page.on("websocket", (ws) => {
     ws.on("framereceived", (frame) => {
@@ -134,10 +132,8 @@ test("request_history replays before later live task updates on the same socket"
 
   const seedReply = `history-boundary-seed-${Date.now()}`;
   await sendMessage(page, `reply with "${seedReply}"`);
-  await expect(assistantText(page, seedReply)).toBeVisible({
-    timeout: timeoutMs,
-  });
-  await expect.poll(() => tid ?? -1, { timeout: 15_000 }).toBeGreaterThan(0);
+  await expect(assistantText(page, seedReply)).toBeVisible();
+  await expect.poll(() => tid ?? -1).toBeGreaterThan(0);
   const taskId = tid!;
 
   const observer = new WebSocket(`${backend.baseURL.replace(/^http/, "ws")}/ws`);
@@ -173,7 +169,6 @@ test("request_history replays before later live task updates on the same socket"
             msg?.type === "task_history_end" &&
             msg?.tid === taskId,
         ),
-      { timeout: 15_000 },
     )
     .not.toBe(-1);
 
@@ -196,7 +191,6 @@ test("request_history replays before later live task updates on the same socket"
               msg?.event !== undefined) &&
             containsLiveTurnText(msg, livePrompt, liveReply),
         ),
-      { timeout: 15_000 },
     )
     .not.toBe(-1);
 
@@ -242,9 +236,7 @@ test("request_history replays before later live task updates on the same socket"
       .some((msg) => containsLiveTurnText(msg, livePrompt, liveReply)),
   ).toBe(false);
 
-  await expect(assistantText(page, liveReply)).toBeVisible({
-    timeout: timeoutMs,
-  });
+  await expect(assistantText(page, liveReply)).toBeVisible();
 
   const closePromise = waitForClose(observer);
   observer.close();

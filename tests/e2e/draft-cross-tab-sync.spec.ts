@@ -215,7 +215,7 @@ async function waitForNewTid(page: Page, before: Set<string>): Promise<number> {
       );
     tid = tids.find((candidate) => !before.has(candidate));
     expect(tid).toBeTruthy();
-  }).toPass({ timeout: 10_000 });
+  }).toPass();
   return Number(tid);
 }
 

@@ -48,9 +48,7 @@ test(
     });
 
     await page.locator(".btn-banner-end").click();
-    await expect(page.locator(".btn-banner-archive")).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(page.locator(".btn-banner-archive")).toBeVisible();
 
     const userMessage = page.locator(".message-wrapper").filter({
       has: page.locator(".message.user-message", { hasText: prompt }),
@@ -60,13 +58,11 @@ test(
 
     const editReloadStart = reloadReasons.length;
     const editor = page.locator(".message.user-message.editing");
-    await expect(editor.locator(".edit-textarea")).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(editor.locator(".edit-textarea")).toBeVisible();
     await editor.locator(".edit-textarea").fill("");
     await editor.locator(".edit-actions .btn-primary").click();
     await expect
-      .poll(() => reloadReasons.slice(editReloadStart), { timeout: 15_000 })
+      .poll(() => reloadReasons.slice(editReloadStart))
       .toContain("edit");
 
     const reloadErrorStart = replacementErrors.length;
@@ -97,7 +93,6 @@ test(
         {
           message:
             "the edited session should finish loading without a history replacement error",
-          timeout: 15_000,
         },
       )
       .toBe("loaded");

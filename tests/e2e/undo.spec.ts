@@ -32,29 +32,19 @@ test("undo moves user message text to input box", async ({
   await enterSession(page);
 
   await sendMessage(page, 'Please reply with "reply-one"');
-  await expect(assistantText(page, "reply-one")).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(assistantText(page, "reply-one")).toBeVisible();
 
   await sendMessage(page, 'Please reply with "reply-two"');
-  await expect(assistantText(page, "reply-two")).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(assistantText(page, "reply-two")).toBeVisible();
 
   await sendMessage(page, 'Please reply with "reply-three"');
-  await expect(assistantText(page, "reply-three")).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(assistantText(page, "reply-three")).toBeVisible();
 
   await sendMessage(page, 'Please reply with "reply-four"');
-  await expect(assistantText(page, "reply-four")).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(assistantText(page, "reply-four")).toBeVisible();
 
   await sendMessage(page, 'Please reply with "reply-five"');
-  await expect(assistantText(page, "reply-five")).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(assistantText(page, "reply-five")).toBeVisible();
 
   await killSession(page, agentType);
 
@@ -71,9 +61,7 @@ test("undo moves user message text to input box", async ({
     "reply-four",
     "reply-five",
   ]) {
-    await expect(replyUser.filter({ hasText: marker })).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(replyUser.filter({ hasText: marker })).toBeVisible();
   }
 
   // Undo at message 3
@@ -84,21 +72,17 @@ test("undo moves user message text to input box", async ({
     .last();
   await thirdUserMsg.hover();
 
-  await expect(thirdUserMsg.locator(".undo-btn")).toBeVisible({
-    timeout: 5_000,
-  });
+  await expect(thirdUserMsg.locator(".undo-btn")).toBeVisible();
   await thirdUserMsg.locator(".undo-btn").click();
 
-  await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+  await expect(page.locator(".undo-dialog")).toBeVisible();
   await page.locator(".btn-undo").click();
 
   // After undo: exactly 2 confirmed user messages remain
-  await expect(replyUser).toHaveCount(2, { timeout: 15_000 });
+  await expect(replyUser).toHaveCount(2);
 
   // After undo: exactly 2 assistant messages remain (reply-one and reply-two)
-  await expect(page.locator(".message.assistant-message")).toHaveCount(2, {
-    timeout: 15_000,
-  });
+  await expect(page.locator(".message.assistant-message")).toHaveCount(2);
 
   // Messages 1 and 2 are still visible (user + assistant)
   await expect(replyUser.filter({ hasText: "reply-one" })).toBeVisible();
@@ -114,10 +98,9 @@ test("undo moves user message text to input box", async ({
 
   // Input box contains the undone message text
   const input = page.locator(".input-textarea:visible").first();
-  await expect(input).toBeVisible({ timeout: 15_000 });
+  await expect(input).toBeVisible();
   await expect(input).toHaveValue(
     'Please reply with "reply-three"\n\nPlease reply with "reply-four"\n\nPlease reply with "reply-five"',
-    { timeout: 15_000 },
   );
 
   if (agentType === "codex") {
@@ -127,18 +110,16 @@ test("undo moves user message text to input box", async ({
           (event) => event.relation_type === "undo-backup",
         ),
       ).toBeTruthy();
-    }).toPass({ timeout: 15_000 });
+    }).toPass();
 
     const backupTid = taskCreatedEvents.find(
       (event) => event.relation_type === "undo-backup",
     )!.tid;
     await page.reload();
     const backup = page.locator(`.sidebar-item[data-tid="${backupTid}"]`);
-    await expect(backup).toBeVisible({ timeout: 15_000 });
+    await expect(backup).toBeVisible();
     await backup.click();
-    await expect(assistantText(page, "reply-five")).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(assistantText(page, "reply-five")).toBeVisible();
   }
 });
 
@@ -150,9 +131,7 @@ test(
 
     const prompt = 'Please reply with "first-undo-draft"';
     await sendMessage(page, prompt);
-    await expect(assistantText(page, "first-undo-draft")).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(assistantText(page, "first-undo-draft")).toBeVisible();
 
     await killSession(page, agentType);
 
@@ -161,29 +140,25 @@ test(
         has: page.locator(".user-message", { hasText: "first-undo-draft" }),
       })
       .last();
-    await expect(firstUserMsg).toBeVisible({ timeout: 15_000 });
+    await expect(firstUserMsg).toBeVisible();
     await firstUserMsg.hover();
 
-    await expect(firstUserMsg.locator(".undo-btn")).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(firstUserMsg.locator(".undo-btn")).toBeVisible();
     await firstUserMsg.locator(".undo-btn").click();
 
-    await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator(".undo-dialog")).toBeVisible();
     await page.locator(".btn-undo").click();
 
     await expect(
       page.locator(".message.user-message:not(.pending)", {
         hasText: "first-undo-draft",
       }),
-    ).toHaveCount(0, { timeout: 15_000 });
-    await expect(assistantText(page, "first-undo-draft")).toHaveCount(0, {
-      timeout: 15_000,
-    });
+    ).toHaveCount(0);
+    await expect(assistantText(page, "first-undo-draft")).toHaveCount(0);
 
     const input = page.locator(".input-textarea:visible").first();
-    await expect(input).toBeVisible({ timeout: 15_000 });
-    await expect(input).toHaveValue(prompt, { timeout: 15_000 });
+    await expect(input).toBeVisible();
+    await expect(input).toHaveValue(prompt);
   },
 );
 
@@ -197,11 +172,9 @@ test(
 
     await enterSession(page);
     await sendMessage(page, `Reply exactly with ${selected}. ${prompt}`);
-    await expect(assistantText(page, selected)).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(assistantText(page, selected)).toBeVisible();
     await sendMessage(page, `Reply exactly with ${later}`);
-    await expect(assistantText(page, later)).toBeVisible({ timeout: 30_000 });
+    await expect(assistantText(page, later)).toBeVisible();
 
     let assistant = page
       .locator(".message-wrapper", {
@@ -209,11 +182,9 @@ test(
       })
       .last();
     await assistant.hover();
-    await expect(assistant.locator(".undo-btn")).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(assistant.locator(".undo-btn")).toBeVisible();
     await assistant.locator(".undo-btn").click();
-    await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator(".undo-dialog")).toBeVisible();
     // Assistant boundaries never carry a file checkpoint, even during live
     // JSONL reconciliation.
     await expect(
@@ -223,9 +194,7 @@ test(
 
     await killSession(page, agentType);
     await page.reload();
-    await expect(assistantText(page, selected)).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(assistantText(page, selected)).toBeVisible();
     assistant = page
       .locator(".message-wrapper", {
         has: page.locator(".assistant-message", { hasText: selected }),
@@ -241,14 +210,10 @@ test(
     );
     await page.locator(".btn-undo").click();
 
-    await expect(assistantText(page, selected)).toHaveCount(0, {
-      timeout: 15_000,
-    });
-    await expect(assistantText(page, later)).toHaveCount(0, {
-      timeout: 15_000,
-    });
+    await expect(assistantText(page, selected)).toHaveCount(0);
+    await expect(assistantText(page, later)).toHaveCount(0);
     await expect(
       page.locator(".message.user-message:not(.pending)", { hasText: prompt }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible();
   },
 );

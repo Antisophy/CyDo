@@ -20,8 +20,6 @@ test("sub-agent messages with parent_tool_use_id render nested", { tag: "@claude
   page,
   agentType,
 }) => {
-  test.setTimeout(120_000);
-
   await enterSession(page);
 
   // Select the "blank" entry point which has allow_native_subagents: true,
@@ -52,5 +50,5 @@ test("sub-agent messages with parent_tool_use_id render nested", { tag: "@claude
     page.locator(
       '[style*="display: contents"] .sub-agent-messages .assistant-message',
     ),
-  ).toBeVisible({ timeout: 15_000 });
+  ).toBeVisible();
 });

@@ -1,8 +1,6 @@
 import { test, expect, enterSession, sendMessage } from "./fixtures";
 
 test("subtask auto-ends after satisfying missing-outputs retry", { tag: "@claude-only" }, async ({ page }) => {
-  test.setTimeout(120_000);
-
   let childTid: number | null = null;
 
   page.on("websocket", (ws) => {
@@ -25,7 +23,6 @@ test("subtask auto-ends after satisfying missing-outputs retry", { tag: "@claude
   await expect
     .poll(() => childTid, {
       message: "expected subtask to be created",
-      timeout: 30_000,
     })
     .not.toBeNull();
 
@@ -33,12 +30,14 @@ test("subtask auto-ends after satisfying missing-outputs retry", { tag: "@claude
   const subtaskItem = page.locator(`.sidebar-item[data-tid="${childTid}"]`);
 
   await parentItem.click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible();
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
   await expect(
     page.locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
 
   await subtaskItem.click();
   await expect(page.locator(`.sidebar-item[data-tid="${childTid}"].active`)).toBeVisible();
@@ -47,11 +46,11 @@ test("subtask auto-ends after satisfying missing-outputs retry", { tag: "@claude
     page.locator('[style*="display: contents"] .message-list')
       .getByText("Missing required outputs")
       .last(),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
 
   await expect(
     subtaskItem.locator(".task-type-icon.completed, .task-type-icon.resumable"),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
   await expect(subtaskItem.locator(".task-type-icon.processing")).not.toBeVisible();
   await expect(subtaskItem.locator(".task-type-icon.alive")).not.toBeVisible();
   await expect(subtaskItem.locator(".task-type-icon.failed")).not.toBeVisible();
@@ -61,8 +60,6 @@ test("subtask auto-ends after satisfying missing-outputs retry", { tag: "@claude
 test("repro: manually ending a resumed completed subtask does not rerun output enforcement", { tag: "@claude-only" }, async ({
   page,
 }) => {
-  test.setTimeout(120_000);
-
   let childTid: number | null = null;
 
   page.on("websocket", (ws) => {
@@ -90,7 +87,6 @@ test("repro: manually ending a resumed completed subtask does not rerun output e
   await expect
     .poll(() => childTid, {
       message: "expected subtask to be created",
-      timeout: 30_000,
     })
     .not.toBeNull();
 
@@ -101,26 +97,26 @@ test("repro: manually ending a resumed completed subtask does not rerun output e
   );
 
   await parentItem.click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible();
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
   await expect(
     currentMessages.getByText("Done.", { exact: true }).last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   await subtaskItem.click();
   await expect(
     page.locator(`.sidebar-item[data-tid="${childTid}"].active`),
   ).toBeVisible();
-  await expect(page.locator(".btn-banner-resume:visible").first()).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(
+    page.locator(".btn-banner-resume:visible").first(),
+  ).toBeVisible();
   await expect(currentMessages.getByText("Missing required outputs")).toHaveCount(
     0,
   );
 
   await page.locator(".btn-banner-resume:visible").first().click();
-  await expect(page.locator(".btn-banner-end:visible").first()).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(page.locator(".btn-banner-end:visible").first()).toBeVisible();
 
   const doneCountBeforeQuestion = await currentMessages
     .getByText("Done.", { exact: true })
@@ -132,7 +128,6 @@ test("repro: manually ending a resumed completed subtask does not rerun output e
   await expect
     .poll(
       async () => currentMessages.getByText("Done.", { exact: true }).count(),
-      { timeout: 60_000 },
     )
     .toBeGreaterThan(doneCountBeforeQuestion);
 
@@ -140,7 +135,7 @@ test("repro: manually ending a resumed completed subtask does not rerun output e
 
   await expect(
     subtaskItem.locator(".task-type-icon.completed, .task-type-icon.resumable"),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
   await expect(subtaskItem.locator(".task-type-icon.processing")).not.toBeVisible();
   await expect(subtaskItem.locator(".task-type-icon.alive")).not.toBeVisible();
   await expect(subtaskItem.locator(".task-type-icon.failed")).not.toBeVisible();

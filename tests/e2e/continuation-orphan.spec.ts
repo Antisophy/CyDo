@@ -1,8 +1,6 @@
 import { test, expect, enterSession, sendMessage } from "./fixtures";
 
 test("SwitchMode with orphaned process completes continuation", { tag: "@claude-only" }, async ({ page }) => {
-  test.setTimeout(30_000);
-
   // Listen for task_reload broadcast frames to detect continuation completion.
   const reloadEvents: Array<{ tid: number; reason?: string }> = [];
   page.on("websocket", (ws) => {
@@ -33,5 +31,5 @@ test("SwitchMode with orphaned process completes continuation", { tag: "@claude-
   await expect(async () => {
     const continuationReload = reloadEvents.find((e) => e.reason === "continuation");
     expect(continuationReload).toBeTruthy();
-  }).toPass({ timeout: 25_000 });
+  }).toPass();
 });

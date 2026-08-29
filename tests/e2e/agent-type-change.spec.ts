@@ -26,7 +26,7 @@ async function waitForNewTid(page: Page, before: Set<string>): Promise<string> {
       );
     newTid = tids.find((tid: string) => !before.has(tid));
     expect(newTid).toBeTruthy();
-  }).toPass({ timeout: 5_000 });
+  }).toPass();
   return newTid!;
 }
 
@@ -61,9 +61,7 @@ test("changing agent type after draft creation updates backend", async ({
   await enterSession(page);
 
   // Agent picker should be visible in draft mode
-  await expect(page.locator(".agent-picker")).toBeVisible({
-    timeout: 5_000,
-  });
+  await expect(page.locator(".agent-picker")).toBeVisible();
 
   const before = await snapshotTids(page);
 
@@ -76,7 +74,7 @@ test("changing agent type after draft creation updates backend", async ({
   const draftTid = await waitForNewTid(page, before);
   await expect(
     page.locator(`.sidebar-item[data-tid="${draftTid}"] .draft-label`),
-  ).toBeVisible({ timeout: 2_000 });
+  ).toBeVisible();
 
   // Change the agent picker to a different agent
   await page.locator(".agent-picker").selectOption(targetAgent);

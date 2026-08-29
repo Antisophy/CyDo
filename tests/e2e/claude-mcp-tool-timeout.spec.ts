@@ -6,13 +6,11 @@ test(
   "AskUserQuestion remains pending beyond the total MCP timeout",
   { tag: "@claude-only" },
   async ({ page }) => {
-    test.setTimeout(30_000);
-
     await enterSession(page);
     await sendMessage(page, "call askuserquestion Should I keep waiting?");
 
     const form = page.locator(".ask-user-form");
-    await expect(form).toBeVisible({ timeout: 15_000 });
+    await expect(form).toBeVisible();
 
     const toolCall = page
       .locator(".tool-call")

@@ -45,9 +45,7 @@ test("background command spinner disappears after command completes", { tag: "@c
   // must clear once the late item/completed arrives. If it already finished
   // before this assertion, the spinner is already absent and this still
   // confirms the regression stays fixed.
-  await expect(page.locator(".tool-icon-spinner")).not.toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(page.locator(".tool-icon-spinner")).not.toBeVisible();
 });
 
 // Regression test: multiple concurrent background commands.
@@ -93,7 +91,7 @@ test("multiple background command spinners all disappear after completion", { ta
 
   // Wait for both commands to finish.
   // sleep 8 finishes ~8s after start, sleep 10 ~10s after start (offset by ~0.5s).
-  await expect(spinners).toHaveCount(0, { timeout: 20_000 });
+  await expect(spinners).toHaveCount(0);
 });
 
 // Regression test: late output_delta content after turn/stop is rendered.
@@ -128,7 +126,7 @@ test("late command output appears after turn completes", { tag: "@codex-only" },
   // block and rendered by the UI.
   await expect(
     page.locator(".tool-result", { hasText: "late-output-marker" }),
-  ).toBeVisible({ timeout: 10_000 });
+  ).toBeVisible();
 });
 
 test("kill stops codex background command before delayed side effect", { tag: "@codex-only" }, async ({
@@ -199,10 +197,8 @@ test("killing one codex task also interrupts sibling session on pooled server", 
   const siblingTask = page
     .locator(".sidebar-item:not(.active):not(.sidebar-new-task)")
     .first();
-  await siblingTask.click({ timeout: 15_000 });
-  await expect(page.locator(".btn-banner-resume")).toBeVisible({
-    timeout: 30_000,
-  });
+  await siblingTask.click();
+  await expect(page.locator(".btn-banner-resume")).toBeVisible();
 
   await page.locator(".btn-banner-resume").click();
   await sendMessage(page, 'Please reply with "sibling-resumed"');

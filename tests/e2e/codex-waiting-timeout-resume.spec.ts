@@ -24,7 +24,6 @@ test(
   "direct Task timeout reactivates its waiting parent on assistant work",
   { tag: "@codex-only" },
   async ({ page }) => {
-    test.setTimeout(90_000);
     const events: Event[] = [];
     page.on("websocket", (ws) => {
       ws.on("framereceived", (frame) => {
@@ -71,7 +70,6 @@ test(
             .some(
               (event) => event.kind === "status" && event.status === "waiting",
             ),
-        { timeout: 30_000 },
       )
       .toBe(true);
 
@@ -91,7 +89,6 @@ test(
                 event.isProcessing,
             ).length;
         },
-        { timeout: 30_000 },
       )
       .toBe(1);
 

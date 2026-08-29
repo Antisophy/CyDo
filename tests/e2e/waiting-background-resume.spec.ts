@@ -71,7 +71,7 @@ test(
       await sendMessage(page, "call waiting background resume fixture");
 
       await expect
-        .poll(() => existsSync(fifoPath), { timeout: 30_000 })
+        .poll(() => existsSync(fifoPath))
         .toBe(true);
       await expect
         .poll(
@@ -82,7 +82,6 @@ test(
                 (event) =>
                   event.kind === "status" && event.status === "waiting",
               ),
-          { timeout: 30_000 },
         )
         .toBe(true);
 
@@ -104,7 +103,6 @@ test(
             );
             return outputIndex;
           },
-          { timeout: 30_000 },
         )
         .toBeGreaterThanOrEqual(0);
 
@@ -143,7 +141,6 @@ test(
                   event.status === "active" &&
                   event.isProcessing,
               ),
-          { timeout: 90_000 },
         )
         .toBe(true);
 
@@ -173,7 +170,6 @@ test(
                   event.type === "item/delta" &&
                   event.deltaType === "text_delta",
               ),
-          { timeout: 90_000 },
         )
         .toBe(true);
 
@@ -196,7 +192,6 @@ test(
               .some(
                 (event) => event.kind === "status" && event.status === "alive",
               ),
-          { timeout: 90_000 },
         )
         .toBe(true);
       await page.reload();

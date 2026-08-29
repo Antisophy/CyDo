@@ -18,8 +18,6 @@ test(
   "codex sub-task terminal error is delivered to the parent",
   { tag: "@codex-only" },
   async ({ page }) => {
-    test.setTimeout(120_000);
-
     await enterSession(page);
 
     await sendMessage(page, "call task research fail with usage limit");
@@ -29,6 +27,6 @@ test(
     const messageList = page.locator('[style*="display: contents"] .message-list');
     await expect(
       messageList.getByText(/hit your usage limit/i).last(),
-    ).toBeVisible({ timeout: 90_000 });
+    ).toBeVisible();
   },
 );

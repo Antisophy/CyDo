@@ -23,7 +23,7 @@ test(
       page,
       `create file ${testFile} with content ${firstContent}`,
     );
-    await expect(assistantText(page, "Done.")).toBeVisible({ timeout: 30_000 });
+    await expect(assistantText(page, "Done.")).toBeVisible();
     expect(readFileSync(testFile, "utf8").trimEnd()).toBe(firstContent);
 
     const checkpointAssistant = page
@@ -49,18 +49,14 @@ test(
       page,
       `create file ${testFile} with content ${secondContent}`,
     );
-    await expect(assistantText(page, "Done.")).toHaveCount(2, {
-      timeout: 30_000,
-    });
+    await expect(assistantText(page, "Done.")).toHaveCount(2);
     expect(readFileSync(testFile, "utf8").trimEnd()).toBe(secondContent);
 
     await sendMessage(
       page,
       `create file ${testFile} with content ${thirdContent}`,
     );
-    await expect(assistantText(page, "Done.")).toHaveCount(3, {
-      timeout: 30_000,
-    });
+    await expect(assistantText(page, "Done.")).toHaveCount(3);
     expect(readFileSync(testFile, "utf8").trimEnd()).toBe(thirdContent);
 
     await killSession(page, agentType);
@@ -81,7 +77,7 @@ test(
     await expect(thirdUndoButton).toBeFocused();
     await expect(thirdUndoButton).toBeVisible();
     await thirdUndoButton.press("Enter");
-    await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator(".undo-dialog")).toBeVisible();
     await expect(
       page.locator('.undo-dialog input[type="checkbox"]').nth(1),
     ).toBeChecked();
@@ -93,9 +89,7 @@ test(
       page.locator('.undo-dialog input[type="checkbox"]').nth(1),
     ).toBeChecked();
     await page.locator(".btn-undo").click();
-    await expect(page.locator(".undo-result-banner")).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(page.locator(".undo-result-banner")).toBeVisible();
 
     // The selected third checkpoint restores the second write, proving the
     // backend passed the resolved checkpoint rather than an adjacent one.
@@ -120,7 +114,7 @@ test(
     await expect(secondUndoButton).toBeFocused();
     await expect(secondUndoButton).toBeVisible();
     await secondUndoButton.press("Enter");
-    await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator(".undo-dialog")).toBeVisible();
     await expect(
       page.locator('.undo-dialog input[type="checkbox"]').nth(1),
     ).toBeChecked();
@@ -132,19 +126,15 @@ test(
       page.locator('.undo-dialog input[type="checkbox"]').nth(1),
     ).toBeChecked();
     await page.locator(".btn-undo").click();
-    await expect(page.locator(".undo-result-banner")).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(page.locator(".undo-result-banner")).toBeVisible();
     await expect
-      .poll(() => readFileSync(testFile, "utf8").trimEnd(), { timeout: 15_000 })
+      .poll(() => readFileSync(testFile, "utf8").trimEnd())
       .toBe(firstContent);
     await sendMessage(
       page,
       `create file ${testFile} with content ${fourthContent}`,
     );
-    await expect(assistantText(page, "Done.")).toHaveCount(4, {
-      timeout: 30_000,
-    });
+    await expect(assistantText(page, "Done.")).toHaveCount(4);
     expect(readFileSync(testFile, "utf8").trimEnd()).toBe(fourthContent);
 
     await killSession(page, agentType);
@@ -155,17 +145,15 @@ test(
       .last();
     await conversationOnly.hover();
     await conversationOnly.locator(".undo-btn").click();
-    await expect(page.locator(".undo-dialog")).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator(".undo-dialog")).toBeVisible();
     await page.locator('.undo-dialog input[type="checkbox"]').nth(1).uncheck();
     await page.locator(".btn-undo").click();
-    await expect(page.locator(".undo-result-banner")).toBeVisible({
-      timeout: 15_000,
-    });
+    await expect(page.locator(".undo-result-banner")).toBeVisible();
     await expect(
       page.locator(".message.user-message:not(.pending)", {
         hasText: fourthContent,
       }),
-    ).toHaveCount(0, { timeout: 15_000 });
+    ).toHaveCount(0);
     expect(readFileSync(testFile, "utf8").trimEnd()).toBe(fourthContent);
   },
 );

@@ -163,14 +163,14 @@ test(
       page.locator(".sidebar-item .sidebar-label", {
         hasText: "orphan-agent-task",
       }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible();
     await page
       .locator(".sidebar-item .sidebar-label", { hasText: "orphan-agent-task" })
       .click();
 
     // The stream must contain exactly one error diagnostic block.
     const errorMsg = page.locator(".diagnostic-message.diagnostic-error");
-    await expect(errorMsg).toHaveCount(1, { timeout: 10_000 });
+    await expect(errorMsg).toHaveCount(1);
 
     // The body must mention the orphan agent name and say it is not configured.
     await expect(errorMsg).toContainText(/agent.*nonexistent.*is not configured/i);
@@ -188,12 +188,12 @@ test(
       page.locator(".sidebar-item .sidebar-label", {
         hasText: "orphan-agent-task",
       }),
-    ).toBeVisible({ timeout: 15_000 });
+    ).toBeVisible();
     await page
       .locator(".sidebar-item .sidebar-label", { hasText: "orphan-agent-task" })
       .click();
     const errorMsgAfterReload = page.locator(".diagnostic-message.diagnostic-error");
-    await expect(errorMsgAfterReload).toHaveCount(1, { timeout: 10_000 });
+    await expect(errorMsgAfterReload).toHaveCount(1);
     await expect(errorMsgAfterReload).toContainText(
       /agent.*nonexistent.*is not configured/i,
     );

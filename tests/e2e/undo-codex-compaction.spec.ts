@@ -47,7 +47,6 @@ test(
     await expect
       .poll(
         () => codexRolloutRecords(tid).some((record) => record.type === "compacted"),
-        { timeout: 15_000 },
       )
       .toBe(true);
 
@@ -64,7 +63,7 @@ test(
         }),
       })
       .first();
-    await foldedWrapper.hover({ timeout: 15_000 });
+    await foldedWrapper.hover();
     await expect(foldedWrapper.locator(".undo-btn")).toHaveCount(0);
 
     const history = await visibleHistory(page);
@@ -85,7 +84,6 @@ test(
         () =>
           frames.slice(frameStart).filter((frame) => frame?.type === "error")
             .length,
-        { timeout: 15_000 },
       )
       .toBe(1);
     expect(

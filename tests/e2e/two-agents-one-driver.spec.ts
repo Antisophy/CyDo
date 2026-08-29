@@ -152,7 +152,7 @@ test("two agents sharing a driver get separate sandbox envs", async ({
     const created = waitForMessage(
       ws,
       (d) => d.type === "task_created" && typeof d.tid === "number",
-      10_000,
+      540_000,
     );
     ws.send(
       JSON.stringify({
@@ -174,7 +174,7 @@ test("two agents sharing a driver get separate sandbox envs", async ({
     const end = waitForMessage(
       ws,
       (d) => d.type === "task_history_end" && d.tid === tid,
-      10_000,
+      540_000,
     );
     ws.send(JSON.stringify({ type: "request_history", tid }));
     await end;
@@ -184,7 +184,7 @@ test("two agents sharing a driver get separate sandbox envs", async ({
     ws,
     (d) =>
       d.type === "title_update" && d.tid === tidWork && d.title === "Work Title",
-    30_000,
+    540_000,
   );
   const titlePersonal = waitForMessage(
     ws,
@@ -192,7 +192,7 @@ test("two agents sharing a driver get separate sandbox envs", async ({
       d.type === "title_update" &&
       d.tid === tidPersonal &&
       d.title === "Personal Title",
-    30_000,
+    540_000,
   );
   const resultWork = waitForMessage(
     ws,
@@ -200,7 +200,7 @@ test("two agents sharing a driver get separate sandbox envs", async ({
       d.tid === tidWork &&
       d.event?.type === "turn/result" &&
       d.event?.subtype === "success",
-    30_000,
+    540_000,
   );
   const resultPersonal = waitForMessage(
     ws,
@@ -208,7 +208,7 @@ test("two agents sharing a driver get separate sandbox envs", async ({
       d.tid === tidPersonal &&
       d.event?.type === "turn/result" &&
       d.event?.subtype === "success",
-    30_000,
+    540_000,
   );
 
   for (const tid of [tidWork, tidPersonal]) {

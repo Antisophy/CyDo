@@ -1,9 +1,6 @@
 import { test, expect, enterSession, sendMessage } from "./fixtures";
 import type { Locator, Page } from "@playwright/test";
 
-// All ask/answer tests require launching sub-tasks which takes more time.
-const TALK_TIMEOUT = 120_000;
-
 type TaskResultItem = Record<string, unknown>;
 type TaskCreatedEventLike = {
   tid: number;
@@ -313,9 +310,7 @@ async function extractLatestQuestionQid(page: Page): Promise<number> {
 }
 
 async function activeTid(page: Page): Promise<number> {
-  await expect(page.locator(".sidebar-item.active").first()).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(page.locator(".sidebar-item.active").first()).toBeVisible();
   const rawTid = await page
     .locator(".sidebar-item.active")
     .first()
@@ -337,16 +332,13 @@ async function createTopLevelTask(page: Page): Promise<number> {
       .locator('[style*="display: contents"] .message-list')
       .getByText(marker, { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   await expect
     .poll(
       async () => {
         const tids = await sidebarTids(page);
         return tids[tids.length - 1] ?? 0;
-      },
-      {
-        timeout: 60_000,
       },
     )
     .toBeGreaterThan(beforeMaxTid);
@@ -358,16 +350,12 @@ async function openTask(page: Page, tid: number): Promise<void> {
   await page.locator(`.sidebar-item[data-tid="${tid}"]`).click();
   await expect(
     page.locator(`.sidebar-item[data-tid="${tid}"].active`),
-  ).toBeVisible({
-    timeout: 10_000,
-  });
+  ).toBeVisible();
 }
 
 async function sidebarTids(page: Page): Promise<number[]> {
   await expect
-    .poll(async () => page.locator(".sidebar-item[data-tid]").count(), {
-      timeout: 30_000,
-    })
+    .poll(async () => page.locator(".sidebar-item[data-tid]").count())
     .toBeGreaterThan(0);
   return page.locator(".sidebar-item[data-tid]").evaluateAll((nodes) =>
     nodes
@@ -383,7 +371,6 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   const observedTaskEvents = observeTaskEvents(page);
   const taskCreatedEvents = observeTaskCreatedEvents(page);
   const reloadEvents = observeTaskReloadEvents(page);
@@ -398,7 +385,7 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("initial-result", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   // Wait for the parent's turn to complete (mock responds "Done." after seeing
   // the Task tool result). This ensures the session is in "alive" state before
@@ -409,16 +396,16 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   // L137's Task call drifts focus to the child. Wait for the corrective
   // focus_hint(child → parent) to land (child completes its turn and
   // exits) before sending the follow-up Ask, otherwise its sendMessage
   // may click the child's textarea, which gets hidden mid-action when
   // focus returns to parent.
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 90_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   let childTid: number | null = null;
   await expect(async () => {
@@ -427,7 +414,7 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
         (event) => event.relation_type === "subtask" && event.parent_tid === 1,
       )?.tid ?? null;
     expect(childTid).not.toBeNull();
-  }).toPass({ timeout: 30_000 });
+  }).toPass();
 
   const doneCountBeforeFollowUpAsk = await currentMessageList(page)
     .getByText("Done.", { exact: true })
@@ -523,7 +510,7 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("follow-up-answered", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   if (agentType === "claude") {
     await expect
@@ -532,9 +519,6 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
           return currentMessageList(page)
             .getByText("Done.", { exact: true })
             .count();
-        },
-        {
-          timeout: 30_000,
         },
       )
       .toBeGreaterThan(doneCountBeforeFollowUpAsk);
@@ -546,7 +530,7 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
       '[style*="display: contents"] .message-list .message.user-message.system-user-message',
       { hasText: "Follow-up from parent" },
     ),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   await expect
     .poll(
@@ -554,29 +538,27 @@ test("Ask/Answer: follow-up to completed sub-task", async ({
         reloadEvents
           .slice(reloadCountBeforeFollowUpAsk)
           .some((event) => event.tid === childTid),
-      { timeout: 90_000 },
     )
     .toBe(true);
 
   await page.reload();
   await openTask(page, 1);
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
   await openTask(page, childTid!);
   await expect(
     page.locator(
       '[style*="display: contents"] .message-list .message.user-message.system-user-message',
       { hasText: "Follow-up from parent" },
     ),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: child asks parent, parent answers", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   const observedTaskResults = observeTaskResultItems(page);
 
   await enterSession(page);
@@ -594,12 +576,11 @@ test("Ask/Answer: child asks parent, parent answers", async ({
   // then navigate back to the parent (tid=1) to see the Task result with the question.
   await page.locator('.sidebar-item[data-tid="2"]').waitFor({
     state: "visible",
-    timeout: 30_000,
   });
   await page.locator('.sidebar-item[data-tid="1"]').click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   // Wait for question to appear in parent's Task tool result.
   await expect(
@@ -607,7 +588,7 @@ test("Ask/Answer: child asks parent, parent answers", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("what approach should I use?")
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   const questionResult = await waitForTaskResultItem(
     observedTaskResults,
@@ -626,7 +607,7 @@ test("Ask/Answer: child asks parent, parent answers", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   // Parent answers the pending question using the observed qid.
   await sendMessage(page, `call answer ${capturedQid} use approach A`);
@@ -639,13 +620,12 @@ test("Ask/Answer: child asks parent, parent answers", async ({
         '[style*="display: contents"] .message-list .tool-result, [style*="display: contents"] .message-list .cydo-task-spec',
       )
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: parent can answer child question after another Task call", async ({
   page,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   const observedTaskResults = observeTaskResultItems(page);
   const observedTaskEvents = observeTaskResultEvents(page);
 
@@ -658,7 +638,7 @@ test("Ask/Answer: parent can answer child question after another Task call", asy
       .locator('[style*="display: contents"] .message-list')
       .getByText("interleaved question")
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   const questionResult = await waitForTaskResultItem(
     observedTaskResults,
@@ -674,7 +654,7 @@ test("Ask/Answer: parent can answer child question after another Task call", asy
       .locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   const beforeInterveningTaskResultIndex = observedTaskResults.length;
   await sendMessage(
@@ -686,7 +666,7 @@ test("Ask/Answer: parent can answer child question after another Task call", asy
       .locator('[style*="display: contents"] .message-list')
       .getByText("interleaving-child-done", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   await expect(
     waitForTaskResultItem(
       observedTaskResults,
@@ -696,9 +676,9 @@ test("Ask/Answer: parent can answer child question after another Task call", asy
   ).resolves.toBeTruthy();
 
   await page.locator('.sidebar-item[data-tid="1"]').click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   const beforeAnswerTaskResultIndex = observedTaskResults.length;
   const beforeAnswerEventCount = observedTaskEvents.length;
@@ -729,7 +709,6 @@ test("Ask/Answer: completed task result exposes success status and preserved fie
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   const observedTaskResults = observeTaskResultItems(page);
   const observedTaskEvents = observeTaskResultEvents(page);
 
@@ -737,9 +716,7 @@ test("Ask/Answer: completed task result exposes success status and preserved fie
   await sendMessage(page, 'call task research reply with "structured-success"');
 
   const taskTool = lastTaskTool(page);
-  await expect(taskTool).toContainText("structured-success", {
-    timeout: 90_000,
-  });
+  await expect(taskTool).toContainText("structured-success");
 
   expect(
     await waitForTaskResultItem(
@@ -776,16 +753,13 @@ test("Ask/Answer: task validation errors expose error status and error field", a
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   const observedTaskResults = observeTaskResultItems(page);
 
   await enterSession(page);
   await sendMessage(page, "call task invalid_type reproduce the bug");
 
   const taskTool = lastTaskTool(page);
-  await expect(taskTool).toContainText(/not in creatable_tasks/i, {
-    timeout: 90_000,
-  });
+  await expect(taskTool).toContainText(/not in creatable_tasks/i);
 
   expect(
     await waitForTaskResultItem(
@@ -805,14 +779,13 @@ test("Ask/Answer: task summaries preserve literal JSON-looking child final text"
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   const observedTaskResults = observeTaskResultItems(page);
 
   await enterSession(page);
   await sendMessage(page, "call task research reply with json-summary-fixture");
 
   const taskTool = lastTaskTool(page);
-  await expect(taskTool).toContainText("qid", { timeout: 90_000 });
+  await expect(taskTool).toContainText("qid");
   expect(
     await waitForTaskResultItem(
       observedTaskResults,
@@ -832,8 +805,6 @@ test("Ask/Answer: batch with one completing child and one asking child", async (
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
-
   const observedTaskResults = observeTaskResultItems(page);
 
   await enterSession(page);
@@ -850,7 +821,7 @@ test("Ask/Answer: batch with one completing child and one asking child", async (
       .locator('[style*="display: contents"] .message-list')
       .getByText("what approach should I use?")
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   // Wait for the parent's turn to complete after returning the question.
   // Sending Answer while this turn is still finalizing can race and skip
@@ -860,7 +831,7 @@ test("Ask/Answer: batch with one completing child and one asking child", async (
       .locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   // Capture the qid from child B's observed question result.
   const questionResult = await waitForTaskResultItem(
@@ -883,7 +854,7 @@ test("Ask/Answer: batch with one completing child and one asking child", async (
     )
     .last()
     .locator(".cydo-task-spec");
-  await expect(finalSpecs).toHaveCount(2, { timeout: 90_000 });
+  await expect(finalSpecs).toHaveCount(2);
   await expect(
     finalSpecs.nth(0).locator('[data-testid="cydo-task-spec-open"]'),
   ).toHaveAttribute("href", /\/task\/2$/);
@@ -897,7 +868,6 @@ test("Ask/Answer: same-workspace top-level peer Ask succeeds", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   await enterSession(page);
   await sendMessage(page, 'reply with "peer-root-ready"');
   await expect(
@@ -905,7 +875,7 @@ test("Ask/Answer: same-workspace top-level peer Ask succeeds", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("peer-root-ready", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   const askerTid = await activeTid(page);
 
   // Create another top-level task.
@@ -930,7 +900,6 @@ test("Ask/Answer: same-workspace top-level peer Ask succeeds", async ({
         if (await peerQuestion.isVisible()) return "questioned";
         return "pending";
       },
-      { timeout: 60_000 },
     )
     .not.toBe("pending");
 
@@ -944,7 +913,7 @@ test("Ask/Answer: same-workspace top-level peer Ask succeeds", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("peer-answer", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   await expect(
     page.locator(
       `.sidebar-item[data-tid="${askerTid}"] .task-type-icon.waiting`,
@@ -956,7 +925,6 @@ test("Ask/Answer: same-workspace non-direct Ask succeeds", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   await enterSession(page);
   await sendMessage(page, 'reply with "non-direct-root-ready"');
   await expect(
@@ -964,7 +932,7 @@ test("Ask/Answer: same-workspace non-direct Ask succeeds", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("non-direct-root-ready", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   const rootTid = await activeTid(page);
   const observedRootTaskResults = observeTaskResultItems(page, rootTid);
 
@@ -980,7 +948,7 @@ test("Ask/Answer: same-workspace non-direct Ask succeeds", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("non-direct-leaf-ready", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   const leafTaskResult = await waitForTaskResultItem(
     observedRootTaskResults,
     (item) =>
@@ -992,7 +960,6 @@ test("Ask/Answer: same-workspace non-direct Ask succeeds", async ({
   expect(leafTid).toBeGreaterThan(askerTid);
   await page.locator(`.sidebar-item[data-tid="${leafTid}"]`).waitFor({
     state: "visible",
-    timeout: 30_000,
   });
 
   // Ask from top-level peer to a non-direct task in the same workspace.
@@ -1013,14 +980,13 @@ test("Ask/Answer: same-workspace non-direct Ask succeeds", async ({
         if (await nonDirectAnswer.isVisible()) return "answered";
         return "pending";
       },
-      { timeout: 60_000 },
     )
     .not.toBe("pending");
 
-  await expect(nonDirectAnswer).toBeVisible({ timeout: 60_000 });
+  await expect(nonDirectAnswer).toBeVisible();
   await expect(
     page.locator(`.sidebar-item[data-tid="${askerTid}"].active`),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   await openTask(page, leafTid);
   await expect(
@@ -1028,10 +994,10 @@ test("Ask/Answer: same-workspace non-direct Ask succeeds", async ({
       .locator(".system-user-message")
       .filter({ hasText: /Question from task.*qid=/ })
       .last(),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
 
   await openTask(page, askerTid);
-  await expect(nonDirectAnswer).toBeVisible({ timeout: 60_000 });
+  await expect(nonDirectAnswer).toBeVisible();
   await expect(
     page.locator(
       `.sidebar-item[data-tid="${askerTid}"] .task-type-icon.waiting`,
@@ -1043,7 +1009,6 @@ test("Ask/Answer: wrong answerer gets Unknown question ID", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   const observedTaskResults = observeTaskResultItems(page);
   await enterSession(page);
 
@@ -1056,7 +1021,7 @@ test("Ask/Answer: wrong answerer gets Unknown question ID", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("what approach should I use?")
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   const questionResult = await waitForTaskResultItem(
     observedTaskResults,
     (item) =>
@@ -1081,7 +1046,7 @@ test("Ask/Answer: wrong answerer gets Unknown question ID", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText(/unknown question id/i)
       .last(),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
 
   // Authorized answerer responds and unblocks the waiting child.
   await openTask(page, askerTid);
@@ -1093,11 +1058,10 @@ test("Ask/Answer: wrong answerer gets Unknown question ID", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("recovered-answer", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: self Ask is rejected", async ({ page, agentType }) => {
-  test.setTimeout(TALK_TIMEOUT);
   await enterSession(page);
   await sendMessage(page, 'reply with "self-ask-root-ready"');
   await expect(
@@ -1105,7 +1069,7 @@ test("Ask/Answer: self Ask is rejected", async ({ page, agentType }) => {
       .locator('[style*="display: contents"] .message-list')
       .getByText("self-ask-root-ready", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   const selfTid = await activeTid(page);
 
   await sendMessage(page, `call ask ${selfTid} hello`);
@@ -1115,7 +1079,7 @@ test("Ask/Answer: self Ask is rejected", async ({ page, agentType }) => {
       .locator('[style*="display: contents"] .message-list')
       .getByText(/ask target must be a different task/i)
       .last(),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
   await expect(
     page.locator(
       `.sidebar-item[data-tid="${selfTid}"] .task-type-icon.waiting`,
@@ -1127,8 +1091,6 @@ test("Ask/Answer: invalid Ask target returns error", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
-
   await enterSession(page);
 
   // Ask a nonexistent tid — should return an error.
@@ -1140,15 +1102,13 @@ test("Ask/Answer: invalid Ask target returns error", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText(/not found/i)
       .last(),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: tid field present in Task results", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
-
   await enterSession(page);
 
   // Create a sub-task that completes with a known result.
@@ -1156,13 +1116,12 @@ test("Ask/Answer: tid field present in Task results", async ({
 
   await page.locator('.sidebar-item[data-tid="2"]').waitFor({
     state: "visible",
-    timeout: 30_000,
   });
 
   await page.locator('.sidebar-item[data-tid="1"]').click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   // Wait for the result to appear in the parent transcript.
   await expect(
@@ -1170,7 +1129,7 @@ test("Ask/Answer: tid field present in Task results", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("check-tid", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   // The tid field should be visible in the tool result display.
   // The task result item renders remaining fields (after summary/error) as key: value.
@@ -1179,15 +1138,13 @@ test("Ask/Answer: tid field present in Task results", async ({
       .locator('[style*="display: contents"] .message-list .cydo-task-spec')
       .getByText(/tid/)
       .last(),
-  ).toBeVisible({ timeout: 10_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: two children asking simultaneously are queued", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
-
   const observedTaskResults = observeTaskResultItems(page);
   const taskCreatedEvents = observeTaskCreatedEvents(page);
 
@@ -1209,18 +1166,17 @@ test("Ask/Answer: two children asking simultaneously are queued", async ({
     expect(subtaskTids.length).toBeGreaterThanOrEqual(2);
     secondChildTid = subtaskTids[1] ?? null;
     expect(secondChildTid).not.toBeNull();
-  }).toPass({ timeout: 30_000 });
+  }).toPass();
 
   // Wait for both children to appear in the sidebar (confirms auto-focus to tid=2
   // has settled), then navigate back to the parent (tid=1) to see the Task result.
   await page.locator(`.sidebar-item[data-tid="${secondChildTid}"]`).waitFor({
     state: "visible",
-    timeout: 30_000,
   });
   await page.locator('.sidebar-item[data-tid="1"]').click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   // Wait for the first question to appear in parent's Task tool result.
   await expect(
@@ -1228,7 +1184,7 @@ test("Ask/Answer: two children asking simultaneously are queued", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("what approach?")
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   // Wait for parent's Turn 2 to complete (mock returns "Done." for the Task result).
   await expect(
@@ -1236,7 +1192,7 @@ test("Ask/Answer: two children asking simultaneously are queued", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   // Capture qid of the first question from the observed task result.
   const firstQuestion = await waitForTaskResultItem(
@@ -1258,9 +1214,9 @@ test("Ask/Answer: two children asking simultaneously are queued", async ({
   // before the next sendMessage, otherwise selectors may match the
   // child's view and the next sendMessage's click may resolve to a
   // child textarea that gets hidden mid-action by the wrapper flip.
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 90_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   // Capture qid of the second question from the next observed item/result after the first answer.
   const secondQuestion = await waitForTaskResultItem(
@@ -1278,9 +1234,9 @@ test("Ask/Answer: two children asking simultaneously are queued", async ({
   // the autonomous round-trip (inciting hint → child works → corrective hint →
   // parent active) must have completed. Wait explicitly so sendMessage resolves
   // :visible.first() against parent's textarea.
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 90_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   // Answer the second child using the observed qid.
   await sendMessage(page, `call answer ${secondQid} answer two`);
@@ -1292,15 +1248,13 @@ test("Ask/Answer: two children asking simultaneously are queued", async ({
         '[style*="display: contents"] .message-list .tool-result, [style*="display: contents"] .message-list .cydo-task-spec',
       )
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: Ask to active sub-task delivers follow-up message", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
-
   await enterSession(page);
 
   // "call active-child-test" creates:
@@ -1314,12 +1268,11 @@ test("Ask/Answer: Ask to active sub-task delivers follow-up message", async ({
   // created and the auto-focus to tid=2 has settled), then navigate to tid=1.
   await page.locator('.sidebar-item[data-tid="3"]').waitFor({
     state: "visible",
-    timeout: 30_000,
   });
   await page.locator('.sidebar-item[data-tid="1"]').click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   // Wait for child 3's question to appear in the parent's Task tool result.
   await expect(
@@ -1327,7 +1280,7 @@ test("Ask/Answer: Ask to active sub-task delivers follow-up message", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("am I doing this right?")
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   // Wait for the parent's Turn 2 to complete: after the Task result with the
   // question is delivered, the mock responds "Done." which the parent outputs
@@ -1338,7 +1291,7 @@ test("Ask/Answer: Ask to active sub-task delivers follow-up message", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   // Parent asks the stalling (active) child tid=2 with a follow-up.
   // This should succeed now — asking an active child is allowed.
@@ -1350,15 +1303,13 @@ test("Ask/Answer: Ask to active sub-task delivers follow-up message", async ({
   // The old behavior would have returned an error immediately without changing state.
   await expect(
     page.locator('.sidebar-item[data-tid="1"] .task-type-icon.waiting'),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: parent returns to waiting after answering mid-batch", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
-
   const observedTaskResults = observeTaskResultItems(page);
 
   await enterSession(page);
@@ -1372,12 +1323,11 @@ test("Ask/Answer: parent returns to waiting after answering mid-batch", async ({
   // the stalling tid=2, which never completes).
   await page.locator('.sidebar-item[data-tid="3"]').waitFor({
     state: "visible",
-    timeout: 30_000,
   });
   await page.locator('.sidebar-item[data-tid="1"]').click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   // Wait for child 3's question in the parent's Task tool result, then for
   // the parent's turn to complete ("Done.").
@@ -1386,13 +1336,13 @@ test("Ask/Answer: parent returns to waiting after answering mid-batch", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("am I doing this right?")
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   await expect(
     page
       .locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   const questionResult = await waitForTaskResultItem(
     observedTaskResults,
@@ -1411,15 +1361,13 @@ test("Ask/Answer: parent returns to waiting after answering mid-batch", async ({
   await sendMessage(page, `call answer ${capturedQid} keep going`);
   await expect(
     page.locator('.sidebar-item[data-tid="1"] .task-type-icon.waiting'),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
-
   await enterSession(page);
 
   // "call busy-child-test" creates two children:
@@ -1432,14 +1380,13 @@ test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued", async ({
   // created its sub-task and entered "waiting" status.
   await page.locator('.sidebar-item[data-tid="4"]').waitFor({
     state: "visible",
-    timeout: 30_000,
   });
 
   // Navigate to parent (tid=1) which should have the Task result.
   await page.locator('.sidebar-item[data-tid="1"]').click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   // Wait for the parent's turn to finish (mock responds "Done." after task result).
   await expect(
@@ -1447,7 +1394,7 @@ test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   // Parent asks the busy (waiting) child tid=2.
   await sendMessage(page, "call ask 2 hey are you done?");
@@ -1455,15 +1402,13 @@ test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued", async ({
   // Ask is enqueued — parent enters "waiting" state (no error returned).
   await expect(
     page.locator('.sidebar-item[data-tid="1"] .task-type-icon.waiting'),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: Ask to busy sub-task fails if child exits before delivery", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
-
   await enterSession(page);
 
   // "call busy-child-test" creates:
@@ -1473,32 +1418,31 @@ test("Ask/Answer: Ask to busy sub-task fails if child exits before delivery", as
 
   await page.locator('.sidebar-item[data-tid="4"]').waitFor({
     state: "visible",
-    timeout: 30_000,
   });
 
   await page.locator('.sidebar-item[data-tid="1"]').click();
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
   await expect(
     page
       .locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   // Parent asks the busy child. Delivery is queued on the child's idle callbacks.
   await sendMessage(page, "call ask 2 child-exit-before-delivery?");
   await expect(
     page.locator('.sidebar-item[data-tid="1"] .task-type-icon.waiting'),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
 
   // Stop the child before it can become idle and drain the queued injected Ask.
   await page.locator('.sidebar-item[data-tid="2"]').click();
-  await expect(page.locator('.sidebar-item[data-tid="2"].active')).toBeVisible({
-    timeout: 10_000,
-  });
-  await page.getByRole("button", { name: "Kill" }).click({ timeout: 30_000 });
+  await expect(
+    page.locator('.sidebar-item[data-tid="2"].active'),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Kill" }).click();
 
   await page.locator('.sidebar-item[data-tid="1"]').click();
   await expect(
@@ -1506,14 +1450,13 @@ test("Ask/Answer: Ask to busy sub-task fails if child exits before delivery", as
       .locator('[style*="display: contents"] .message-list')
       .getByText(/Session ended while waiting for Ask response/i)
       .last(),
-  ).toBeVisible({ timeout: 15_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: yield enforcement steers parent with unanswered child question", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT * 2);
   const taskCreatedEvents = observeTaskCreatedEvents(page);
 
   await enterSession(page);
@@ -1542,7 +1485,7 @@ test("Ask/Answer: yield enforcement steers parent with unanswered child question
       )?.tid ?? null;
     expect(parentTid).not.toBeNull();
     expect(childTid).not.toBeNull();
-  }).toPass({ timeout: 30_000 });
+  }).toPass();
 
   // Wait for the child sidebar item to settle before switching focus back to
   // the parent; otherwise the auto-focus chain can still move from parent→child
@@ -1550,7 +1493,6 @@ test("Ask/Answer: yield enforcement steers parent with unanswered child question
   // wrong task.
   await page.locator(`.sidebar-item[data-tid="${childTid}"]`).waitFor({
     state: "visible",
-    timeout: 30_000,
   });
 
   // Navigate to the parent task to see its message list.
@@ -1562,7 +1504,7 @@ test("Ask/Answer: yield enforcement steers parent with unanswered child question
       .locator('[style*="display: contents"] .message-list')
       .getByText(/sub-task waiting for answer/i)
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 
   await page.reload();
   await openTask(page, parentTid!);
@@ -1571,14 +1513,13 @@ test("Ask/Answer: yield enforcement steers parent with unanswered child question
       .locator('[style*="display: contents"] .message-list')
       .getByText(/sub-task waiting for answer/i)
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 });
 
 test("Ask/Answer: answer delivery is deferred until child becomes idle", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   await enterSession(page);
 
   // Create a child that completes normally.
@@ -1588,22 +1529,22 @@ test("Ask/Answer: answer delivery is deferred until child becomes idle", async (
       .locator('[style*="display: contents"] .message-list')
       .getByText("initial-result", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   await expect(
     page
       .locator('[style*="display: contents"] .message-list')
       .getByText("Done.", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   // L713's Task call drifts focus to the child. Wait for the corrective
   // focus_hint(child → parent) to land (child completes its turn and
   // exits) before sending the follow-up Ask, otherwise its sendMessage
   // may click the child's textarea, which gets hidden mid-action when
   // focus returns to parent.
-  await expect(page.locator('.sidebar-item[data-tid="1"].active')).toBeVisible({
-    timeout: 90_000,
-  });
+  await expect(
+    page.locator('.sidebar-item[data-tid="1"].active'),
+  ).toBeVisible();
 
   // Ask follow-up with "deferred-test" trigger — child will Answer + do extra Bash work.
   await sendMessage(page, "call ask 2 deferred-test");
@@ -1614,7 +1555,7 @@ test("Ask/Answer: answer delivery is deferred until child becomes idle", async (
       .locator('[style*="display: contents"] .message-list')
       .getByText("deferred-answer-result", { exact: true })
       .last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
 });
 
 test(
@@ -1629,7 +1570,6 @@ test(
     // the asker is NOT in waiting. This reproduces a production crash where
     // that delivery hit the strict waiting→active transition and the enforce
     // brought down the whole backend.
-    test.setTimeout(TALK_TIMEOUT);
     await enterSession(page);
 
     // Create a child that completes normally.
@@ -1639,19 +1579,19 @@ test(
         .locator('[style*="display: contents"] .message-list')
         .getByText("initial-result", { exact: true })
         .last(),
-    ).toBeVisible({ timeout: 90_000 });
+    ).toBeVisible();
     await expect(
       page
         .locator('[style*="display: contents"] .message-list')
         .getByText("Done.", { exact: true })
         .last(),
-    ).toBeVisible({ timeout: 30_000 });
+    ).toBeVisible();
 
     // Wait for the corrective focus_hint (child → parent) to land before
     // sending the follow-up Ask (see the deferred-delivery test above).
     await expect(
       page.locator('.sidebar-item[data-tid="1"].active'),
-    ).toBeVisible({ timeout: 90_000 });
+    ).toBeVisible();
 
     // The mock streams the Ask as block 0 of a message whose block 1 keeps
     // trickling for ~25s. The child answers with post-answer work
@@ -1665,7 +1605,7 @@ test(
         .locator('[style*="display: contents"] .message-list')
         .getByText("deferred-answer-result", { exact: true })
         .last(),
-    ).toBeVisible({ timeout: 90_000 });
+    ).toBeVisible();
 
     // The parent's trailing Bash tool call must also run to completion —
     // the turn survives the mid-stream answer delivery.
@@ -1674,7 +1614,7 @@ test(
         .locator('[style*="display: contents"] .message-list')
         .getByText("post-ask-work", { exact: true })
         .last(),
-    ).toBeVisible({ timeout: 60_000 });
+    ).toBeVisible();
   },
 );
 
@@ -1682,7 +1622,6 @@ test("Ask/Answer: Answer with invalid qid returns error", async ({
   page,
   agentType,
 }) => {
-  test.setTimeout(TALK_TIMEOUT);
   await enterSession(page);
   await sendMessage(page, "call answer 999 hello");
   await expect(
@@ -1690,7 +1629,7 @@ test("Ask/Answer: Answer with invalid qid returns error", async ({
       .locator('[style*="display: contents"] .message-list')
       .getByText(/unknown question/i)
       .last(),
-  ).toBeVisible({ timeout: 60_000 });
+  ).toBeVisible();
 });
 
 test(
@@ -1699,7 +1638,6 @@ test(
   async ({ page, agentType }) => {
     // Claude-specific: only the Anthropic mock can reliably return SwitchMode
     // after a Task tool result in a deterministic sequence.
-    test.setTimeout(TALK_TIMEOUT * 2);
 
     await enterSession(page);
 
@@ -1716,7 +1654,7 @@ test(
           hasText: "SwitchMode",
         })
         .last(),
-    ).toBeVisible({ timeout: 90_000 });
+    ).toBeVisible();
 
     // Wait for the mode-switch system message divider.
     await expect(
@@ -1728,7 +1666,7 @@ test(
           },
         )
         .last(),
-    ).toBeVisible({ timeout: 30_000 });
+    ).toBeVisible();
 
     // The resumed plan_mode receives the Sub-task waiting reminder and calls Answer.
     // Wait for the Answer tool call to appear — confirms the fix is working.
@@ -1738,7 +1676,7 @@ test(
           hasText: "Answer",
         })
         .last(),
-    ).toBeVisible({ timeout: 90_000 });
+    ).toBeVisible();
 
     // Wait for the child task (tid=2) to show as completed in the sidebar.
     // Research sub-tasks are resumable after completion, so accept either status class.
@@ -1746,14 +1684,14 @@ test(
       page.locator(
         '.sidebar-item[data-tid="2"] .task-type-icon.completed, .sidebar-item[data-tid="2"] .task-type-icon.resumable',
       ),
-    ).toBeVisible({ timeout: 60_000 });
+    ).toBeVisible();
 
     // Wait for the final Task tool result (batch completed) to appear in the parent.
     await expect(
       page
         .locator('[style*="display: contents"] .message-list .cydo-task-spec')
         .last(),
-    ).toBeVisible({ timeout: 90_000 });
+    ).toBeVisible();
   },
 );
 
@@ -1763,7 +1701,6 @@ test(
   async ({ page, agentType }) => {
     // Claude-specific: only the Anthropic mock can reliably return Handoff then Answer
     // after a Task tool result in a deterministic multi-step sequence.
-    test.setTimeout(TALK_TIMEOUT * 2);
 
     await enterSession(page);
 
@@ -1780,13 +1717,11 @@ test(
     // Wait for the grandchild (tid=3) to appear in the sidebar.
     await page.locator('.sidebar-item[data-tid="3"]').waitFor({
       state: "visible",
-      timeout: 30_000,
     });
 
     // No continuation (tid=4) should be created — Handoff must be rejected.
-    // Check immediately: if the backend incorrectly accepted Handoff, tid=4 would
-    // appear quickly. Use not.toBeVisible() with a short timeout so the test
-    // doesn't wait 90 seconds for something that should never appear.
+    // not.toBeVisible() is satisfied the moment tid=4 is absent, so this
+    // returns immediately unless the backend incorrectly accepted Handoff.
     await expect(page.locator('.sidebar-item[data-tid="4"]')).not.toBeVisible();
 
     // After the Handoff rejection, the mock calls Answer which fulfills the
@@ -1797,13 +1732,13 @@ test(
       page.locator(
         '.sidebar-item[data-tid="3"] .task-type-icon.completed, .sidebar-item[data-tid="3"] .task-type-icon.resumable',
       ),
-    ).toBeVisible({ timeout: 90_000 });
+    ).toBeVisible();
 
     // Wait for the child task (tid=2) to complete — confirms it recovered fully.
     await expect(
       page.locator(
         '.sidebar-item[data-tid="2"] .task-type-icon.completed, .sidebar-item[data-tid="2"] .task-type-icon.resumable',
       ),
-    ).toBeVisible({ timeout: 60_000 });
+    ).toBeVisible();
   },
 );

@@ -63,7 +63,7 @@ test("export-html creates viewable HTML file", { tag: "@claude-only" }, async ({
 
     await expect(
       page.locator('[data-testid="assistant-text"]', { hasText: "export-marker-ok" }),
-    ).toBeVisible({ timeout: 10_000 });
+    ).toBeVisible();
 
     await expect(page.locator(".sidebar-item")).toHaveCount(
       await page.locator(".sidebar-item").count(),
@@ -148,7 +148,7 @@ workspaces:
       page.locator('[data-testid="assistant-text"]', {
         hasText: "custom-export-marker-ok",
       }),
-    ).toBeVisible({ timeout: 10_000 });
+    ).toBeVisible();
   } finally {
     try {
       unlinkSync(outputPath);
@@ -361,7 +361,6 @@ async function findNativeJsonlContaining(
         found = matches.length === 1 ? matches[0] : undefined;
         return matches.length;
       },
-      { timeout: 20_000 },
     )
     .toBe(1);
   return found!;
@@ -410,7 +409,7 @@ function readFileOrEmpty(path: string): string {
 
 async function activeTaskTid(page: Page): Promise<string> {
   const row = page.locator(".sidebar-item.active");
-  await expect(row).toBeVisible({ timeout: 5_000 });
+  await expect(row).toBeVisible();
   const tid = await row.getAttribute("data-tid");
   expect(tid).toBeTruthy();
   return tid!;
@@ -447,9 +446,7 @@ profiledTest(
 
     await enterSession(page);
     await sendMessage(page, `reply with "${liveMarker}"`);
-    await expect(assistantText(page, liveMarker)).toBeVisible({
-      timeout: 60_000,
-    });
+    await expect(assistantText(page, liveMarker)).toBeVisible();
 
     const tid = await activeTaskTid(page);
     const realFile = await findNativeJsonlContaining(
@@ -513,7 +510,7 @@ profiledTest(
       await enterSession(page);
       await expect(
         page.locator('.agent-picker option[value="work-claude"]'),
-      ).toHaveText("Profile C", { timeout: 20_000 });
+      ).toHaveText("Profile C");
 
       const resultAfterReconfigure = exportHtmlCli(
         profileBackend,
@@ -556,9 +553,7 @@ profiledTest(
 
     await enterSession(page);
     await sendMessage(page, `reply with "${liveMarker}"`);
-    await expect(assistantText(page, liveMarker)).toBeVisible({
-      timeout: 60_000,
-    });
+    await expect(assistantText(page, liveMarker)).toBeVisible();
 
     const tid = await activeTaskTid(page);
     await findNativeJsonlContaining(profileBackend.profileB, liveMarker);

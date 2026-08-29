@@ -146,7 +146,7 @@ async function waitForNewTid(page: Page, before: Set<string>): Promise<number> {
       );
     tid = tids.find((candidate) => !before.has(candidate));
     expect(tid).toBeTruthy();
-  }).toPass({ timeout: 10_000 });
+  }).toPass();
   return Number(tid);
 }
 
@@ -399,7 +399,6 @@ test("held incremental bootstrap keeps an archived child route truthful", async 
   baseURL,
   agentType,
 }) => {
-  test.setTimeout(120_000);
   const seedContext = await browser.newContext({ baseURL });
   const seedPage = await seedContext.newPage();
   const seedRecorder = installPassiveRecorder(seedPage);
@@ -431,10 +430,10 @@ test("held incremental bootstrap keeps an archived child route truthful", async 
   );
   await expect(
     seedMessages.getByText(childMarker, { exact: true }).last(),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   await expect(
     seedMessages.getByText("Done.", { exact: true }).last(),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
 
   const directChild = () =>
     seedRecorder
@@ -444,7 +443,7 @@ test("held incremental bootstrap keeps an archived child route truthful", async 
           task.parentTid === parentTid && task.relationType === "subtask",
       );
   await expect
-    .poll(() => directChild()?.tid ?? null, { timeout: 30_000 })
+    .poll(() => directChild()?.tid ?? null)
     .not.toBeNull();
   const childTid = directChild()?.tid;
   if (childTid === undefined)
@@ -452,21 +451,20 @@ test("held incremental bootstrap keeps an archived child route truthful", async 
 
   await expect(
     seedPage.locator(`.sidebar-item[data-tid="${parentTid}"].active`),
-  ).toBeVisible({ timeout: 90_000 });
+  ).toBeVisible();
   await seedPage.locator(".btn-banner-stop:visible").click();
   await expect(seedPage.locator(".btn-banner-archive:visible")).toHaveText(
     "Archive",
-    { timeout: 15_000 },
   );
 
   const childLink = seedPage.locator(`.sidebar-item[data-tid="${childTid}"]`);
-  await expect(childLink).toBeVisible({ timeout: 30_000 });
+  await expect(childLink).toBeVisible();
   await childLink.click();
   await expect(
     seedPage.locator(`.sidebar-item[data-tid="${childTid}"].active`),
   ).toBeVisible();
   const archiveButton = seedPage.locator(".btn-banner-archive:visible");
-  await expect(archiveButton).toHaveText("Archive", { timeout: 30_000 });
+  await expect(archiveButton).toHaveText("Archive");
   await archiveButton.click();
   await expect(archiveButton).toHaveText("Unarchive");
 

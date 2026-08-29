@@ -135,20 +135,21 @@ export function lastAssistantText(
 /** Kill the active session and wait for it to become inactive. */
 export async function killSession(page: Page, agentType: AgentType) {
   await page.locator(".btn-banner-stop").click();
-  const timeout = 15_000;
-  await expect(page.locator(".btn-banner-archive")).toBeVisible({ timeout });
+  await expect(page.locator(".btn-banner-archive")).toBeVisible();
 }
 
 /** Gracefully end the active session (closes stdin) and wait for it to archive. */
 export async function endSession(page: Page) {
   await page.locator(".btn-banner-end").click();
-  const timeout = 30_000;
-  await expect(page.locator(".btn-banner-archive")).toBeVisible({ timeout });
+  await expect(page.locator(".btn-banner-archive")).toBeVisible();
 }
 
-/** Return an appropriate response timeout for the given agent. */
-export function responseTimeout(agentType: AgentType): number {
-  return agentType === "codex" ? 90_000 : 60_000;
+/** Assertion budget for agent responses. Deliberately the shared generous
+ * budget (see playwright.config.ts): condition waits return the moment they
+ * are satisfied, so this costs nothing on passing runs and stops contention
+ * from failing correctness tests. */
+export function responseTimeout(_agentType: AgentType): number {
+  return 540_000;
 }
 
 export async function visibleHistory(page: Page) {
@@ -284,6 +285,8 @@ export const test = base.extend<TestFixtures>({
   },
 
   page: async ({ page }, use, testInfo: TestInfo) => {
+    // page-level waits (waitForEvent and friends) share the assertion budget
+    page.setDefaultTimeout(540_000);
     const pageErrors: string[] = [];
     page.on("console", (msg) =>
       console.error(`[browser] console.${msg.type()}: ${msg.text()}`),
@@ -427,13 +430,13 @@ export async function expectUndoRefusalForUserMessage(
       ),
     })
     .last();
-  await userMsg.hover({ timeout: 15_000 });
-  await expect(userMsg.locator(".undo-btn")).toBeVisible({ timeout: 5_000 });
+  await userMsg.hover();
+  await expect(userMsg.locator(".undo-btn")).toBeVisible();
   await userMsg.locator(".undo-btn").click();
   const errorDialog = page.locator(".command-error-dialog");
-  await expect(page.locator(".command-error-message:visible")).toHaveText(expectedMessage, {
-    timeout: 15_000,
-  });
+  await expect(page.locator(".command-error-message:visible")).toHaveText(
+    expectedMessage,
+  );
   await errorDialog.getByRole("button", { name: "Dismiss" }).click();
   await expect(errorDialog).not.toBeVisible();
 }

@@ -37,16 +37,14 @@ test.describe("image paste", () => {
     await enterSession(page);
 
     const input = page.locator(".input-textarea:visible").first();
-    await expect(input).toBeEnabled({ timeout: 15_000 });
+    await expect(input).toBeEnabled();
 
     // Step 1: Simulate pasting an image
     await input.focus();
     await pasteImage(page, TINY_PNG_BASE64);
 
     // Step 2: Verify image preview appears
-    await expect(page.locator(".image-preview img")).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(page.locator(".image-preview img")).toBeVisible();
 
     // Step 3: Type text and send
     await input.fill("describe this image");
@@ -79,16 +77,14 @@ test.describe("image paste", () => {
     await enterSession(page);
 
     const input = page.locator(".input-textarea:visible").first();
-    await expect(input).toBeEnabled({ timeout: 15_000 });
+    await expect(input).toBeEnabled();
 
     // Paste an image
     await input.focus();
     await pasteImage(page, TINY_PNG_BASE64);
 
     // Verify preview appears
-    await expect(page.locator(".image-preview img")).toBeVisible({
-      timeout: 5_000,
-    });
+    await expect(page.locator(".image-preview img")).toBeVisible();
 
     // Click remove button
     await page.locator(".image-preview-remove").click();

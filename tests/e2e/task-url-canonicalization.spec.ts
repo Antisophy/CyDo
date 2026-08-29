@@ -49,10 +49,9 @@ test(
     // Case: already-canonical cold load. Zero replaceState calls, and the
     // client (re-)requests project-scoped task types (step 2's fix).
     await page.goto(canonicalUrl);
-    await expect(assistantText(page, "alpha")).toBeVisible({ timeout: 30_000 });
+    await expect(assistantText(page, "alpha")).toBeVisible();
     await expect(page.locator(`.sidebar-item[data-tid="${tid}"]`)).toHaveClass(
       /\bactive\b/,
-      { timeout: 10_000 },
     );
     await expect
       .poll(
@@ -60,7 +59,6 @@ test(
           page.evaluate(() =>
             (window as any).__sentTypes.includes("request_task_types"),
           ),
-        { timeout: 10_000 },
       )
       .toBe(true);
     expect(await page.evaluate(() => (window as any).__replaceStateCalls)).toBe(
@@ -69,36 +67,26 @@ test(
 
     // Case: legacy /task/<tid> gets rewritten to the canonical URL.
     await page.goto(`/task/${tid}`);
-    await expect(page).toHaveURL(new RegExp(`${projectRoot}/task/${tid}$`), {
-      timeout: 15_000,
-    });
-    await expect(assistantText(page, "alpha")).toBeVisible({ timeout: 30_000 });
+    await expect(page).toHaveURL(new RegExp(`${projectRoot}/task/${tid}$`));
+    await expect(assistantText(page, "alpha")).toBeVisible();
     await expect(page.locator(`.sidebar-item[data-tid="${tid}"]`)).toHaveClass(
       /\bactive\b/,
-      { timeout: 10_000 },
     );
 
     // Case: a bogus scope also gets rewritten to the canonical URL.
     await page.goto(`/bogus-ws/bogus-proj/task/${tid}`);
-    await expect(page).toHaveURL(new RegExp(`${projectRoot}/task/${tid}$`), {
-      timeout: 15_000,
-    });
-    await expect(assistantText(page, "alpha")).toBeVisible({ timeout: 30_000 });
+    await expect(page).toHaveURL(new RegExp(`${projectRoot}/task/${tid}$`));
+    await expect(assistantText(page, "alpha")).toBeVisible();
     await expect(page.locator(`.sidebar-item[data-tid="${tid}"]`)).toHaveClass(
       /\bactive\b/,
-      { timeout: 10_000 },
     );
 
     // Case: the correction replaces rather than pushes, so it never becomes
     // a back-stack entry.
     await page.goto(projectRoot);
-    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled({
-      timeout: 15_000,
-    });
+    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled();
     await page.goto(`/task/${tid}`);
-    await expect(page).toHaveURL(new RegExp(`${projectRoot}/task/${tid}$`), {
-      timeout: 15_000,
-    });
+    await expect(page).toHaveURL(new RegExp(`${projectRoot}/task/${tid}$`));
     await page.goBack();
     expect(new URL(page.url()).pathname).toBe(projectRoot);
   },
