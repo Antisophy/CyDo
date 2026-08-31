@@ -42,10 +42,10 @@ public:
 	void cancelAll()
 	{
 		foreach (tid; host_.snapshotTaskIds())
-			cancelBackgroundWork(tid);
+			cancelTaskBackgroundWork(tid);
 	}
 
-	void cancelBackgroundWork(int tid)
+	void cancelTaskBackgroundWork(int tid)
 	{
 		auto td = host_.getTask(tid);
 		if (td is null)
@@ -55,6 +55,14 @@ public:
 			td.titleGenKill();
 			td.titleGenKill = null;
 		}
+		cancelSessionBackgroundWork(tid);
+	}
+
+	void cancelSessionBackgroundWork(int tid)
+	{
+		auto td = host_.getTask(tid);
+		if (td is null)
+			return;
 		if (td.suggestGenKill !is null)
 		{
 			td.suggestGenKill();

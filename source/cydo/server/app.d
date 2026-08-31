@@ -2866,7 +2866,7 @@ class App
 
 	private void cancelExitBackgroundWork(int tid)
 	{
-		derivedTextJobs.cancelBackgroundWork(tid);
+		derivedTextJobs.cancelSessionBackgroundWork(tid);
 	}
 
 	/// Returns true when the reset already emitted a task reload (unavailable

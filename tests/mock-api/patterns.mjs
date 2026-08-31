@@ -44,6 +44,9 @@ export function matchPattern(userText) {
   // Title generation subprocess — extract a recognizable title from the prompt.
   // Uses includes() for the same reason as SUGGESTION MODE above.
   if (userText.includes("Generate a concise title")) {
+    if (userText.includes("title-switch-overlap-fixture")) {
+      return { type: "held_title", text: "Overlapping Title Survived" };
+    }
     const innerMatch = userText.match(/reply with "([^"]*)"/i);
     return { type: "text", text: innerMatch ? innerMatch[1] : "Test Task" };
   }
@@ -772,6 +775,11 @@ export function matchPattern(userText) {
   // "run orphan then switchmode" — timed bash (sleep 999) followed by switchmode
   if (/run orphan then switchmode/i.test(userText))
     return { type: "orphan_then_switchmode" };
+
+  // Hold the main response until the matching title one-shot has reached the
+  // API, then ask Claude to switch mode while that one-shot is still active.
+  if (/title-switch-overlap-fixture/i.test(userText))
+    return { type: "switchmode_after_title_started", continuation: "plan" };
 
   // "call switchmode <continuation>" → MCP SwitchMode tool call
   match = userText.match(/call switchmode (\S+)/i);

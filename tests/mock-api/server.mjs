@@ -132,6 +132,36 @@ function streamToolUseResponse(
   res.end();
 }
 
+function createTitleSwitchOverlapFixture() {
+  let held;
+  let signalStarted;
+  const started = new Promise((resolve) => {
+    signalStarted = resolve;
+  });
+
+  return {
+    started,
+    hold(res, model, text) {
+      if (held !== undefined)
+        throw new Error("title switch overlap fixture already holds a response");
+      held = { res, model, text };
+      res.once("close", () => {
+        if (held?.res === res) held = undefined;
+      });
+      signalStarted();
+    },
+    release() {
+      if (held === undefined) return false;
+      const pending = held;
+      held = undefined;
+      streamTextResponse(pending.res, pending.text, pending.model);
+      return true;
+    },
+  };
+}
+
+const titleSwitchOverlapFixture = createTitleSwitchOverlapFixture();
+
 // Stream a message whose first block is a complete Ask tool_use while a
 // second Bash tool_use block keeps trickling input_json_delta for several
 // seconds. Claude Code ≥2.1.2xx dispatches a completed tool_use block
@@ -1087,6 +1117,20 @@ function handleMessages(req, res) {
       ...usageTestHeaders,
     });
 
+    const originalText = findOriginalUserText(messages);
+    if (
+      typeof userText === "string" &&
+      userText.startsWith("[SYSTEM: Mode switch:") &&
+      originalText?.includes("title-switch-overlap-fixture")
+    ) {
+      const released = titleSwitchOverlapFixture.release();
+      console.log(
+        `[mock-api] title-switch-overlap release=${released ? "completed" : "already-closed"}`,
+      );
+      streamTextResponse(res, "mode-switch-title-release", model);
+      return;
+    }
+
     // If last message contains tool_result, check for multi-step sequences
     // before defaulting to "Done."
     if (isToolResult) {
@@ -1280,6 +1324,17 @@ function handleMessages(req, res) {
         },
       });
       // Do NOT call res.end() — connection stays open until the process is killed.
+    } else if (intent.type === "held_title") {
+      titleSwitchOverlapFixture.hold(res, model, intent.text);
+    } else if (intent.type === "switchmode_after_title_started") {
+      titleSwitchOverlapFixture.started.then(() => {
+        streamToolUseResponse(
+          res,
+          "mcp__cydo__SwitchMode",
+          { continuation: intent.continuation },
+          model,
+        );
+      });
     } else if (intent.type === "text") {
       streamTextResponse(res, intent.text, model);
     } else if (intent.type === "parallel_shell") {
