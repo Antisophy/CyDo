@@ -3573,7 +3573,7 @@ pre.extra-field-value {
   align-items: center;
   justify-content: center;
   grid-column: 2;
-  grid-row: 1 / -1;
+  grid-row: 3 / -1;
 }
 
 .session-empty-inner {

@@ -15,6 +15,7 @@ import { useTheme, ThemeContext } from "./useTheme";
 import { DevModeContext } from "./devMode";
 import { Sidebar, flatTaskOrder } from "./components/Sidebar";
 import { DraftSessionView, SessionView } from "./components/SessionView";
+import { SystemBanner } from "./components/SystemBanner";
 import { WelcomePage } from "./components/WelcomePage";
 import { SearchPopup } from "./components/SearchPopup";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -407,6 +408,19 @@ function AppContent() {
     setSidebarOpen(false);
   }, []);
 
+  const placeholderContent = activeTaskId?.startsWith("archive") ? (
+    <span class="archive-placeholder">Archived tasks</span>
+  ) : activeTaskId === "import" ? (
+    <span class="archive-placeholder">Importable sessions</span>
+  ) : tasksLoaded && activeTaskId !== null && active === null ? (
+    <>
+      <span>Task {activeTaskId} not found</span>
+      <a href="/">Go to home</a>
+    </>
+  ) : (
+    <span>Loading task…</span>
+  );
+
   return (
     <DevModeContext.Provider value={devMode}>
       <ThemeContext.Provider value={theme}>
@@ -532,34 +546,31 @@ function AppContent() {
                 </div>
               );
             })}
-          {!draftView &&
-            !activeTaskPaneRenderable &&
-            (activeTaskId?.startsWith("archive") ? (
+          {!draftView && !activeTaskPaneRenderable && (
+            <>
+              <SystemBanner
+                sessionInfo={null}
+                defaultAgent={effectiveDefaultAgent}
+                connected={connected}
+                tasksLoading={tasksLoading}
+                totalCost={0}
+                isProcessing={false}
+                stdinClosed={false}
+                alive={false}
+                canStop={false}
+                theme={theme}
+                onToggleTheme={toggleTheme}
+                onStop={() => {}}
+                onCloseStdin={() => {}}
+                taskType={undefined}
+                onToggleSidebar={toggleSidebar}
+                hasGlobalAttention={attention.size > 0}
+              />
               <div class="session-empty">
-                <div class="session-empty-inner">
-                  <span class="archive-placeholder">Archived tasks</span>
-                </div>
+                <div class="session-empty-inner">{placeholderContent}</div>
               </div>
-            ) : activeTaskId === "import" ? (
-              <div class="session-empty">
-                <div class="session-empty-inner">
-                  <span class="archive-placeholder">Importable sessions</span>
-                </div>
-              </div>
-            ) : tasksLoaded && activeTaskId !== null && active === null ? (
-              <div class="session-empty">
-                <div class="session-empty-inner">
-                  <span>Task {activeTaskId} not found</span>
-                  <a href="/">Go to home</a>
-                </div>
-              </div>
-            ) : (
-              <div class="session-empty">
-                <div class="session-empty-inner">
-                  <span>Loading task…</span>
-                </div>
-              </div>
-            ))}
+            </>
+          )}
           {searchPopup}
           {serverError && (
             <CommandErrorDialog

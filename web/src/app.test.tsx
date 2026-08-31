@@ -271,6 +271,13 @@ function makeDraftView(): DraftViewSnapshot {
   };
 }
 
+function expectPlaceholderFrame(html: string): void {
+  const root = document.createElement("div");
+  root.innerHTML = html;
+  expect(root.querySelectorAll(".system-banner")).toHaveLength(1);
+  expect(root.querySelectorAll(".session-empty")).toHaveLength(1);
+}
+
 describe("server command errors", () => {
   let container: HTMLDivElement | null = null;
 
@@ -1304,11 +1311,22 @@ describe("server command errors", () => {
 describe("missing numeric tasks", () => {
   const tid = 123;
 
+  it("renders the archive placeholder with the shared system banner", () => {
+    state.activeTaskId = "archive-123";
+
+    const html = renderToString(h(App, {}));
+
+    expectPlaceholderFrame(html);
+    expect(html).toContain("Archived tasks");
+    expect(html).not.toContain("Loading task…");
+  });
+
   it("shows a not-found message once the tasks list has loaded", () => {
     state.activeTaskId = String(tid);
 
     const html = renderToString(h(App, {}));
 
+    expectPlaceholderFrame(html);
     expect(html).toContain(`Task ${tid} not found`);
     expect(html).not.toContain("Loading task…");
   });
@@ -1320,6 +1338,7 @@ describe("missing numeric tasks", () => {
 
     const html = renderToString(h(App, {}));
 
+    expectPlaceholderFrame(html);
     expect(html).toContain("Loading task…");
     expect(html).not.toContain(`Task ${tid} not found`);
   });
