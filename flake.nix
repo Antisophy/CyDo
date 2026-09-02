@@ -283,7 +283,8 @@ EOF
               ln -s ${frontend}/dist-export $out/share/cydo/web/dist-export
               ln -s ${defs} $out/share/cydo/defs
 
-              makeWrapper $out/share/cydo/cydo $out/bin/cydo
+              makeWrapper $out/share/cydo/cydo $out/bin/cydo \
+                --suffix PATH : ${pkgs.bubblewrap}/bin
               runHook postInstall
             '';
 
