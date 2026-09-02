@@ -194,7 +194,8 @@ class DiscoveryService
 
 			if (result.status != 0)
 			{
-				warningf("Discovery failed for workspace '%s': exit %d", ws.name, result.status);
+				warningf("Discovery failed for workspace '%s': exit %d: %s", ws.name,
+					result.status, result.output);
 				workspacesInfo_ ~= WorkspaceInfo(ws.name, null, ws.default_agent, ws.default_task_type);
 				continue;
 			}
