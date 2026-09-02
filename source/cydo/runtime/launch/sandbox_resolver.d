@@ -89,7 +89,7 @@ ResolvedSandbox resolveSandboxForDiscovery(SandboxConfig global, SandboxConfig w
 			"sandbox.paths"));
 
 	if (cydoBinDir.length > 0)
-		result.paths.require(cydoBinDir, PathAccess.ro,
+		result.paths.requireReadVisible(cydoBinDir,
 			SandboxPathOrigin(SandboxPathOriginKind.launchRequirement, "discovery",
 				"CyDo binary directory"));
 
@@ -663,10 +663,9 @@ unittest
 	assert(discoveryView.declaration.get.origin.detail
 		== "sandbox.paths (" ~ discoveryWorkspaceAlias ~ ")");
 	assert(discovery.paths.exact(agentOnlyPath).isNull);
-	auto cydoView = discovery.paths.exact(cydoDir).get;
-	assert(cydoView.effectiveMode == PathMode.ro);
-	assert(cydoView.requirement.get.origin.kind
-		== SandboxPathOriginKind.launchRequirement);
+	// The writable discovery root already makes the CyDo directory visible, so
+	// requireReadVisible deliberately does not add a redundant exact entry.
+	assert(discovery.paths.exact(cydoDir).isNull);
 
 	SandboxConfig maskedWorkspace;
 	maskedWorkspace.paths[root] = PathMode.tmpfs;

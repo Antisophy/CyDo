@@ -110,6 +110,12 @@ string[] executableMountPaths(string executablePath)
 /// Append the inner command after the returned prefix.
 string[] buildCommandPrefix(ref ResolvedSandbox sandbox, string workDir)
 {
+	return buildCommandPrefix(sandbox, workDir, resolveNixCurrentSystem());
+}
+
+private string[] buildCommandPrefix(ref ResolvedSandbox sandbox, string workDir,
+	string currentSystem)
+{
 	if (!sandbox.useBwrap)
 		return buildEnvPrefix(sandbox, workDir);
 
@@ -148,14 +154,32 @@ string[] buildCommandPrefix(ref ResolvedSandbox sandbox, string workDir)
 		else
 			args ~= ["--tmpfs", "/tmp"];
 
-		auto currentSystem = resolveNixCurrentSystem();
+		auto nixView = sandbox.paths.exact("/nix");
+		bool nixPathRegistered = !nixView.isNull;
+		bool nixStoreInPlan;
+		if (!nixView.isNull)
+		{
+			final switch (nixView.get.effectiveMode)
+			{
+				case PathMode.ro:
+				case PathMode.rw:
+				case PathMode.always_rw:
+					nixStoreInPlan = true;
+					break;
+				case PathMode.tmpfs:
+				case PathMode.empty_dir:
+				case PathMode.empty_file:
+					break;
+			}
+		}
+		if (nixStoreInPlan)
+			builtinMounts ~= "/nix";
 
 		if (currentSystem.length > 0)
 		{
 			// NixOS: mount nix store, system binaries, and minimal /etc + /run
 			// entries needed for DNS, TLS, and bwrap-wrapped binaries.
 			static immutable nixPaths = [
-				"/nix",
 				"/bin",
 				"/lib64",
 				"/usr/bin",
@@ -165,6 +189,11 @@ string[] buildCommandPrefix(ref ResolvedSandbox sandbox, string workDir)
 				"/etc/ssl",
 				"/etc/static/ssl",
 			];
+			if (!nixPathRegistered && exists("/nix"))
+			{
+				args ~= ["--ro-bind", "/nix", "/nix"];
+				builtinMounts ~= "/nix";
+			}
 			foreach (p; nixPaths)
 				if (exists(p))
 				{
@@ -503,6 +532,17 @@ version (unittest) private NativeHistoryProfile rendererTestNativeHistoryProfile
 		sandbox.env["HOME"] = "/tmp";
 	sandbox.env[rule.profileEnvName] = root;
 	return resolveNativeHistoryProfile(sandbox, rule);
+}
+
+version (unittest) private size_t rendererSequenceCount(const string[] args,
+	const string[] sequence)
+{
+	size_t count;
+	foreach (i; 0 .. args.length)
+		if (i + sequence.length <= args.length
+			&& args[i .. i + sequence.length] == sequence)
+			++count;
+	return count;
 }
 
 unittest
@@ -1304,6 +1344,113 @@ unittest
 		assert(logicalAfter[i].declaration.get.origin.detail
 			== view.declaration.get.origin.detail);
 	}
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, remove, rmdirRecurse, write;
+	import std.path : buildPath;
+
+	assert(exists("/nix/store"), "renderer /nix mount test requires /nix/store");
+
+	auto root = buildPath("/tmp", "cydo-renderer-nix-mount");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+	{
+		if (exists(root))
+			rmdirRecurse(root);
+	}
+
+	auto fakeBin = buildPath(root, "bin");
+	mkdirRecurse(fakeBin);
+	write(buildPath(fakeBin, "bwrap"), "");
+	auto oldPath = environment.get("PATH", "");
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	scope (exit) environment["PATH"] = oldPath;
+
+	auto nixMount = ["--ro-bind", "/nix", "/nix"];
+	auto requirementOrigin = SandboxPathOrigin(
+		SandboxPathOriginKind.launchRequirement, "renderer nix mount", "required path");
+	auto configOrigin = SandboxPathOrigin(
+		SandboxPathOriginKind.globalConfig, "renderer nix mount", "user path");
+
+	ResolvedSandbox required;
+	required.isolate_filesystem = true;
+	required.paths.requireReadVisible("/nix/store", requirementOrigin);
+	assert(!required.paths.exact("/nix").isNull);
+	auto requiredArgs = buildCommandPrefix(required, "", "");
+	assert(rendererSequenceCount(requiredArgs, nixMount) == 1);
+
+	ResolvedSandbox withoutNix;
+	withoutNix.isolate_filesystem = true;
+	auto withoutNixArgs = buildCommandPrefix(withoutNix, "", "");
+	assert(rendererSequenceCount(withoutNixArgs, nixMount) == 0);
+
+	ResolvedSandbox nixOs;
+	nixOs.isolate_filesystem = true;
+	auto nixOsArgs = buildCommandPrefix(nixOs, "", "/run/current-system");
+	assert(rendererSequenceCount(nixOsArgs, nixMount) == 1);
+
+	ResolvedSandbox configured;
+	configured.isolate_filesystem = true;
+	configured.paths.set("/nix", PathMode.ro, configOrigin);
+	configured.paths.requireReadVisible("/nix/store", requirementOrigin);
+	auto configuredArgs = buildCommandPrefix(configured, "", "");
+	assert(rendererSequenceCount(configuredArgs, nixMount) == 1);
+
+	foreach (sandbox; [required, withoutNix, configured])
+		foreach (tempFile; sandbox.tempFiles)
+			if (exists(tempFile))
+				remove(tempFile);
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, remove, rmdirRecurse, symlink, write;
+	import std.path : buildPath;
+
+	// /bin/sh is a symlink into /nix/store in Nix test environments. The test
+	// only creates a link in /tmp and never writes to the store itself.
+	auto physicalTarget = realPath("/bin/sh");
+	if (!exists("/nix/store") || !physicalTarget.startsWith("/nix/"))
+		return;
+
+	auto root = buildPath("/tmp", "cydo-renderer-nix-symlink");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+	{
+		if (exists(root))
+			rmdirRecurse(root);
+	}
+
+	auto fakeBin = buildPath(root, "bin");
+	mkdirRecurse(fakeBin);
+	write(buildPath(fakeBin, "bwrap"), "");
+	auto oldPath = environment.get("PATH", "");
+	environment["PATH"] = fakeBin ~ ":" ~ oldPath;
+	scope (exit) environment["PATH"] = oldPath;
+
+	auto executable = buildPath(fakeBin, "nix-shell");
+	symlink("/bin/sh", executable);
+	auto resolvedExecutable = resolveExecutablePath(executable, null);
+	assert(resolvedExecutable == executable);
+	assert(realPath(resolvedExecutable).startsWith("/nix/"));
+
+	ResolvedSandbox sandbox;
+	sandbox.isolate_filesystem = true;
+	auto origin = SandboxPathOrigin(
+		SandboxPathOriginKind.agentRequirement, "renderer nix symlink", "executable");
+	foreach (path; executableMountPaths(resolvedExecutable))
+		sandbox.paths.requireReadVisible(path, origin);
+
+	auto args = buildCommandPrefix(sandbox, "", "");
+	assert(rendererSequenceCount(args, ["--ro-bind", "/nix", "/nix"]) == 1);
+
+	foreach (tempFile; sandbox.tempFiles)
+		if (exists(tempFile))
+			remove(tempFile);
 }
 
 unittest

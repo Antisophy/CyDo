@@ -162,6 +162,8 @@ struct SandboxPaths
 	void requireReadVisible(string rawPath, SandboxPathOrigin origin)
 	{
 		auto path = normalizeSandboxPath(rawPath, describeOrigin(origin));
+		if (path == "/nix" || path.startsWith("/nix/"))
+			require("/nix", PathAccess.ro, origin);
 		if (path in entries_)
 		{
 			require(path, PathAccess.ro, origin);
