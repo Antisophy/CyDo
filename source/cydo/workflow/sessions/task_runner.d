@@ -1025,7 +1025,8 @@ public:
 
 			current.isProcessing = false;
 			current.stdinClosed = false;
-			if (exitCode != 0 && current.status != TaskStatus.completed)
+			if (exitCode != 0 && current.status != TaskStatus.completed
+				&& current.status != TaskStatus.failed)
 				current.error = lastStderr;
 			auto historyResolution = host_.ensureHistoryLoadedForExit(tid);
 			host_.finalReconcileJsonlIfPresent(tid, historyResolution);
@@ -1094,7 +1095,8 @@ public:
 				return;
 			}
 
-			if (!intentionalExit && current.status != TaskStatus.completed)
+			if (!intentionalExit && current.status != TaskStatus.completed
+				&& current.status != TaskStatus.failed)
 			{
 				if (current.error.length == 0)
 					current.error = "Process exited unexpectedly";

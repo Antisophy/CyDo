@@ -3938,9 +3938,11 @@ version (unittest)
 	import ae.sys.dataset : joinData;
 	import ae.utils.array : as;
 
+	import cydo.agent.contract : SessionConfig;
 	import cydo.agent.drivers.claude : ClaudeCodeAgent;
 	import cydo.agent.drivers.codex : CodexAgent;
 	import cydo.agent.drivers.copilot : CopilotAgent;
+	import cydo.runtime.launch.types : ProcessLaunch;
 }
 
 version (unittest) private final class TestClaudePromptAgent : ClaudeCodeAgent
@@ -3975,7 +3977,9 @@ version (unittest) private final class GatedSubmissionSession : AgentSession
 	size_t sendCalls;
 	private void delegate(TranslatedEvent) outputHandler_;
 	private void delegate(string) nativeSessionStartedHandler_;
+	private void delegate(int) exitHandler_;
 	private string nativeSessionId_;
+	private bool alive_ = true;
 
 	Promise!AgentSubmissionReceipt sendMessage(const(ContentBlock)[] content,
 		string correlationId = null, bool isContextBootstrap = false)
@@ -3996,6 +4000,15 @@ version (unittest) private final class GatedSubmissionSession : AgentSession
 	void reject(size_t index, string message)
 	{
 		gates[index].reject(new Exception(message));
+	}
+
+	void deliverServerExit(int status)
+	{
+		alive_ = false;
+		auto cb = exitHandler_;
+		exitHandler_ = null;
+		if (cb !is null)
+			cb(status);
 	}
 
 	TranslatedEvent nativeUserEcho(string text, string correlationId = null)
@@ -4047,8 +4060,8 @@ version (unittest) private final class GatedSubmissionSession : AgentSession
 	}
 	@property void onOutput(void delegate(TranslatedEvent) dg) { outputHandler_ = dg; }
 	@property void onStderr(void delegate(string line) dg) {}
-	@property void onExit(void delegate(int status) dg) {}
-	@property bool alive() { return true; }
+	@property void onExit(void delegate(int status) dg) { exitHandler_ = dg; }
+	@property bool alive() { return alive_; }
 }
 
 version (unittest) private final class GatedSubmissionRunner : TaskSessionRunner
@@ -4093,6 +4106,34 @@ version (unittest) private final class GatedSubmissionRunner : TaskSessionRunner
 			launched_[tid] = true;
 			return resolve(state);
 		};
+	}
+}
+
+version (unittest) private final class GatedSubmissionCodexAgent : CodexAgent
+{
+	GatedSubmissionSession session;
+
+	override AgentSession createSession(int tid, string resumeSessionId,
+		ProcessLaunch launch, SessionConfig config = SessionConfig.init)
+	{
+		session = new GatedSubmissionSession;
+		return session;
+	}
+}
+
+/// Avoid process-launch setup while retaining TaskSessionRunner's production
+/// session callback wiring and exit handling.
+version (unittest) private final class PreparedSubmissionExitRunner : TaskSessionRunner
+{
+	this(TaskSessionRunnerHost host)
+	{
+		super(host);
+	}
+
+	override TaskSessionLaunch prepareTaskSessionLaunch(int tid, Agent taskAgent,
+		TaskTypeDef* typeDef)
+	{
+		return TaskSessionLaunch.init;
 	}
 }
 
@@ -4929,6 +4970,167 @@ unittest
 		&& toJson(fixture.session.contents[2]) == toJson(fixture.session.contents[3])
 		&& browser.worktreeTid == browserTid
 		&& fixture.app.taskPathResolver.worktreePath(browser) == browserWorktreePath);
+}
+
+// Regression: a rejected initial Codex turn/start can settle before a later
+// process-exit callback observes the same task.
+unittest
+{
+	auto root = buildPath(tempDir(), "cydo-app-codex-initial-submission-exit");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope(exit) if (exists(root)) rmdirRecurse(root);
+	mkdirRecurse(root);
+
+	auto projectPath = buildPath(root, "project");
+	mkdirRecurse(projectPath);
+	auto defs = buildPath(root, "defs");
+	mkdirRecurse(buildPath(defs, "prompts"));
+	write(buildPath(defs, "prompts", "start.md"), "{{task_description}}\n");
+	write(buildPath(defs, "task-types.yaml"),
+		"user_entry_points:\n"
+		~ "  direct:\n"
+		~ "    task_type: direct_test\n"
+		~ "    description: Direct\n"
+		~ "    prompt_template: prompts/start.md\n"
+		~ "task_types:\n"
+		~ "  direct_test:\n"
+		~ "    model_class: large\n");
+
+	auto dbPath = buildPath(tempDir(),
+		"cydo-app-codex-initial-submission-exit.sqlite");
+	if (exists(dbPath))
+		remove(dbPath);
+	scope(exit) if (exists(dbPath)) remove(dbPath);
+	auto fixture = new GatedSubmissionFixture(dbPath);
+	fixture.app.config.system_keyword = "SYSTEM";
+	fixture.app.config.workspaces = [WorkspaceConfig(name: "test", root: root)];
+	fixture.app.taskDirTemplate = "{{ workspace_root }}/tasks/{{ tid }}";
+	fixture.app.taskTypeCatalog = new TaskTypeCatalog(defs,
+		buildPath(defs, "task-types.yaml"), (string name) => name == "codex");
+	fixture.app.taskPathResolver = new TaskPathResolver(TaskPathResolverHost(
+		getTask: (int tid) {
+			auto task = tid in fixture.app.tasks;
+			return task is null ? null : task;
+		},
+		workspaces: () => fixture.app.config.workspaces,
+		taskDirTemplate: () => fixture.app.taskDirTemplate,
+	));
+	fixture.app.taskLifecycle = TaskLifecycle(
+		getTask: (int tid) {
+			auto task = tid in fixture.app.tasks;
+			return task is null ? null : task;
+		},
+		persistStatus: (int tid, string status) {
+			fixture.app.persistence.setStatus(tid, status);
+		},
+		persistNeedsAttention: (int tid, bool needsAttention) {
+			fixture.app.persistence.setNeedsAttention(tid, needsAttention);
+		},
+		publishSnapshot: (int tid) {
+			fixture.app.broadcastTaskUpdate(tid);
+		},
+	);
+	fixture.app.systemMessageNormalizer = new SystemMessageNormalizer(
+		SystemMessageNormalizerHost(
+			systemKeyword: () => fixture.app.config.system_keyword,
+			projectPathForTask: (int tid) {
+				auto task = tid in fixture.app.tasks;
+				return task is null ? null : task.projectPath;
+			},
+			taskTypesForProject: (string path) =>
+				fixture.app.taskTypeCatalog.getTaskTypesForProject(path),
+			entryPointsForProject: (string path) =>
+				fixture.app.taskTypeCatalog.getEntryPointsForProject(path),
+			loadTemplateText: (string templateName, string path) => "",
+		));
+	fixture.app.workflowTools = new WorkflowToolsBackend(WorkflowToolsHost.init);
+
+	auto agent = new GatedSubmissionCodexAgent;
+	fixture.app.agentsByName["codex"] = agent;
+	auto runner = new PreparedSubmissionExitRunner(TaskSessionRunnerHost(
+		getTask: (int tid) {
+			auto task = tid in fixture.app.tasks;
+			return task is null ? null : task;
+		},
+		agentForTask: (int tid) => cast(Agent) agent,
+		tryAgentForTask: (int tid) => cast(Agent) agent,
+		setAgentSessionId: (int tid, string sessionId) {},
+		clearLastActive: (int tid) {},
+		broadcastTask: (int tid, TranslatedEvent event) {},
+		publishTaskSnapshot: (int tid) {
+			fixture.app.broadcastTaskUpdate(tid);
+		},
+		drainIdleCallbacksOnExit: (int tid) {},
+		hasPendingSubTask: (int tid) => false,
+		hasTaskDependency: (int tid) => false,
+		hasPendingChildQuestion: (int tid) => false,
+		parentTaskForChild: (int childTid) => 0,
+		deliverFailedPendingSubTaskResult: (int tid) => false,
+		deliverWaitingParentResultsIfReady: (int tid) => resolve(),
+		failPendingAskUserQuestionOnExit: (int tid) {},
+		failPendingPermissionPromptOnExit: (int tid) {},
+		failPendingAskRouteOnExit: (int tid) {},
+		cancelExitBackgroundWork: (int tid) {},
+		resetHistoryWatermarkAfterExit: (int tid) => false,
+		touchAndPersistLastActive: (int tid) {},
+		findAliveAncestor: (int tid) => -1,
+		broadcastFocusHint: (int fromTid, int toTid) {},
+		transitionTask: (int tid, TaskStatus expectedFrom, TaskStatus to,
+			TaskNotificationChange notification) {
+			fixture.app.taskLifecycle.transitionTask(tid, expectedFrom, to,
+				notification);
+		},
+		transitionTaskFrom: (int tid, TaskStatus[] expectedFrom, TaskStatus to,
+			TaskNotificationChange notification) {
+			fixture.app.taskLifecycle.transitionTask(tid, expectedFrom, to,
+				notification);
+		},
+		persistResultText: (int tid, string resultText) {
+			fixture.app.persistence.setResultText(tid, resultText);
+		},
+		emitTaskReload: (int tid) {},
+		ensureHistoryLoadedForExit: (int tid) =>
+			Nullable!TaskHistoryResolution.init,
+		finalReconcileJsonlIfPresent: (int tid,
+			Nullable!TaskHistoryResolution resolution) {},
+		stopJsonlWatch: (int tid) {},
+		shuttingDown: () => false,
+		taskTypeCatalog: fixture.app.taskTypeCatalog,
+	));
+	fixture.app.taskSessionRunner = runner;
+
+	WsMessage message;
+	message.type = "create_task";
+	message.workspace = "test";
+	message.project_path = projectPath;
+	message.agent_name = "codex";
+	message.entry_point = "direct";
+	message.content = JSONFragment(toJson(
+		[ContentBlock("text", "first Codex message")]));
+	fixture.app.handleCreateTaskMsg(fixture.socket, message);
+	drainSubmissionNextTicks();
+
+	int createdTid;
+	foreach (row; fixture.app.persistence.loadTasks())
+		if (row.tid > createdTid)
+			createdTid = row.tid;
+	auto task = &fixture.app.tasks[createdTid];
+	assert(agent.session !is null && agent.session.gates.length == 1
+		&& task.status == TaskStatus.active);
+
+	// A turn/start error rejects the submission without ending CodexSession.
+	// Let the application's initial-submission callback commit active -> failed.
+	agent.session.reject(0, "Codex turn/start rejected initial submission");
+	drainSubmissionNextTicks();
+	assert(agent.session.alive && task.status == TaskStatus.failed);
+
+	// If the app-server subsequently exits, the production runner callback must
+	// accept that the task is already failed and leave it failed without throwing.
+	agent.session.deliverServerExit(17);
+	assert(task.status == TaskStatus.failed
+		&& task.error == "Codex turn/start rejected initial submission"
+		&& task.resultText == "Codex turn/start rejected initial submission");
 }
 
 unittest
