@@ -443,7 +443,32 @@ string findBwrap()
 			return candidate;
 	}
 
-	assert(false, "bwrap binary not found");
+	throw new Exception("bubblewrap (bwrap) is required for process/filesystem "
+		~ "sandboxing of spawned agents, which is enabled by default, but the "
+		~ "bwrap binary was not found. Looked in "
+		~ "/run/wrappers/bin/bwrap, /usr/bin/bwrap, and the backend PATH. "
+		~ "Install bubblewrap using your distribution's package manager.");
+}
+
+unittest
+{
+	if (exists("/run/wrappers/bin/bwrap") || exists("/usr/bin/bwrap"))
+		return;
+
+	auto oldPath = environment.get("PATH", "");
+	environment["PATH"] = "/tmp/cydo-find-bwrap-without-binary";
+	scope (exit) environment["PATH"] = oldPath;
+
+	bool thrown;
+	try
+		findBwrap();
+	catch (Exception e)
+	{
+		thrown = true;
+		assert(e.msg.canFind("bwrap"), e.msg);
+		assert(e.msg.canFind("bubblewrap"), e.msg);
+	}
+	assert(thrown);
 }
 
 /// Resolve /run/current-system symlink target (NixOS).
