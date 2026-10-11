@@ -117,11 +117,21 @@ struct UsageUiConfig
 	@Optional bool remaining;
 }
 
+struct ContextUiConfig
+{
+	/// categories of the context the agent's harness adds around a turn
+	/// (the attachment type in a Claude transcript: hook_success,
+	/// total_tokens_reminder, nested_memory, ...) to leave out of the
+	/// timeline. Empty or absent shows every category.
+	@Optional string[] hidden_categories;
+}
+
 /// Preferences for the web UI. The whole section reaches every page in
 /// server_status, on connect and again on each config reload.
 struct UiConfig
 {
 	@Optional UsageUiConfig usage;
+	@Optional ContextUiConfig context;
 }
 
 struct CydoConfig
@@ -444,5 +454,18 @@ version (unittest)
 
 		assertThrown(parseConfigString!CydoConfig(
 			workspacesYAML ~ "ui:\n  usage:\n    coloring: rainbow\n", "/dev/null"));
+	}
+
+	// 15. Context categories to hide parse as a list, and default to none.
+	unittest
+	{
+		auto defaults = parseConfigString!CydoConfig(workspacesYAML, "/dev/null");
+		assert(defaults.ui.context.hidden_categories.length == 0);
+
+		auto yaml = workspacesYAML ~ "ui:\n  context:\n    hidden_categories:\n"
+			~ "      - total_tokens_reminder\n      - batching_reminder_sent\n";
+		auto config = parseConfigString!CydoConfig(yaml, "/dev/null");
+		assert(config.ui.context.hidden_categories
+			== ["total_tokens_reminder", "batching_reminder_sent"]);
 	}
 }

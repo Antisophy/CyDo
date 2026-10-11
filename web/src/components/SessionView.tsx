@@ -30,6 +30,9 @@ import { FileViewer } from "./FileViewer";
 import { requestNotificationPermissionFromGesture } from "../useNotifications";
 import { LogoBanner } from "./LogoBanner";
 import { isMarkdownPath } from "../lib/fileFormats";
+import { HiddenContextCategoriesContext } from "./ContextAttachments";
+
+const noHiddenCategories: readonly string[] = [];
 
 interface Props {
   task: TaskState;
@@ -423,27 +426,31 @@ function SessionViewInner({
           </div>
         </div>
       ) : (
-        <MessageList
-          taskTid={tid}
-          messages={task.messages}
-          replacementEvents={task.replacementEvents}
-          historyOperations={task.historyOperations}
-          blocks={task.blocks}
-          isProcessing={task.isProcessing}
-          bandStatus={deriveBandStatus(
-            normalizeSessionStatus(task.sessionStatus),
-            task.isProcessing,
-            task.stdinClosed,
-            task.alive,
-          )}
-          onFork={onFork}
-          onUndo={onUndo}
-          onEditMessage={!task.alive ? onEditMessage : undefined}
-          onEditRawEvent={!task.alive ? onEditRawEvent : undefined}
-          onViewFile={openFileViewer}
-          spawnedTidsByItemId={task.spawnedTidsByItemId}
-          getTaskHref={getTaskHref}
-        />
+        <HiddenContextCategoriesContext.Provider
+          value={ui?.context?.hidden_categories ?? noHiddenCategories}
+        >
+          <MessageList
+            taskTid={tid}
+            messages={task.messages}
+            replacementEvents={task.replacementEvents}
+            historyOperations={task.historyOperations}
+            blocks={task.blocks}
+            isProcessing={task.isProcessing}
+            bandStatus={deriveBandStatus(
+              normalizeSessionStatus(task.sessionStatus),
+              task.isProcessing,
+              task.stdinClosed,
+              task.alive,
+            )}
+            onFork={onFork}
+            onUndo={onUndo}
+            onEditMessage={!task.alive ? onEditMessage : undefined}
+            onEditRawEvent={!task.alive ? onEditRawEvent : undefined}
+            onViewFile={openFileViewer}
+            spawnedTidsByItemId={task.spawnedTidsByItemId}
+            getTaskHref={getTaskHref}
+          />
+        </HiddenContextCategoriesContext.Provider>
       )}
       {undoPreview && undoPreview.messagesRemoved >= 0 && (
         <UndoConfirmDialog

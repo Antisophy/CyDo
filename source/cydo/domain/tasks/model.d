@@ -14,6 +14,7 @@ import ae.utils.json : JSONFragment, JSONName, JSONOptional, JSONPartial;
 import ae.utils.promise : Promise, PromiseQueue;
 import ae.utils.statequeue : StateQueue;
 
+import cydo.agent.context_chains : ContextChains;
 import cydo.agent.session : AgentSubmissionReceipt;
 import cydo.protocol : ContentBlock, ItemStartedEvent;
 import cydo.runtime.config : UiConfig;
@@ -610,6 +611,9 @@ struct TaskData
 	bool archived;
 	long createdAt;    // StdTime; 0 = not set
 	long lastActive;   // StdTime; 0 = not set
+	/// the context chains of the live transcript tail (see
+	/// translateContextAttachment)
+	ContextChains tailContextChains;
 
 	/// Git repository root for the selected project.
 	/// Falls back to projectPath if git resolution fails.

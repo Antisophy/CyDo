@@ -381,8 +381,12 @@ export interface UsageUiConfig {
   coloring?: "pace" | "percent";
   remaining?: boolean;
 }
+export interface ContextUiConfig {
+  hidden_categories?: string[];
+}
 export interface UiConfig {
   usage?: UsageUiConfig;
+  context?: ContextUiConfig;
 }
 export interface ServerStatusMessage {
   type: "server_status";

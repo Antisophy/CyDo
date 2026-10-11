@@ -282,14 +282,16 @@ unittest
 
 	// the page receives the ui section as configured, defaults included
 	auto defaults = buildServerStatus(false, false, "/nonexistent");
-	assert(defaults.canFind(`"ui":{"usage":{"coloring":"pace","remaining":false}}`), defaults);
+	assert(defaults.canFind(`"ui":{"usage":{"coloring":"pace","remaining":false},`
+		~ `"context":{"hidden_categories":[]}}`), defaults);
 
 	UiConfig ui;
 	ui.usage.coloring = UsageColoring.percent;
 	ui.usage.remaining = true;
+	ui.context.hidden_categories = ["total_tokens_reminder"];
 	auto configured = buildServerStatus(false, false, "/nonexistent", ui);
-	assert(configured.canFind(`"ui":{"usage":{"coloring":"percent","remaining":true}}`),
-		configured);
+	assert(configured.canFind(`"ui":{"usage":{"coloring":"percent","remaining":true},`
+		~ `"context":{"hidden_categories":["total_tokens_reminder"]}}`), configured);
 }
 
 unittest
