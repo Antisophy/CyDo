@@ -447,7 +447,10 @@ function SystemInitView({ message }: { message: DisplayMessage }) {
 
 function TaskLifecycleView({ message }: { message: DisplayMessage }) {
   const raw = message.rawSource as Record<string, unknown>;
-  const isStarted = raw.subtype === "task_started";
+  // live events carry the agnostic type ("task/started"); the subtype check
+  // is kept for raw claude history events that retain the original shape
+  const isStarted =
+    raw.type === "task/started" || raw.subtype === "task_started";
   const taskType = raw.task_type;
   const taskId = raw.task_id;
 
