@@ -1,4 +1,5 @@
 import { memo } from "preact/compat";
+import { NestedHistoryContext } from "./NestedHistoryLoadMore";
 import {
   useEffect,
   useLayoutEffect,
@@ -51,6 +52,10 @@ interface Props {
   historyWindowStep?: number;
   /** load `step` more messages of older history; 0 = all */
   onLoadMoreHistory?: (step: number) => void;
+  /** sub-agent transcripts whose older part is held back, by Agent call */
+  nestedHistoryWindows?: ReadonlyMap<string, number>;
+  /** load `step` more messages of one sub-agent's transcript; 0 = all */
+  onLoadMoreNestedHistory?: (parentToolUseId: string, step: number) => void;
 }
 
 function ResultMessageView({ message }: { message: DisplayMessage }) {
@@ -878,6 +883,8 @@ export function MessageList({
   historyWindowStart,
   historyWindowStep,
   onLoadMoreHistory,
+  nestedHistoryWindows,
+  onLoadMoreNestedHistory,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -982,6 +989,41 @@ export function MessageList({
   useEffect(() => {
     setLoadingMore(false);
   }, [historyWindowStart, taskTid]);
+
+  // a sub-agent's older messages land inside its Agent block; holding the
+  // distance from the bottom keeps the reader where they were, as for the
+  // task's own load-more, and the batch landing (the windows changing)
+  // brings that block's buttons back or removes them
+  const [loadingNested, setLoadingNested] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
+  const heldNestedScrollRef = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (el !== null && heldNestedScrollRef.current !== null)
+      el.scrollTop = heldNestedScrollRef.current;
+    heldNestedScrollRef.current = null;
+    setLoadingNested(new Set());
+  }, [nestedHistoryWindows, taskTid]);
+  const nestedHistory = useMemo(
+    () => ({
+      windows: nestedHistoryWindows,
+      step: historyWindowStep,
+      loading: loadingNested,
+      load: (parentToolUseId: string, step: number) => {
+        const el = containerRef.current;
+        if (el) heldNestedScrollRef.current = el.scrollTop;
+        onLoadMoreNestedHistory?.(parentToolUseId, step);
+        setLoadingNested((prev) => new Set(prev).add(parentToolUseId));
+      },
+    }),
+    [
+      nestedHistoryWindows,
+      historyWindowStep,
+      loadingNested,
+      onLoadMoreNestedHistory,
+    ],
+  );
 
   // On session switch, scroll to bottom (scrollTop 0 = bottom in column-reverse).
   const prevTaskTid = useRef(taskTid);
@@ -1100,122 +1142,124 @@ export function MessageList({
 
   return (
     <ReplacementEventsContext.Provider value={replacementEvents}>
-      <div
-        class={`message-list${historyWindowed ? " history-windowed" : ""}`}
-        ref={containerRef}
-      >
-        <StatusBand status={bandStatus} />
-        <div class="message-list-inner">
-          {historyWindowStart != null &&
-            historyWindowStart > 0 &&
-            historyWindowStep != null &&
-            historyWindowStep > 0 &&
-            onLoadMoreHistory && (
-              <div class="load-more-row">
-                {loadingMore ? (
-                  <div
-                    class="load-more-loading"
-                    aria-label="Loading older messages"
-                  >
-                    <StatusBand status="requesting" />
-                  </div>
-                ) : (
-                  <>
-                    <button
-                      class="btn"
-                      onClick={() => {
-                        loadMore(historyWindowStep);
-                      }}
+      <NestedHistoryContext.Provider value={nestedHistory}>
+        <div
+          class={`message-list${historyWindowed ? " history-windowed" : ""}`}
+          ref={containerRef}
+        >
+          <StatusBand status={bandStatus} />
+          <div class="message-list-inner">
+            {historyWindowStart != null &&
+              historyWindowStart > 0 &&
+              historyWindowStep != null &&
+              historyWindowStep > 0 &&
+              onLoadMoreHistory && (
+                <div class="load-more-row">
+                  {loadingMore ? (
+                    <div
+                      class="load-more-loading"
+                      aria-label="Loading older messages"
                     >
-                      Load {historyWindowStep} more
-                    </button>
-                    <button
-                      class="btn"
-                      onClick={() => {
-                        loadMore(historyWindowStep * 5);
-                      }}
-                    >
-                      Load {historyWindowStep * 5} more
-                    </button>
-                    <button
-                      class="btn"
-                      onClick={() => {
-                        loadMore(0);
-                      }}
-                    >
-                      Load all
-                    </button>
-                  </>
-                )}
-              </div>
-            )}
-          {topLevelMessages.map((msg) => {
-            const resolvedBlocks =
-              msg.type === "assistant"
-                ? ((msg.blockIds ?? [])
-                    .map((id) => blocks.get(id))
-                    .filter(Boolean) as Block[])
-                : [];
-            const seqs =
-              msg.seq == null
-                ? []
-                : Array.isArray(msg.seq)
-                  ? msg.seq
-                  : [msg.seq];
-            const boundaries = seqs
-              .map((seq) => replacementEvents.get(seq))
-              .filter(
-                (event) =>
-                  (event?.type === "item/started" ||
-                    event?.type === "turn/stop") &&
-                  event.history_boundary,
-              );
-            const boundary =
-              boundaries.length === 1
-                ? (
-                    boundaries[0] as {
-                      history_boundary: {
-                        anchor: string;
-                        kind: "user" | "provisional_user" | "agent_turn";
-                        checkpoint_uuid?: string;
-                      };
-                    }
-                  ).history_boundary
-                : undefined;
-            const actionUuid = boundary?.anchor;
-            const isForkable =
-              !!boundary && !!historyOperations?.fork[boundary.kind];
-            const isUndoable =
-              !!boundary && !!historyOperations?.undo[boundary.kind];
-            return (
-              <MessageView
-                key={msg.id}
-                msg={msg}
-                tid={taskTid}
-                resolvedBlocks={resolvedBlocks}
-                childrenByParent={childrenByParent}
-                resolvedBlocksByMsg={resolvedBlocksByMsg}
-                onViewFile={onViewFile}
-                onFork={isForkable ? handleFork : undefined}
-                onUndo={isUndoable ? handleUndo : undefined}
-                onEdit={msg.type === "user" ? handleEditMessage : undefined}
-                onEditRaw={handleEditRawEvent}
-                actionUuid={actionUuid}
-                actionBoundary={
-                  boundary
-                    ? {
-                        kind: boundary.kind,
-                        checkpointUuid: boundary.checkpoint_uuid,
+                      <StatusBand status="requesting" />
+                    </div>
+                  ) : (
+                    <>
+                      <button
+                        class="btn"
+                        onClick={() => {
+                          loadMore(historyWindowStep);
+                        }}
+                      >
+                        Load {historyWindowStep} more
+                      </button>
+                      <button
+                        class="btn"
+                        onClick={() => {
+                          loadMore(historyWindowStep * 5);
+                        }}
+                      >
+                        Load {historyWindowStep * 5} more
+                      </button>
+                      <button
+                        class="btn"
+                        onClick={() => {
+                          loadMore(0);
+                        }}
+                      >
+                        Load all
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+            {topLevelMessages.map((msg) => {
+              const resolvedBlocks =
+                msg.type === "assistant"
+                  ? ((msg.blockIds ?? [])
+                      .map((id) => blocks.get(id))
+                      .filter(Boolean) as Block[])
+                  : [];
+              const seqs =
+                msg.seq == null
+                  ? []
+                  : Array.isArray(msg.seq)
+                    ? msg.seq
+                    : [msg.seq];
+              const boundaries = seqs
+                .map((seq) => replacementEvents.get(seq))
+                .filter(
+                  (event) =>
+                    (event?.type === "item/started" ||
+                      event?.type === "turn/stop") &&
+                    event.history_boundary,
+                );
+              const boundary =
+                boundaries.length === 1
+                  ? (
+                      boundaries[0] as {
+                        history_boundary: {
+                          anchor: string;
+                          kind: "user" | "provisional_user" | "agent_turn";
+                          checkpoint_uuid?: string;
+                        };
                       }
-                    : undefined
-                }
-                spawnedTidsByItemId={spawnedTidsByItemId}
-                getTaskHref={getTaskHref}
-              />
-            );
-          })}
+                    ).history_boundary
+                  : undefined;
+              const actionUuid = boundary?.anchor;
+              const isForkable =
+                !!boundary && !!historyOperations?.fork[boundary.kind];
+              const isUndoable =
+                !!boundary && !!historyOperations?.undo[boundary.kind];
+              return (
+                <MessageView
+                  key={msg.id}
+                  msg={msg}
+                  tid={taskTid}
+                  resolvedBlocks={resolvedBlocks}
+                  childrenByParent={childrenByParent}
+                  resolvedBlocksByMsg={resolvedBlocksByMsg}
+                  onViewFile={onViewFile}
+                  onFork={isForkable ? handleFork : undefined}
+                  onUndo={isUndoable ? handleUndo : undefined}
+                  onEdit={msg.type === "user" ? handleEditMessage : undefined}
+                  onEditRaw={handleEditRawEvent}
+                  actionUuid={actionUuid}
+                  actionBoundary={
+                    boundary
+                      ? {
+                          kind: boundary.kind,
+                          checkpointUuid: boundary.checkpoint_uuid,
+                        }
+                      : undefined
+                  }
+                  spawnedTidsByItemId={spawnedTidsByItemId}
+                  getTaskHref={getTaskHref}
+                />
+              );
+            })}
+          </div>
         </div>
-      </div>
+      </NestedHistoryContext.Provider>
     </ReplacementEventsContext.Provider>
   );
 }

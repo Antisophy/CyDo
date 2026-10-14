@@ -70,6 +70,11 @@ interface Props {
   historyWindowStep?: number;
   /** load `step` more messages of older history for a task; 0 = all */
   onLoadMoreHistory?: (tid: number, step: number) => void;
+  onLoadMoreNestedHistory?: (
+    tid: number,
+    parentToolUseId: string,
+    step: number,
+  ) => void;
 }
 
 function SessionViewInner({
@@ -105,6 +110,7 @@ function SessionViewInner({
   agentUsage,
   historyWindowStep,
   onLoadMoreHistory,
+  onLoadMoreNestedHistory,
 }: Props) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const insertTextRef = useRef<((text: string) => void) | null>(null);
@@ -434,6 +440,14 @@ function SessionViewInner({
             onLoadMoreHistory
               ? (step) => {
                   onLoadMoreHistory(tid, step);
+                }
+              : undefined
+          }
+          nestedHistoryWindows={task.nestedHistoryWindows}
+          onLoadMoreNestedHistory={
+            onLoadMoreNestedHistory
+              ? (parentToolUseId, step) => {
+                  onLoadMoreNestedHistory(tid, parentToolUseId, step);
                 }
               : undefined
           }

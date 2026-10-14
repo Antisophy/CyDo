@@ -372,6 +372,7 @@ export class Connection {
     beforeSeq: number,
     limit: number,
     deviceClass: string,
+    parentToolUseId?: string,
   ): boolean {
     return this.send(
       JSON.stringify({
@@ -380,8 +381,15 @@ export class Connection {
         before_seq: beforeSeq,
         limit,
         device_class: deviceClass,
+        tool_use_id: parentToolUseId,
       }),
     );
+  }
+
+  /** stop receiving a task's events; its next history request subscribes
+   *  again */
+  unsubscribeTask(tid: number): boolean {
+    return this.send(JSON.stringify({ type: "unsubscribe_task", tid }));
   }
 
   forkTask(tid: number, anchor: string) {

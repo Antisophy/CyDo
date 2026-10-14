@@ -300,6 +300,9 @@ export interface TaskState {
    *  lazy rendering: with a window the DOM is small and `content-visibility`
    *  only makes the scroll height jitter, but an unwindowed replay needs it. */
   historyWindowed?: boolean;
+  /** Sub-agent transcripts whose older events the server held back, by the
+   *  Agent call's tool use id: the seq the held part ends before. */
+  nestedHistoryWindows?: ReadonlyMap<string, number>;
   /** First replayed seq of the current window; > 0 means older history exists
    *  on the server, unsent. */
   historyWindowStart?: number;

@@ -1114,12 +1114,23 @@ struct TaskHistoryStartMessage
 
 /// Frames a replay of the messages *older* than what the client already holds,
 /// so it can prepend them instead of rebuilding its list.
+/// A sub-agent's transcript (the events under one Agent call) held back by a
+/// windowed replay: the client has its events from before_seq on, and older
+/// ones load on request.
+struct NestedHistoryWindow
+{
+	string parent_tool_use_id;
+	int before_seq;
+}
+
 struct TaskHistoryPrependStartMessage
 {
 	string type = "task_history_prepend_start";
 	int tid;
 	int window_start; // first seq in this batch; 0 means the task's beginning
 	int before_seq;   // where the batch stops, i.e. the client's current start
+	// set when the batch is the older part of one sub-agent's transcript
+	@JSONOptional string parent_tool_use_id;
 }
 
 struct TaskHistoryPrependEndMessage
@@ -1127,12 +1138,17 @@ struct TaskHistoryPrependEndMessage
 	string type = "task_history_prepend_end";
 	int tid;
 	int window_start;
+	@JSONOptional string parent_tool_use_id;
+	// sub-agent transcripts in this batch that still have older events
+	NestedHistoryWindow[] nested_windows;
 }
 
 struct TaskHistoryEndMessage
 {
 	string type = "task_history_end";
 	int tid;
+	// sub-agent transcripts the replay held back the older part of
+	NestedHistoryWindow[] nested_windows;
 }
 
 /// Check if a raw line is a queue-operation event (fast string search).

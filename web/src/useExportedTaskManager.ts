@@ -261,6 +261,7 @@ export function useExportedTaskManager(): TaskManager {
     dismissServerError: noop,
     historyWindowStep: 0,
     loadMoreHistory: () => {},
+    loadMoreNestedHistory: () => {},
     devMode: false,
     exportLoadError,
     navigateHome: noop,

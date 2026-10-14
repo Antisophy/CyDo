@@ -136,6 +136,7 @@ vi.mock("./connection", () => {
     readonly sendMessage = vi.fn();
     readonly requestTaskTypes = vi.fn();
     readonly requestHistory = vi.fn(() => true);
+    readonly unsubscribeTask = vi.fn(() => true);
 
     constructor() {
       testState.connection = this;

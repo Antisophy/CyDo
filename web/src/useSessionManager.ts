@@ -35,6 +35,8 @@ import {
   rebuildFromFrames,
   reduceHistoryFrame,
   reduceUnconfirmedUserMessage,
+  appendFrame,
+  mergeFramesBySeq,
   type HistoryBoundaryEvent,
   type HistoryFrame,
 } from "./historyContinuation";
@@ -278,6 +280,12 @@ export interface TaskManager {
   historyWindowStep: number;
   /** load `step` more messages of older history (0 = all) */
   loadMoreHistory: (tid: number, step: number) => void;
+  /** the next older part of one sub-agent's transcript, by its Agent call */
+  loadMoreNestedHistory: (
+    tid: number,
+    parentToolUseId: string,
+    step: number,
+  ) => void;
   exportLoadError?: string | null;
   navigateHome: () => void;
   navigateToProject: (workspace: string, projectName: string) => void;
@@ -1298,6 +1306,30 @@ export function useTaskManager(
     requestedHistoryRef.current.add(task.uuid);
   }, []);
 
+  const loadMoreNestedHistory = useCallback(
+    (tid: number, parentToolUseId: string, step: number) => {
+      const task = findByTid(tid);
+      if (!task) throw new Error(`Loading more history requires task ${tid}`);
+      const beforeSeq = task.nestedHistoryWindows?.get(parentToolUseId);
+      if (beforeSeq === undefined) return; // nothing of it is held back
+      if (prependCaptureRef.current.has(task.uuid)) return; // one batch at a time
+
+      prependCaptureRef.current.set(task.uuid, { phase: "requested" });
+      const sent = connRef.current?.requestHistoryBefore(
+        tid,
+        beforeSeq,
+        step === 0 ? -1 : step,
+        deviceClass(),
+        parentToolUseId,
+      );
+      if (!sent) {
+        prependCaptureRef.current.delete(task.uuid);
+        throw new Error(`History request failed for ${tid}`);
+      }
+    },
+    [],
+  );
+
   const releaseTombstonedActivity = useCallback(
     (
       projectKey: ProjectKey,
@@ -1393,7 +1425,7 @@ export function useTaskManager(
       };
       const frame: HistoryFrame = { kind: "event", msg, seq, ts };
       const frames = historyFramesRef.current.get(uuid);
-      if (frames) frames.push(frame);
+      if (frames) appendFrame(frames, frame);
       else historyFramesRef.current.set(uuid, [frame]);
       let updated = reduceHistoryFrame(prev, frame);
       if (!updated.historyLoaded && updated.historyTotal !== undefined) {
@@ -1827,6 +1859,7 @@ export function useTaskManager(
             ...beginTaskHistoryReplay(t0, total - windowStart),
             historyWindowed: (msg.window_limit ?? 0) > 0,
             historyWindowStart: windowStart,
+            nestedHistoryWindows: undefined,
           };
           liveStates.set(t0.uuid, t);
           setTasks((prev) => {
@@ -1866,21 +1899,27 @@ export function useTaskManager(
           // (init/metadata replayed from before the window) stays ahead of
           // the slice, and context the slice now covers is dropped since the
           // slice carries the authoritative copy at those seqs
+          // every frame goes in by seq: the slice is older than what is held,
+          // except where a sub-agent launched in it continues later, and a
+          // sub-agent's older part interleaves with the task's own events
           const cached = historyFramesRef.current.get(t0.uuid) ?? [];
-          const sliceEnd = t0.historyWindowStart ?? 0;
-          const context: HistoryFrame[] = [];
-          const rest: HistoryFrame[] = [];
-          for (const f of cached) {
-            if (f.kind === "event" && f.seq !== undefined && f.seq < sliceEnd) {
-              if (f.seq < windowStart) context.push(f);
-            } else {
-              rest.push(f);
-            }
-          }
-          const frames = context.concat(capture.frames, rest);
+          const frames = mergeFramesBySeq(cached, capture.frames);
           historyFramesRef.current.set(t0.uuid, frames);
           grownHistoryRef.current.add(t0.uuid);
-          const t = rebuildFromFrames(t0, frames, windowStart);
+          const nested = new Map(t0.nestedHistoryWindows);
+          if (msg.parent_tool_use_id) nested.delete(msg.parent_tool_use_id);
+          for (const w of msg.nested_windows ?? [])
+            nested.set(w.parent_tool_use_id, w.before_seq);
+          const t = {
+            ...rebuildFromFrames(
+              t0,
+              frames,
+              msg.parent_tool_use_id
+                ? (t0.historyWindowStart ?? 0)
+                : windowStart,
+            ),
+            nestedHistoryWindows: nested,
+          };
           liveStates.set(t0.uuid, t);
           setTasks((prev) => {
             if (!prev.has(t0.uuid)) return prev;
@@ -1930,6 +1969,12 @@ export function useTaskManager(
             pendingHistoryReplies: 0,
             inputDraft,
             sessionStatus: t0.isProcessing ? t0.sessionStatus : null,
+            nestedHistoryWindows: new Map(
+              (msg.nested_windows ?? []).map((w) => [
+                w.parent_tool_use_id,
+                w.before_seq,
+              ]),
+            ),
           };
           liveStates.set(t0.uuid, t);
 
@@ -2551,10 +2596,12 @@ export function useTaskManager(
     }
   }, [connected, activeTaskId, tasks]);
 
-  // Extra history loaded with "Load more" persists only while its task is
-  // focused: on unfocus the task falls back to the plain window, so grown
-  // timelines never pile up in memory. Refocusing replays the window fresh
-  // through the effect above (historyLoaded false, request guard cleared).
+  // A task's history lives in the page only while the task is shown: on
+  // unfocus the page unsubscribes from its events and drops its timeline,
+  // so tasks streaming in the background (sub-agents especially) cost
+  // nothing here, and nothing a page once opened piles up in memory.
+  // Refocusing replays the window fresh through the effect above
+  // (historyLoaded false, request guard cleared).
   // the previous route id, not uuid: on the first run the tid-to-uuid map may
   // not be populated yet, and this effect's only dep is the route id, so a
   // uuid recorded then would stay null forever and mask every later unfocus
@@ -2565,10 +2612,15 @@ export function useTaskManager(
     if (previousId === null || previousId === activeTaskId) return;
     const prevTid = parseTaskId(previousId);
     if (prevTid === null) return;
-    const previous = tidToUuid.get(prevTid);
-    if (previous === undefined) return;
-    if (!grownHistoryRef.current.has(previous)) return;
+    releaseTaskHistory(prevTid);
+  }, [activeTaskId]);
 
+  function releaseTaskHistory(tid: number) {
+    const previous = tidToUuid.get(tid);
+    if (previous === undefined) return;
+    // with no connection there is nothing to end: a drop ends every
+    // subscription
+    connRef.current?.unsubscribeTask(tid);
     grownHistoryRef.current.delete(previous);
     historyFramesRef.current.delete(previous);
     prependCaptureRef.current.delete(previous);
@@ -2580,6 +2632,7 @@ export function useTaskManager(
       historyTotal: undefined,
       historyReceived: undefined,
       historyWindowStart: undefined,
+      nestedHistoryWindows: undefined,
       historyLoaded: false,
     };
     liveStates.set(previous, released);
@@ -2589,7 +2642,7 @@ export function useTaskManager(
       next.set(previous, released);
       return next;
     });
-  }, [activeTaskId]);
+  }
 
   // Replay outbox entries after tasks_list arrives and WS is connected.
   // The backend deduplicates by nonce, so replaying is safe.
@@ -3567,6 +3620,7 @@ export function useTaskManager(
     devMode,
     historyWindowStep,
     loadMoreHistory,
+    loadMoreNestedHistory,
     exportLoadError: null,
     navigateHome,
     navigateToProject,

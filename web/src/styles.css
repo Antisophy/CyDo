@@ -962,6 +962,11 @@ body,
   padding: 12px 0 20px;
 }
 
+/* the same row at the top of a sub-agent's messages, inside its Agent block */
+.nested-load-more-row {
+  padding: 6px 0 10px;
+}
+
 .load-more-row .btn {
   background: var(--bg-tertiary);
   color: var(--text-dim);

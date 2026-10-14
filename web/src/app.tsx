@@ -78,6 +78,7 @@ function AppContent() {
     devMode,
     historyWindowStep,
     loadMoreHistory,
+    loadMoreNestedHistory,
     navigateHome,
     navigateToProject,
     getProjectHref,
@@ -545,6 +546,7 @@ function AppContent() {
                     agentUsage={agentUsage}
                     historyWindowStep={historyWindowStep}
                     onLoadMoreHistory={loadMoreHistory}
+                    onLoadMoreNestedHistory={loadMoreNestedHistory}
                     getTaskHref={getTaskHref}
                   />
                 </div>

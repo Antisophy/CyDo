@@ -22,7 +22,8 @@ import cydo.protocol : ContentBlock, ItemStartedEvent, TaskEventEnvelope,
 	HistoryBoundaryKind, extractContentText;
 import cydo.runtime.config : AgentDriver;
 import cydo.domain.storage.persistence : LoadedHistory;
-import cydo.domain.tasks.model : QueueOperationProbe, TaskData, TaskHistoryEndMessage,
+import cydo.domain.tasks.model : NestedHistoryWindow, QueueOperationProbe, TaskData,
+	TaskHistoryEndMessage,
 	TaskHistoryPrependEndMessage, TaskHistoryPrependStartMessage,
 	TaskHistoryStartMessage, Watermark, buildSyntheticUserEvent, extractEventFromEnvelope,
 	extractTsFromEnvelope, watermarkFromPath;
@@ -470,20 +471,36 @@ class HistoryEventPipeline
 		foreach (contextIndex; sessionContextBefore(td, windowStart))
 			sendHistoryRecordAt(ws, tid, td, contextIndex);
 
-		sendHistoryRange(ws, tid, td, windowStart, td.history.length);
+		NestedHistoryWindow[] nestedWindows;
+		if (messageLimit > 0)
+			sendHistoryIndices(ws, tid, td, selectHistory(td, null, windowStart,
+				td.history.length, windowStart, messageLimit, nestedWindows));
+		else
+			sendHistoryRange(ws, tid, td, windowStart, td.history.length);
 		if (host_.resolveTaskHistory(tid).kind == TaskHistoryResolutionKind.access)
 			host_.sendHistoryOperations(ws, tid);
 
-		ws.send(Data(toJson(TaskHistoryEndMessage("task_history_end", tid)).representation));
+		ws.send(Data(toJson(TaskHistoryEndMessage("task_history_end", tid,
+			nestedWindows)).representation));
 		host_.sendReplaySupplementalState(ws, tid);
 		host_.subscribe(ws, tid);
 		host_.onHistorySubscribed(tid);
 	}
 
-	/// Replay the messages immediately older than a window the client already
-	/// holds, so it can prepend them instead of rebuilding its list; growing
-	/// the window instead would replay everything the client already has.
-	void handleRequestHistoryBefore(WebSocketAdapter ws, int tid, int beforeSeq, int messageLimit)
+	/// Replay the messages immediately older than an already-loaded window.
+	///
+	/// The client keeps what it has and prepends this, so nothing on screen is
+	/// rebuilt and the view does not move; growing the window instead would
+	/// mean replaying everything the client already holds.
+	///
+	/// With `parentToolUseId` set, the batch is instead the older part of
+	/// that sub-agent's transcript, held back by an earlier windowed replay.
+	/// Either way, a sub-agent launched within the batch comes with its own
+	/// transcript, windowed the same way, and the batch carries seqs past
+	/// `beforeSeq` when such a transcript continues there; the client places
+	/// every frame by seq.
+	void handleRequestHistoryBefore(WebSocketAdapter ws, int tid, int beforeSeq,
+		int messageLimit, string parentToolUseId = null)
 	{
 		if (tid < 0)
 			return;
@@ -495,15 +512,165 @@ class HistoryEventPipeline
 		size_t end = beforeSeq < 0 ? 0 : beforeSeq;
 		if (end > td.history.length)
 			end = td.history.length;
-		auto start = messageLimit > 0 ? historyWindowStart(td, messageLimit, end) : 0;
+		import std.conv : to;
+		import std.exception : enforce;
 
+		size_t start;
+		size_t scanFrom;
+		if (parentToolUseId.length == 0)
+		{
+			start = messageLimit > 0 ? historyWindowStart(td, messageLimit, end) : 0;
+			scanFrom = start;
+		}
+		else
+		{
+			// the transcript starts after its launch, the Agent call itself
+			auto launch = findLaunch(td, parentToolUseId, end);
+			enforce(launch < end, "no Agent call " ~ parentToolUseId
+				~ " before seq " ~ to!string(end));
+			start = launch + 1;
+			scanFrom = launch + 1;
+		}
+
+		NestedHistoryWindow[] nestedWindows;
+		auto indices = selectHistory(td, parentToolUseId, start, end, scanFrom,
+			messageLimit, nestedWindows);
+		auto batchStart = indices.length > 0 ? indices[0] : end;
 		ws.send(Data(toJson(TaskHistoryPrependStartMessage("task_history_prepend_start",
-			tid, cast(int) start, cast(int) end)).representation));
-		sendHistoryRange(ws, tid, td, start, end);
+			tid, cast(int) (parentToolUseId.length == 0 ? start : batchStart),
+			cast(int) end, parentToolUseId)).representation));
+		sendHistoryIndices(ws, tid, td, indices);
 		ws.send(Data(toJson(TaskHistoryPrependEndMessage("task_history_prepend_end",
-			tid, cast(int) start)).representation));
+			tid, cast(int) (parentToolUseId.length == 0 ? start : batchStart),
+			parentToolUseId, nestedWindows)).representation));
 		host_.subscribe(ws, tid);
 		host_.onHistorySubscribed(tid);
+	}
+
+	/// The index of the item/started that launched a sub-agent (its Agent
+	/// tool call), searching back from `end`; `end` when there is none.
+	private size_t findLaunch(TaskData* td, string toolUseId, size_t end)
+	{
+		@JSONPartial static struct LaunchProbe
+		{
+			string type; @JSONOptional string item_type; @JSONOptional string item_id;
+		}
+		foreach_reverse (i; 0 .. end)
+		{
+			LaunchProbe probe;
+			td.history[i].enter((scope const(ubyte)[] bytes) {
+				auto event = extractEventFromEnvelope(bytes.as!(char[]));
+				if (event.length > 0)
+					probe = jsonParse!LaunchProbe(event);
+			});
+			if (probe.type == "item/started" && probe.item_type == "tool_use"
+				&& probe.item_id == toolUseId)
+				return i;
+		}
+		return end;
+	}
+
+	/// The events a windowed replay sends, in seq order. `root` names whose
+	/// events the range is about: null for the task's own (parentless)
+	/// events, already windowed to [rootStart, rootEnd); a tool use id for a
+	/// sub-agent's transcript, windowed here to its newest `messageLimit`
+	/// messages (prompts, text, and tool calls) within [rootStart, rootEnd). Each sub-agent launched by an
+	/// included event is included in turn, windowed the same way over its
+	/// events from `scanFrom` to the end of the history; a sub-agent whose
+	/// launch is not included is left out, since nothing would show it.
+	/// `nestedWindows` gets every sub-agent whose older events were held back.
+	private size_t[] selectHistory(TaskData* td, string root, size_t rootStart,
+		size_t rootEnd, size_t scanFrom, int messageLimit,
+		ref NestedHistoryWindow[] nestedWindows)
+	{
+		@JSONPartial static struct SelectProbe
+		{
+			string type; @JSONOptional string item_type; @JSONOptional string item_id;
+			@JSONOptional bool is_meta; @JSONOptional bool is_synthetic;
+			@JSONOptional string parent_tool_use_id;
+		}
+		auto count = td.history.length > scanFrom ? td.history.length - scanFrom : 0;
+		auto parents = new string[count];
+		auto bubble = new bool[count];
+		auto launches = new string[count];
+		size_t[][string] byParent;
+		foreach (i; scanFrom .. td.history.length)
+		{
+			SelectProbe probe;
+			td.history[i].enter((scope const(ubyte)[] bytes) {
+				auto event = extractEventFromEnvelope(bytes.as!(char[]));
+				if (event.length > 0)
+					probe = jsonParse!SelectProbe(event);
+			});
+			auto k = i - scanFrom;
+			parents[k] = probe.parent_tool_use_id;
+			// a sub-agent's text reaches its transcript but never the live
+			// stream, so while it runs its messages are its tool calls; they
+			// count toward its window alongside its prompt and text
+			bubble[k] = probe.type == "item/started" && !probe.is_meta && !probe.is_synthetic
+				&& (probe.item_type == "user_message" || probe.item_type == "text"
+					|| probe.item_type == "tool_use");
+			if (probe.type == "item/started" && probe.item_type == "tool_use")
+				launches[k] = probe.item_id;
+			byParent.require(probe.parent_tool_use_id) ~= i;
+		}
+
+		bool[size_t] included;
+		// (parent, events of it to consider, whether to window them)
+		static struct Pending { string parent; size_t lo; size_t hi; bool window; }
+		Pending[] queue = [Pending(root, rootStart, rootEnd, root.length > 0)];
+		bool[string] visited;
+		while (queue.length > 0)
+		{
+			auto item = queue[0];
+			queue = queue[1 .. $];
+			if (item.parent in visited)
+				continue;
+			visited[item.parent] = true;
+			size_t[] events;
+			foreach (i; byParent.get(item.parent, null))
+				if (i >= item.lo && i < item.hi)
+					events ~= i;
+			size_t first = 0;
+			if (item.window && messageLimit > 0)
+			{
+				size_t bubbles = 0;
+				foreach_reverse (n, i; events)
+					if (bubble[i - scanFrom] && ++bubbles >= cast(size_t) messageLimit)
+					{
+						first = n;
+						break;
+					}
+				if (first > 0)
+					nestedWindows ~= NestedHistoryWindow(item.parent, cast(int) events[first]);
+			}
+			foreach (i; events[first .. $])
+			{
+				included[i] = true;
+				auto launched = launches[i - scanFrom];
+				if (launched.length > 0)
+					queue ~= Pending(launched, i + 1, td.history.length, true);
+			}
+		}
+		import std.algorithm : sort;
+		auto indices = included.keys;
+		indices.sort();
+		return indices;
+	}
+
+	private void sendHistoryIndices(WebSocketAdapter ws, int tid, TaskData* td,
+		const size_t[] indices)
+	{
+		size_t next = 0;
+		foreach (i, ref msg; td.history)
+		{
+			if (next >= indices.length)
+				break;
+			if (i != indices[next])
+				continue;
+			emitHistoryRecord(ws, tid, msg, i);
+			next++;
+		}
 	}
 
 	private void sendHistoryRange(WebSocketAdapter ws, int tid, TaskData* td,
@@ -1989,3 +2156,139 @@ unittest
 	assert(wsAll.sent.length == 9, "full replay carries no duplicated context");
 }
 
+unittest
+{
+	import ae.net.asockets : ConnectionState, DisconnectType, IConnection;
+	import ae.sys.dataset : joinData;
+	import ae.utils.array : as;
+	import ae.utils.json : jsonParse;
+	import cydo.domain.tasks.model : Watermark;
+
+	enum tid = 75;
+	auto td = TaskData(tid, "local", "/tmp");
+	td.history.reset(Watermark.none());
+	class StubWebSocketAdapter : WebSocketAdapter
+	{
+		string[] sent;
+
+		this()
+		{
+			super(new class IConnection
+			{
+				ConnectionState state_ = ConnectionState.connected;
+				void delegate(string, DisconnectType) disconnectHandler;
+
+				@property ConnectionState state() { return state_; }
+				void send(scope Data[] data, int priority) {}
+				void disconnect(string reason, DisconnectType type)
+				{
+					state_ = ConnectionState.disconnected;
+					disconnectHandler(reason, type);
+				}
+				@property void handleConnect(void delegate() value) {}
+				@property void handleReadData(void delegate(Data) value) {}
+				@property void handleDisconnect(void delegate(string, DisconnectType) value)
+				{
+					disconnectHandler = value;
+				}
+				@property void handleBufferFlushed(void delegate() value) {}
+			});
+		}
+
+		override void send(scope Data[] data, int priority)
+		{
+			sent ~= cast(string) data.joinData().toGC().as!string;
+		}
+	}
+	HistoryEventPipelineHost host;
+	host.getTask = (int t) => t == tid ? &td : null;
+	host.resolveTaskHistory = (int t) => TaskHistoryResolution.noSession();
+	host.injectAgentNameIntoSessionInit = (string translated, string agentName) => translated;
+	host.normalizeKnownSystemMessageMeta = (string translated, int t) => translated;
+	host.sendToSubscribed = (int t, Data data) {};
+	host.subscribe = (WebSocketAdapter ws, int t) {};
+	host.sendHistoryOperations = (WebSocketAdapter ws, int t) {};
+	host.broadcastHistoryOperations = (int t) {};
+	host.sendReplaySupplementalState = (WebSocketAdapter ws, int t) {};
+	host.onHistorySubscribed = (int t) {};
+	host.updateClaudeUsageFromEvent = (int t, string translated) => false;
+	host.planBroadcast = (int t, TranslatedEvent ev) => HistoryBroadcastPlan.init;
+
+	auto pipeline = new HistoryEventPipeline(host);
+	// a sub-agent (T) launched from the task, and one (G) launched from T
+	foreach (event; [
+		`{"type":"item/started","item_type":"user_message","uuid":"u1"}`,                          // 0
+		`{"type":"item/started","item_type":"text","item_id":"a1"}`,                               // 1
+		`{"type":"item/started","item_type":"tool_use","item_id":"T"}`,                            // 2
+		`{"type":"item/started","item_type":"user_message","uuid":"t0","parent_tool_use_id":"T"}`, // 3
+		`{"type":"item/started","item_type":"text","item_id":"t1","parent_tool_use_id":"T"}`,      // 4
+		`{"type":"item/started","item_type":"tool_use","item_id":"G","parent_tool_use_id":"T"}`,   // 5
+		`{"type":"item/started","item_type":"user_message","uuid":"g0","parent_tool_use_id":"G"}`, // 6
+		`{"type":"item/started","item_type":"text","item_id":"g1","parent_tool_use_id":"G"}`,      // 7
+		`{"type":"item/started","item_type":"text","item_id":"g2","parent_tool_use_id":"G"}`,      // 8
+		`{"type":"item/started","item_type":"text","item_id":"t2","parent_tool_use_id":"T"}`,      // 9
+		`{"type":"item/started","item_type":"text","item_id":"t3","parent_tool_use_id":"T"}`,      // 10
+		`{"type":"item/started","item_type":"text","item_id":"a2"}`,                               // 11
+	])
+		pipeline.appendAndBroadcastTaskEvent(tid, TranslatedEvent(event, null, AbsTime(1000)));
+
+	@JSONPartial static struct SeqProbe { int seq = -1; }
+	@JSONPartial static struct Window { string parent_tool_use_id; int before_seq; }
+	@JSONPartial static struct EndProbe
+	{
+		string type; @JSONOptional int window_start; @JSONOptional string parent_tool_use_id;
+		@JSONOptional Window[] nested_windows;
+	}
+	int[] seqs(string[] sent)
+	{
+		int[] result;
+		foreach (message; sent[1 .. $ - 1])
+			result ~= jsonParse!SeqProbe(message).seq;
+		return result;
+	}
+
+	// window 2: the task's own newest two bubbles (a1, a2) and the launch of
+	// T between them; T's own newest two (t2, t3), its older part held back,
+	// and G not at all, since its launch is in T's held part
+	auto ws = new StubWebSocketAdapter();
+	scope(exit) ws.disconnect("test complete", DisconnectType.requested);
+	pipeline.handleRequestHistory(ws, tid, 2);
+	assert(seqs(ws.sent) == [1, 2, 9, 10, 11], ws.sent[$ - 1]);
+	auto end = jsonParse!EndProbe(ws.sent[$ - 1]);
+	assert(end.type == "task_history_end");
+	assert(end.nested_windows.length == 1 && end.nested_windows[0].parent_tool_use_id == "T"
+		&& end.nested_windows[0].before_seq == 9);
+
+	// T's next two messages (t1, and the launch of G, a tool call), with
+	// G windowed in turn
+	auto wsT = new StubWebSocketAdapter();
+	scope(exit) wsT.disconnect("test complete", DisconnectType.requested);
+	pipeline.handleRequestHistoryBefore(wsT, tid, 9, 2, "T");
+	assert(seqs(wsT.sent) == [4, 5, 7, 8], wsT.sent[$ - 1]);
+	auto endT = jsonParse!EndProbe(wsT.sent[$ - 1]);
+	assert(endT.type == "task_history_prepend_end" && endT.parent_tool_use_id == "T"
+		&& endT.window_start == 4);
+	assert(endT.nested_windows.length == 2);
+	foreach (w; endT.nested_windows)
+		assert((w.parent_tool_use_id == "T" && w.before_seq == 4)
+			|| (w.parent_tool_use_id == "G" && w.before_seq == 7), wsT.sent[$ - 1]);
+
+	// the rest of T
+	auto wsT2 = new StubWebSocketAdapter();
+	scope(exit) wsT2.disconnect("test complete", DisconnectType.requested);
+	pipeline.handleRequestHistoryBefore(wsT2, tid, 4, 2, "T");
+	assert(seqs(wsT2.sent) == [3], wsT2.sent[$ - 1]);
+
+	// G's older part
+	auto wsG = new StubWebSocketAdapter();
+	scope(exit) wsG.disconnect("test complete", DisconnectType.requested);
+	pipeline.handleRequestHistoryBefore(wsG, tid, 7, 2, "G");
+	assert(seqs(wsG.sent) == [6], wsG.sent[$ - 1]);
+	assert(jsonParse!EndProbe(wsG.sent[$ - 1]).nested_windows.length == 0);
+
+	// the task's own older part (u1) comes with nothing nested
+	auto wsRoot = new StubWebSocketAdapter();
+	scope(exit) wsRoot.disconnect("test complete", DisconnectType.requested);
+	pipeline.handleRequestHistoryBefore(wsRoot, tid, 1, 2);
+	assert(seqs(wsRoot.sent) == [0], wsRoot.sent[$ - 1]);
+}

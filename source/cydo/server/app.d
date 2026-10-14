@@ -1308,6 +1308,7 @@ class App
 			case "create_task":       handleCreateTaskMsg(ws, json); break;
 			case "request_history":   handleRequestHistory(ws, json); break;
 			case "request_history_before": handleRequestHistoryBefore(ws, json); break;
+			case "unsubscribe_task":  clientHub.unsubscribe(ws, json.tid); break;
 			case "message":           handleUserMessage(json); break;
 			case "resume":            handleResumeMsg(json); break;
 			case "interrupt":         handleInterruptMsg(json); break;
@@ -1510,7 +1511,7 @@ class App
 	private void handleRequestHistoryBefore(WebSocketAdapter ws, WsMessage json)
 	{
 		historyPipeline.handleRequestHistoryBefore(ws, json.tid, json.before_seq,
-			resolveHistoryLimit(json.limit, json.device_class));
+			resolveHistoryLimit(json.limit, json.device_class), json.tool_use_id);
 	}
 
 	/// Turn a client's request into an actual window size.
