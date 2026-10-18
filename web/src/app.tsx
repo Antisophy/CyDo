@@ -330,7 +330,7 @@ function AppContent() {
         return;
       }
       if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
-      const order = flatTaskOrder(sidebarTasks);
+      const order = flatTaskOrder(sidebarTasks, ui.sidebar);
       if (e.shiftKey) {
         // Jump to next/prev task with attention, wrapping around
         if (order.length === 0) return;
@@ -378,6 +378,7 @@ function AppContent() {
     };
   }, [
     sidebarTasks,
+    ui.sidebar,
     activeTaskId,
     setActiveTaskId,
     attention,
@@ -436,6 +437,7 @@ function AppContent() {
           )}
           <Sidebar
             tasks={sidebarTasks}
+            config={ui.sidebar}
             tasksLoading={tasksLoading}
             activeTaskId={activeTaskId}
             attention={attention}

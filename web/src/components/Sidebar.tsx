@@ -7,6 +7,7 @@ import {
   useState,
 } from "preact/hooks";
 import type { TypeInfo } from "../useSessionManager";
+import type { SidebarUiConfig } from "../protocol";
 import { ensureIconStyles } from "./TaskTypeIcon";
 import { isPlainLeftClick } from "../utils";
 import relSubtaskIcon from "../icons/rel-subtask.svg?raw";
@@ -175,6 +176,8 @@ export interface SidebarTask {
   taskType?: string;
   hasPendingQuestion?: boolean;
   hasMessages?: boolean;
+  /** when the task last saw work, for ordering by activity */
+  lastActive?: number;
 }
 
 interface TreeNode {
@@ -184,7 +187,10 @@ interface TreeNode {
   knownChildCount: number;
 }
 
-export function flatTaskOrder(tasks: SidebarTask[]): string[] {
+export function flatTaskOrder(
+  tasks: SidebarTask[],
+  config: SidebarUiConfig = {},
+): string[] {
   const ids: string[] = [];
   function walk(nodes: TreeNode[]) {
     for (const n of nodes) {
@@ -192,8 +198,31 @@ export function flatTaskOrder(tasks: SidebarTask[]): string[] {
       walk(n.children);
     }
   }
-  walk(buildTree(tasks));
+  walk(buildTree(tasks, config));
   return ids;
+}
+
+/** Order every level by activity: siblings re-sort among themselves, least
+ *  recently active first like the creation order puts the oldest first, and
+ *  nothing is reparented. A node counts as active as its most recently
+ *  active descendant, at any depth, so a parent rises with work beneath it.
+ *  The sort is stable, so equal activity keeps the creation order. */
+function sortByActivity(nodes: TreeNode[]): TreeNode[] {
+  const activity = new Map<TreeNode, number>();
+  function subtreeActivity(node: TreeNode): number {
+    let newest = node.task.lastActive ?? 0;
+    for (const child of node.children)
+      newest = Math.max(newest, subtreeActivity(child));
+    activity.set(node, newest);
+    return newest;
+  }
+  function sortLevel(level: TreeNode[]): TreeNode[] {
+    return [...level]
+      .sort((a, b) => activity.get(a)! - activity.get(b)!)
+      .map((node) => ({ ...node, children: sortLevel(node.children) }));
+  }
+  for (const node of nodes) subtreeActivity(node);
+  return sortLevel(nodes);
 }
 
 function insertArchiveNodes(nodes: TreeNode[]): TreeNode[] {
@@ -224,7 +253,10 @@ function insertArchiveNodes(nodes: TreeNode[]): TreeNode[] {
   });
 }
 
-export function buildTree(tasks: SidebarTask[]): TreeNode[] {
+export function buildTree(
+  tasks: SidebarTask[],
+  config: SidebarUiConfig = {},
+): TreeNode[] {
   const tidSet = new Set(tasks.map((t) => t.tid));
   const childMap = new Map<number, SidebarTask[]>();
   const roots: SidebarTask[] = [];
@@ -252,6 +284,9 @@ export function buildTree(tasks: SidebarTask[]): TreeNode[] {
   }
 
   let tree = toNodes(roots);
+  // before the group nodes go in, which have no activity of their own and
+  // keep their places
+  if (config.sort === "activity") tree = sortByActivity(tree);
   tree = insertArchiveNodes(tree);
 
   // Handle archived roots
@@ -659,6 +694,8 @@ const SidebarItem = memo(function SidebarItem({
 
 // --- Sidebar component ---
 
+const NO_SIDEBAR_CONFIG: SidebarUiConfig = {};
+
 interface Props {
   tasks: SidebarTask[];
   tasksLoading: boolean;
@@ -678,6 +715,8 @@ interface Props {
   onOpenSearch?: () => void;
   onArchive?: (tid: number) => void;
   hasGlobalAttention?: boolean;
+  /** the config's ui.sidebar section */
+  config?: SidebarUiConfig;
 }
 
 export const Sidebar = memo(function Sidebar({
@@ -699,8 +738,9 @@ export const Sidebar = memo(function Sidebar({
   onOpenSearch,
   onArchive,
   hasGlobalAttention,
+  config = NO_SIDEBAR_CONFIG,
 }: Props) {
-  const tree = useMemo(() => buildTree(tasks), [tasks]);
+  const tree = useMemo(() => buildTree(tasks, config), [tasks, config]);
   const flatItems = useMemo(
     () => flattenTree(tree, activeTaskId, taskTypes, tasksLoading),
     [tree, activeTaskId, taskTypes, tasksLoading],

@@ -249,6 +249,7 @@ export interface TaskManager {
     taskType?: string;
     hasPendingQuestion?: boolean;
     hasMessages?: boolean;
+    lastActive?: number;
   }>;
   workspaces: WorkspaceInfo[];
   entryPoints: EntryPointInfo[];
@@ -3348,6 +3349,9 @@ export function useTaskManager(
         taskType: t.taskType,
         hasPendingQuestion: t.hasPendingQuestion,
         hasMessages: t.messages.length > 0,
+        // a task that never ran counts from its creation, so a fresh draft
+        // sorts with the newest work
+        lastActive: t.lastActive || t.createdAt || 0,
       }));
 
     const prev = prevSidebarTasksRef.current;
@@ -3371,7 +3375,8 @@ export function useTaskManager(
           t.archiving === p.archiving &&
           t.taskType === p.taskType &&
           t.hasPendingQuestion === p.hasPendingQuestion &&
-          t.hasMessages === p.hasMessages
+          t.hasMessages === p.hasMessages &&
+          t.lastActive === p.lastActive
         );
       })
     ) {

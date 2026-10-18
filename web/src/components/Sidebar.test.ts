@@ -491,3 +491,72 @@ describe("Sidebar loading marker markup", () => {
     expect(container.textContent).not.toContain("(loading…)");
   });
 });
+
+describe("sidebar activity sort", () => {
+  const activity = { sort: "activity" } as const;
+
+  it("keeps the creation order by default", () => {
+    const tasks = [
+      task(1, { lastActive: 500 }),
+      task(2, { lastActive: 100 }),
+      task(3, { lastActive: 900 }),
+    ];
+    expect(flatTaskOrder(tasks)).toEqual(["1", "2", "3"]);
+    expect(flatTaskOrder(tasks, { sort: "creation" })).toEqual(["1", "2", "3"]);
+  });
+
+  it("orders by activity like the creation order, oldest first", () => {
+    const tasks = [
+      task(1, { lastActive: 500 }),
+      task(2, { lastActive: 100 }),
+      task(3, { lastActive: 900 }),
+    ];
+    expect(flatTaskOrder(tasks, activity)).toEqual(["2", "1", "3"]);
+  });
+
+  it("counts a parent as active as its most recently active descendant", () => {
+    // 1 is stale itself, but its grandchild 3 is the newest work anywhere
+    const tasks = [
+      task(1, { lastActive: 100 }),
+      task(2, { lastActive: 100, parentTid: 1 }),
+      task(3, { lastActive: 900, parentTid: 2 }),
+      task(4, { lastActive: 500 }),
+    ];
+    expect(flatTaskOrder(tasks, activity)).toEqual(["4", "1", "2", "3"]);
+  });
+
+  it("re-sorts siblings among themselves without reparenting", () => {
+    const tasks = [
+      task(1, { lastActive: 100 }),
+      task(2, { lastActive: 800, parentTid: 1 }),
+      task(3, { lastActive: 200, parentTid: 1 }),
+    ];
+    expect(flatTaskOrder(tasks, activity)).toEqual(["1", "3", "2"]);
+  });
+
+  it("keeps the creation order between equally active tasks", () => {
+    const tasks = [
+      task(1, { lastActive: 500 }),
+      task(2, { lastActive: 500 }),
+      task(3, { lastActive: 100 }),
+    ];
+    expect(flatTaskOrder(tasks, activity)).toEqual(["3", "1", "2"]);
+  });
+
+  it("leaves Archive and Import where the creation order has them", () => {
+    const tasks = [
+      task(1, { lastActive: 900 }),
+      task(2, { lastActive: 100, archived: true }),
+      task(3, { lastActive: 800, status: "importable" }),
+      task(4, { lastActive: 50 }),
+    ];
+    expect(flatTaskOrder(tasks, activity)).toEqual([
+      "archive",
+      "2",
+      "import",
+      "3",
+      "4",
+      "1",
+    ]);
+  });
+});

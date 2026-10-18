@@ -117,11 +117,23 @@ struct UsageUiConfig
 	@Optional bool remaining;
 }
 
+/// What the sidebar orders tasks by. `creation` is the tid order the list has
+/// always had; `activity` orders by when each task last saw work, a parent
+/// counting as active as its most recently active descendant. Either way,
+/// siblings only re-sort among themselves.
+enum SidebarSort { creation, activity }
+
+struct SidebarUiConfig
+{
+	@Optional SidebarSort sort = SidebarSort.creation;
+}
+
 /// Preferences for the web UI. The whole section reaches every page in
 /// server_status, on connect and again on each config reload.
 struct UiConfig
 {
 	@Optional UsageUiConfig usage;
+	@Optional SidebarUiConfig sidebar;
 }
 
 struct CydoConfig
@@ -444,5 +456,20 @@ version (unittest)
 
 		assertThrown(parseConfigString!CydoConfig(
 			workspacesYAML ~ "ui:\n  usage:\n    coloring: rainbow\n", "/dev/null"));
+	}
+
+	// 15. The sidebar sort defaults to creation, takes activity, and an
+	// unknown value is an error.
+	unittest
+	{
+		auto defaults = parseConfigString!CydoConfig(workspacesYAML, "/dev/null");
+		assert(defaults.ui.sidebar.sort == SidebarSort.creation);
+
+		auto config = parseConfigString!CydoConfig(
+			workspacesYAML ~ "ui:\n  sidebar:\n    sort: activity\n", "/dev/null");
+		assert(config.ui.sidebar.sort == SidebarSort.activity);
+
+		assertThrown(parseConfigString!CydoConfig(
+			workspacesYAML ~ "ui:\n  sidebar:\n    sort: alphabetical\n", "/dev/null"));
 	}
 }

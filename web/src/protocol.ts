@@ -381,8 +381,12 @@ export interface UsageUiConfig {
   coloring?: "pace" | "percent";
   remaining?: boolean;
 }
+export interface SidebarUiConfig {
+  sort?: "creation" | "activity";
+}
 export interface UiConfig {
   usage?: UsageUiConfig;
+  sidebar?: SidebarUiConfig;
 }
 export interface ServerStatusMessage {
   type: "server_status";
