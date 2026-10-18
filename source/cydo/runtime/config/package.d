@@ -123,9 +123,18 @@ struct UsageUiConfig
 /// siblings only re-sort among themselves.
 enum SidebarSort { creation, activity }
 
+/// Which end of the sidebar the newest tasks go. `oldest_first` is the
+/// bottom-up list the sidebar has always had: the oldest at the top, the
+/// newest and New Task at the bottom, where the list rests. `newest_first`
+/// reads top-down instead, New Task and the newest tasks at the top, where it
+/// then rests; Archive and Import, and the folded run of finished subtasks,
+/// move to the far end of their level.
+enum SidebarOrder { oldest_first, newest_first }
+
 struct SidebarUiConfig
 {
 	@Optional SidebarSort sort = SidebarSort.creation;
+	@Optional SidebarOrder order = SidebarOrder.oldest_first;
 }
 
 /// Preferences for the web UI. The whole section reaches every page in
@@ -471,5 +480,20 @@ version (unittest)
 
 		assertThrown(parseConfigString!CydoConfig(
 			workspacesYAML ~ "ui:\n  sidebar:\n    sort: alphabetical\n", "/dev/null"));
+	}
+
+	// 16. The sidebar order defaults to oldest_first, takes newest_first, and
+	// an unknown value is an error.
+	unittest
+	{
+		auto defaults = parseConfigString!CydoConfig(workspacesYAML, "/dev/null");
+		assert(defaults.ui.sidebar.order == SidebarOrder.oldest_first);
+
+		auto config = parseConfigString!CydoConfig(
+			workspacesYAML ~ "ui:\n  sidebar:\n    order: newest_first\n", "/dev/null");
+		assert(config.ui.sidebar.order == SidebarOrder.newest_first);
+
+		assertThrown(parseConfigString!CydoConfig(
+			workspacesYAML ~ "ui:\n  sidebar:\n    order: sideways\n", "/dev/null"));
 	}
 }

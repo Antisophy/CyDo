@@ -352,8 +352,12 @@ function AppContent() {
           .querySelector(`.sidebar-item[data-tid="${next}"]`)
           ?.scrollIntoView({ block: "nearest" });
       } else {
-        // Visual order: tasks in flatTaskOrder, then New Task at bottom
-        const visual: (string | null)[] = [...order, null];
+        // Visual order: tasks in flatTaskOrder, with New Task beside the
+        // newest end, the bottom or (newest first) the top
+        const visual: (string | null)[] =
+          ui.sidebar?.order === "newest_first"
+            ? [null, ...order]
+            : [...order, null];
         const idx = visual.indexOf(activeTaskId);
         const dir = e.key === "ArrowUp" ? -1 : 1;
         const nextIdx = (idx + dir + visual.length) % visual.length;

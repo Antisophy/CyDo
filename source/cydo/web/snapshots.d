@@ -282,13 +282,13 @@ unittest
 
 	// the page receives the ui section as configured, defaults included
 	auto defaults = buildServerStatus(false, false, "/nonexistent");
-	assert(defaults.canFind(`"ui":{"usage":{"coloring":"pace","remaining":false},"sidebar":{"sort":"creation"}}`), defaults);
+	assert(defaults.canFind(`"ui":{"usage":{"coloring":"pace","remaining":false},"sidebar":{"sort":"creation","order":"oldest_first"}}`), defaults);
 
 	UiConfig ui;
 	ui.usage.coloring = UsageColoring.percent;
 	ui.usage.remaining = true;
 	auto configured = buildServerStatus(false, false, "/nonexistent", ui);
-	assert(configured.canFind(`"ui":{"usage":{"coloring":"percent","remaining":true},"sidebar":{"sort":"creation"}}`),
+	assert(configured.canFind(`"ui":{"usage":{"coloring":"percent","remaining":true},"sidebar":{"sort":"creation","order":"oldest_first"}}`),
 		configured);
 }
 

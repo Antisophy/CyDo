@@ -560,3 +560,127 @@ describe("sidebar activity sort", () => {
     ]);
   });
 });
+
+describe("sidebar newest-first order", () => {
+  const newestFirst = { order: "newest_first" } as const;
+
+  it("mirrors every level, Archive and Import sinking to the end", () => {
+    const tasks = [
+      task(1),
+      task(2, { parentTid: 1 }),
+      task(3, { parentTid: 1 }),
+      task(4, { archived: true }),
+      task(5, { status: "importable" }),
+      task(6),
+    ];
+    expect(flatTaskOrder(tasks)).toEqual([
+      "archive",
+      "4",
+      "import",
+      "5",
+      "1",
+      "2",
+      "3",
+      "6",
+    ]);
+    expect(flatTaskOrder(tasks, newestFirst)).toEqual([
+      "6",
+      "1",
+      "3",
+      "2",
+      "import",
+      "5",
+      "archive",
+      "4",
+    ]);
+  });
+
+  it("puts the most recently active first when sorting by activity", () => {
+    const tasks = [
+      task(1, { lastActive: 100 }),
+      task(2, { lastActive: 900, parentTid: 1 }),
+      task(3, { lastActive: 500 }),
+    ];
+    expect(
+      flatTaskOrder(tasks, { sort: "activity", order: "newest_first" }),
+    ).toEqual(["1", "2", "3"]);
+  });
+
+  it("folds the oldest run of finished subtasks, which now trails", () => {
+    const done = { status: "completed" };
+    const tasks = [
+      task(1),
+      task(2, { parentTid: 1, ...done }),
+      task(3, { parentTid: 1, ...done }),
+      task(4, { parentTid: 1, alive: true }),
+    ];
+    const flat = flattenTree(
+      buildTree(tasks, newestFirst),
+      null,
+      [],
+      false,
+      true,
+    ).filter((item) => item.kind === "ordinary");
+    expect(flat.map((i) => i.id)).toEqual(["1", "4", "subtasks:1"]);
+    expect(flat[2]!.attentionTids).toEqual([3, 2]);
+    // the summary is the parent's last row now, so its connector ends there
+    expect(flat[1]!.guides & 1).toBe(1);
+    expect(flat[2]!.guides & 1).toBe(0);
+  });
+
+  it("renders top-down with New Task first", () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    try {
+      render(
+        h(Sidebar, {
+          tasks: [task(1, { title: "older" }), task(2, { title: "newer" })],
+          tasksLoading: false,
+          activeTaskId: "1",
+          attention: new Set<number>(),
+          onSelectTask: vi.fn(),
+          onNewTask: vi.fn(),
+          getTaskHref: (id: string) => `/task/${id}`,
+          taskTypes: [],
+          config: newestFirst,
+        }),
+        container,
+      );
+      const list = container.querySelector(".sidebar-list")!;
+      expect(list.classList.contains("newest-first")).toBe(true);
+      const rows = [...list.children].map((row) => row.textContent);
+      expect(rows).toEqual(["New Task", "newer", "older"]);
+    } finally {
+      render(null, container);
+      container.remove();
+    }
+  });
+
+  it("keeps the bottom-up DOM order by default", () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    try {
+      render(
+        h(Sidebar, {
+          tasks: [task(1, { title: "older" }), task(2, { title: "newer" })],
+          tasksLoading: false,
+          activeTaskId: "1",
+          attention: new Set<number>(),
+          onSelectTask: vi.fn(),
+          onNewTask: vi.fn(),
+          getTaskHref: (id: string) => `/task/${id}`,
+          taskTypes: [],
+        }),
+        container,
+      );
+      const list = container.querySelector(".sidebar-list")!;
+      expect(list.classList.contains("newest-first")).toBe(false);
+      // column-reverse shows this bottom to top: older, newer, New Task
+      const rows = [...list.children].map((row) => row.textContent);
+      expect(rows).toEqual(["New Task", "newer", "older"]);
+    } finally {
+      render(null, container);
+      container.remove();
+    }
+  });
+});
