@@ -1082,6 +1082,11 @@ body,
 
 .task-lifecycle-desc {
   color: var(--text);
+  /* a background command's description is its whole command line, which can
+     hold a path or token wider than the row; as a flex item it would refuse
+     to shrink below that and push the message list sideways */
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* Control response messages */
